@@ -1,0 +1,345 @@
+系统的看一下page的管理.
+1. lowmem_reserve
+和系统参数lowmem_reserve_ratio有关,系统一个node的内存包括3个zone(DMA,NORMAL,HIGHMEM), 每次分配时估计能知道分配目的，分配的内存用于什么？DMA/NORMAL/HIGHMEM. 分配来源也是这三个zone.这三个zone优先级不同,因此在高优先级(DMA)分配底优先级(HIGHMEM)的内存，需要有所保留,根据lowmem_reserve_ratio算出一个二维数组lowmem_reserve[][], 然后考虑某个zone剩余的page, 如果leftpage[fromzone] < lowmem_reserve[fromzone][tozone],分配失败.  tozone表示分配的内存的用途,fromzone表示从哪个zone中分配.
+lowmem_reserve[i][j]  =  
+    if (i<j):   sum(zone[i+1] ... zone[j]) / lowmem_reserve_ratio[i]
+    else :      0
+
+    lowmem_reserve_ratio_sysctl_handler
+    -> setup_per_zone_lowmem_reserve
+    
+    全局变量totalreserve_pages和dirty_balance_reserve, zone->dirty_balance_reserve和这些相关.
+    这个参数在__zone_watermark_ok, 涉及到两个zone, 在准备时首先选出一个最好的zone,但真正分配时遍历zonelist的所有zone,所以有力量个zone.
+
+2. compound page
+位置一块的页共同管理，分配. compound的管理有以下信息:
+    * page[1].lru.next = dtor 第二页的lru.next表示注销函数
+    * page[1].lru.prev = order 第二页的lru.pre表示order
+    * 第0页设置PG_head标志,其他页设置PG_tail标志, PG_tail好像还没有，使用PG_reclaim.但PG_reclaim在pagecache中,compound page 无法进入page cache. 
+        PG_compound & PG_reclaim = PG_tail
+        PG_compound & ~PG_reclaim = PG_head
+    * 除了第0页，其他page->_count = 0
+    * 其他page->first_page = page[0]
+不清楚哪里会分配大页,如果使用大的page，管理省了不少事情. 大部分是驱动申请大的页,还有hugetlb使用大的页。如果说提高效率,也就是在地址映射中有用. hugetlb是内核的一个feature,刚才看到只有shmem和hugetlbfs使用它，好像是直接给用户态提供一个大的地址连续的内存.
+
+3. page定义
+    * flags
+    * address_space inode或者anon_vma,  根据PAGE_MAPPING_ANON.根据这里,把pagecache中的page分成两种,swap的page同样也是使用address_space.  address_space->i_mmap实现的功能和anon_vma类似.
+    *  - index 对应address_space, 或者对应vma中的偏移.
+       - freelist 给slub使用
+    *  - counters 给slub使用
+       - * _mapcount   如果它=-182,则表示在buddy中,如果-1,表示它没有被使用.
+         * _count  用于page的 referrened, 而且在page释放和分配时使用
+    *  - lru  实际上很多page的队列使用这个组成
+       - page *next, pages, pobjects  给slub使用
+    *  - private 给mapping的页使用, 需要PG_private.  在buddy中,它表示order.
+       - kmem_cache slab, 
+       - page * first_page  在compound page中使用
+从数据结构的定义看,page和address_space, vma, slab等有关系. 还有page buddy system有关. address_space/anon_vma的作用包括追踪page在 address space table中的使用.
+
+4. zone
+这是一个管理page的结构, 这里必须考虑各种情况，保证系统的page够用. page包括free, reclaimed等.
+    * watermark,在分配内存是考虑是否需要收回内存,包含三个,MIN/LOW/HIGH
+    * lowmem_reserver[MAX_NR_ZONES] 参考上面
+    * dirty_balance_reserve  表示系统需要保留的dirty脏页数? 这个好像对应一个内核参数.
+    * per_cpu_pageset pageset 每个cpu有一个page队列
+    * free_area buddy系统, 每个页还有多种migrate: 
+        - MIGRATE_UNMOVABLE
+        - MIGRATE_RECLAIMABLE	这三种是互斥的,和lru有些关系
+        - MIGRATE_MOVABLE
+        - MIGRAGE_PCPTYPES
+        - MIGRAGE_RESERVE  	这个是预留的? 
+        - MIGRAGE_ISOLATE	这种page处于特殊状态,不能分配,在回收中或移动中
+        - MIGRAGE_TYPES
+
+    * lruvec 包含5个lru队列, 根据address_space/anon_vma分成两种,根据回收过程分成两种
+		inactive_anon, 
+		active_anon, 
+		inactive_file, 
+		active_file, 
+		unevictable,
+    * vm_stat 还有一个全局的，一块变化. 。。 复杂
+    * bit wait queue
+    * pglist_data
+    * zone_start_pfn, spanned_pages, present_pages
+
+    * per_cpu_pageset
+        per_cpu_pages
+        - count
+        - high  限制，当page过多，刷会buddy  使用percpu_pagelist_fraction设定
+        - batch 每次操作的个数
+
+5. page统计 vm_stat:
+    * NR_FREE_PAGES 在buddy的page分配和释放是修改这个,这里应该表示buddy系统中的系统内存, 或者和它同时变化.
+    * NR_LRU_BASE 表示zone->lruvec中的page数量,这些page肯定不再buddy中.
+    * NR_INACTIVE_ANON = NR_LRU_BASE 下面5个对应5个lru队列
+    * NR_ACTIVE_ANON   
+    * NR_INACTIVE_FILE
+    * NR_ACTIVE_FILE
+    * NR_UNEVICTABLE 这个应该不仅看PG_unevictable. 在page确定是evictable时,减小.
+    * NR_MLOCK 这个应该是在修改PG_mlocked时改变
+    * NR_ANON_PAGES: 在page第一次建立tlb映射时，修改这个计数
+    * NR_ISOLATED_ANON: 在migrate page时,把page从lru队列取出来时，修改这个计数
+    * NR_ISOLATED_FILE: 上面是anon page, 这个是file page
+    * NR_FILE_DIRTY: 应该文件脏页
+    * NR_UNSTABLE_NFS: NFS使用的页?
+    * NR_WRITEBACK: 在写回的page? 这里面的页计数完全互斥吗?
+    * NR_FILE_PAGES: 表示page cache的页数?
+    * NR_FILE_MAPPED: 表示mmap的页
+    * NR_SLAB_RECLAIMABLE: 这是啥?
+
+    
+    * zone_dirty_ok:  page-writeback.c
+    在分配时,如果要分配写的页,检查系统脏页比率.
+    zone_reclaimable_pages:表示可回收的page? 它包括NR_ACTIVE_FILE+NR_INACTIVE_FILE,如果支持swap,还包括NR_ACTIVE_ANON+NR_INACTIVE_ANON. nr_swap_pages表示swap的剩余空间.
+    系统参数 vm_dirty_ratio表示系统允许的dirty页面, zone可以支持的脏页(可用以写的,什么内存分配了不用于写呢?), 计算free page, 可回收page, 减去预留脏页数. 虽然使用free的,但理论上和zone所有的page差不多.
+        free pages + zone_reclaimable_pages - zone->dirty_balance_reserve
+    dirty page表示已经脏的页,
+        NR_FILE_DIRTY + NR_UNSTABLE_NFS + NR_WRITEBACK
+
+    * page cache 计数
+    page cache就是文件使用的cache(NR_FILE_PAGES),应该全部在lru中,有的建立映射(NR_FILE_MAPPED), 有的是脏页(NR_FILE_DIRTY).
+
+    gfp_t, 表示在 __get_free_pages中使用的参数, 就是分配页使用的标志, 还有一些ALLOC_*的标志,在get_page_from_freelist中使用, gfp_to_alloc_flags(gfp_t)用于转换标志.
+    ___GFP_DMA / ___GFP_HIGHMEM / ___GFP_DMA32 / ___GFP_MOVABLE 表示在那个zone中分配
+    ___GFP_WAIT  分配过程可等待,可以有回收动作.
+    ___GFP_HIGH  相当于GFP_AUTOMIC, 影响alloc_flags
+    ___GFP_IO    在page回收中使用，申请的page用于IO？
+    ___GFP_FS    和__GFP_IO类似, 还和OOM有关系?
+    ___GFP_COLD  对头队尾操作
+    ___GFP_NOWARN  warn报警
+    ___GFP_REPEAT  重复，但可能失败,控制分配动作中使用的回收过程，回收动作会更严格一些.should_continue_reclaim
+    ___GFP_NOFAIL  一直分配下去
+    ___GFP_NORETRY 不能重试? 在分配时有回收动作，不会反复执行
+    ___GFP_COMP
+    ___GFP_ZERO
+    ___GFP_NOMEMALLOC   不是分配内存，做什么? 使用这个标志，不会努力分配内存的ALLOC_HARDER
+    ___GFP_HARDWALL     和node/mem管理有关
+    ___GFP_THISNODE     和上面一样, zonelist是否使用fallback, 备用zone?
+    ___GFP_RECLAIMABLE  和migratetype有关,和__GFP_MOVABLE一块用 
+    ___GFP_NO_KSWAPD    
+    ___GFP_WRITE        这个好奇怪
+    ___GFP_OTHER_NODE
+
+    alloc_flag包含
+    ALLOC_WMARK_MIN / ALLOC_WMARK_LOW / ALLOC_WMARK_HIGH / ALLOC_NO_WATERMARKS   默认是LOW,决定分配页时是否回收, 一般会设置ALLOC_WMARK_MIN, 没看到哪里设置其他值. 在 __alloc_pages_may_oom中,使用ALLOC_WMARK_HIGH. 在普通分配中使用ALLOC_WMARK_LOW.
+    ALLOC_HARDER 
+    ALLOC_HIGH      __GFP_HIGH
+    ALLOC_CPUSET    
+
+6. page 的flag表示
+这里是非常复杂的,但也要描述一下
+    * PG_swapbacked page在内核或在swap中,比如tmpfs/ramfs,和page是文件缓存对立.
+    * PG_active 这个和上面一块索引page在lru的那个队列中
+    * PG_unevictable 表示page是unevictable的. page是否可以是evictable,还要看PG_mlocked标志和address_space->flags的AS_UNEVICTABLE, 或vm_area_struct->flags的VM_LOCKED
+    * PG_mlocked 表示page被mlock住
+    * PG_lru 在page进入5个lru队列时设置.
+    * PG_reserved 在系统启动中会保留一些page,其他地方还使用吗?
+
+好乱，不知从何开始了!
+7. page free
+    __free_pages -> __free_pages_ok -> free_one_page -> __free_one_page 
+    free_pages -> __free_pages
+    free_hot_cold_page -> free_one_page  
+
+    * 把page放到buddy中, 修改NR_FREE_PAGES计数. page释放时需要保证一下条件:
+        - _mapcount = -1
+        - mapping = NULL
+        - _count = 0
+        - 不带这些标志: PG_lru, PG_locked, PG_private, PG_private_2, PG_writeback, PG_reserved, PG_slab, PG_swapcache, PG_active, PG_unevictable, PG_mlocked, PG_compound
+    * page从zone->per_cpu_pages中释放  
+        drain_pages -> free_pcppages_bulk(zone, count, per_cpu_pages)
+    * 释放page时,可以先把它放到per_cpu_pages中, cold和hot的区别就是链表的头和尾
+
+这里只是page-alloc.c，内容太多了，但扎扎实实的看，应该没问题.
+8. page alloc
+    在分配一页page时, 先在per_cpu_pages队列中分配, 如果队列为空,从先buddy中分配per_cpu_pages->batch数据的page. 如果分配多页,直接在buddy中分配. 如果page分配到per_cpu_pages,也减NR_FREE_PAGES的计数.
+    buffered_rmqueue -> rmqueue_bulk -> __rmqueue
+                     -> __rmqueue() -> __rmqueue_smallest
+                                    -> __rmqueue_fallback
+    buffered_rmqueue(zone, order, migratetype) 根据migratetype在zone中分配page,如果分配失败，使用备用的migratetype.
+
+    对上面进行包装
+    __get_free_pages(gfp_t, order)
+    > alloc_pages
+     > alloc_pages_current(gfp_t, ...) 这是在mempolicy中
+      > alloc_page_interleave
+      > __alloc_pages_nodemask  (没有完成，待续)
+
+    alloc_page_interleave
+    > __alloc_pages
+     > __alloc_pages_nodemask(.. order, zonelist, NULL)
+
+    mempolicy包含多种分配策略,它们应该是对应特定task或VMA,和zonelist公共使用,zonelist是对应某个pglist_data.
+        MPOL_DEFAULT
+        MPOL_PREFERRED
+        MPOL_BIND
+        MPOL_INTERLEAVE
+    上面的四种情况，可以参考set_mempolicy和mbind调用,这里就是挑出zonelist和nodemask,给下面的函数使用. 
+    zonelist是一个索引结构,里面包括一个队列的zone,以及表示zone的nodeid,index(类型),zone是否full的标志. index表示zone的类型(DMA/NORMAL),根据gfp_t可获取分配需求的类型.
+    这个函数还考虑migratetype,根据gfp_t获取movable和reclaimable而定(allocflags_to_migratetype)和zone type. 
+
+    __alloc_pages_nodemask(gfp_t, order, zonelist, nodemask_t) zonelist/nodemask_t是哪里来的?
+    > should_fail_alloc_page(gfp_mask, order) fault-injection
+    > gfp_zone(gfp_t) 获取high_zoneindex
+    > allocflags_to_migratetype(gfp_t)  获取high_zoneindex
+    > get_mems_allowed() 需要访问current可使用的cpuset, 加锁，在分配失败时检查这个时候有变化，可以再次分配.
+    > first_zones_zonelist 获取preferred_zone
+    > get_page_from_freelist(gfp_t, nodemask_t,order, zonelist, high_zoneindex, ALLOC_WMARK_LOW|ALLOC_CPUSET, preferred_zone, migratetype) 虽然有preferred_zone,但还是遍历zonelist, 
+     * zone_dirty_ok  gfp_mask带有__GFP_WRITE
+     * zone_watermark_ok(zone, order, mark, classzone_idx, alloc_flags) 这里涉及lowmem_ratio, 目标zone是get_page_from_freelist的参数
+     * 如果上面检查不满足，回收page?   zone_reclaim(zone, gfp_mask, order)
+     > buffered_rmqueue(preferredzone, zone, order, gfp_mask, migratetype) 不知为何这里参数有两个zone. 这里有替别人分配内存的服务,统计数据是否跨node分配.
+     如果无法分配,修改zonelist,标注zone full
+
+    > __alloc_pages_slowpath(gfp_mask, order, zonelist, high_zoneind, nodemask, preferred_zone, migratetype)  在zonelist都不能满足时的备用方案,
+     > wake_all_kswapd  唤醒pglist_data上的kswapd
+     > get_page_from_freelist(gfp_mask, nodemask, order, zonelist, high_zoneidx, alloc_flags, preferred_zone, migratetype) 这时alloc_flags没有ALLOC_WATERMAKR*相关的标志,不会在考虑限制等.
+     > __alloc_pages_high_priority 循环分配，每次分配是使用io_schedule等待一段时间, 检查gfp_t的__GFP_NOFAIL
+     > __alloc_pages_direct_compact(gfp_mask, order ...) 调整page位置,重新分配
+      > try_to_compact_pages
+      > get_page_from_freelist
+     > __alloc_pages_direct_reclaim()
+      > __perform_reclaim 发起reclaim动作
+      > get_page_from_freelist(gfp_mask, nodemask, ...)
+      > drain_all_pages 把per_cpu_pageset中的page释放给zone
+     > __alloc_pages_may_oom(gfp, ...) 如果reclaim和compact都没有进展,则启动oom
+      > get_page_from_freelist 先常识分配以下
+      > out_of_memory(zonelist, gfp_mask, order, nodemask, false) 以后再看
+
+    __perform_reclaim 回收page,调用vmscan的try_to_free_pages
+
+9. pagevec (swap.c)
+    为何还有好多percpu的lru数组, 下面数组中的page都会去zone的lru队列.
+    * lru_add_pvecs
+    * lru_rotate_pvecs
+    * lru_deactivate_pvecs
+
+    * active_page_pvecs
+
+10. page compact (compact.c)
+既然看了，就整理一下。 这里是说碎片整理，尽量减小外部碎片. 它使用了migrate的功能, 但是如何整理? 移动时考虑address_map和page cache.其他无法追踪.
+    * 使用/proc/sys/vm/compact_memory 强制整理zone
+    * compaction_suitable()
+    计算fragmentation_index  根据zone的free page数和free block数据，计算它的碎块指数.碎块指数根据要分配order大小的page计数,如果zone能够分配,指数为-1000,没有意义。 只有在分配失败是,才考虑这个指数,一般指数为0~1000, 越靠近0，表示分配失败因为free page太少,越靠近1000表示分配失败因为碎块太多
+        result = 1000 - ( 1000 + freepages * 1000 / request ) / freeblocks
+
+    compact_nodes->compact_node->__compact_pgdat->compact_zone
+      -> compction_suitable
+      -> migrate_prep_local 把本地一些缓存在队列中的page放到lru中
+      -> isolate_migratepages 把page取出来
+      -> migrate_pages(list, ...) 这里应该不会把page转移到其他zone? 应该是本地转移
+    migrate_page使用回调函数决定要把page搬到哪里,这里是
+    compaction_alloc(page, ...) -> isolate_freepages() -> suitable_migration_target() 
+    最后这个函数判断page是否合适作为page migration的目标页,主要看page使用的migratetype
+    get_pageblock_flags_group / get_pageblock_bitmap(zone, pfn) 一个page的类型可能根据zone->pageblock_flags(使用sparsemem时根据section决定), 和zone(section)->pageblock_flags决定. pageblock_flags指向一块内存,保存某个pageblock所有的migratetype. 但不用管了,因为还有set_pageblock_bitmap(zone, ...)
+    migratetype包括:
+    - MIGRATE_UNMOVABLE
+    - MIGRATE_RECLAIMABLE
+    - MIGRATE_MOVABLE  这种可以
+    - MIGRATE_RESERVE 下面两种不能作为migrate的目标页
+    - MIGRATE_ISOLATE
+
+整理一下上面compact的过程,检查是否需要/能够compact, 然后取出需要转移的page,然后使用migrate实现转移，它会从这个zone中分配page,把page转移过去,然后释放被转移的page. 在这里的page扫描中,大量使用了pfn.
+
+11. page migrate
+    * isolate page 这是isolate lru队列中的page. 专门处理带有PG_lru标志的page(__isolate_lru_page). isolate的page好像没有使用特定的变量管理，他们不在buddy中.
+        - ISOLATE_INACTIVE  page在inactive lru中
+        - ISOLATE_ACTIVE
+        - ISOLATE_CLEAN  page没有PG_writeback标志, 没有PG_dirty标志
+        - ISOLATE_UNMAPPED page使用address_space
+        - ISOLATE_ASYNC_MIGRATE 没有PG_writeback标志,如果有PG_dirty,而且使用address_space,需要支持address_space->address_space_operations->migratepage.
+
+    migrate page目前在mempolicy,compact, move_page(syscall)中使用,还有hotplug.
+    migrate_pages->unmap_and_move()-> __unmap_and_move()
+        * 不能重复lock_page, 这个不懂.. task->flags的PF_MEMALLOC表示程序在申请内存?
+        * PG_writeback 等待写回完成
+        * PG_swapcache migrate之后, page不再使用swap
+        * unmap page, 修改对应的pte : anon, file, ksm..
+    继续-> move_to_new_page() -> migrate_page -> migrate_page_move_mapping
+                                          -> address_space_operations->migratepage
+    内容还是太多了，包括address_space, anon_vma等等,两者好像都设计pte
+
+12. watermark
+检查zone的页分配是否超过一定界限, 比较freepage和watermark, lowmem_reserve的关系. 但是在分配page时，如何指定zone的类型.
+    zone_watermark_ok -> __zone_watermark_ok
+    这里不仅检查free page和mark值，还有buddy系统中的每个order队列是否太少. 估计太零散了，也会失败.
+
+13. zone list 
+和memory policy相关, 但没有看出来如何使用memory policy. pglist_data包含zonelist数组.
+pglist_data->zonelist包含一个zone队列,里面按照一定的顺序排列:
+    * ZONELIST_ORDER_NODE 按照node的距离排序,然后按照zone类型排序
+    * ZONELIST_ORDER_ZONE 按照zone类型排序,然后node的距离排序
+
+    build_all_zonelists 在内核启动路径设置/在修改proc参数设置
+    > __build_all_zonelists
+     > build_zonelist(pg_data_t) 这个就是lpglist_data
+     > build_zonelist_cache(pg_data_t)
+
+14. alloc mark
+    分配函数使用的类型:
+    * ALLOC_NO_WATERMARKS
+    * ALLOC_WMARK_MIN
+    * ALLOC_WMARK_LOW
+    * ALLOC_WMARK_HIGH
+
+15. zone reclaim (vmscan.c)
+    回收不是free的page, 给分配函数使用，这里以zone为单位回收. 
+
+16. gfp 
+这个居然是get free page?
+    * ___GFP_DMA
+    * ___GFP_HIGHMEM
+    * ___GFP_DMA32
+    * ___GFP_MOVABLE  上面4个就是对应zone类型
+    * ___GFP_WAIT
+    * ___GFP_HIGH
+    * ___GFP_IO
+    * ___GFP_FS
+
+17. 已经看完了page_alloc.c，现在应该整理以下，虽然有点晚，而且脑袋不大好用
+"Mon May 21 01:07:26 CST 2012"
+这里面还是围绕zone和pglist_data展开的，如何创建zone和设置zone中的各种变量，会影响到系统中相关工作的运行，比如kswap.  当然还有对分配/释放动作的包装.
+这里有一个pageblock的概念，对应上面migratetype, page都属于某个pageblock,它的migratetype也是由这个pageblock决定的?
+
+初始化pglist_data
+    free_area_init(zones_size) 参数是什么东西?
+    > free_area_init_node(0, zones_size, node_start_pfn, ...)
+     > free_area_init_core(pglist_data, zones_size ...)
+        这个函数会计算spanned_pages/present_pages
+        创建pageblock_flags, waitbit table, 初始化buddy队列, page数据结构使用的内存,初始化per_cpu_pageset
+
+    free_area_init_nodes 初始化所有的pglist_data和zone,这个函数在x86特有的函数中调用.
+    > find_zone_movable_pfns_for_nodes 这个没弄明白，机器上还没有ZONE_MOVIABLE, 给每个zone设置对应的范围.
+    > free_area_init_node
+
+里面使用kernelcore/movablecore两个启动参数, 现在的系统上没有movable分区,但migratetype里面有movable,可能使用了movablecore会有.
+
+    arch_zone_lowest_possible_pfn
+    arch_zone_highest_possible_pfn
+
+    free_area_init_core
+    > memmap_init
+     > memmap_init_zone 把所有的page设为reserved,初始化page数据结构
+
+    初始化zone使用的mark数据，这些还需要再整理一遍
+    init_per_zone_wmark_min
+    > setup_per_zone_wmarks 计算min_free_kbytes
+     > __setup_per_zone_wmarks
+      > setup_zone_migrate_reserve
+      > calculate_totalreserve_pages
+    > setup_per_zone_lowmem_reserve
+    > setup_per_zone_inactive_ratio
+ 
+    min_free_kbytes_sysctl_handler 对应min_free_kbytes变量
+    > setup_per_zone_wmarks
+
+    low/high mark根据low mark计算. 先计算/设置min_free_kbytes,然后在此基础上设置low/high, low是5/4 * min, high是3/2 * min
+
+以后该看看vmscan,里面有page状态的转变,还有memory,包含tlb操作,还有vma的相关操作，最后是结果之前page IO的部分,争取这一周看完这些.
+
+18. cleancache.c 
+这里实现一个框架，给page cache使用，在page cache被收回时,先把page给cleancache缓存起来. 后来的zcache使用这个框架. zcache在zram中实现..
+
+19. fadvise(int fs, range..)
+这里主要修改文件的访问方式,还有说一些内存不需要使用/即将使用，出发读写操作. 这里主要用于mmap的内存.

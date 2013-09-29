@@ -1,0 +1,69 @@
+* blk_exec.c 
+
+注释说这个文件提供设置驱动request_queue属性的工具. exec的意思是不是执行request_queue中的request?
+
+1. blk_end_sync_rq(request, error) 应该是request完成时的回调函数. request->end_io_data是一个complete, 唤醒等待它的任务
+ -> _blk_put_request(request_queue, request)
+ -> complete(wait..)
+
+2. blk_execute_rq_nowait(request_queue, gendisk, request, at_head, rq_end_io_fn) 把request插入到驱动的IO调度队列中. 这个at_head决定下面的where..
+ -> 设置request->rq_disk/end_io(回调函数)分参数
+ -> __elv_add_request(request_queue, request, where)
+ -> __blk_run_queue(request_queue)
+ -> 如果request->cmd_type == REQ_TYPE_PM_RESUME? 啥意思? 再次执行request->request_fn
+
+3. blk_execute_rq(request_queue, gendisk, request, at_head) 这个函数是一个同步函数，直到request完成才退出.
+ -> 首先增加request->ref_count计数. 还修改了request->sense?? 设置request->end_io_data为栈变量complete
+ -> blk_execute_rq_nowait(request_queue, bd_disk, request, blk_end_sync_rq) 回调函数...
+ -> wait_for_completion(completion) 等待request完成,这里还有hung_time_timeout情况，如果开启hung检查，不会无限等待completion, 等待一段时间
+
+就这么多? 这个函数果然是scsi/ide中使用的. 谁会调用end_io/blk_end_sync_rq呢?
+
+* blk-lib.c
+
+bio_batch 数据结构
+  * done flags
+  * completion wait...
+
+1. bio_batch_end_io(bio, err) bio->bi_private是bio_batch? 好像和前面bio.c中有冲突,前面bio_map_data也会使用这个成员变量. 如果有错误(err),清除bio_batch->flags的BIO_UPTODATE. 减小bio_batch->done计数,如果减到0，唤醒bio_batch->completion
+ -> bio_put(bio)
+
+2. blkdev_issue_discard(block_device, sector_t, sector_t, gfp_t, flags) 这个函数是发送一个request, 删除(discard)某些扇区? 首先创建一个空的bio,设置sector_t的信息,提交这个请求，等待完成.没看初来discard什么意思？type应该表示request类型，使用REQ_WRITE|REQ_DISCARD.
+ -> blk_queue_discard(request_queue) request_queue->queue_flags是否支持QUEUE_FLAG_DISCARD...
+ -> 检查request_queue->limits.max_discard_sectors,一次request最多支持多少discard?? 如果一次无法完全操作sector_t,则需要多个request. 这些request使用一个bio_batch
+ -> bio_alloc(gfp_mask, 1) 组装bio, bi_sector/bi_end_io/bi_bdev/bi_private. 
+ -> submit_bio(type, bio) type应该对应底层的命令.
+ -> 最后等待bio_batch->completion, 上面的bi_end_io会释放bio_batch->done, 直到所有的reqeust都完成.
+discard sector是为了ssd设备准备的，告诉底层那些sector没有用. 现在ssd需要sector_t映射，无用分区的管理等..
+
+3. blkdev_issue_zeroout(block_device, sector_t sector, sector_t nr_sects, gfp_t) 这个函数是向磁盘的扇区写0, 当然可能无法一次完成所有的nr_sects,还是使用bio_batch多次完成.
+ -> 创建bio  >bio_alloc(gfp_t, nr_sects, BIO_MAX_PAGES)
+ -> 填充page时，都使用empty_zero_page,  多个内存地址对应相同的sector..
+ -> submit_bio(WRITE, bio) 看来使用很简单..
+ -> wait_for_completion(completion)
+
+sb_issue_zeroout(super_block, sector_t, ...) super_block->s_bdev获取block_device... 只有ext4使用它?
+sb_issue_discard(..)
+这个文件也完成了..
+
+* blk-iopoll
+
+blk_iopoll数据结构 这具体是什么操作?
+  * list_head
+  * state / data / weight / max
+  * blk_iopoll_fn   poll..
+
+使用softirq管理一个队列? blk_iopoll_budget / blk_cpu_iopoll
+
+1. blk_iopoll_sched(blk_iopoll) 把blk_iopoll添加到cpu队列blk_cpu_iopoll
+ -> __raise_softirq_irqoff(BLOCK_IOPOLL_SOFTIRQ) 激活softirq?  这里需要硬中端保护
+
+2. __blk_iopoll_complete(blk_iopoll) 删除blk_iopoll, 清除blk_iopoll->state的IOPOLL_F_SCHED
+ blk_iopoll_complete 包装上面，但它会禁止硬中断
+
+3. blk_iopoll_softirq(softirq_action) 软中断的处理函数, 从blk_cpu_iopoll上获取blk_iopoll, 如果带有标志IOPOLL_F_SCHED,执行blk_iopoll->poll函数
+
+4. blk_iopoll_disable(blk_iopoll) 等待blk_iopoll? 等待IOPOLL_F_SCHED标志去掉
+
+5. blk_iopoll_enable(blk_iopoll) 去掉IOPOLL_F_SCHED标志...
+sici中使用iopoll, 不清楚干啥用...., 这几个全是无关痛痒的代码..

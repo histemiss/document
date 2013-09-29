@@ -1,0 +1,440 @@
+* sched.c
+
+** 总结
+   - clnt.c已经完全介绍FSM的各状态,xprt.c会介绍xprt_*对call_*的工作支持，这里就是实现FSM中与底层(网络层)无关的调度管理
+   - 首先最重要的是rpc_wait_queue,这个不是普通的wait_queue,因为它是多队列支持优先级的等待队列.而且支持延时自动唤醒任务功能, 在rpc_xprt中大量使用这种队列.
+   - 这个文件后面有FSM的具体实现，应该把clnt.c中的call_*介绍放到这里才算合适
+   - 最后则详细说明了rpc_task的创建，注销等. 这里还有一个很重要的东西，rpciod.
+   - 一个rpc_task的FSM分了同步和异步两种情况
+   - 同步表示那些函数的执行完全在请求者任务环境中,当rpc_task在某个rpc_wait_queue中等待时，该任务就等待RPC_TASK_QUEUED这个标志.
+   - 而异步则完全使用work_queue, work_queue是执行一个一个work_struct,而且work_struct不能太庞大，那样会让workqueue效率降低，不能一个rpc_task的等待导致整个workqueue的停滞，所以FSM的整个过程分成了多个模块，都对应了状态的转变，具体的可以查看__rpc_execute函数，当rpc_task执行到等待时，它会停止执行。当等待结束时，会自动把FSM扔进workqueue中继续执行.
+
+** rpc_wait
+   #+begin_src 
+	struct list_head	list;		/* wait queue links */ //优先级队列
+	struct list_head	links;		/* Links to related tasks */ //维护同属一个pid的等待rpc_task,pid是workqueue怎么办?
+	struct list_head	timer_list;	/* Timer list */
+	unsigned long		expires;   
+   #+end_src
+
+** rpc_timer
+   #+begin_src 
+	struct timer_list timer;
+	struct list_head list;
+	unsigned long expires;    timer_list  timer   计时器
+   #+end_src
+    
+** rpc_wait_queue
+   #+begin_src 
+	spinlock_t		lock;
+	struct list_head	tasks[RPC_NR_PRIORITY];	/* task queue for each priority level */
+	pid_t			owner;			/* process id of last task serviced */
+	unsigned char		maxpriority;		/* maximum priority (0 if queue is not a priority queue) */
+	unsigned char		priority;		/* current priority */
+	unsigned char		nr;			/* # tasks remaining for cookie */
+	unsigned short		qlen;			/* total # tasks waiting in queue */
+	struct rpc_timer	timer_list;   
+   #+end_src
+   - 这个数据结构基本上实现了调度功能, 主要有两个:优先级队列和计时器.
+   - rpc_task与rpc_wait_queue的操作，他们有两种关联,一种是rpc_task在优先级队列中(如果没有优先级，那就使用一个优先级), 一种是timer队列.
+
+** rpc_task:
+   #+begin_src 
+    tk_count
+    tk_task     把rpc_task放到rpc_clnt->cl_tasks队列
+    rpc_clnt    tk_client
+    rpc_rqst    tk_rqstp
+    rpc_message tk_msg 这是嵌套，task有唯一的rpc_message
+    **** 和其他rpc数据结构的关系, rpc_clnt,rpc_xprt,rpc_message
+    tk_callback  FSM中会执行的回调函数
+    tk_action    FSM下一步要执行的动作   
+    rpc_call_ops tk_ops
+    tk_calldata
+    **** 上面是回调函数
+    tk_timeout  rpc_sleep使用的时间,它给rpc_wait使用
+    tk_runstate
+    **** 超时和运行状态,动态使用
+    workqueue_struct    tk_workqueue    rpc_task_setup传进来的，只用来释放rpc_task,外部的work_queue
+    rpc_wait_queue      tk_waitqueue    一般是rpc_xprt的
+        work_struct tk_work  一般是释放rpc_task中使用,在tk_workqueue上使用
+        rpc_wait    tk_wait 在rpc_wait_queue队列中
+    **** 等待队列
+    ktime_t     tk_start rpc的开始时间
+    tk_status tk_flags 
+    tk_timeouts
+    tk_priority 从rpc_task_setup中获取的,有rpc使用者设定.
+    tk_garb_retry, tk_cred_retry, tk_rebind_retry
+    **** 属性
+   #+end_src
+
+** rpc_call_ops
+   #+begin_src 
+	void (*rpc_call_prepare)(struct rpc_task *, void *); //这是开始rpc是使用
+	void (*rpc_call_done)(struct rpc_task *, void *); //在rpc_exit_task使用
+	void (*rpc_count_stats)(struct rpc_task *, void *);
+	void (*rpc_release)(void *);   //rpc_release_calldata <= rpc_free_task使用
+   #+end_src
+
+** __rpc_disable_timer(rpc_wait_queue, rpc_task)
+   - rpc_task->u->rpc_wait->timer_list在rpc_wait_queue->timer_list.list队列中,从队列中取出来. 
+   - 如果rpc_wait_queue没有等待的rpc_task, 取消rpc_wait_queue->rpc_timer->timer_list
+
+** rpc_set_queue_timer(rpc_wait_queue, expires)
+   - 修改rpc_wait_queue->rpc_timer->expires
+   - mod_timer(timer_list, expires)
+
+** __rpc_add_timer(rpc_wait_queue, rpc_task)
+   - 如果rpc_task->tk_timeout = 0
+   - 根据rpc_task->tk_timeout设定rpc_task->u->rpc_wait->expires
+   - 如果它的expires比rpc_wait_queue->rpc_timer的expires早，或那个timer还没生效，使timer生效
+   > rpc_set_queue_timer(rpc_wait_queue, rpc_task->rpc_wait->expires)
+   - 把这个rpc_task->rpc_wait放到rpc_wait_queue->timer_list->list中
+
+** rpc_rotate_queue_owner(rpc_wait_queue)
+   - 把rpc_task放到rpc_wait_queue优先级队列的最后
+   - rpc_wait_queue->priority表示当前执行的rpc_task的级别
+   - 从rpc_wait_queue->tasks[priority]中取出第一个rpc_task, 如果rpc_task->tk_owner == rpc_wait_queue->owner, 把它放到队列最后
+   - 应该切换pid的rpc_task, 正确让pid平衡的使用rpc. 每次切换rpc_task都会切换rpc_wait_queue->owner, 同样也会把它放到队列尾部??
+
+** rpc_set_waitqueue_priority(rpc_wait_queue, priority)
+   - 设置rpc_wait_queue->priority = priority 
+   - 而且调整rpc_task的顺序 , 每次切换时调整
+   > rpc_rotate_queue_owner(rpc_wait_queue)
+
+** rpc_set_waitqueue_owner(rpc_wait_queue, pid_t)
+   - 设置rpc_wait_queue->owner = pid, rpc_wait_queue->nr = RPC_BATCH_COUNT/16
+
+** rpc_reset_waitqueue_priority(rpc_wait_queue)
+   - 重设为最大的优先级
+   > rpc_set_waitqueue_priority( queue->maxpriority)
+   - pid为0, 应该不会有0的rpc_task
+   > rpc_set_waitqueue_owner( queue, 0)
+
+** __rpc_add_wait_queue_priority(rpc_wait_queue, rpc_task, queue_priority)
+   - 把rpc_task->u->rpc_wait放到rpc_wait_queue->tasks[queue_priority]队列中.
+   - 如果queue_priority超过rpc_wait_queue->maxpriority,就放到maxpriority队列中
+   - 在rpc_wait_queue->tasks队列,rpc_task根据task->tk_owner(pid_t)分组,每组第一个(根据插入顺序)在rpc_wait_queue->tasks队列中，其他rpc_task在第一个rpc_task的队列中rpc_task->u->rpc_wait->links.
+   - 首先查找tasks[priority]中有相同pid的rpc_task, 如果找到把rpc_task->rpc_wait->list放到rpc_task->rpc_wait->links队列
+   - 否则把rpc_task->rpc_wait->list放到tasks[priority]队列中
+
+** __rpc_add_wait_queue(rpc_wait_queue, rpc_task, queue_priority)
+   - 如果rpc_wait_queue使用优先级, rpc_wait_queue->maxpriority> 0, 放到对应的优先级队列
+   > __rpc_add_wait_queue_priority()
+   - 否则把rpc_task->u->rpc_wait->list 放到rpc_wait_queue->tasks[0] 
+   - 如果rpc_task带SWAPPER标志,把它放到队列头上
+   - 设置rpc_task->tk_waitqueue = rpc_wait_queue, rpc_wait_queue->qlen ++
+   - 设置rpc_task->tk_runstate的RPC_TASK_QUEUED, 这是唯一添加RPC_TASK_QUEUED的地方
+
+** __rpc_remove_wait_queue_priority(rpc_task)
+   - 这个函数只有在rpc_task在使用优先级的rpc_wait_queue中时才使用
+   - 同一个pid的rpc_task使用rpc_task->rpc_wait->links队列
+   - 这里要删除links的表头, 用队列中第一个rpc_task取代它
+   - 取出rpc_task->rpc_wait->links->next代表的rpc_task t,把它放到rpc_wait_queue->tasks中
+   > list_move(t->rpc_wait->list, task->rpc_wait->list)
+   - 把刚才的rpc_task->rpc_wait->links上的rpc_task全部放到新的rpc_task上
+   > list_splice_init(task->rpc_wait->links, t->rpc_wait->links)
+
+** __rpc_remove_wait_queue(rpc_wait_queue, rpc_task)
+   - 删除rpc_timer->list关系, 当然是rpc_task->tk_timeout需要有效, 他决定是否在timer链表中
+   > __rpc_disable_timer(rpc_wait_queue, rpc_task)
+   - 如果rpc_wait_queue使用优先级, 处理rpc_wait->links队列
+   > __rpc_revmoe_wait_queue_priority(rpc_task) 
+   - 然后释放rpc_wait->list 
+   > list_del_(rpc_task->rpc_wait->list)
+   - 设置rpc_wait_queue->qlen --
+
+** __rpc_init_prority_wait_queue(rpc_wait_queue, qname, nr_queue)
+   - 初始化rpc_wait_queue,包括rpc_wait_queue->tasks, maxpriority, name
+   - rpc_wait_queue->rpc_timer的回调函数 __rpc_queue_timer_fn
+   > rpc_reset_waitqueue_priority(rpc_wait_queue)
+
+** rpc_init_priority_wait_queue(rpc_wait_queue, name)
+   - 封装上面的函数, RPC_NR_PRIORITY = 4
+   > __rpc_init_priority_wait_queue(rpc_wait_queue, name, RPC_NR_PRIORITY)
+
+** rpc_init_wait_queue(rpc_wait_queue, name)
+   - 不使用优先级的rpc_wait_queue
+   > __rpc_init_priority_wait_queue(rpc_wait_queue, name, 1)
+
+** rpc_destroy_wait_queue(rpc_wait_queue)
+   - 注销timer
+   > del_timer_sync(rpc_wait_queue->rpc_timer->timer)
+
+** rpc_wait_bit_killable(work)
+   - 这是sleep中使用的回调函数, 这里实现等待操作,也就是freezable_schedule. 这里也会检查fatal_signal,如果有致命信号，则返回错误ERESTARTSYS.
+
+** rpc_set_active(rpc_task)
+   - 给rpc_task->tk_runstate添加RPC_TASK_ACTIVE标志,在rpc_execute中使用,表示rpc_task进入FSM。
+
+** rpc_complete_task(rpc_task)
+   - 清除rpc_task->tk_runstate的RPC_TASK_ACTIVE标志, 唤醒等待这个位的任务, 减小rpc_task->tk_count,在rpc_release_task中使用，表示rpc_task退出FSM. 这个好像只有在FSM中调用.
+   > bit_waitqueue(rpc_task->tk_runstate, RPC_TASK_ACTIVE)
+   > __wake_up_locked_key()
+
+** __rpc_wait_for_completion_task(rpc_task, action)
+   - action如果不提供，使用默认的rpc_wait_bit_killable. 这个函数会循环调用,直到等待的位重置,一般这种函数都有schedule类似的操作. 
+   - RPC_TASK_ACTIVE标志任务的结束, 可能给rpc使用者使用.
+   > out_of_line_wait_on_bit(rpc_task->tk_runstate, RPC_TASK_ACTIVE, action, TASK_KILLABLE)
+
+** rpc_wait_for_completion_task(rpc_task) 
+   > __rpc_wait_for_completion_task(rpc_task, NULL)
+
+** rpc_make_runnable(rpc_task)
+   - 设置rpc_task->tk_runstate的RPC_TASK_RUNNING标志,同时去掉RPC_TASK_QUEUED标志.
+   - 如果rpc_task是异步的, 让workqueue执行它; 如果rpc_task是同步的, 唤醒等待的任务.
+   - 如果是异步,work_struct的回调函数是rpc_async_schedule,把它放到rpciod_workqueue上, 而rpc_async_schedule使用__rpc_execute，就是执行FSM
+   > INIT_WORK(rpc_task->u->work_struct, rpc_async_schedule)
+   > queue_work(rpciod_workqueue, rpc_task->u->work_struct)
+   - 如果是同步,唤醒等待RPC_TASK_QUEUED位的任务,应该rpc的请求者
+   > wake_up_bit(rpc_task->tk_runstate, RPC_TASK_QUEUED)
+
+** __rpc_sleep_on_priority(rpc_wait_queue, rpc_task, rpc_action, queue_priority) 
+   - 先把它添加到rpc_wait_queue->tasks队列里，设置FSM的下一个状态是rpc_action: rpc_task->tk_callback=action. 
+   > __rpc_add_wait_queue(rpc_wait_queue, rpc_task, queue_priority)
+   - 操作timer队列,同时修改rpc_wait_queue的计时器. 
+   > __rpc_add_timer(rpc_wait_queue, rpc_task)
+   - 这里要保证rpc_task->tk_callback=NULL，为何? 每次执行完rpc_task->tk_callback,__rpc_execute都会把它设为NULL. 
+   - 设置rpc_task->tk_callback(action)
+
+** rpc_sleep_on(rpc_wait_queue, rpc_task, rpc_action)
+   - 只有rpc_task是active的时候，才能进行这些操作, 等待使用rpc_task->tk_priority. 看出了RPC_TASK_ACTIVE的用处.
+   > __rpc_sleep_on_priority(rpc_wait_queue, rpc_task, action, rpc_task->tk_priority)
+
+** rpc_sleep_on_priority(rpc_wait_queue, rpc_task, rpc_action, priority)
+   > __rpc_sleep_on_priority(rpc_wait_queue, rpc_task, rpc_action, priority-RPC_PRIORITY_LOW)
+
+** __rpc_do_wake_up_task(rpc_wait_queue, rpc_task)
+   - 这里会把rpc_task从rpc_wait_queue中取出来，修改状态，让他开始执行
+   - 从rpc_wait_queue中取出来，做各种链表操作
+   > __rpc_remove_wait_queue(rpc_wait_queue, rpc_task) 
+   - 修改rpc_task的runstate标志, 启动他的FSM
+   > rpc_make_runnable(rpc_task)
+
+** rpc_wake_up_task_queue_locked(rpc_wait_queue, rpc_task)
+   - 如果rpc_task在队列中等待, rpc_wait_queue->tk_runstat&RPC_TASK_QUEUED !=0
+   > __rpc_do_wake_up_task(rpc_wait_queue, rpc_task)
+
+** rpc_wake_up_queued_task(rpc_wait_queue, rpc_task)
+   > rpc_wake_up_task_queue_locked(rpc_wait_queue, rpc_task)
+    上面的操作应该是为某个回调函数服务的.
+
+** __rpc_find_next_queued_priority(rpc_wait_queue)
+   - 这里是rpc_task实现的调度, 应该是优先级的队列操作. 出队是根据优先级和pid均衡决定的
+   - 首先弄清楚rpc_wait_queue->tasks中的rpc_task, 有两层管理:
+   - 一层是所有的相同pid的rpc_task放到一个队列中, rpc_wait->links
+   - 不同pid的rpc_task放到rpc_wait_queue->tasks
+   - 对于优先级的处理可能会有高优先级饿死
+   - 首先处理当前优先级的队列rpc_wait_queue->priority, 获取队列上的第一个rpc_task
+   - 如果他和上一个同属于一个rpc_task, 检查rpc_wait_queue->nr --, 如果>0, 可以调度,直接退出
+   - 如果是0,需要切换rpc_task, 使用队列的下一个. 退出前更新rpc_wait_queue->nr/owner
+   - 如果tasks[priority]为空,处理下一个优先级. 循环处理优先级队列.
+   - 退出时设置rpc_wait_queue的priority,owner,nr
+
+** __rpc_find_next_queued(rpc_wait_queue)
+   - 如果rpc_wait_queue使用优先级
+   > __rpc_find_next_queued_priority(rpc_wait_queue) 
+   - 否则取出rpc_wait_queue->tasks[0]中的第一个
+
+** rpc_wake_up_first(rpc_wait_queue, func, data)
+   - 回调函数, 从rpc_wait_queue中选择一个rpc_task
+   - 先找到一个rpc_task
+   > __rpc_find_next_queued(rpc_wait_queue)
+   - func决定是否要从rpc_wait_queue中唤醒,放到FSM中
+   > func(rpc_task, data)
+   - 如果返回true, 唤醒rpc_task 
+   > rpc_wake_up_task_queue_locked(rpc_wait_queue, rpc_task)
+   - 否则返回NULL
+   - 如果func无效, 直接返回找到的rpc_task
+
+** rpc_wake_up_next_func(rpc_task, data) 
+   - 它可以作为上面的func，但它啥都不做，只返回true.
+
+** rpc_wake_up_next(rpc_wait_queue)
+   - 封装上面的两个函数,无条件唤醒一下.
+   > rpc_wake_up_first(rpc_wait_queue, rpc_wake_up_next_func, NULL) 
+
+** rpc_wake_up(rpc_wait_queue)
+   - 遍历rpc_wait_queue->tasks上的所有rpc_task, 唤醒这些rpc_task
+   -> rpc_wake_up_task_queue_locked(rpc_wait_queue, rpc_task)
+
+** rpc_wake_up_status(rpc_wait_queue, state)
+   - 遍历rpc_wait_queue->tasks上的所有rpc_task
+   - 设置 rpc_task->tk_status = status
+   > rpc_wake_up_task_queue_locked(rpc_wait_queue, rpc_task)
+
+** __rpc_queue_timer_fn(ptr)
+   - 这是rpc_wait_queue->rpc_timer->timer_list使用的回调函数. 他唤醒等待超时的rpc_task
+   - 它遍历rpc_wait_queue->rpc_timer->list中所有rpc_task, 找到所有已经过期的rpc_task,唤醒他们，rpc_task->tk_status = -ETIMEOUT.
+   > time_after_eq(now, rpc_task->rpc_wait->expires)
+   > rpc_wake_up_task_queue_locked(rpc_wait_queue, rpc_task)
+   - 最后如果rpc_timer->list不是空,继续设置timer
+   > rpc_set_queue_timer(rpc_wait_queue, expires)
+   - 有些rpc_task可能不会在rpc_timer队列上
+
+** __rpc_atrun(rpc_task)
+   - rpc_task->tk_status =0, 清除之前的结果
+
+** rpc_delay(rpc_wait_queue, rpc_task, rpc_action) 
+   - 使用全局的delay_queue,而且callback使用上面的函数，使它的状态为0.
+   - 设置rpc_task->tk_timeout = delay, 放到rpc_wait_queue中时也会放到rpc_timer队列中
+   > rpc_sleep_on(delay_queue, rpc_task, __rpc_atrun)
+   - 应该不会有人主动唤醒delay_queue中的rpc_task
+
+** rpc_prepare_task(rpc_task)
+   - 这个还是FSM的操作,在rpc_init_task和restart_rpc中使用.
+   > rpc_task->tk_ops->rpc_call_prepare(rpc_task, rpc_task->tk_calldata)
+
+** rpc_init_task_statistics(rpc_task)
+   - 初始化retry相关的参数
+
+** rpc_reset_task_statistics(rpc_task)
+   - 清除rpc_task->tk_timeout, tk_flags
+   > rpc_init_task_statistics
+
+** rpc_exit_task(rpc_task)
+   - 清空rpc_task->tk_action, 在FSM里会检查到它是空的时候退出循环.
+   > rpc_task->tk_ops->rpc_call_done()
+   - 为何在rpc_task->tk_action不为空的时候使用.
+   > xprt_release(rpc_task) 
+   > rpc_reset_task_statistics(rpc_task)
+
+** rpc_exit(rpc_task, status)
+   - 异步方式使rpc请求结束, 设置rpc_task->tk_action=rpc_exit_task. 如果task在等待队列中,唤醒它.
+   > rpc_wake_up_queued_task(rpc_task->rpc_wait_queue, rpc_task)
+
+** rpc_release_calldata(rpc_call_ops, calldata)
+   - 这是在free rpc_task时使用.
+   > rpc_call_ops->rpc_release(calldata)
+
+** __rpc_execute(rpc_task)
+   - 这是调度的主要执行函数，通过它实现状态转变，把整个rpc过程分成一个一个的work_struct. 其执行过程是一个循环的过程:
+   - 首先找要执行的状态函数, 如果rpc_task->tk_callback有效，使用它, 并改为NULL，否则使用rpc_task->tk_action, 而且把它设为NULL 
+   - 如果没有可用的状态函数,直接退出
+   - 执行状态函数
+   - 如果rpc_task没有到队列中, 继续循环. rpc_task->tk_runstate&RPC_TASK_QUEUED.
+   - 否则,它在队列中,FSM必须停止等待, 如掉RPC_TASK_RUNNING标志
+   - 对于异步任务, 可直接退出函数, 当他在队列中释放时,会自动使用work_struct恢复FSM
+   > task_is_async()
+   - 对于同步任务, 等待RPC_TASK_QUEUED标志, 而且重新运行时设置RPC_TASK_RUNNING
+   > out_of_line_wait_on_bit(rpc_task->tk_runstate, RPC_TASK_QUEUED, rpc_wait_bit_killable, TASK_KILLABLE)
+   - 最后退出循环就使用rpc_task的销毁动作, 释放整个rpc_task
+   > rpc_release_task(rpc_task)
+
+** rpc_execute(rpc_task)
+   - 启动FSM, 设置RPC_TASK_ACTIVE
+   > rpc_set_active(rpc_task)
+   - 开始应该不在队列中,但设置RPC_TASK_RUNNING
+   > rpc_make_runnable(rpc_task)
+   - 如果rpc_task不是异步的,直接开始执行. 如果异步，就不使用这个，只需把它加到workqueue即可,这些在rpc_make_runnable中实现.
+   > __rpc_execute(rpc_task)
+     
+
+** rpc_async_schedule(work_struct)
+   > __rpc_exeute(work_struct=>rpc_task)
+
+** 总结
+   - 整理一下rpc_task->tk_runstate的使用
+   - RPC_TASK_QUEUED: 表示他在rpc_wait_queue中
+        * 添加  __rpc_add_wait_queue
+        * 清除  rpc_make_runnable
+        * 等待  __rpc_execute 使用它实现同步等待
+        * 其他都是判断
+   - RPC_TASK_RUNNING: 表示它在执行,和RPC_TASK_QUEUED类似
+        * 添加  rpc_make_runnable, __rpc_execute
+        * 清除  __rpc_execute
+   - RPC_TASK_ACTIVE: 表示他还在FSM中执行
+        * 添加  rpc_set_active <= rpc_execute
+        * 清楚  rpc_complete_task 
+        * 等待  __rpc_wait_for_completion_task, rpc_complete_task<= rpc_release_task
+
+
+** rpc_malloc(rpc_task, size)
+   - 这个函数会在work_struct中执行，因此不能sleep,导致workqueue hang
+   - 如果size < RPC_BUFFER_MAXSIZE, 使用mempook. gfp为GFP_ATOMIC或GFP_NOWAIT. 
+
+** rpc_free(buffer)
+   - buffer => rpc_buffer 根据rpc_buffer->len,释放rpc_buffer
+
+** rpc_init_task(rpc_task, rpc_task_setup)
+   - 根据rpc_task_setup设置rpc_task
+   - tk_flags
+   - tk_ops
+   - tk_calldata
+   - tk_priority
+   - tk_owner = current->tgid, 对于非IO操作好理解,对于IO,不就是backend_dev的线程?
+   - tk_workqueue
+   - tk_action = rpc_prepare_task  默认的准备函数，代替rpc_task->tk_ops->rpc_call_prepare
+
+** rpc_alloc_task
+   - 从rpc_task_mempool中分配一个rpc_task
+
+** rpc_new_task(rpc_task_setup)
+   > rpc_alloc_task
+   > rpc_init_task
+
+** rpc_free_task(rpc_task)
+   - 如果rpc_task->tk_flags&RPC_TASK_DYNAMIC, 则释放内存给rpc_task_mempool, 如果不是就算静态的? 这里完成最终释放动作，其他都是这样那样的调用它.
+   - 只是释放了calldata
+   > rpc_release_calldata(rpc_call_ops, calldata)
+
+** rpc_async_release(work_struct)
+   - 这是rpc_task->u->work_struct的函数, 放到rpc_task->tk_workqueue中
+   > rpc_free_task(work=>rpc_task)
+
+** rpc_release_resources_task(rpc_task)
+   - 这是释放资源，注销rpc_task之前完成的动作.
+   > xprt->release(rpc_task)
+   - rpc_auth
+   > put_rpccred(rpc_task->rpc_message->rpc_cred)
+   - 释放rpc_clnt的资源
+   > rpc_task_release_client(rpc_task)
+
+** rpc_final_put_task(rpc_task, workqueue_struct)
+   - 释放rpc_task, callback资源和本身
+   - 如果参数的workqueue_struct有效, 利用rpc_task->u->work_struct,回调函数为rpc_async_release, 把它放到队列中. 这个队列是rpc_task_setup传过来的，在nfs中，就是它自己创建的workqueue.
+   - 否则释放
+   > rpc_free_task(rpc_task)
+    
+** rpc_do_put_task(rpc_task, workqueue_struct)
+   - 减小rpc_task->tk_count，如果减到0，做销毁动作
+   > rpc_release_resources_task(rpc_task)
+   > rpc_final_put_task(rpc_task, workqueue_struct)
+
+** rpc_put_task(rpc_task)
+   - 就是同步注销呗, 不是用work_struct. 这是是外部使用的接口.
+   > rpc_do_put_task(rpc_task, NULL)
+
+** rpc_put_task_async
+   > rpc_do_put_task(rpc_task, rpc_task->tk_workqueue)
+
+** rpc_release_task(rpc_task)
+   - 这个函数在__rpc_execute中最后执行
+   -> rpc_release_resources_task(rpc_task)
+   - 这里释放rpc_task计数方式有些复杂
+   - rpc_task异步, 而且rpc_task->tk_count !=1, 或者rpc_task是同步的, rpc_task->tk_count !=2, 其他人在使用, 而且等待RPC_TASK_ACTIVE标志, 先唤醒它们
+   > rpc_complete_task(rpc_task)
+   - 否则减小rpc_task->tk_count
+   - 如果tk_count为0 
+   > rpc_final_put_task(rpc_task, rpc_task->tk_waitqueue)
+
+** rpciod_up() / rpciod_down()
+   - module_get/module_put
+
+** rpciod_start()
+   - 给rpciod_workqueue
+   > alloc_workqueue(..) 
+    
+** rpciod_start()
+   > destroy_workqueue()
+    
+** 总结
+   - 从逻辑上来说,rpc client的功能分成2部分，上部分是rpc_task,它抽象了rpc请求的过程,把rpc的请求过程表示为FSM, 给socket层提供接口;下部分是rpc_xprt,它实现了FSM中的状态功能.
+   - rpc_task的生命过程如下(rpc_run_task)
+    - 准备rpc_task_setup, rpc_clnt已经创建，这里主要rpc_procedure和调用参数处理.
+    - 创建rpc_new_task,使用rpc_task_setup初始化它.
+    - 关联rpc_clnt      rpc_task_set_client
+    - 拷贝rpc_message   rpc_task_set_rpc_message
+    - rpc_call_start    准备FSM的启动函数, 如果没有设置的话
+    - rpc_execute       启动它
+    - 应该就是调用者释放rpc_task.
+   - 但是rpc_task和rpc_xprt关系非常紧密，在FSM中，rpc_task使用的所有状态都需要rpc_xprt做实现对应的功能。由于rpc_clnt的创建没大有实际意义,所以rpc_xprt应该有许多操作. 

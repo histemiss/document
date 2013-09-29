@@ -1,0 +1,1137 @@
+不得不说,写的时候自己也不知道fscahce/cachefiles是怎么工作的,也是走马观花的看了看,几乎没法总结. 但不能白搭半天功夫,不如在浪费点功夫把它整理清除. 现在看完了,这个工程设计的很漂亮，可能就像Document中说的一样,现在再去看可能理解的深一些，为何当初看就不能理解呢？
+
+先说fscache的作用,它就是把数据从远端的nfs server的数据缓存当本地的磁盘上，这里本地磁盘的缓存数据存放在文件，对nfs来说，缓存数据就是针对每个文件的，每个nfs的共享数据文件有一个磁盘缓存文件对应。这里不提供目录缓存。
+在client的用户层与server之间的数据流路径上，包括syscall请求(file_operation),pagecache, bdi+rpc请求.fscache并没有拦截这个路径,而且提供了一个数据流的分支，在pagecache的IO层提供服务，它实现把page数据缓存到backend;写/改page数据时修改缓存中的数据;检索backend中page数据. fscache起的主要作用是检索数据，我感觉它把数据缓存到fscache时，同样还会写到server中，因为fscache不会实现写回server的功能。（如果要缓存写/脏数据，则需要应用者提供新的功能，定期的检查缓存中数据的有效性，如果更新就把数据写回到server，但这显然会增加额外的工作,但我确定nfs没有实现) 对nfs来说，它只实现把新数据给缓存,把无效数据从缓存中删除，从缓存中检索数据.
+然后nfs提供缓存功能，就需要索引这些缓存，本来我以为backend会使用前段的目录结构管理数据,但这里明显不是，它对数据的索引管理比较简单，对nfs来说，它把文件根据super_block分块，而同属一个super_block的文件数据都在一个目录下面缓存,那文件的路径(缓存文件名)就需要非常的长，反正的确这样. 这里根据nfs文件的nfs_fh(相当于inode_number)hash成文件名.
+在fscache有中这么几个对象fscache_cookie,它表示某个frontend的数据对象,然后有fscache_object,fscache_operation, fscache_cache,我想说这些对象属于fscache内部,最后是backend的数据对象,可能backend和fscache的关系更加紧密,以cachefiles举例就是cachefiles_object, cachefiles_cache, cachefiles_one_read/write. 有限是数据对象的管理(其实就是数据文件), fscache_cookie对应着fscache_object, 而fscache_cookie使用树形结构管理，但这里千万别以为这个树就是nfs中的目录树，fscache不管目录,所以这个数就是fscache内部的用于数据管理的树，具体参考下面的某章节描述. 因为fscache实现的是一个松耦合的工具，没有backend，frontend也可以正常工作.所以这里需要灵活的fscache_cookie/fscache_object管理,还有fscahce提供backend随便删除缓存数据的管理,这样fscache_cookie不知道它使用的缓存数据是否存在.fscache_cookie的状态非常不稳定，fscache内部对它的管理使用FSM类型的东西,不断处理它的状态变化,大部分都是异常处理,比如frontend要删除某个数据文件的缓存,backend要删除某些缓存数据等，这些都是作为异步操作实现的. fscache_object会接受事情通知，处理自己的状态，创建或删除缓存。(什么为了加速，对index的fscache_cookie使用的fscache_object不会及时创建，这些比较浮云，才几个index的fscache_cookie??)
+当然更多的操作是数据的缓存和检索，说简单就是读/写，操作单位是page. frontend使用的数据操作接口都是在它自己的page操作中插入的接口(下面的page操作也比较详细，可以看看哪里调用了那些函数),同样backend也需要page map操作,这里可能是为了实现bmap操作，缓存文件和数据文件对应，使用bmap确认缓存文件中没有要求的数据，不能什么都有，然后返回0，那缓存就功能异常了. 继续说读/写操作,使用fscache_operation表示,再具体点就是fscach_retrieval/fscache_storage,在具体点就是cachefiles_one_read, cachefiles_one_write. 同样这里的数据搬运也使用异步实现,异步就需要在各阶段记录状态. 还有read是同步的,或者等待异步的,虽然一些工作不是请求者任务执行的,但请求者必须等待数据的完成,确认数据已经索引回来.write就可以是异步发送. 这里对fscache_operation使用了workqueue调度, 也谈不上调度,就是简单的FIFO. 详细的数据流在下面的某个章节会有所描述.
+一个东西设计的好，就是好用，而且灵活，像它就实现了这个标准,可能学习起来非常繁琐，但这里有设计的表现...  (够了。。。。)
+ 
+fscache相当与一个中间件,它把应用模块作为frontend,把底层存储模块作为backend.对frontend/backend都提供实现接口,只是提供了某些接口,实现数据的缓存/检索等.当然它还实现backend和frontend的脱离,没有backend,前段也可工作,frontend不依赖backend.还有fscache可同时支持多种backend.(这种情况没大有意义).
+fscache开发具有典型的面向对象的模式,它把一些数据类型和操作都使用带方法的类实现,简单概述:和frontend交互的包括fscache_cookie,  和backend交互的包括fscache_cache, fscache_object, fscache_operation. 这里分析bacend是cachefiles, 它包装了fscache_cache->cachefiles_cache, fscache_object->fscache_object. fscache_operation是一个抽象的操作,数据保存操作/数据检索操作使用的struct包装它. 对frontend来说,下面有大量的cookie_netfs_data参数,这里虽然是void指针,但应该是有意义的结构,可能需要nfs实现这些接口,对！ frontend需要实现fscache_cookie_def.
+
+1. fscache_cookie/fscache_cookie_def (fs/fscache_cookie.c)
+  每个fscache_cookie对应一个netfs的对象, 例如普通文件或super_block, 在nfs中对应的有nfs_client, nfs_server(super_block), file(regular), 每个fscache_cookie使用对应的fscache_cookie_def, 表示一类fscache_cookie, 它定义frontend需要提供给backend使用的接口. 
+
+a. 数据结构 
+  fscache_cookie_def 这个数据结构是frontend(nfs)实现的
+    * name
+    * type type有两种FSCACHE_COOKIE_TYPE_INDEX,FSCACHE_COOKIE_TYPE_DATAFILE
+    * select_cache(parent_netfs_data, cookie_netfs_data) 返回fscache_cache_tag, fscache_cache_tag是fscache_cache使用的东西,属于偏backend的内容, 所以frontend可能对backend有所了解,它可以有选择的使用backend.但实际上nfs没有使用这个功能. 这些操作是给backend使用的,估计看了backend,才知道它们有什么用处! 现在看了backend,这些的确是给backend使用的,就是获取frontend数据对象的属性.
+    * get_key(void *cookie_netfs_data, buf...)  返回数据对象的身份标示,用来索引数据
+    * get_attr(void *cookie_netfs_data, ...) 获取缓存对象的大小
+    * get_aux(...)  获取frontend数据对象的辅助属性，用来验证缓存的有效性
+    * check_aux
+    * get_context/put_context   方式backend操作数据时,frontend把数据释放掉
+    * mark_pages_cached(void *cookie_netfs_data, address_space *, pagevec *)  这个没有使用
+    * now_uncached(void *cookie_netfs_data) 给backend使用,当它主动删除缓存文件时，通知frontend,它使用的缓存没有了,清除page的FSCACHE标志.
+  这里的key应该是唯一表示frontend对象的数据, 而get_key就是把frontend的key给backend. aux表示auxiliary 数据,应该表示数据一致性使用的信息, 检查缓存数据是否有效. (你说对了)
+
+  fscache_netfs (fscache可同时支持多种文件系统的缓存，比如cdrom,cifs,afs,nfs,一个fscache_netfs表示一种文件系统)
+    * version name
+    * fscache_cookie primary_index   fscache_cookie数中的分支节点
+    * list_head  所有的netfs对象
+
+  fscache_cookie
+    * usage / lock / stores_lock
+    * n_children 子cookie的数量
+    * backing_objects           管理fscache_object->cookie_link
+    * fscache_cookie_def def
+    * fscache_cookie parent     fscache_cookie树结构
+    * netfs_data  在操作frontend时，使用的参数，它就是frontend的数据对象.
+    * radix_tree_root stores 存储需要写到cache后端中的page,radix_tree中使用的标志:
+    * flags
+        FSCACHE_COOKIE_PENDING_TAG 等待写回
+        FSCACHE_COOKIE_STORING_TAG 在写过程中
+  * flags 每一个都有相应的意义,这些不是互斥的，每个有每个的意思，其中几个可能互斥. 和后端状态相关
+        FSCACHE_COOKIE_LOOKING_UP   backend的fscache_object在查找中
+        FSCACHE_COOKIE_CREATING     backend的fscache_object在创建中
+        FSCACHE_COOKIE_NO_DATA_YET  cookie可用，但backend中没有数据，使用时需要后端分配page存储数据
+        FSCACHE_COOKIE_PENDING_FILL 这个可以去掉了
+        FSCACHE_COOKIE_FILLING      这个也没用
+        FSCACHE_COOKIE_UNAVAILABLE  fscache_cookie的数据缓存不可用
+    
+  从数据结构上看它包含一串fscache_object,因为可能有多种backend(多种fscache_cache), 每个fscache_object使用对应的fscache_cache(但一般情况下应该只有一个后端的fscache_cache); 指向上层的cookie; 一个radix数结构管理page. fscache_cookie应该有多个子fscache_cookie, 没看出向下查找的方法(可能没有这些需求). 
+
+1. fscache_cookie的创建/初始化/删除
+  a. fscache_cookie_init_once(fscache_cookie *)
+    fscache_cookie使用slab内存管理, 这个函数在使用slab(fscache_cookie_jar)分配fscache_cookie时使用，初始化fscache_cookie.
+
+  b. __fscache_acquire_cookie(fscache_cookie, fscache_cookie_def, netfs_data)
+    使用传入参数, 创建一个新的fscache_cookie,他是fscache_cookie的孩子
+    如果创建non-index的fscache_cookie, fscache_cookie_def->flags != INDEX(fscache_cookie_def决定了它的类型??), 调用fscache_acquire_non_index_cookie, 需要创建fscache_object
+
+    fscache_acquire_cookie(fscache_cookie, fscache_cookie_def, netfs_data)
+    封装上面的实现, 这个函数在nfs_open间接调用过来,当然还有其他地方调用它, 这个fscache_cookie保存在nfs_inode中. 参考nfs_fscache_set_inode_cookie(inode, file)
+
+  c. fscache_acquire_non_index_cookie(fscache_cookie)
+    申请一个non-index的fscache_cookie时, 创建对应的fscache_object, fscache_object是后端数据存储使用的结构. index的fscache_cookie就不需要fscache_object? 需要！
+    -> fscache_select_cache_for_object (fscache_cookie->parent) fscache_cookie只是一种frontend数据对象的表示, 如果要缓存它,还需要fscache_object, 而fscache_object使用fscache_cache. 系统可以共存多种fscache_cache. 因此, 一个fscahce_cookie可以使用多个fscache_object. (fscache_cookie->backing_objects队列中使用fscache_object->cookie_link) 关联一个fscache_cookie的fscache_object使用的fscache_cache不同. 在这些fscache_object中, 不能有使用相同的fscache_cache的. 通过fscache_cache和fscache_object可唯一确定fscache_cookie, 如何索引？ fscache_object可直接索引fscache_cookie.
+    ->fscache_alloc_object(fscache_cache,fscache_cookie) 分配fscache_object之后放到了fscache_cookie->backing_objects.first, 如果有多个fscache_cache, 这样会不会乱掉? 不清楚.
+    -> fscache_cookie->def->get_attr(cookie->netfs_data, i_size) 获取fscahce_cookie表示的frontend对象缓存使用的空间大小
+    -> fscache_set_store_limit(fscache_object, i_size)
+    -> fscache_enqueue_object (把object的work_queue加到fscache_object_wq, 它好像使用一个FSM的东西)
+      fscache_object_wq和fscache_object_cong_wait(wait_queue_head_t)??  fscache_object_wq是工作队列，处理fscache_object的状态变化, fscache_object_cong_wait是等待队列, 在fscache_object_wq中使用, 如果看一下代码可看出它为何等待?!
+
+  d. fscache_alloc_object(fscache_cache, fscache_cookie)
+    fscache_cache分配fscache_object, 创建缓存使用的backend对象.
+    -> fscache_cache->fscache_cache_ops->alloc_object(fscache_cache, fscache_cookie) fscache_cache_ops后backend实现的接口
+    -> fscache_alloc_object(fscache_cache, fscache_cookie->parent) 创建父cookie的fscache_object. (看来index的fscache_cookie也需要fscache_object)
+    -> fscache_attach_object(fscache_cookie, fscache_object) fscache_cookie->parent构成cookie树,但是fscache_object也有类似的树结构, fscache_object->parent指向fscache_cookie->parent->backing_objects队列中的fscache_object.
+    
+  e. fscache_attach_object(fscache_cookie, fscache_object)
+    一个fscache_object隶属一个fscache_cache, 它要和cookie->parent->backing_object中同类(同属于一个fscache_cache)的object联系起来（父子关系, 只有子指向父, 没有父指向子,与fscache_cookie的管理关系类似，只有向上指的指针。 加到全局rbtree中, 根据指针排序
+    这里在找parent fscache_object时,要检查它是否在死亡中FSCACHE_OBJECT_DYING, 这样就不用创建新的.
+    * 把它放到fscache_cache->object_list队列中
+    * 把它放到fscache_cookie->backing_objects
+    * -> fscache_objlist_add(fscache_object) 把它放到全局rttree fscache_object_list结构中
+    fscache_cookie有树形结构，fscache_object同样也有.
+
+  f. __fscache_update_cookie(fscache_cookie)
+    遍历fscache_cookie->backing_objects, 发送事件fscache_raise_event(fscache_object, FSCACHE_OBJECT_EV_UPDATE) frontend的数据对象有变化?更新fscache_object,他们使用一种事件机制,估计会自动检查数据的一致性,然后做出更新.
+
+    fscache_update_cookie对它封装,实际上在fscache.h中对这里的大部分'__'开头的函数进行封装,或许这些就是frontend使用的接口.
+
+  g. __fscache_relinquish_cookie(fscache_cookie, int retire)
+    删除一个fscache_cookie, 同时删除fscache_cookie关联的fscache_object.
+    if fscache_cookie->flags = FSCACHE_COOKIE_CREATING, 这个fscache_cookie在创建中(或许backend在创建中),等待创建完成.
+    fscache_object的删除使用事件方式, 遍历fscache_cookie->backing_objects, 如果retire=1发送事件FSCACHE_OBJECT_EV_RETIRE,否则发送FSCACHE_OBJECT_EV_RELEASE.
+    -> fscache_raise_event(fscache_object, event)
+    -> fscache_cookie_put 释放fscache_cookie.
+    这里需要注意的是改变计数fscache_cookie->usage, fscache_cookie->n_children
+  
+    fscache_relinquish_cookie(fscache_cookie, retire) 对这个函数封装,给frontend(nfs)使用,它会判断fscache_cookie_valid,没用的判断
+
+  h. __fscache_cookie_put(fscache_cookie)
+    释放fscache_cookie使用的内存, 如果父cookie没人用(fscache_cookie->usage), 则释放父cookie. 
+    说一下fscache_cookie->usage用法:
+      * 初始为1, 增加parent->usage (__fscache_acquire_cookie)
+      * 每关联一个fscache_object增1 (fscache_attach_object)
+      * 断掉和fscache_object的联系时减1 (__fscache_relinquish_cookie)
+      * 释放fscache_cookie时减1 (fscache_cookie_put/__fscache_cookie_put后者释放父cookie->usage)
+      * 为了保持上锁顺序, 先锁fscache_cookie, 再锁fscache_object. 增1, 再fscache_cookie_put
+    fscache_cookie_put(fscache_cookie)包装上面的实现
+
+    这些所谓的frontend接口中, 可惜的是nfs使用比较少,与fscache_cookie相关的包括
+        * fscache_relinquish_cookie
+        * fscache_acquire_cookie
+    afs都有fscache_update_cookie, 或许上面两个就足够了. 下面是page的操作,用来实现数据IO, 这样fscache_operation和page相关的应该有frontend使用的接口. 后面会详细的解释这些功能，但应该看看nfs中哪里调用了这些功能.
+        * fscache_uncache_all_inode_pages
+        * fscache_maybe_release_page
+        * fscache_wait_on_page_write
+        * fscache_read_or_alloc_page
+        * fscache_read_or_alloc_pages
+        * fscache_write_page
+        * fscache_uncache_page
+
+下面应该介绍netfs(nfs)，就把整个文档分成两部分:frontend和backend, frontend 介绍fscache_cookie(def)和fscache_netfs
+        
+2. fscache_netfs(fs/fscache/netfs.c; fs/fscache/fsdef.c)
+  fscache_netfs表示一个使用fscache的前端文件系统, 主要包含顶层fscache_cookie
+    * version / name
+    * fscache_cookie primary_index
+    * link
+
+  a. fscache_netfs_list 队列中是fscache_netfs->link
+
+下面的操作说明如何构建frontend使用的fscache_cookie组成的树形结构.树顶是fscache_fsdef_index, 第一层是fscache_netfs->primary_index,他们使用的fscache_cookie_def是fscache_fsdef_netfs_def, 在下一层就是netfs(nfs)中决定的,对nfs来说,下一层节点是nfs_client->fscache,再下一层是nfs_server->fscache, 再一次层是nfs_inode->fscache. 每一层存的数据是不一样的,使用的fscache_cookie_tag也是不一样的.
+
+  b. __fscache_register_netfs(fscache_netfs)
+    这里主要是创建fscache_netfs->primary_index, 并把它加到fscache的cookie树中.还要注册fscache_netfs, fscache_netfs只是有个索引功能,使用fscache_netfs_list管理所有的fscache_netfs. 这个fscache_cookie->netfs_data=fscache_netfs. 
+
+  c. __fscache_unregister_netfs(fscache_netfs)
+    释放fscache_netfs, 同时删除fscache_netfs->primary_index.
+    -> fscache_relinquish_cookie
+
+  当注册一个netfs时, 它的fscache_cookie在fscache_fsdef_index下面, 它使用的fscache_cookie在fscache_netfs->primary_index下面.
+    第一层:
+      * fscache_fsdef_index_def(fscache_cookie_def) 
+        名字是.FS-Cache 没有其他有意义的东西. 它是全局唯一的,所以不需要什么给backend准备的,而且也是不变的.
+      * fscache_fsdef_index(fscache_cookie) 
+        使用def是fscache_fsdef_index_def, 它会有fscache_object吗?
+
+    第二层:
+      * fscache_fsdef_netfs_def 
+        (fscache_netfs->primary_index使用的fscache_cookie_def), name="FSDEF.netfs", 有效操作为get_key/get_aux/check_aux
+          a. fscache_fsdef_netfs_get_key(void *, buffer ...)
+            获取fscache_netfs->name
+          b. fscache_fsdef_netfs_get_aux(void *, buffer ...)
+            获取fscache_netfs->version
+          c. fscache_fsdef_netfs_check_aux(void *, buffer ...)
+            判断fscache_netfs->version和buffer是否一致, 这个版本有何意义? 不清楚,但fscache_object中使用它.
+
+3 (/fs/nfs/fscache.c)
+数据结构:
+  这是nfs的第二层的fscache_cookie, 它在nfs_fscache_netfs(fscache_netfs)->primary_index下面. 使用nfs_fscache_server_index_def.
+    a. nfs_server_key 它只是fscache_cookie_def->get_key中使用的辅助函数,用来唯一的标示nfs_server.
+      * nfsversion
+      * family
+      * port  ipv4_addr
+
+    nfs_fscache_server_index_def
+      * name = "NFS.server"
+      * get_key = nfs_server_get_key
+        nfs_server_get_key(void cookie_netfs_data, buf, len)
+          cookie_netfs_data应该从fscache_cookie->netfs_data, 这里他是nfs_server,在buf中填充一个nfs_server_key
+
+    b. nfs_fscache_get_client_cookie(nfs_client *)
+      创建第二层的fscache_cookie,第一层在fscache_netfs中创建了,现在在他下面创建.
+      -> fscache_acquire_cookie(nfs_fscache_netfs.primary_index, nfs_fscache_server_index_def)的cookie下面分配一个cookie
+
+    c. nfs_fscache_release_client_cookie(nfs_client)
+      释放第二层fscache_cookie. 在关闭nfs_client时使用
+      -> fscache_relinquish_cookie(nfs_client->fscache)
+
+  第三次nfs_server使用的fscache_cookie, 它在nfs_client->fscache下面创建.
+    nfs_fscache_key 它于某个super_block对应？属于某个nfs_server, 包含一个mount的信息,数据结构好大阿. 全局变量nfs_fscache_keys使用rbtree管理所有的key, 用得着吗?
+      * rb_node node
+      * nfs_client 指针, 如果使用这个作为key,那每次挂载的都不一样
+      * s_flags
+      * nfs_fsid
+      * rsize/wsize/acregmin/acregmax/acdirmin/acdirmax nfs_server
+      * rpc_auth rpc_authflavor
+      * uniq_len / uniquifier  
+    nfs_fscache_super_index_def 
+      * name = NFS.super
+      * type = FSCACHE_COOKIE_TYPE_INDEX
+      * get_key = nfs_super_get_key
+        nfs_super_get_key(nfs_server, buf)
+          获取nfs_server->fscache_key给buf
+
+    a. nfs_fscache_get_super_cookie(super_block, uniq, nfs_clone_mount)
+      -> 构造一个nfs_fscache_key, 把super_block的信息存进去,key保存到nfs_server->fscache_key中,同时还保存到全局rbtree中. 这个nfs_server就给fscache_cookie_def->netfs_data.
+      -> fscache_acquire_cookie, 分配一个cookie,它在nfs_client->fscache的下面,使用fscache_cookie_def为nfs_fscache_super_index_def
+
+    b. nfs_fscache_release_super_cookie(super_block)
+      释放nfs_server->nfs_fscache_key和fscache.
+      -> fscache_relinquish_cookie
+
+  第四层nfs_inode使用的fscache_cookie,他在nfs_server->fscache下面
+    首先是一些fscache_cookie_def使用的接口函数
+    nfs_fscache_inode_object_def(/fs/nfs/fscache-index.c, 这里调整了顺便,已经不能按照代码文件分了！！)
+      * name = "NFS.fh"
+      * type = FSCACHE_COOKIE_TYPE_DATAFILE  不是INDEX了..
+      * get_key = nfs_fscache_inode_get_key
+      * get_attr = nfs_fscache_inode_get_attr
+      * get_aux = nfs_fscache_inode_get_aux
+      * check_aux = nfs_fscache_inode_check_aux
+      * now_uncached = nfs_fscache_inode_now_uncached
+      * get_context = nfs_fh_get_context
+      * put_context = nfs_fh_put_context
+
+    a. nfs_fscache_inode_get_key
+      返回nfs_inode->nfs_fh作为key
+
+    b. nfs_fscache_inode_get_attr(nfs_inode)
+      返回nfs_inode文件的大小  nfs_inode->vfs_inode->i_size
+
+    c. nfs_fscache_inode_get_aux(nfs_inode, buf)
+      nfs_fscache_inode_auxdata
+        * mtime / ctime
+        * size / change_attr
+      返回nfs_inode的这些信息给buf
+
+    d. nfs_fscache_inode_check_aux(nfs_inode, buf)
+      检查上面的那些信息,还不清楚nfs_object的哪里用到这些信息,但应该检查数据的有效性.
+
+    e. nfs_fscache_inode_now_uncached
+      这个函数果然是backend使用的,在backend的缓存数据删除时,它通知frontend，让它清除对应page上的标志. 遍历nfs_inode->vfs_inode.i_mapping, 清除page上的Private标志
+      -> pagevec_lookup(address_space, ...)
+      -> ClearPageFsCache(page)
+
+    f. nfs_fscache_inode_get_context(cookie_netfs_data, context)
+      这个nfs_open_context, 递增它的计数,不让他删除
+
+    g. nfs_fscache_inode_put_context(cookie_netfs_data, context)
+      上面的逆操作
+
+frontend使用的接口函数
+    a. nfs_fscache_init_inode_cookie(inode *)
+      设置nfs_inode->flags, 添加NFS_INO_FSCACHE, 只有reg的inode使用. 在初始化nfs_inode时使用,设置nfs_inode->fscache=NULL,但添加NFS_INO_FSCACHE,还不如不设.
+
+    b. nfs_fscache_enable_inode_cookie(inode *)
+      给nfs_inode创建一个fscache_cookie, 使用nfs_fscache_inode_object_def, netfs_data使用nfs_inode.
+      -> fscache_acquire_cookie, 创造一个cookie, 它在nfs_server->fscache使用的cookie下面创建
+
+    c. nfs_fscache_release_inode_cookie(inode)
+      释放nfs_inode->fscache.
+      -> fscache_relinquish_cookie(fscache_cookie)
+
+    d. nfs_fscache_zap_index_cookie
+      fscache_relinquish_cookie释放nfsinode->fscache, 这里是回收, 不清楚fscache_object的处理有和区别?
+
+    e. nfs_fscache_disable_inode_cookie(inode *)
+      关闭inode使用的fscache_cookie, 关闭fscache_cookie使用的fscache_object
+      -> fscache_uncache_all_inode_pages(fscache_cookie, inode)
+      -> nfs_fscache_zap_inode_cookie
+
+    f. nfs_fscache_inode_lock, nfs_fscache_inode_unlock (inode)
+      使用nfsinode->flags的NFS_INO_FSCACHE_LOCK位作为锁, 锁不住会等待这一位.
+
+    h. nfs_fscache_set_inode_cookie(inode, file *)
+      判断file使用的inode是否可使用fscache, 只有在RDONLY方式打开文件时才能使用锁, 判断的是file->f_flags & O_ACCMODE. 这里在打开file时才创建fscache_cookie,而不是在创建nfs_inode时创建,只有在访问时才使用！
+
+    i. nfs_fscache_reset_inode_cookie(inode *)
+      重新给inode构造cookie, 因为file的revalidate操作
+      -> fscache_relinquish_cookie
+      -> fscache_acquire_cookie
+上面还是建立和释放fscache_cookie, 有4层fscache_cookie实现了整个缓存数据对象的管理, 比较调理
+
+下面的操作接口和page操作相关,应该看到后面再回来总结
+    j. nfs_fscache_release_page(page *, gfp_t)
+      page->mapping->host=>nfsinode->cookie
+      -> fscache_maybe_release_page(cookie, page, gfp)
+      这里要在缓存中删除某页,首先注意到fscache_cookie->store可以索引page，但它的功能仅限与在往缓存中写数据时使用，把page放到上面，加上PENDING/STORING标志,而写完之后就把page从radix_tree_root中删除. 相反它需要往底层掉，使用fscache_cache_ops->uncache_page, 可怜的是这个函数什么都没实现，就让数据放在哪里。会不会出错? 首先对frontend来说,数据的缓存是以文件为单位,但数据IO操作以page为单位,如果文件有缓存,那么取page时，应该先去缓存取数,并且把这个page设置标志FSCACHE,这里的删除操作就是把FSCACHE标志去掉. 这样太简单了,所以也只有在文件只读时使用fscache(比如CDROM, 而且在文件在改动(或写打开时)就会把整个backend的缓存删掉! 应该是.
+
+    k. __nfs_fscache_invalidate_page(page *, inode*)
+      -> fscache_wait_on_page_write
+      -> fscache_uncache_page
+
+    n. nfs_readpage_from_fscache_complete(page, void *context)
+      page从fscache读出来,如果有错误, 使用nfs_readpage_async从server上读取数据
+      -> 更新page,SetPageUptodate
+
+    o. __nfs_readpage_from_fscache(nfs_open_context, inode, page)
+      -> fscache_read_or_alloc_page 应该是从cache中取数据
+
+    p. __nfs_readpages_from_fscache(nfs_open_context, inode, address_space, list_head(pages))
+      -> fscache_read_or_alloc_pages...
+
+    q. __nfs_readpage_to_fscache(inode, page, sync)
+      这个函数在nfs的从server取回数据时调用,把数据缓存起来. (nfs_readpage_release)
+      -> fscache_write_page(cookie, page, GFP_KERNEL)
+      把数据放到fscache中
+    应该看看nfs如何使用这些接口.
+
+
+BACKEND
+这里也说一下fscache作用的时间，在每次挂载nfs后，之前挂载的应该不会使用，即使挂载的同一个server的共享目录。这样在挂载之后，文件打开后开始缓存数据，只要挂载的文件系统运行中，那它缓存的数据就有效。 所以这种缓存是运行时缓存，热缓存.
+
+1. fscache_cache_tag/fscache_cache(fs/fscache/cache.c)
+  fscache_cache_tag用来索引fscache_cache, 成员变量主要为fscache_cache,name. (当初怎么总结的？！！) 它和fscache_cache是一一对应的,但fscache_cache是嵌在其他数据结构里面的.
+  a. 使用全局队列fscache_cache_tag_list管理所有的fscache_cache_tag,可根据name查找某个fscache_cache_tag. __fscache_lookup_cache_tag/__fscache_release_cache_tag
+  b. 使用它来对fscache_cache进行索引
+    I. fscache_select_cache_for_object(cookie *）
+      输入是cookie, 使用 cookie->def->select_cache(void *, void *) 获取 fscache_select_tag. 这个功能没人使用.
+    II. fscache_add_cache/fscache_withdraw_cache
+      操作fscache_cache_tag队列
+
+  fscache_cache数据结构会内嵌到cachefiles_cache中, 主要管理object, 和backend有关. 列举一些内容：
+  a. fscache_cache_ops: 定义与page, object相关的操作函数
+    * name
+    * fscache_object *alloc_object(fscache_cache, fscache_cookie)
+    * int lookup_object(fscache_object)      出发lookup动作
+    * void lookup_complete(fscache_object )  backend的lookup过程结束，告诉fscache_object使用的FSM.
+    * fscache_object *grab_object(fscache_object)   递增fscache_object->usage
+    * int pin_object(fscache_object)        pin/unpin啥意思? 没有实现
+    * void unpin_object(fscache_object)
+    * void update_object(fscache_object)    更新backend的数据对象
+    * void drop_object(fscache_object)      释放fscache_object, 但可能会删除缓存的数据.
+    * void put_object(fscache_object)       同样也是释放fscache_object,但不会删除缓存的数据.
+    * void sync_object(fscache_object)      同步
+    * int attr_changed(fscache_object)      改变backend使用的数据属性
+    * int reserve_space(fscache_object, loff_t)
+    * int read_or_alloc_page(fscache_object, page, loff_t)  读数据
+    * int read_or_alloc_pages(fscache_object, page, loff_t)
+    * int allocate_page(fscache_object, page, loff_t)
+    * int allocate_pages(fscache_object, page, loff_t)
+    * int write_page(fscache_storage, page)
+    * int write_pages(fscache_storage, page)
+    * void uncache_page(fscache_object, page)
+    * void dissociate_pages(fscache_cache)
+    这些read_alloc相关的在cachefiles中没有实质使用，因为cachefiles使用文件缓存数据，文件本来就有空洞，所以释放缓存了数据首先使用bmap判断，那么分配空间更浮云了，只有cachefiles底层使用的磁盘有足够的空间即可!!
+
+  b. fscache_cache
+    * fscache_cache_ops
+    * fscache_cache_tag
+    * kobject  这个还算合理
+    * list_head link 所有的fscache_cache都在一个列表中
+    * max_index_size 最多的index数量?
+    * identifier[36]   什么label??
+    * work_struct op_gc 还好我对workqueue也很熟悉, 它使用系统的system_wq
+    * list_head object_list 队列中是fscache_object->cache_link
+    * list_head op_gc_list  队列中是fscache_operation->pending_link,哇哇,开始涉及fscache_operation, fscache_operation也是使用workqueue?因为没注意到cachefiles启动内核线程. 是的！有个fscache_op_wq.
+    * object_list_lock / op_gc_list_lock / object_count / flags
+    * fscache_object fsdef  每个fscache_cache都有一个顶层fscache_object,别忘了fscache_object也有一个树形的结构，和fscache_cookie对应.
+
+  fscache_cache的对应操作: 注册或释放fscache_cache.
+  a. 全局变量: 
+    fscahce_cache_list 所有的fscache_cache
+    fscache_cache_cleared_wq 等待队列,在关闭cachefiles时,需要关闭fscache_object,等待关闭动作.
+    fscache_cache_tag_list 所有的fscache_cache_tag队列
+
+  b. __fscache_lookup_cache_tag
+  c. __fscache_release_cache_tag
+    上面两个访问fscache_cache_list队列, 添加或释放fscache_cache_tag.
+
+  d. fscache_select_cache_for_object(fscache_cookie)
+    为frontend的数据对象fscache_cookie找一个backend的存储fscache_cache.
+    使用fscache_cookie关联的第一个fscache_object, 查找fscache_cache.
+    如果找不到使用fscache_cookie->def->select_cache, 获取fscache_cache_tag, fscache_cookie_def用在前端netfs定义对象, 而fscache_cache在后端定义, 这里使用fscache_cache_tag可能就使用name索引后端的fscache_cache.
+    如果找不到使用fscache_cache_list.next(全局cache队列)
+    貌似能找到一个就可以.
+    
+  e. fscache_init_cache(fscache_cache, fscache_cache_ops, ...)
+    初始化fscache_cache. fscache_cache->op_gc这个work_struct执行的函数fscache_operation_gc.
+
+  f. fscache_add_cache(fscache_cache, fscache_object, tagname)
+    向fscache注册一个backend的fscache_cache.
+    -> __fscache_lookup_cache_tag 根据tagname找一个fscache_cache_tag
+    -> kobject_create_and_add(tagname, fscache_root), 为cache创建一个kobject
+    -> 填充fscache_object,它是一个顶层的object,也是fscache_cache->fsdef,它的cookie是fscache_fsdef_index(cookie),把它放到fscache_fsdef_index的backing_objects队列中,全局fscache_object的rbtree中,把它放到fscache_cache的object_list队列中.
+    -> 把开始找到的fscahce_cache_tag和fscache_cache关联起来.把cache放到全局队列fscache_cache_list. 
+    这里涉及到了fscache_cache,fscache_cache_tag,fscache_cookie,fscache_object. 一个fscache_fsdef_index对应着后端的实现，一般只有一个后端支持.
+
+  g. fscache_withdraw_all_objects
+    给fscache_cache->object_list的每个fscache_object发送事件FSCACHE_OBJECT_EV_WITHDRAW, 释放fscache_object
+    -> fscache_raise_event(fscache_object, FSCACHE_OBJECT_EV_WITHDRAW)
+
+  h. fscache_withdraw_cache
+    释放fscache_cache(tag),同步数据/page操作
+    -> fscache_cache->ops->sync_cache
+    -> fscache_cache->ops->dissociate_pages
+    -> fscache_withdraw_all_objects
+    -> wait_event(fscache_cache_cleared_wq, fscache_cache->object_count==0)
+    -> wait_event(fscache_cache_cleared_wq, list_empty(fscache_cache->object_list))
+    -> fscache_release_cache_tag(fscache_cache_tag)
+这里的操作仅仅函盖fscache_cache的注册和关闭,并没有fscache_object/以及数据的操作.
+ 
+3. fscache_object(fs/fscache/object.c)
+  fscache_object
+    * fscache_object_state state 这里决定fscache_object的状态，它会影响FSM的操作
+      FSCACHE_OBJECT_INIT               初始化状态
+      FSCACHE_OBJECT_LOOKING_UP         lookup状态
+      FSCACHE_OBJECT_CREATING
+
+      FSCACHE_OBJECT_AVAILABLE          //active状态
+      FSCACHE_OBJECT_ACTIVE
+      FSCACHE_OBJECT_UPDATING
+    
+      FSCACHE_OBJECT_DYING              //die状态
+    
+      FSCACHE_OBJECT_LC_DYING
+      FSCACHE_OBJECT_RELEASING
+      FSCACHE_OBJECT_RECYCLING
+      FSCACHE_OBJECT_WITHDRAWING
+      FSCACHE_OBJECT_DEAD
+      FSCACHE_OBJECT__NSTATES
+
+    * debug_id / n_children / n_ops / n_obj_ops / n_in_progress / n_exclusive / n_reads / lookup_jif / flags
+    * event_mask event 通过这些状态触发FSM的操作, 这些事件大部分不是好东西！
+      FSCACHE_OBJECT_EV_REQUEUE
+      FSCACHE_OBJECT_EV_UPDATE
+      FSCACHE_OBJECT_EV_CLEARED
+      FSCACHE_OBJECT_EV_ERROR
+      FSCACHE_OBJECT_EV_RELEASE
+      FSCACHE_OBJECT_EV_RETIRE
+      FSCACHE_OBJECT_EV_WITHDRAW
+      FSCACHE_OBJECT_EVENTS_MASK
+
+    * cache_link  放在fscache_cache队列中
+    * cookie_link 放在fscache_cookie队列中
+    * fscache_cache / fscache_cooki 
+    * fscache_object parent
+    * list_head depentents  子fscache_object的创建依赖父fscache_object的创建动作
+    * dep_link     这个队列是子fscache_object->dependents
+    * pending_ops  忘了！！
+    * rb_node objlist_link 放在全局rbtree结构中
+    * store_limit / store_limit_l
+
+
+操作函数
+  a. fscache_done_parent_op(object *)
+    fscache_object的一个fscache_operation完成? 告诉object的父object, 它将要消失, 如果parent的子object数为0, 则给parent发送FSCACHE_OBJECT_EV_CLEARED. 还没看出这个事件有什么实质性的作用. 或许在错误处理中使用,在子fscache_object释放后，也释放父fscache_object.
+
+  b. fscache_object_state_machine
+    object使用的状态机,有点像SUNRPC,但这里简单点,而且没有那么多的状态,主要工作包括lookup/creation/recycle and retirement/withdrawal. 虽然输入状态情况很多,但输出状态/状态改变操作只有上面四种. 还是先看看状态转换中的操作函数.
+    先检查fscache_object->state
+      * FSCACHE_OBJECT_INIT => fscache_initialise_object. 
+        创建fscache_object,但前提是fscache_object->parent->state是FSCACHE_OBJECT_AVAILABLE, 如果parent状态不满足要求,把fscache_object->dep_link放到parent->dependents. 如果parent满足要求,把状态改为FSCACHE_OBJECT_LOOKING_UP,进行下一个状态操作.
+      * FSCACHE_OBJECT_LOOKING_UP/FSCACHE_OBJECT_CREATING => fscache_object在lookup阶段,
+        -> fscache_lookup_object 使用fscache_cache_ops的lookup_object操作. 这一步完成后,没有状态的改变?
+      * FSCACHE_OBJECT_AVAILABLE => fscache_object在active状态 
+        -> fscache_object_available ,表示fscache_object对象已经创建完成,可以开始相关数据操作, 出发fscache_cache_ops->lookup_complete, 让它再次进入FSM.
+      * FSCACHE_OBJECT_ACTIVE => fscache_object在active状态
+      * FSCACHE_OBJECT_UPDATING => fscache_object在active状态,清除FSCACHE_OBJECT_EV_UPDATE事件
+        -> fscache_object->cache->ops->update_object(fscache_object)
+      * FSCACHE_OBJECT_LC_DYING (dying during lookup or creation) fscache_object在terminal状态
+        清除fscache_cookie的FSCACHE_COOKIE_LOOKING_UP/FSCACHE_COOKIE_CREATING标志. 把fscache_object->state改为FSCACHE_OBJECT_DYING.
+        -> fscache_done_parent_op(fscache_object)
+      * FSCACHE_OBJECT_DYING  fscache_object处于terminal状态
+        -> fscache_enqueue_dependents
+        -> fscache_start_operation
+        为何没有销毁的动作?
+      * FSCACHE_OBJECT_ABORT_INIT  fscache_object处于terminal状态, fscache_object在初始化过程中有错误.
+        去掉fscache_cookie->flags的FSCACHE_COOKIE_CREATING,唤醒等待的任务.
+      * FSCACHE_OBJECT_RELEASING/RECYCLING: fscache_object处于terminal状态
+        -> fscache_release_object 释放fscache_object
+      * FSCACHE_OBJECT_WITHDRAWING:  fscache_object处于terminal状态
+        ->fscache_withdraw_object
+
+    如果fscache_object在lookup状态收到以下信号:
+      FSCACHE_OBJECT_EV_WITHDRAW/FSCACHE_OBJECT_EV_RETIRE/FSCACHE_OBJECT_EV_RELEASE/FSCACHE_OBJECT_EV_ERROR,则它的状态改为FSCACHE_OBJECT_LC_DYING
+    如果fscache_object在active状态收到以下信号:
+      FSCACHE_OBJECT_EV_WITHDRAW/FSCACHE_OBJECT_EV_RETIRE/FSCACHE_OBJECT_EV_RELEASE/FSCACHE_OBJECT_EV_ERROR,则它的状态改为FSCACHE_OBJECT_DYING;
+      FSCACHE_OBJECT_EV_UPDATE, 状态改为FSCACHE_OBJECT_UPDATING
+      其他, 状态改为FSCACHE_OBJECT_ACTIVE
+    如果fscache_object在terminal状态收到信号: 为何这里会有这么多状态
+      FSCACHE_OBJECT_EV_WITHDRAW: 状态改为FSCACHE_OBJECT_WITHDRAWING
+      FSCACHE_OBJECT_EV_RETIRE: FSCACHE_OBJECT_RECYCLING
+      FSCACHE_OBJECT_EV_RELEASE: FSCACHE_OBJECT_RELEASING
+      FSCACHE_OBJECT_EV_ERROR: FSCACHE_OBJECT_WITHDRAWING
+      FSCACHE_OBJECT_EV_CLEARED: FSCACHE_OBJECT_DYING
+
+  c. fscache_object_work_func(work_struct)
+    这是fscache_object->work使用的回调函数,完成状态机的工作。要是没有workqueue,内核中该有多少线程?!
+    -> fscache_object_state_machine(fscache_object)
+    -> fscache_enqueue_object(fscache_object) 如果fscache_object->event还有没处理的,继续执行它的FSM
+    -> 清除FSCACHE_OBJECT_EV_REQUEUE
+    -> fscache_put_object(fscache_object)
+
+下面是fscache_object使用的操作,不知道是否够上面的FSM用的?
+  * fscache_object初始化,保证使fscache_object树形结构完善起来,因为index类型的fscache_cookie对应的fscache_object不一定有用（用来缓存数据),所以它们的创建可能不及时.
+  * lookup操作, 应该获取fscache_cache中的对象数据
+  * active: fscache_object创建完成,而且可以进行数据的缓存操作,缓存操作应该就有两种:保存缓存的数据，更新缓存的数据，检索缓存的数据，删除缓存的数据.
+  * drop/withdraw操作, 表示要释放fscache_object
+fscache_object的操作使用事件驱动,如果设置有效事件fscache_object->event(fscache_object->maskevent会影响某些事件),则同时把它放到fscache_object_wq中执行。但事件触发的动作参考fscache_object->state,不同的状态进行不同的操作,根据状态和事件确认fscache_object的新状态. 如果有多个事件,则再次进入FSM处理操作.
+对于fscache_object收到的信号,只有几个是好的: REQUEUE / UPDATE, 其他都是错误的事件. 所以这里还主要是处理错误,而真正的数据操作，使用fscache_operation还没看到.
+fscache_object的状态变化还影响这fscache_cookie的状态变化.
+
+  c. fscache_initialise_object(fscache_object *)
+    这里不是简单的fscache_object的初始化, fscache_object使用fscache_cache分配.
+    I. 检查fscache_object的事件(event),如果不正常, 则把object的state改为FSCACHE_OBJECT_ABORT_INIT, 然后返回错误。 初始化过程中有异常.
+    II. 如果object没有父object, 或者父object的状态为FSCACHE_OBJECT_DYING+, 则设置其事件为FSCACHE_OBJECT_EV_WITHDRAW, 返回错误。他会再进入状态机,释放这个fscache_object.
+    III. 如果父object的状态为FSCACHE_OBJECT_AVAILABLE-(不可用), 
+      -> fscache_object->cache->ops->grab_object(object) 
+      把它放到parent的dependents列表中? 这是为何? 如果parent的状态为FSCACHE_OBJECT_INIT, 则把它放到队列中(fscache_enqueue_object. 
+      -> fscache_enqueue_object(fscache_object)
+    IIII. 这个fscache_object算是初始化完成的,修改父object的子object计数, 然后状态改为FSCACHE_OBJECT_LOOKING_UP,添加事件FSCACHE_OBJECT_EV_REQUEUE,他会再次进入队列执行.
+
+  d. fscache_lookup_object(fscache_object *)
+    * 检查fscache_object->state > FSCACHE_OBJECT_DYING, 设置事件FSCACHE_OBJECT_EV_WITHDRAW.
+    * 调用fscache_object->cache->ops->lookup_object 这里操作没有任何返回,看cachefiles的实现吧.
+    * 如果object的事件为FSCACHE_OBJECT_EV_ERROR, 则fscache_cookie的flags改为FSCACHE_COOKIE_UNAVAILABLE
+
+  e. fscache_object_lookup_negative(fscache_object *)
+    只有在fscache_object->state = FSCACHE_OBJECT_LOOKING_UP时才用. 把状态改为FSCACHE_OBJECT_CREATING， 设置事件FSCACHE_OBJECT_EV_REQUEUE, 修改fscache_cookie->flags,去掉FSCACHE_COOKIE_LOOKING_UP,唤醒等待这个标志的任务,添加FSCACHE_COOKIE_PENDING_FILL和FSCACHE_COOKIE_NO_DATA_YET.
+
+  f. fscache_obtained_object(fscache_object *)
+    * 如果object->state = FSCACHE_OBJECT_LOOKING_UP, 改为FSCACHE_OBJECT_AVAILABLE, 则清除fscache_cookie->flags的FSCACHE_COOKIE_NO_DATA_YET和FSCACHE_COOKIE_LOOKING_UP, 唤醒等待FSCACHE_COOKIE_LOOKING_UP的任务,同时设置FSCACHE_OBJECT_EV_REQUEUE.
+    * 否则 fscache_object->state设为FSCACHE_OBJECT_AVAILABLE, 添加事件FSCACHE_OBJECT_EV_REQUEUE
+    清除fscache_cookie->flags的FSCACHE_COOKIE_CREATING, 并唤醒等待这个标志的任务.
+    上面的函数是出发lookup_object操作,而这个函数没有有效的操作,只需修改相关对象的属性.
+    
+  g. fscache_object_available(fscache_object *)
+    这个函数不清楚在哪里调用,但应该是检查结果状态.
+    去掉fscache_cookie->flags的FSCACHE_COOKIE_CREATING标志,唤醒等待它的任务. 可能是fscache_object的某个fscache_operation完成,启动下一个动作.
+    -> fscache_done_parent_op(fscache_object)
+    fscache_object->n_in_progress =0 && fscache_object->n_ops>0
+      -> fscache_start_operations(fscache_object)
+    object->cache->ops->lookup_complete, 当有了数据则把它从object的组织中取出来. 如果fscache_cookie的flags包含FSCACHE_COOKIE_CREATING, 则去掉, 而且唤醒等待该位的任务. 如果obj->n_ops大于0, 则说明有等待的任务, 调用object->pending_ops, 使用 fscache_start_operations(object)
+    -> fscache_enqueue_dependents 把fscache_object->dependents队列上的fscache_object放到FSM中. 应该是父fscache_object动作完成,触发它的子fscache_object.
+
+  h. fscache_drop_object(fscache_object *)
+    把它从cache的object队列中删除, 调用cache->ops->drop_object(object)
+    把它从父object的队列中删除, 然后给parent发送消息FSCACHE_OBJECT_EV_CLEARED.
+    -> fscache_put_object (object->cache->ops->put_object
+    这里是把fscache_object从fscache_cache中删除.
+
+  i. fscache_release_object
+    -> fscache_drop_object(fscache_object)
+
+  j. fscache_withdraw_object(fscache_object *)
+    把fscache_object和对应的fscache_cookie的关系释放掉, 同时在fscache_cache中把它释放掉.
+    -> fscache_cookie_put(fscache_cookie)
+    -> fscache_drop_object
+
+  k. fscache_withdrawing_object(fscache_cache, fscache_object )
+    backend把使用中的fscache_object回收, 把状态改为FSCACHE_OBJECT_WITHDRAWING,并且放入FSM
+    ->fscahce_enqueue_object(object)
+
+  l. fscache_get_object/fscache_put_object
+    object->cache->ops->grab_object/put_object
+
+  m. fscache_enqueue_object(fscache_object *)
+    把fscache_object的work_struct放入workqueue,执行它的状态转换函数.
+    把object->work放到fscache_object_wq中, queue_work返回0,表示work_struct已经在队列中,否则返回1. 如果返回1, 唤醒等待队列fscache_object_cong_wait, 不清楚谁会等待在这里?
+
+  这里有新情况,使用2个workqueue_struct:
+      * fscache_object_wq
+      * fscache_op_wq
+    fscache_object_congested() 表示fscache_object_wq是否阻塞
+
+  n. fscache_object_sleep_till_congested(long *timeoutp)
+    如果fscache_object_wq阻塞,返回,否则等待在fscache_object_cong_wait队列上一段时间. 为何阻塞就不用等待?
+    -> fscache_object_congested()
+    -> add_wait_queue_exclusive(fscache_object_cong_wait, wait)
+    -> schedule_timeout()
+    -> finish_wait(fscache_object_cong_wait, wait_queue)
+    
+  o. fscache_enqueue_dependents(object)
+    对object的denp上的object, 把他们放到FSM中. 这里使用的workqueue_struct是fscache_object_wq. 如果fscache_object_wq队列阻塞,唤醒fscache_object_cong_wait等待队列.
+    -> fscache_enqueue_object
+    -> fscache_put_object(dep)
+
+  p. fscache_dequeue_object(fscache_object *)
+    把object从任何等待队列中取出来, 但使用的链表数据结构是object->dep_link. 这里是什么队列呢?这应该是fscache_object从fscache_object_wq队列中任务完成的操作?
+
+  q. fscache_check_aux(object, buf, length)
+    如果没有object->cookie->def->check_aux, 返回FSCACHE_CHECKAUX_OKAY
+    -> fscache_object->cookie->def_check_aux 获取aux数据，和buf内容比较,返回比较结果. 这里没有什么操作,应该是给别人使用了.
+
+4. fscache_operation(fs/fscache/operation.c)
+  fscache使用异步操作机制实现数据的存取和检索, 某个操作使用fscache_operation表示, 一般这个数据结构嵌在其他数据结构中. 介绍数据域: 
+  * work_struct 异步工作
+  * list_head pend_link 等待队列 在fscache_object->pending_ops队列中
+  * fscache_object
+  * flags (ASYNC, MYTHREAD, WAITING, EXCLUSIVE, DEAD, DEC_READ_CNT )
+  * fscache_operation_processor_t
+  * fscache_operation_release_t
+
+  数据操作函数
+  a. fscache_enqueue_operation(fscache_operation *)
+    fscache_operation执行的动作应该是fscache_operation_processor_t(processor),动作执行有两种情况,一种在workqueue中,fscache_operation->flags = FSCACHE_OP_ASYNC, 把它放到fscache_op_wq中;另一种是在应用任务的环境中执行,这里不处理,fscache_operation->flags = FSCACHE_OP_MYTHREAD.
+
+  b. fscache_run_op(fscache_object *, fscache_operation *)
+    递增fscache_object->n_in_progress, 唤醒等待fscache_operation->flags的FSCACHE_OP_WAITING标志, 
+    -> fscache_enqueue_operation(fscache_operation)  不得不说的包装！！！
+
+  c. fscache_submit_exclusive_op(fscache_object, fscache_operation )
+    向fscache_object提交一个独占的fscache_operation, 如果有其他任务执行,则把它放到fscache_object->pending_ops队列中.
+    如果fscache_object是初始化状态,只能放到fscache_operation->pending_ops队列.
+    如果fscache_object是avtive状态,递增fscache_object->n_ops, n_exclusive. 
+      * 如果n_ops>1,说明原来就有等待的fscache_operation. 
+      * 如果fscache_operation->pending_ops不是空,说明有fscache_operation等待. 有等待的,fscache_object->n_ops==1?? 
+        -> fscache_start_operations
+      * 其他情况就是没有其他操作
+        -> fscache_run_op(fscache_object, fscache_operation)
+
+  d. fscache_report_unexpected_submission  //显示错误
+     fscache_abort_object(fscache_object)
+
+  e. fscache_submit_op(fscache_object *, fscache_operation *)
+    这里添加的fscache_operation不是独占的?不是独占又怎么样? 也是把它放到fscache_object->pending_ops队列.
+    -> fscache_start_operations(fscache_object)
+    -> fscache_run_op(fscache_operation)
+      
+  f. fscache_start_operation (fscache_object *)
+    执行fscache_object->pending_ops队列上的fscache_object, 如果fscache_operation->flags带FSCACHE_OP_EXCLUSIVE,则必须保证fscache_operation->in_progress=0, 否则停止处理. 下面的操作是异步的,也就是会开始多个fscache_operation.
+    -> fscache_run_op(fscache_object, fscache_operation)
+    这个函数在submit时处理,而且在fscache_put_operation时处理,也就是fscache_operation完成时处理.
+
+  g. fscache_cancel_op( fscache_operation *)
+    取消pending的fscache_operation, 把它从fscache_object->pending_ops中释放,减小fscache_object->n_ops/n_exclusive
+    -> fscache_put_operation
+
+  h. fscache_put_operation(fscache_operation *)
+    释放fscache_operation,减小fscache_operation->n_ops / n_in_progress / n_exclusive.
+    -> fscache_operation->release()
+    fscache_operation正在使用中,那就把它放到fscache_cache->op_gc_list. 异步释放.
+    如果fscache_object->n_in_progress==0
+    -> fscache_start_operations(fscache_object),调度新的fscache_operation
+    如果fscache_object->n_ops=0,发送事件
+    -> fscache_raise_event(fscache_object, FSCACHE_OBJECT_EV_CLEARED) 这算什么事件?不疼不痒的?
+
+  i. fscache_operation_gc(work_struct *)
+    遍历fscache_cache->op_gc_list,对每个fscache_operation做fscache_put_operation的动作.
+
+  j. fscache_op_work_func(work_struct *)
+    这是应该是fscache_operation->work_struct使用的回调函数,它包装了fscache_operation->processor.
+    -> processor()
+    -> fscache_put_operation(fscache_operation)
+
+上面两部分介绍了fscache_object/fscache_operation两种调度的机制,对fscache_cache来说fscache_object既是数据处理的组织单位,也是调度的手段,而fscache_operation则是数据操作的单位,也是调度这些操作的手段. 对fscache_object来说,它的创建和释放都不负责,但它的状态变化是非常灵活的,因为这里要实现frontend和backend的完全隔离,所以它的状态非常活跃.frontend在删除或更新数据时,需要通知backend,但backend可能没有缓存那些数据.backend可能删除缓存的数据,同样告诉frontend它不再缓存这些. 对fscache_object,使用事件机制处理,处理的操作是双向的. 而事件的处理使用workqueue. 对于fscache_operation,操作应该就两个:添加和取消. 而fscache_operation分了同步/异步，和共享/互斥. fscach_operation操作同样也使用fscache_op_work.
+
+5. page/storage/retrieval (fs/fscache/page.c) 下面应该是以页为单位的具体操作
+  a. __fscache_check_page_write(fscache_cookie, page)
+    检测page是否已经写到backend中,可能会把page放到fscache_cookie->sotres中?
+    -> radix_tree_lookup(fscache_cookie->stores, page->index)
+  
+  b. __fscache_wait_on_page_write(fscache_cookie, page)
+    等待在fscache_cookie->flags的第0位, 这一位没有意义? 直到page已经在fscache_cookie中. fscache对pagecache的影响有多大?
+ 
+  c. __fscache_maybe_release_page(fscache_cookie, page, gfp_t)
+    检查page是否可从fscache_cookie中释放. 要释放page, 如果它在fscache_cookie->sotre中管理,把它从address_space中释放,然后把它的数据从缓存中删除?
+    -> fscache_tree_lookup(fscache_cookie->radix_tree_root, page->index)
+    -> radix_tree_tag_get(fscache_cookie->radix_tree_root, page->index, FSCACHE_COOKIE_STORING_TAG) 如果page正在写,返回失败
+    -> radix_tree_delete(fscache_cookie->radix_tree_root, page->index)
+    -> page_cache_release(page)
+    -> wake_up_bit(fscache_cookie->flags, 0)  为何页的操作使用fscache_cookie.
+    -> __fscache_uncache_page(fscache_cookie, page)
+
+    fscache_maybe_release_page(fscache_cookie, page, pfg) 对上面进行包装
+ 
+  d. fscache_end_page_write(fscache_object, page)
+    page已经放到cache中, 清除fscache_object->radix_tree_root的FSCACHE_COOKIE_SOTRING_TAG. 如果radix_tree_root中page没有标志FSCACHE_COOKIE_PENDING_TAG, 则释放page
+    -> radix_tree_tag_clear(fscache_cookie->radix_tree_root, page->index, FSCACHE_COOKIE_SOTRING_TAG)
+    -> wake_up_bit(fscache_cookie->flags, 0)
+    -> radix_tree_tag_get(radix_tree_root, page->index, FSCACHE_COOKIE_PENDING_TAG)
+    -> radix_tree_delete(fscache_cookie->radix_tree_root, page->index)
+    -> page_cache_release(page)
+    FSCACHE_COOKIE_PENDING_TAG表示等待写入backend? 为何要删除page,写完就要删除?
+
+  e. fscache_attr_changed_op(fscache_operation *)
+    这是什么意思?
+    -> fscache_object->cache->ops->attr_changed(fscache_object)
+    -> fscache_abort_object
+
+  f. __fscache_attr_changed(fscache_cookie)
+    frontend通知backend,数据对象所有改变,需要backend做些动作.
+    -> fscache_operation_init(fscache_operation, fscache_attr_changed_op,创建一个fscache_operation,它执行的动作是上面的函数.
+    -> fscache_submit_exclusive_op(fscache_object, fscache_operation) 随便取出一个fscache_cookie的fscache_object.
+    -> fscache_put_operation(fscache_operation)
+
+    fscache_attr_changed对上面的函数进行包装.
+  
+下面是缓存数据检索动作使用的操作
+  数据结构:
+  fscache_retrieval用于数据检索, 这里只使用了fscache_operation的调度机制,直接的数据操作没在让它做.
+    * fscache_operation
+    * address_space
+    * fscache_rw_complete_t end_io_func 这个end_io_func使用应用这传进来的,详细说明参考cachefiles_read_copier
+    * context (void *) 
+    * list_head  (list of things to be done by backend?  后端?)
+    * start_time
+   
+  g. fscache_release_retrieval_op(fscache_operation *)
+    -> fscache_put_context(fscache_retrieval->op.object->cookie, fscache_retrieval->context) 这个context是什么东西?
+
+  h. fscache_alloc_retireval(address_space, fscache_rw_complete_t, context)
+    构造一个fscache_retrieval, 把参数包装起来, fscache_operation->releaso是fscache_release_retrieval_op. 这个操作是同步的FSCACHE_OP_MYTHREAD. 为何要包装这个实现,难道有多种检索?
+
+  i. fscache_wait_for_deferred_lookup(fscache_cookie)
+    等待fscache_cookie->flags中的FSCACHE_COOKIE_LOOKING_UP. 等待fscache_cookie完成lookup状态.
+
+  j. fscache_wait_for_retrieval_activation(fscache_object, fscache_retrieval)
+    等待fscache_retrieval->op.flags中的FSCACHE_OP_WAITING位,如果首次等待失败, 则取消fscache_cancel_op, 取消失败再次等待. 等待结果是fscache_cookie进入active状态.
+
+  k. __fscache_read_or_alloc_page(fscach_cookie, page, fscache_rw_complete_t, void, gfp_t)
+    从cache中读出一页, 或分配空间?
+    -> fscache_wait_for_deferred_lookup, 确保fscache_cookie完成lookup阶段.
+    -> fscache_alloc_retrieval(page->mapping, ...) 构造一个fscache_retrieval
+    -> fscache_submit_op(object, fscache_retrieval) 这里没有设定fscache_operation->processor.
+    -> fscache_get_context(fscache_object->fscache_cookie, fscache_operation->conext) 不让netfs中的context释放掉,这样下面的page操作才不出错
+    -> fscache_wait_for_retrieval_activation
+    -> if fscache_object->cookie->flags contain FSCACHE_COOKIE_NO_DATA_YET
+         fscache_object->cache->ops->allocate_page(op, page, pfg)
+       else
+         fscache_object->cache->ops->read_or_alloc_page(op, page, pfg)
+    -> fscache_put_retrieval
+    数据的读取使用同步方式,因为fscache_operation使用标志FSCACHE_OP_MYTHREAD,所以他不会在workqueue中执行，当它被调度时, 会唤醒这里的等待(fscache_wait_for_retrieval_activation), 在这里触发fscache_cache_ops中的操作
+
+  l. __fscache_read_alloc_pages
+    和上面一样,不过使用的是
+      -> fscache_cache_ops->alloc_pages
+      -> fscache_cache_ops->read_or_alloc_pages
+    
+  m. __fscache_alloc_page(fscache_cookie, page, gfp)
+    从cache中分配一块空间，存储page 这是函数是__fscache_read_or_alloc_page的简化版
+    -> fscache_wait_for_deferred_lookup
+    -> fscache_alloc_retrieval
+    -> fscache_wait_for_retrieval_activation
+    -> fscache_object->cache->ops->allocate_page
+    -> fscache_put_retrieval
+
+现在处理把数据写到缓存中
+  fscache_storage
+  * fscache_operation
+  * store_limit
+
+  n. fscache_write_op( fscache_operation )
+    把cache中的page写到后端存储中.
+    -> radix_tree_gang_lookup_tag(... FSCACHE_COOKIE_PENDING_TAG) 取出一个page，带有标志FSCACHE_COOKIE_PENDING_TAG
+    -> radix_tree_tag_set(... FSCACHE_COOKIE_STORING_TAG) 
+    -> radix_tree_tag_clear(... FSCACHE_COOKIE_PENDING_TAG) 清除PENDING标志, 添加STORING标志.
+    -> fscache_object->cache->ops->write_page(fscache_object, page)
+    -> fscache_end_page_write(fscache_object, page) 清除fscache_cookie->stores中的page.
+    -> fscache_abort_object(fscache_object) 如果上面的操作有问题,则修改fscache_object的状态
+    -> fscache_enqueue_operation(fscache_operation) 如果成功继续执行这个写任务,把fscache_operation继续添加到调度队列中.
+  
+  o. __fscache_write_page(fscache_cookie, page, gfp_t)
+    把page写到cache的后端存储中,使用异步的方式写操作.
+    -> fscache_operation_init 创建一个fscache_storage
+    -> radix_tree_insert(fscache_cookie->stores, page, page) 把page放到fscache_cookie->stores中,设置FSCACHE_COOKIE_PENDING_TAG, 这样写操作就会处理这个page.
+    -> page_cache_get(page)
+    -> if fscache_object->flags包含标志FSCACHE_OBJECT_PENDING_WRITE ,说明已经有fscache_operation在执行写操作.
+       else fscache_submit_op(fscache_object, fscache_operation). 把fscache_object标志为FSCACHE_OBJECT_PENDING_WRITE, 如果没有标志, 则提交fscache_operation
+    -> fscache_put_operation(fscache_operation)
+
+  p. __fscache_uncache_page(fscache_cookie, page)
+    从cache的fscache_cookie中删除一页, 根据page标志,决定它是否在fscache中. 清除FSCACHE_COOKIE_NO_DATA_YET标志(这个标志表示数据没有从磁盘读到内存???)
+    -> fscache_object->cache->ops->uncache_page(fscache_object, page)
+  
+  q. fscache_mark_pages_cached(fscache_retrieval, pagevec)
+    这应该是在检索操作完成后使用的，它把所有page添加FSCACHE标志. 
+    -> fscache_cookie->def->mark_pages_cached(netfs, mapping, pagevec)
+
+  r. __fscache_uncache_all_inode_pages(fscache_cookie, inode)
+    删除inode使用的所有缓存? 遍历inode使用的所有pagecache, 如果她们在写操作,等待操作完成,然后把她们从backend中删除.
+    -> pagevec_lookup(pagevec, address_mapping ...)
+    -> __fscache_wait_on_page_write(fscache_cookie, page)
+    -> __fscache_uncache_page(fscache_cookie, page)
+     
+7. fscache_objlist_data object队列, 使用rbtree管理object(fs/fscache/object-list.c)
+  a. fscache_objlist_lookup/fscache_objlist_add 从rbtree中找object(指针作为key)
+  b. fscache_object_destroy(fscache_object) 把object从rbtree中删除
+
+上面就是所有的fscache的数据操作,主要为alloc,retrieval(read),write,uncache.这些操作都给应用层提供的接口，怎么用不用太详细的说，说一下实现。上面提到fscache_operation分了2中(这里还没有互斥这一说), 而读就是用同步方式,它的实际操作是在调用这环境中实现,它顶多使用了fscache_operation的调度机制，为何使用呢? 写就是使用异步方式，如果有page要写,先把它放到fscache_cookie->stores中,然后启动一个fscache_operation循环的找fscache_operation上的page.写完成后会把fscache_cookie->stores上的page释放掉。这些都是操作过程中的,读写使用的page,backend还需要维护起来,这里的写和读的操作频率应该很低，要是很高的话pagecache就没什么用！！
+
+cachefiles模块
+这里是真正的backend, 它需要实现一个fscache_cache,注册进去,然后实现fscache_cache_ops中的接口即可！ 但它还必须有数据的组织方法,数据的检索和存储方式等等.因为它的缓存数据放在磁盘中存储,所以索引方式基本上是目录，而存储就是基本的文件操作.
+(fs/cachefiles/key.c)
+  a. cachefiles_cook_key(buf, len, type)
+    把fscache_cookie获取的key数据转换为cachefiles认识的key, 然后作为路径名.路径名使用"\0+"分割开, 例如下面的应该是4个fscache_cookie的key组成的.
+./@4a/I03nfs/@22/Jo00000008400000000000000000000000400/@70/J1100000000000YghG4gIH-BOGmOYpNYk24a0000000020000800Kb000wFe000jt000oG3000000040000g000000000/@f1/EA0g00sg010wa000000wOvJuI1Eihf4G0jNsmPnyGzIza08Irf570
+    I. 第一层的key是"nfs", 全是ascii，不用映射, I表示index, 03表示长度, nfs
+    II. 下面三层的key应该是不可打印, 把3个byte扩展为4个bite. 第一个为nfs_client对应的key,内容为ip地址，ipv6的localhost为::1,所以只有一个1. 二个为nfs_server(superblock)对应的key,比较麻烦. 第三个为inode文件对应的key, 是一个filehandle.
+
+  cachefiles_object
+    * fscache_object
+    * cachefiles_lookup_data 这是什么东西？！
+    * dentry dentry backer  只有non-index的fscache_cookie对应的fscache_object才使用backer, 而且backer也就是dentry
+    * i_size , flags , usage, type, new
+    * rb_node active_node
+  
+  cachefiles_lookup_data 这是做什么的?
+    * cachefiles_xattr auxdata
+    * key
+  cachefiles_xattr
+    * len / type / data
+
+cachefiles_object的创建/释放 (fs/cachefiles/interface.c)
+  a. cachefiles_alloc_object(fscache_cache, fscache_cookie)
+    这里是创建cachefiles_object(fscache_object),必须准备好fscache_cookie,才能在cachefiles_cache(fscache_cache)创建它, 准备cachefiles_lookup_data. 
+    -> fscache_object_init(fscache_operation, fscache_cookie, fscache_cache)
+    -> fscache_cookie->def->get_key(fscache_cookie->netfs_data, buffer ...)获取frontend数据对应的标示(nfsfh/nfs_server_key)
+    -> cachefiles_cook_key(buf, len, cachefiles_object->type) 获取fscache_cookie对应的key, 转换为cachefiles使用的key
+    -> fscache_cookie->def->get_aux(fscache_cookie->netfs_data, cachefiles_xattr->data, len) 获取frontend数据对象的辅助信息(nfs_fscache_inode_auxdata),把cachefiles_xattr和key包装到cachefiles_lookup_data, 放到cachefiles_object->lookup_data上面。
+
+  b. cachefiles_lookup_object(fscache_object)
+    填充cachefiles_object使用的存储信息(dentry之类的), 根据cachefiles_object(fscache_object)的parent, 还有key获取对应的dentry， 这些就是fscache_object的lookup操作,他完成之后fscache_object应该变成active状态. 这里必须保证fscache_object的父fscache_object已经初始化完成, 也就是初始化阶段已经完成, 否则无法继续寻找路径.
+    -> cachefiles_begin_secure(cachefiles_cache ...)
+    -> cachefiles_walk_to_object(cachefiles_object/parent, cachefiles_object, cachefiles_lookup_data->key, cachefiles_lookup_data->auxdata) 这个看后面的解释吧.
+    -> cachefiles_end_secure
+    -> cachefiles_attr_changed(fscache_object) 更新存储文件的信息.
+    -> if err, fscache_object->lookup_error
+
+  d. cachefiles_lookup_complete(fscache_object)
+    释放cachefiles_lookup_data的key/auxdata使用的内存, 为何查找完成后就释放了? 都是临时的?
+
+  e. cachefiles_grab_object(fscache_object)
+    不要释放掉backend的数据对象.
+    -> atomic_inc(cachefiles_object->usage)
+
+  f. cachefiles_update_object(fscache_object)
+    frontend的数据对象信息有所更新,对应的更新backend的数据对象. 更新cachefiles中cachefiles_object的auxiliary数据
+    -> fscache_cookie->def->get_aux 获取aux数据
+    -> cachefiles_begin_secure
+    -> cachefiles_update_object_xattr(cachefiles_object, cachefiles_xattr) 还要把这些信息写到cachefiles使用的文件中?至于吗?
+    -> cachefiles_end_secure
+
+  g. cachefiles_drop_object(fscache_object )
+    这应该给fscache提供的接口,释放fscache_object的backend数据. 如果fscache_object->state=FSCACHE_OBJECT_RECYCLING，把它使用的资源放到可回收的地方,对cachefiles来说,可能就是把文件放到graved目录中. 
+    释放这个cachefiles_object。 释放它使用的dentry，把它从cachefiles_cache的rbtree中删除，去掉CACHEFILES_OBJECT_ACTIVE
+    -> cachefiles_delete_object(cachefiles_cache, cachefiles_object) 为何这个单对FSCACHE_OBJECT_RECYCLING使用?
+    -> dput(cachefiles_object->backer) 
+    -> dput(cachefiles_object->dentry) 关闭cachefiles使用的文件系统对象
+    -> 把cachefiles_object从cachefiles_cache的rbtree中删除,唤醒等待CACHEFILES_OBJECT_ACTIVE标志的任务.
+
+  h. cachefiles_put_object(fscache_object)
+    释放cachefiles_object, 包括他用的 cachefiles_lookup_data, 内存, fscache_object. 两个rbtree管理,重复吧！！
+
+  i. cachefiles_sync_cache(fscache_cache)
+    这个是同步缓存到磁盘中,用现成的操作
+    -> sync_filesystem(cachefiles_cache->mnt->mnt_sb)
+
+  j. cachefiles_attr_changed(fscache_object)
+    frontend的数据对象改变了, 通知backend,但这里的改变只有文件大小. 这里cachefiles对应改变底层文件的大小
+    -> fscache_object->cookie->def->get_attr 获取netfs_data对应的数据大小
+    -> i_size_read(cachefiles_object->backer->d_inode) 如果fscache_object获取的i_size和get_attr获取的size, 或inode的size相同, 说明文件大小没有改变
+    -> notify_change(cachefiles_object->backer, iattr)
+
+  k. fscache_cache_ops => cachefiles_cache_ops给cachefiles_cache使用, 枚举一下：
+    alloc_object = cachefiles_alloc_object 创建
+    lookup_object = cachefiles_lookup_object 把cachefiles_object和底层文件关联起来,用来检索数据
+    .lookup_complete    = cachefiles_lookup_complete, 关联完成删除这些中间数据.
+    .grab_object        = cachefiles_grab_object, 不让cachefiles_object被释放
+    .update_object      = cachefiles_update_object, 更新aux信息
+    .drop_object        = cachefiles_drop_object, 删除cachefiles_object对表的数据对象.
+    .put_object     = cachefiles_put_object,  注销cachefiles_object
+    .sync_cache     = cachefiles_sync_cache,  同步数据的存储
+    .attr_changed       = cachefiles_attr_changed,  更改文件大小
+    .read_or_alloc_page = cachefiles_read_or_alloc_page,  下面以后再说...
+    .read_or_alloc_pages    = cachefiles_read_or_alloc_pages,
+    .allocate_page      = cachefiles_allocate_page,
+    .allocate_pages     = cachefiles_allocate_pages,
+    .write_page     = cachefiles_write_page,
+    .uncache_page       = cachefiles_uncache_page,
+    .dissociate_pages   = cachefiles_dissociate_pages
+数据对象在缓存中的删除,才是真正的数据删除,而cachefiles_object对象的注销不是.
+
+  
+(fs/cachefiles/namei.c) 因为cachefiles使用文件代表frontend的数据对象(实际上他们也是文件),使用目录索引文件,因此少不了文件操作，这里是一些辅助信息.
+  a. __cachefiles_printk_object(cachefiles_object, char *prefix, buf) 
+    打印cachefiles_object相关信息
+  
+  b. cachefiles_mark_object_buried(cachefiles_cache, dentry)
+    dentry对应的cachefiles_object被删除, 设置cachefiles->flags的CACHEFILES_OBJECT_BURIED标志. cachefiles_object存储在cachefiles_cache->active_node表示的rbtree中, 树中节点的值就是dentry,可能用来处理dentry到cachefiles_object的索引. 
+
+  c. cachefiles_mark_object_active(cachefiles_cache, cachefiles_object)
+    * 设置cachefiles_object->flags的CACHEFILES_OBJECT_ACTIVE, 并把cachefiles_object放到cachefiles_cache->active_node表示的rbtree中. 
+    如果找到cachefiles_object,使用相同的dentry,问题比较严重, 而且fscache_object.state不是DYING, 返回错误. 等待fscache_object对象的销毁. 否则等待cachefiles_object->flags的CACHEFILES_OBJECT_ACTIVE位, 直到fscache_object_sleep_till_congested返回0.  这个cachefiles_object被释放
+    -> fscache_cache_ops->put_object(fscache_object)
+    
+  d. cachefiles_bury_object(cachefiles_cache, dentry/dir, rep ...)
+    这是删除backend的数据对象，删除cachefiles_object对应的cachefiles文件, 把cachefiles目录放到graveyard中.
+    if rep->d_inode->i_mode 是普通文件, vfs_unlink删除这个文件,并且是出他对应的cachefiles_object. 当然rep在dir目录下面.
+    else mv rep graveyard/newfolder, 新的目录根据时间和cachefiles_cache->gravecounter构造.
+      -> lookup_one_line(name, cachefiles_cache->graveyard, len)
+      -> vfs_remove(dir->d_inode, rep, cachefiles_cache->graveyard->d_inode, grave)
+      -> cachefiles_mark_object_buried
+
+  e. cachefiles_delete_object(cachefiles_cache, cachefiles_object)
+    如果cachefiles_object->flags 有 CACHEFILES_OBJECT_BURIED, 退出, 别人已经释放它
+    -> cachefiles_bury_object(cachefiles_cache, dir, cachefiles_object->dentry, false)  dir=dget_parent(cachefiles_object->dentry) 释放cachefiles_cache底层的文件/目录.
+
+  f. cachefiles_walk_to_object(cachefiles_object, cachefiles_object, key, cachefiles_xattr *aux)
+    为cachefiles_object创建底层的文件/目录,key就是一个路径名称, 如果对应的文件已经存在,检查aux信息,如果不符合,删除那个文件对应的cachefiles_object, 重新创建inode. 根据aux信息设置xattr信息.  
+    key是以'\0'隔开的一系列目录名, 最后以两个'\0'结尾.  这里的文件必须支持map操作.
+    -> lookup_one_line(name, dir, len)
+    -> fscache_object_lookup_negative(cachefiles_object->fscache) 查找缓存数据对象失败.告诉fscache_object的状态.
+    -> cachefiles_has_space
+    -> vfs_mkdir(dir->d_inode, next/dentry, 0)
+    -> vfs_create(dir->d_inode, next/dentry, S_IFREG, 0)
+    -> cachefiles_check_object_xattr(cachefiles_object, cachefiles_xattr)
+    -> cachefiles_bury_object(cachefiles_object, dir/dentry, next/dentry ...) 删除已经存在的文件对应的旧cachefiles_object. 
+    -> cachefiles_mark_object_active(cachefiles_cache, cachefiles_object) 文件创建成功,告诉cachefiles_object
+    -> cachefiles_set_object_xattr(cachefiles_object, cachefiles_xattr)
+    -> fscache_obtained_object(fscache_object) 推动FSM向前变化.
+
+  g. cachefiles_get_directory(cachefiles_cache, dentry, dirname)
+    在dentry下面创建dirname文件夹.
+    -> lookup_one_len(dirname, dentry, len)
+    -> vfs_mkdir(dentry->d_inode, dirname ...)
+    
+  h. cachefiles_check_active(cachefiles_cache, dentry, filename)
+    查找filename对应的cachefiles_object是否正在使用
+    -> lookup_one_line(filename, dentry, len)
+    -> 在cachefiles_cache中, 检查是否有dentry对应的cachefiles_object, 没有找到, 返回找到的dentry, 否则返回-EBUSY等.
+
+  i. cachefiles_cull(cachefiles_cache, dentry, filename)
+    删除没有使用的cachefiles_object, 在cache manager daemon中使用
+    -> cachefiles_check_active(cachefiles_cache, dentry, filename)
+    -> cachefiles_remove_object_xattr(cachefiles_cache, dentry)
+    -> cachefiles_bury_object(cachefiles_cache, dir, victim, 0)
+
+  j. cachefiles_check_in_use(cachefiles_cache, dentry, filename)
+    检查cachefiles_object是否在使用中
+    -> cachefiles_check_active
+上面的这些好杂！！  还有cachefiles给用户提供接口,可以删除缓存使用的文件,这样更麻烦了!!
+
+(fs/cachefiles/rdwr.c) 这里应该实现缓存数据的磁盘操作(反正我已经之道了fscache的读写操作)
+  数据结构
+    cachefiles_one_read
+      * wait_queue_t monitor
+      * page back_page, netfs_page
+      * fscache_retrieval op 这里没有嵌套,只是一个指针.
+      * op_link 
+  
+    cachefiles_one_write
+      * page netfs_page
+      * cachefiles_object
+      * obj_link
+      * fscache_rw_complete_t end_io_func
+      * context 这个为何和fscache_retireval类似？
+  
+  a. cachefiles_read_waiter(wait_queue_t, mode, sync, void *key)
+    这应该是一个等待的回调函数, 等待使用的是cachefiles_one_read->monitor. 它等待page->flags的PG_locked位. 在任务的睡眠循环中检查唤醒条件.
+    * 把cachefiles_one_read->monitor->task_list从wait_queue_head_t的链表中取出来,完成等待操作.
+    * 把cachefiles_one_read->op_link放到fscache_retireval->to_do链表中,retrieval是同步的,都没注意那个函数的实现..
+    -> fscache_enqueue_retrieval(cachefiles_one_read->fscache_retrieval) 把fscache_operation放到工作队列中.
+    wake_up_page会触发这个回调函数, 检测IO操作完成触发的唤醒事件. 
+    
+  b. cachefiles_read_reissue(cachefiles_object, cachefiles_one_read)
+    读取fscache中的一页, 把数据读到cacefiles_one_read->back_page中. 读取数据使用address_space_ops, 这里也确认page->address_space和cachefiles_object->backer->d_inode->i_mapping是同一个东西.  把cachefiles_one_read->monitor放到page的等待队列中, 检查页是否有数据Uptodate标志, 如果没有, 使用readpage读取数据. 和cachefiles_read_file_backing_file_one区别是不用再创建cachefiles_one_read.
+    -> add_page_wait_queue(page, cachefiles_one_read)
+    -> address_space->a_ops->readpage(0, page)
+    这个函数在cachefiles_read_copier()中调用,而它是fscache_operation.processor. 读出缓存数据竟然也使用fscache_operation,为何不直接把缓存数据读到netfs的page中? 还要先放到自己的page中? 这里的两个page使用不同的address_space，因为不同的文件么！！
+
+  d. cachefiles_read_copier(fscache_operation) 
+    这个函数是在fscache_operation->processor使用的操作函数,它用来从磁盘文件中读取数据. 首先这个fscache_operation肯定不是fscache_retrieval, 因为它根本不用processor. 这个fscache_operation应该是管理数据从backend的文件的page搬到frontend的page中. 上面的fscache_retrieval只是一个同步工具,它告诉调用者执行fscache_cache_ops->allocate_page/read_or_alloc_page, 而这些操作就使用这些这里的函数,所以上面的两个fscache_operation看来是一样的,只不过数据的索引/读取经过了两个过程. 
+    fscache_retrieval->to_do是cachefiles_one_read队列,它负责backend的数据page填充, 检查cachefiles_one_read->back_page的Uptodate标志
+      * 如果有效,则把它的数据复制给cachefiles_one_read->netfs_page. 哪里创建的cachefiles_one_read操作?
+        -> PageUptodate(cachefiles_one_read->backpage)
+        -> copy_highpage(cachefiles_one_read->netfs_page, cachefiles_one_read->back_page)
+        -> fscache_mark_pages_cached(cachefiles_one_read->fscache_operation, page)
+        -> page_cache_release(cachefiles_one_read->back_page)
+        -> fscache_end_io(fscache_retrieval, netfs_page, error) 这个调用fscache_retrieval->end_io_func,而这个函数是nfs传进来的,它在netfs_page填充数据后,做一些处理,比如设置标志等. (uptodate, unlock)
+        -> page_cache_release(cachefiles_one_read->netfs_page) 各种释放操作
+        -> fscache_put_retrieval(fscache_retrieval)
+        -> kfree(fscache_retrieval)
+      * 如果无效,则看下一页,或者退出，重新把这个fscache_retrieval放到workqueue中.
+        -> fscache_enqueue_retrieval(fscache_operation)
+
+  e. cachefiles_read_backing_file_one(cachefiles_object, fscache_retrieval, page, pagevec)
+    这里创建cachefiles_one_read,它应该调用上面的函数,而且为fscache_cache_ops->read_or_alloc_page服务
+    * 首先创建一个cachefiles_one_read, monitor使用的睡眠函数为cachefiles_read_waiter
+    * 从cachefiles_object->backer->inode->i_mapping中取出对应的page,如果没有page,则分配一个. 
+      -> find_get_page(address_space, netpage->index)
+      -> page_cache_alloc_code(address_space)
+      -> add_to_page_cache(netpage, address_space, netpage->index, GFP_KERNEL)
+    * 然后现在有了netfs_page和back_page, 给cachefiles_one_read. 然后读取数据
+      -> address_space_ops->readpage(NULL, page)
+    * 读取完成后检查读取的结果,这些要异步实现,就是让fscache_retrieval做这些工作
+      -> page_cache_get(netfs_page / backpage)
+      -> add_page_wait_queue(backpage, cachefiles_one_read->monitor) 等它唤醒之后,它会把cachefiles_one_read放到对应的fscache_retrieval中.
+    * 后面的操作和cachefiles_page_copier的释放资源部分差不多
+      -> fscache_mark_pages_cached(fscache_retrieval, pagevec)
+      -> copy_highpage(netfs_page, bckpage)
+      -> fscache_end_io(fscache_retrieval, netfs_page, 0)
+      -> page_cache_release(backpage)
+      -> fscache_put_retrieval(fscache_retrieval)
+      -> page_cache_release(newpage)
+      -> kfree(cachefiles_one_read)
+
+  f. cachefiles_read_or_alloc_page(fscache_retrieval, page, gfp_t)
+    这是cachefiles_cache_ops->read_or_alloc_page使用的接口函数,它从fscache_read_or_alloc_page中调用,它接受一个fscache_retrieval，把它改为异步方式,继续调用它. 这里要读取page对应的缓存中的数据,先要查看缓存中是否有对应的数据,使用高科技bmap实现.
+    -> fscache_retrieval->fscache_object=>cachefiles_object->backer->d_inode->i_mapping->a_ops->bmap(address_space, block) 如果文件中有对应的数据,返回非0，否则返回0
+    -> cachefiles_read_backing_file_one(cachefiles_object, fscache_retrieval, page ...) 如果有数据,则使用cachefiles_one_read把它读出来.
+    -> fscache_mark_pages_cached  否则直接把这些netfs_page设为cached,而且返回ENODATA. 
+
+  g. cachefiles_read_backing_file(cachefiles_object, fscache_retrieval, list_head, pagevec)
+    这个函数与cachefiles_read_backing_file_one类似, 不过它读取list_head中所有page. page->lru构成list_head链表. 不再详细说明了,完全可以使用那个函数
+   
+  h. cachefiles_read_or_alloc_pages(fscache_retrieval, list_head, ...)
+    这个函数和cachefiles_read_or_alloc_page也对应.
+
+  i. cachefiles_allocate_page(fscache_retrieval, page, gfp_g)
+    在cachefiles中分配块空间, 存储page. 只是检查是否有足够的空间, 没有在cachefiles的IO操作.
+    -> cachefiles_has_space(cachefiles_cache, 0, 1) 检查cachefiles是否有空间
+    -> fscache_mark_pages_cached(fscache_retrieval, pagevec)
+    不清楚cachefiles什么时候把netfs的数据写回磁盘,或什么时候netfs把数据给backend. 不妨先看fscache的相关接口, 然后上面有调用write_page, 看来下面就是了.
+
+  j. cachefiles_allocate_pages(fscache_retrieval, list_head ...)
+    与上面的操作相同
+
+  k. cachefiles_write_page(fscache_storage, page)
+    把page写到cachefiles中. 好像是同步操作, 没有复杂的等待之类的. 这里使用map写.
+    -> dentry_open(cachefiles_object->object->backer, cachefiles_cache->mnt ...) 打开文件
+    -> kmap(netfs_page)
+    -> file->f_op->write(file, data, len, pos) 写数据,的确是够普通的调用
+    -> kunmap(netfs_page)
+    -> fput(file)
+
+  l. cachefiles_uncache_page(fscache_object, page) 
+    把page与cachefiles分离. 这个page应该是netfs的page. 不知道这个锁是什么时候加的? 
+    -> spin_unlock(cachefiles_object->fscache.cookie->lock)
+
+上面还是以页为单位的数据搬运,它和fscache_read/write结合起来,对整个数据的流动有了整体的思路. 首先数据缓存不想pagecache会频繁的读写,起码不会比pagecache频繁,哪里是第一层的cache,这个fscache就是在pagecache和server之间建立了一层cache,如果上层应用需要读写数据,对应到fscache也需要有相应的动作. 不过动作就是简单的读/写.读叫做检索数据: fscache_retrieval,写叫做存储数据:fscache_storage. 检索操作就是backend提供page,让它把数据放到page中. 如果没有数据怎么办? 这里应该有对上层的通知，让它去server拿数据.如果有数据,则异步方式从磁盘中读取出来,而且充分的利用了pagecache. 这里分了3个阶段: frontend调用fscache的接口创造fscache_retrieval,并放到调度队列中调度; fscache出发backend的fscache_cache_ops->read_or_alloc_page; backend从磁盘中把数据取出来，利用pagecache的map IO方式. 这三个阶段使用不同的等待条件,可以研究一下. 而写数据比较简单,frontend直接创建异步的fscache_storage,把page传进来,fscache使用backend的fscache_cache_ops->write_page,使用文件操作把数据存到磁盘,后面的IO使用同步方式.
+
+(fs/cachefiles/xattr.c) 这里是如果frontend的数据对象发生改变,对对应的修改backend的数据,其实没必要看了，因为对整个数据流了解了就可以,还有后面的cachefiles的如何启动，用户的可操作性等。就看到这里把,已经花了接近2天功夫，几乎重新学习一边.
+
+  a. cachefiles中的文件使用xattr, cachefiles_xattr_cache = "user.CacheFiles.cache"
+
+  b. cachefiles_check_object_type(cachefiles_object)
+    根据cachefiles_object的属性, 设置它所关联的文件的xattr. 
+    -> vfs_setxattr(cachefiles_object->dentry, cachefiles_xattr_cache, xtype, 3) xtype为cachefiles_object->fscache.cookie->def->type. 如果出错, 则读出来比较.
+
+  c. cachefiles_set_object_xattr(cachefiles_object, cachefiles_xattr)
+    设置cachefiles_object的xattr
+    -> vfs_setxattr(dentry, cachefiles_xattr_cache, cachefiles_xattr->type ...)
+  d. cachefiles_update_object_xattr(cachefiles_object, cachefiles_xattr)
+    和上面操作相同
+
+  e. cachefiles_check_object_xattr(cachefiles_object, cachefiles_xattr)
+    读取cachefiles_xattr, 然后和传入参数比较, 如果不对则更新.
+    -> vfs_getxattr(dentry, cachefiles_xattr_cache ...)
+    -> fscache_check_aux(...)
+    -> vfs_setxattr
+
+  f. cachefiles_remove_object_xattr(cachefiles_cache, dentry)
+    -> vfs_removexattr(dentry, cachefiles_xattr_cache)
+
+(fs/cachefiles/bind.c)
+  a. cachefiles_deamon_bind(cachefiles_cache, args)
+    检查cachafiles_cache的参数
+    -> cachefiles_daemon_add_cache(cachefiles_cache)
+
+  b. cachefiles_daemon_add_cache(cachefiles_cache)
+    构造一个cachefiles_object: fsdef
+    -> kern_path(...)
+    -> vfs_statfs(path, stats) 填充cachefiles_cache
+    -> cachefiles_get_directory(cachefiles_cache, path.dentry, "cache") 打开cache子文件夹, 把这个文件夹dentry给刚创建的cachefiles_object
+    -> 创建graveyard子文件夹, 给cachefiles_cache->graveyard
+    -> fscache_init_cache(cachefiles_cache->cache, cachefiles_cache_ops ...)
+    -> fscache_object_init(cachefiles_object->fscache ...)
+    -> fscache_add_cache(fscache_cache, fscache_object, fscache_cache_tag)
+    -> cachefiles_cache->flags + CACHEFILES_READY 
+
+  c. cachefiles_daemon_unbind(cachefiles_cache)
+    -> fscache_withdraw_cache
+    -> dput(cachefiles_cache->graveyard)
+
+(fs/cachefiles/daemon.c)
+  这里只有创建cachefiles_cache，给打开的cachefiles文件, 还有通过读写这个文件更正它对应的cachefiles_cache的行为, 这里的bind命令在bind.c文件中，对应cachefiles_daemon_bind，注册创建的cachefiles_cache
+  a. cachefiles_daemon_open(inode, file)
+    创建cachefiles_cache  file->private_data = cachefiles_cache, cachefiles_cache->cachefilesd = file
+
+  b. cachefiles_daemon_release(inode, file)
+    -> cachefiles_daemon_unbind(cachefiles_cache
+
+  c. cachefiles_daemon_read(file, buffer ...)
+    把cachefiles_cache的信息放到buffer中. cachefiles_cache = file->private
+
+  d. cachefiles_daemon_write(file, buffer ...)
+    根据buffer中的内容, 执行相应命令, 修改cachefiles_cache的状态
+
+  e. cachefiles_daemon_poll(file, poll_table_struct)
+    -> poll_wait(file, cachefiles_cache->daemon_pollwq ...)
+    -> if cachefiles_cache->flags包含CACHEFILES_STATE_CHANGED => POLLIN
+    -> if cachefiles_cache->flags包含CACHEFILES_CULLING => POLLOUT
+  f. cachefiles_daemon_frun 
+     cachefiles_daemon_fcull
+     cachefiles_daemon_fstop
+     cachefiles_daemon_brun
+     cachefiles_daemon_bcull
+     cachefiles_daemon_bstop
+     cachefiles_daemon_dir
+     cachefiles_daemon_secctx
+     cachefiles_daemon_tag
+     cachefiles_daemon_cull(cachefiles_cache, name)
+       -> cachefiles_cull(cachefiles_cache, pwd.dentry, name)什么是当前目录? 删除文件夹对应的cachefiles_object, 应该是daemon程序使用的pwd, 因为这些都是daemon的操作
+     cachefiles_daemon_inuse(cachefiles_cache, name)
+       -> cachefiles_check_in_use(cachefiles_cache ...)检查name是否在使用中
+
+(fs/cachefiles/internal.h)
+  a. cachefiles_state_changed(cachefiles_cache)
+    cachefiles_cache->flags + CACHEFILES_STATE_CHANGED
+    -> wake_up_all(cachefiles_cache->daemon_pollwq)
+
+(fs/cachefiles/main.c)
+  a. cachefiles_init
+    模块加载函数, 主要注册miscdev(cachefiles), 创建slab_cache: cachefiles_object_jar, cachefiles_proc_init建立proc目录.
+  
+  b. cachefiles_exit
+    
+
+所有代码都看完, 梳理一下
+  cachefiles_daemon_bind -> cachefiles_daemon_add_cache -> fscache_init_cache, fscache_object_init, fscache_add_cache
+
+  1. cachefiles_cache->tag = "CacheFiles" 根据tag名找fscache_cache_tag. 在查找的时候也对应添加. 只有name和cache. cachefiles_cache->tag只能在cachefiles_daemon_tag中修改. 是否可根据这个添加多个cachefiles_cache呢？
+  
+  2. fscache_add_cache中, cachefiles_cache(fscache_cache)包含一个cachefiles_object(fscache_object, 传入参数), cachefiles_object使用的fscache_cookie是fscache_fsdef_index，这是一个公共cookie, 而且是最顶层的fscache_cookie。现在不清楚为何一个fscache_cookie可以关联fscache_object.
+
+  3. cachefiles_object依赖fscache_cookie的key和xattr, key是fscache_cookie->def->get_key(参考上面nfs的3种key, 还有cachefiles_cook_key的解释).
+
+  4. 在fscache_init_cache中, 传入参数cachefiles_cache_ops，它在fs/cachefiles/interface.c中, 定义了cachefiles_object的相关操作.
+
+  5. cachefiles_cache_ops相关操作包含cachefiles_object的分配,查找，状态改变，删除操作, 还有读写操作。
+    a.  创建/获取/释放/删除操作为cachefiles_alloc_object/cachefiles_grab_object/cachefiles_drop_object/cachefiles_put_object, 获取cachefiles_lookup_data，关联fscache_cookie/fscache_cache; 获取只是增加计数; 释放操作需要释放fscache_object,还有cachefiles后端文件; 删除操作需要减小计数，释放内存等。
+    b. 查找操作cachefiles_lookup_object/cachefiles_lookup_complete， 让cachefiles_object关联cachefiles中的文件/文件夹, 主要根据cachefiles_lookup_data, key决定路径，aux决定是否有效。
+    c. 更新操作cachefiles_update_object，更新aux信息.
+    d. 刷新操作cachefiles_sync_cache, 刷新整个cache的后端文件系统
+    e. 改变cachefiles后端文件大小cachefiles_attr_changed
+    f. 读操作cachefiles_read_or_alloc_page(s), 分配一页，从cachefiles中把数据读出来。没有数据就不读了，但不知道什么时候写进去，下面有下的操作。读只看到异步读，cachefiles_read_reissue. 读分两部分：触发和搬数据. 触发是使用cachefiles_one_read，把它的wait_queue_t放到page的等待队列上。搬数据是等页数据读出来后放到netfs的页中。这两者没有直接联系,使用fscache_operation中的状态机实现。
+    g. 写操作cachefiles_allocate_page(s)/cachefiles_write_page 把数据写回到cachefiles中，只有同步操作
+    e. 其他操作cachefiles_uncache_page/cachefiles_dissociate_pages把缓存中的数据删除之类的. 但都没有有效的操作. 看来是没有把某一页从cache中删除之类的操作，只有把整个fscache_object删除操作.
+  6. cachefiles还有和user工具互动的部分，删除某个缓存文件之类的. cachefiles_bury_object/cachefiles_cull

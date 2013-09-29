@@ -1,0 +1,595 @@
+* question
+  - freeze fs: 包含5种, SB_UNFROZEN/SB_FREEZE_WRITE.. 都什么意义??
+  - btrfs_fs_info->generation和btrfs_header->generation有什么联系?  他们和btrfs_trans_handle->transid有什么联系?
+
+* transaction.c
+
+** btrfs_transaction
+   #+begin_src 
+     transid   //在初始化时是 ++ btrfs_fs_info->generation
+
+     num_writers   //在join操作中使用,增加这些变量..在释放btrfs_trans_handle时减小.
+     use_count     //计数管理,变为0释放对象; join增;默认为2;释放btrfs_trans_handle时减;commit完成释放2次..
+     num_joined    //join的次数,只增不减..
+     
+     commit_lock    //transaction的状态..
+     in_commit      //在commit transaction时设定,但从没有改回来过, 提交之后就不能用了吧.
+     commit_done    //在commit完全完成时,设定
+     blocked        //commit开始,设置blocked为1, 提交delayed ref/item等,然后开始写回page, blocked就为0..
+     
+     list_head list    //btrfs_fs_info->trans_list队列..
+     extent_io_tree dirty_pages    //需要写回的数据?? 对应btrfs_fs_info->btrfs_inode->i_mapping
+     start_time
+     wait_queue_head_t writer_wait   //等待条件是num_writers>1
+     wait_queue_head_t commit_wait   //等待条件是commit_done
+     
+     list_head pending_snapshots    //创建snapshot在这里完成,创建subvol呢?? 在ioctl中可看到..
+     btrfs_delayed_ref_root delayed_refs   //所有的btrfs_extent_item的操作
+
+     aborted
+     // transaction包括extent ref?? snapshot, 
+     // transaction和log也有关系,就是创建transaction时,不能存在log..(tree mod log)
+   #+end_src
+
+** btrfs_trans_type
+   #+begin_src 
+        //trans的各种操作..
+     	TRANS_START,
+	TRANS_JOIN,
+	TRANS_USERSPACE,
+	TRANS_JOIN_NOLOCK, //JOIN_NOLOCK表示已经提交transaction，现在要等待它.
+	TRANS_ATTACH,   //表示找到当前transaction,提交它.
+        //后面2种不会写回磁盘,
+   #+end_src
+
+** btrfs_trans_handle
+   #+begin_src 
+	u64 transid;    //btrfs_transaction->generation
+	u64 bytes_reserved;   //btrfs_block_rsv中使用的空间? size??
+	u64 qgroup_reserved;
+	unsigned long use_count;  //使用计数管理对象,只有在start transaction,重复使用current的transaction时增加..在end_transaction时减小..
+	unsigned long blocks_reserved;
+	unsigned long blocks_used;
+	unsigned long delayed_ref_updates;
+	struct btrfs_transaction *transaction;
+	struct btrfs_block_rsv *block_rsv;
+	struct btrfs_block_rsv *orig_rsv;
+	short aborted;
+	short adding_csums;
+	bool allocating_chunk;
+	enum btrfs_trans_type type;
+	/*
+	 * this root is only needed to validate that the root passed to
+	 * start_transaction is the same as the one passed to end_transaction.
+	 * Subvolume quota depends on this
+	 */
+	struct btrfs_root *root;
+	struct seq_list delayed_ref_elem;
+	struct list_head qgroup_ref_list;
+	struct list_head new_bgs;
+   #+end_src
+   - btrfs_root和btrfs_transaction应该也有关系,但没有数据结构上的关系, btrfs_root->last_trans和btrfs_trans_handle->transid相同, btrfs_root也在btrfs_fs_info的rd tree中标志BTRFS_ROOT_TRANS_TAG
+   - btrfs_trans_hanele和btrfs_transaction什么关系??
+
+** btrfs_pending_snapshot
+   #+begin_src 
+     //创建snapshot需要的参数
+     dentry dentry
+     btrfs_root root
+     btrfs_root snap
+     btrfs_qgroup_inherit inherit
+     btrfs_block_rsv block_rsv
+     error
+     readonly
+     list_head list
+   #+end_src
+
+** btrfs_reserve_flush_enum
+   #+begin_src 
+     //回收磁盘空间需要的参数.
+     BTRFS_RESERVE_NO_FLUSH
+     BTRFS_RESERVE_FLUSH_LIMIT
+     BTRFS_RESERVE_FLUSH_ALL
+   #+end_src
+
+** put_transaction(btrfs_transaction)
+   - 使用btrfs_transaction->use_count管理索引,如果减为0,释放内存. 使用kmem_cache管理.
+
+** switch_commit_root(btrfs_root)
+   - 更新btrfs_root->commit_root, 这是extent_buffer,换成btrfs_root->node. 根节点可能cow,换成新的tree block
+   > free_extent_buffer(btrfs_root->commit_root)
+   > btrfs_root_node(btrfs_root)
+
+** can_join_transaction(btrfs_transaction, type)
+   - 检查是否能join transaction,就是和用transaction.. 满足三个条件时不能使用..
+   - btrfs_transaction->in_commit
+   - type不是TRANS_JOIN / TRANS_JOIN_NOLOCK.
+   - 也就是TRANS_JOIN/TRANS_JOIN_NOLOCK才能join, 或者btrfs_transaction没有在提交中. 这个提交是什么状态??
+
+** join_transaction(btrfs_root, type)
+   - btrfs_fs_info->trans_no_join!=0, 表示btrfs_fs_info->running_transaction处在某种状态, 不能join, 或者可以被TRANS_JOIN_NOLOCK使用.
+   - 如果btrfs_fs_info->running_transaction有效,就使用它
+   - 检查能否join, 如果不满足提交返回-EBUSY
+   > can_join_transaction(btrfs_transaction, type)
+   - 增加btrfs_tranaction->use_count/num_writers/num_joined 
+   - 如果当前btrfs_transaction有效,必须使用,否则返回-EBUSY?!
+   - 创建一个btrfs_transaction, 初始化,还有内部btrfs_delayed_ref_root, 把它添加到btrfs_fs_info->trans_list队列, 初始化extent_io_tree.
+   > extent_io_tree_init(btrfs_transaction->dirty_pages, btrfs_fs_info->btrfs_inode->i_mapping)
+   - 递增btrfs_fs_info->generation, 复制到btrfs_transaction->transid. 这里还涉及到log tree, btrfs_fs_info->tree_mod_seq_list/tree_mod_log必须没有关联其他结构,在transaction开始时，这些必须是清除的.
+   - 这个函数没有返回值, 只是用来创建btrfs_fs_info->btrfs_transaction. 或者本来有效时,增加它的使用值.
+
+** record_root_in_trans(btrfs_trans_handle, btrfs_root)
+   - 这里关系到btrfs_root->last_trans = btrfs_transaction->transid..  建立起来btrfs_root和btrfs_trans_handle的某种关系..
+   - 如果btrfs_root->last_trans < btrfs_transaction->transid, 就可以把这个btrfs_root放到transaction管理中.
+   - btrfs_root->last_trans = btrfs_transaction->transid
+   > radix_tree_tag_set(btrfs_fs_info->fs_roots_radix, btrfs_root->root_key.objectid, BTRFS_ROOT_TRANS_TAG)
+   > btrfs_init_reloc_root(btrfs_trans_handle, btrfs_root)
+
+** btrfs_record_root_in_trans(btrfs_trans_handle, btrfs_root)
+   - btrfs_root->ref_cows != 0. btrfs_transaction管理btrfs_root会做什么??
+   > record_root_in_trans(btrfs_trans_handle, btrfs_root)
+
+** wait_current_trans(btrfs_root)
+   - 等待btrfs_root->btrfs_fs_info->running_transaction, 如果btrfs_transaction->blocked有效,等待这个值变为0. 
+   - 可以重新创建一个新的btrfs_transaction?! 
+   > wait_event(btrfs_root->btrfs_fs_info->transaction_wait, ! btrfs_transaction->blocked)
+
+** may_wait_transaction(btrfs_root, type)
+   - 检查type是否需要等待??!!
+   - btrfs_fs_info->log_root_recovering有效时,肯定不会等?
+   - type = TRANS_USERSPACE, 可能会等. 因为它可能碰到提交中的transaction
+   - type = TRANS_START, 而且btrfs_fs_info->open_ioctl_trans=0, 也可能会等??
+
+** start_transaction(btrfs_root, num_items, type, btrfs_reserve_flush_enum)
+   - 创建新的btrfs_trans_handle
+   - 还不了解transaction的功能..  检查btrfs_fs_info->fs_state&BTRFS_SUPER_FLAG_ERROR, 如果有错误，返回-EROFS..  
+   - transaction的功能就是向磁盘刷数据
+   - 这个函数应该是启动一个btrfs_trans_handle, 建立btrfs_root和btrfs_trans_handle的关系..或者和btrfs_transaction.. 还要预留空间..
+   - 检查current->journal_info, 使用这个btrfs_trans_handle, 增加btrfs_trans_handle->use_count, 而且保存btrfs_trans_handle->block_rsv到btrfs_trans_handle->orig_rsv..  
+   - 这时type必须是TRANS_JOIN或TRANS_JOIN_NOLOCK.
+   - 最后退出时,如果current->journal_info无效,设置它为准备好的btrfs_trans_handle
+   - 下面创建新的btrfs_trans_handle
+   - 首先预留metadata空间.num_items表示操作中修改btree可能使用的磁盘空间..
+   > btrfs_calc_trans_metadata_size(btrfs_root, num_items)
+   - 放到btrfs_fs_info->trans_block_rsv中.
+   > btrfs_block_rsv_add(btrfs_root, btrfs_root->btrfs_fs_info->trans_block_rsv, num_bytes, flush)
+   > kmem_cache_alloc(btrfs_trans_handle_cachep, GFP_NOFS)
+   - 对于前3种transaction,可能会写磁盘,禁止freeze
+   > sb_start_intwrite(btrfs_root->btrfs_fs_info->super_block)
+   - 如果可能会等待transaction, 直接先去等待. 使用btrfs_transaction->blocked
+   > may_wait_transaction(btrfs_root, type)
+   > wait_current_trans(btrfs_root)
+   - 准好btrfs_fs_info->running_transaction, 
+   - 如果返回-EBUSY, 循环等待btrfs_transaction->blocked变量,队列使用btrfs_fs_info->transaction_wait..
+   - 这也是transaction串行提交的地方
+   > join_transaction(btrfs_root, type)
+   > wait_current_trans(btrfs_root)
+   - 如果是TRANS_ATTACH, 而第一次获取不了btrfs_transaction,就直接返回-ENOENT
+   - 初始化btrfs_trans_handle, use_count=1
+   - transid就是btrfs_transaction->transid, 所以总体来说,如果transaction提交不是很快的话,generation也不会增长太快.
+   - 再次检查btrfs_transaction->blocked, 如果有效,在这里提交这个transaction
+   > btrfs_commit_transaction(btrfs_trans_handle, btrfs_root)
+   - 然后重新申请.
+   - 准备好btrfs_trans_handle, 它使用btrfs_fs_info->trans_block_rsv, btrfs_trans_handle->bytes_reserved=num_bytes. 都记录下来,释放的时候会用到.
+   > btrfs_record_root_in_trans(btrfs_trans_handle, btrfs_root)
+   - 最后把这个btrfs_root放到这个btrfs_trans_handle管理中,当然可能早就在里面.
+
+** btrfs_start_transaction(btrfs_root, num_items)
+   - 预留空间时如果没有了空间,使用各种回收方法.
+   > start_transaction(btrfs_root, num_items, TRANS_START, BTRFS_RESERVE_FLUSH_ALL)
+   - 这是普通的transaction使用时调用的函数.
+
+** btrfs_start_transaction_lflush(btrfs_root, num_items)
+   > start_transaction(btrfs_root, num_items, TRANS_START, BTRFS_RESERVE_FLUSH_LIMIT)
+   - 没有使用的?!
+
+** btrfs_join_transaction(btrfs_root)
+   > start_transaction(btrfs_root, 0, TRANS_JOIN, 0)
+   - 也有很多使用,在底层使用的多,比如tree-io中.
+
+** btrfs_join_transaction_nolock(btrfs_root)
+   > TRANS_JOIN_NOLOCK
+   - 在free space inode写回数据时专用. 那时就不用新的空间了? 还是已经预留.
+
+** btrfs_start_ioctl_transaction(btrfs_root)
+   > TRANS_USERSPACE..
+
+** btrfs_attach_transaction(btrfs_root)
+   > TRANS_ATTACH 
+   - 找当前的btrfs_transaction, 如果找不到,可能有一个在内存中,没有写到磁盘中,只是状态不能join.
+   - 在cleaner_kthread中使用它.
+
+** btrfs_attach_transaction_barrier(btrfs_root)
+   > start_transaction(btrfs_root, 0, TRANS_ATTACH, 0)
+   - 如果返回-ENOENT,说明没有btrfs_transaction可join. 需要确保所有的btrfs_transaction都提交
+   > btrfs_wait_for_commit(btrfs_root, 0)
+
+** wait_for_commit(btrfs_root, btrfs_transaction commit)
+   - 等待btrfs_transaction->commit_done, 整个btrfs_transaction完成..
+   > wait_event(btrfs_transaction->commit_wait, btrfs_transaction->commit_done)
+
+** btrfs_wait_for_commit(btrfs_root, transid)
+   - btrfs_fs_info->last_trans_committed表示刚刚提交的transaction, 在transaction commit结束时更新它为btrfs_transaction->transid. 
+   - 表示这个generation已经在磁盘上了.
+   - transid有效, transid < btrfs_fs_info->last_trans_committed, 不用操作了,直接退出.
+   - 然后在btrfs_fs_info->trans_list上找一个btrfs_transaction->transid = transid.
+   - 如果所有的btrfs_transaction->transid > transid, 没有可以提交的退出
+   - 如果有一个,等待它完全写回磁盘. 所有的btrfs_transaction是串行提交的.
+   > wait_for_commit(btrfs_root, btrfs_transaction)
+   > put_transaction(btrfs_transaction)
+   - 如果transid无效,找一个提交中的
+   - 反向遍历btrfs_fs_info->trans_list队列, 找一个btrfs_transaction->in_commit!=0, 而且btrfs_transaction->commit_done=0.
+   - 可能都没有在这个状态吗? 在in_commit之后,才能换btrfs_fs_info->running_transaction??
+
+** btrfs_throttle(btrfs_root)
+   - btrfs_fs_info->open_ioctl_trans = 0, 等待btrfs_transaction
+   > wait_current_trans(btrfs_root)
+
+** should_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 是否应该停止这个btrfs_trans_handle. 是否已经使用了global_block_rsv->size的一半空间?! global_block_rsv是很大的!!
+   > btrfs_block_rsv_check(btrfs_root, btrfs_root->btrfs_fs_info->global_block_rsv, 5)
+     
+** btrfs_should_end_transaction(btrfs_trans_handle, btrfs_root)
+   - btrfs_transaction->blocked!=0 或者btrfs_fs_info->btrfs_delayed_ref_root->flushing!=0, 需要停止btrfs_trans_handle
+   - updates是btrfs_transaction->delayed_ref_updates. 提交一些btrfs_delayed_ref_node, 它是当前btrfs_delayed_ref_node总数.
+   > btrfs_run_delayed_refs(btrfs_transaction, btrfs_root, updates)
+   - 提交之后应该会占用一些预留的空间,然后检查预留空间是否减小.
+   > should_end_transaction(btrfs_transaction, btrfs_root)
+   - 所有metadata操作就是btree操作,所有的btree操作都会转化到tree block的使用.
+
+** __btrfs_end_transaction(btrfs_trans_handle, btrfs_root, throttle)
+   - 这里的参数是btrfs_trans_handle
+   - 减小btrfs_transaction->use_count, 减为0时才删除.. 这里没有复杂的包装,但计数应该不会超过2. 这时btrfs_transaction嵌套.
+   - 释放btrfs_fs_info->trans_block_rsv中的空间. 这里要释放btrfs_trans_handle创建时的预留的空间,但实际释放剩余的.
+   > btrfs_trans_release_metadata(btrfs_transaction, btrfs_root)
+   - 处理qgroup的东西.
+   - 检查btrfs_trans_handle->new_bgs, 把btrfs_block_group_item写回磁盘.
+   > btrfs_create_pending_block_groups(btrfs_trans_handle, btrfs_root)
+   - 处理btrfs_trans_handle->btrfs_transaction->btrfs_delayed_ref_root,又写回一次. 前提是btrfs_delayed_ref_root->num_heads_ready>64
+   > btrfs_run_delayed_refs(btrfs_trans_handle, btrfs_root, ref_updates)
+   - 释放预留空间
+   > btrfs_trans_release_metadata(btrfs_trans_handle, btrfs_root)
+   - 处理新的btrfs_block_group_cache
+   > btrfs_create_pending_block_groups(btrfs_trans_handle, btrfs_root)
+   - type != TRANS_JOIN_NOLOCK, 检查是否应该停止btrfs_transaction. 
+   > should_end_transaction(btrfs_trans_handle, btrfs_root)
+   - btrfs_transaction->blocked = 1. 
+   - 这是第1阶段, 在创建btrfs_trans_handle, 碰到这个标志,主动去提交btrfs_transaction.
+   - type != TRANS_JOIN_NOLOCK, 而且btrfs_transaction没有提交, btrfs_transaction->in_commit = 0, 检测怎么提交?!
+   - 参数throttle != 0, 直接执行commit动作
+   > btrfs_commit_transaction(btrfs_trans_handle, btrfs_root)
+   - 参数throttle = 0, 使用transaction_kthread处理transaction, 
+   > wake_up_process(btrfs_fs_info->transaction_kthread)
+   - 上面不一定提交btrfs_transaction,只是可能.
+   - 然后这里开始释放btrfs_trans_handle. 它使用的btrfs_fs_info->running_transaction.
+   - 减小btrfs_transaction->use_writers, 这是btrfs_transaction可以提交了,至少这2者没有关系.
+   - 唤醒等待的任务? 谁等待?
+   - wake_up(btrfs_transaction->writer_wait)
+   - throttle != 0的时候释放inode, 这个和btree没什么关系.
+   > btrfs_run_delayed_iputs(btrfs_root)
+   > put_transaction(btrfs_transaction)
+   - 最后释放btrfs_trans_handle...
+   - 现在看btrfs_trans_handle和btrfs_transaction没什么关系. 
+   - 使用transid
+   - 使用它的计数,不让它释放
+   - 使用num_writers, 不让他提交.
+
+** btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   > __btrfs_end_transaction(btrfs_trans_handle, btrfs_root, 0)
+
+** btrfs_end_transaction_throttle(btrfs_trans_handle, btrfs_root)
+   > __btrfs_end_transaction(, , 1)
+   - throttle参数为1..
+
+** btrfs_end_transaction_dmeta(btrfs_trans_handle, btrfs_root)
+   > __btrfs_end_transaction(, , 1)
+
+** btrfs_write_marked_extents(btrfs_root, extent_io_tree, mark)
+   - 遍历extent_io_tree中有mark的空间, 删除对应的mark标志,并把数据写会.写会数据使用btrfs_fs_info->btrfs_inode->address_space, 所以extent_io_tree应该是btrfs_transaction->dirty_pages. 它使用pagecache就是btrfs_fs_info->btree_inode, 也就是整个btree的文件.
+   > find_first_extent_bit(extent_io_tree, start, start, end, mark, extent_state)
+   > convert_extent_bit(extent_io_tree, start, end, EXTENT_NEED_WAIT, mark, extent_state, GFP_NOFS)
+   > filemap_fdatawrite_range(address_space, start, end)
+   - 这里写会使用WB_SYNC_ALL, 但也不写等待完成.
+
+** btrfs_wait_marked_extents(btrfs_root, extent_io_tree, mark)
+   - 和上面类似,但是等待数据刷新完成. 这里使用的EXTENT_NEED_WAIT.
+   > find_first_extent_bit(extent_io_tree, start, start, end, EXTENT_NEED_WAIT, extent_state)
+   > clear_extent_bit(extent_io_tree, start, end, EXTENT_NEED_WAIT, 0, 0, extent_state, GFP_NOFS)
+   > filemap_fdatawait_range(address_space, start, end)
+
+** btrfs_write_and_wait_marked_extents(btrfs_root, extent_io_tree, mark)
+   > btrfs_write_marked_extents(btrfs_root, extent_io_tree, mark)
+   > btrfs_wait_marked_extents(btrfs_root, extent_io_tree, mark)
+
+** btrfs_write_and_wait_transaction(btrfs_trans_handle, btrfs_root)
+   - 如果参数btrfs_trans_handle = NULL, 使用pagecahce决定写回那些page
+   > filemap_write_and_wait(btrfs_fs_info->btrfs_inode->address_space)
+   - 否则使用extent_state决定写回哪些.
+   > btrfs_write_and_wait_marked_extents(btrfs_root, btrfs_trans_handle->btrfs_transaction->dirty_pages, EXTENT_DIRTY)
+
+** update_cowonly_root(btrfs_trans_handle, btrfs_root)
+   - 如果btrfs_root的根节点tree block改变,更新它在tree root中的指针.
+   - 首先把空间的使用信息(free space)写回磁盘.
+   > btrfs_write_dirty_block_groups(btrfs_trans_handle, btrfs_root)
+   - 检查btrfs_root->btrfs_root_item是否改变,检查btrfs_root_item->bytenr / btrfs_root_item->bytes_used,和btrfs_root->extent_buffer->start.. 也就是子树根节点的位置. 如果变化了更新节点信息.
+   > btrfs_update_root(btrfs_trans_handle, btrfs_fs_info->tree_root, btrfs_root->btrfs_key, btrfs_root->btrfs_root_item)
+   - 循环执行这两个操作,直到节点信息不再改变..
+
+** commit_cowonly_roots(btrfs_trans_handle, btrfs_root)
+   - 先提交延时操作.
+   > btrfs_run_delayed_refs(btrfs_trans_handle, btrfs_root, -1)
+   - 找到tree root的根节点tree block
+   > btrfs_lock_root_node(btrfs_fs_info->tree_root)
+   - 分配一个新的tree block,作为数根节点.
+   > btrfs_cow_block(btrfs_trans_handle, btrfs_fs_info->tree_root, extent_buffer, NULL, 0, extent_buffer)
+   - 又是一遍btrfs_delayed_ref_node
+   > btrfs_run_delayed_refs(btrfs_trans_handle, btrfs_root, -1)
+   > btrfs_run_dev_stats(btrfs_trans_handle, btrfs_root->btrfs_fs_info)
+   > btrfs_run_dev_replace(btrfs_trans_handle, btrfs_root->btrfs_fs_info)
+   > btrfs_run_qgroups(btrfs_trans_handle, btrfs_root->btrfs_fs_info)
+   - 遍历btrfs_fs_info->dirty_cowonly_roots链表, 处理树根..btrfs_root->dirty_list
+   > update_cowonly_root(btrfs_trans_handle, btrfs_root)
+   - 更换新的tree root根节点.
+   > switch_commit_root(btrfs_fs_info->extent_root)
+   - 更新btrfs_root->commit_root, 不过仅限于extent root
+   - 继续设备replace?!
+   > btrfs_after_dev_replace_commit(btrfs_fs_info)
+
+** btrfs_add_dead_root(btrfs_root)
+   - 把btrfs_root->root_list添加到btrfs_root->btrfs_fs_info->dead_roots队列中..
+
+** commit_fs_roots(btrfs_trans_handle, btrfs_root)
+   - 在btrfs_fs_info->fs_roots_radix中查找一些btrfs_root指针,带有BTRFS_ROOT_TRANS_TAG的标志. 这些标志表示它和btrfs_trans_handle有关系. 这里应该和上面很想,更新tree root的节点信息.
+   > radix_tree_gang_lookup_tag(btrfs_fs_info->fs_roots_radix, gang, 0, ARRAY_SIZE(gang), BTRFS_ROOT_TRANS_TAG)
+   - 处理这些btrfs_root, 释放对应的log tree.
+   > btrfs_free_log(btrfs_trans_handle, btrfs_root)
+   - 不清楚reloc怎么管理, 为何一个tree使用一个..
+   > btrfs_update_reloc_root(btrfs_trans_handle, btrfs_root)
+   - 删除它在tree root中的orphan节点. 如果它有inode对应的orphan节点,那就不能删除.
+   > btrfs_orphan_commit_root(btrfs_trans_handle, btrfs_root)
+   - btrfs_root使用的free ino inode
+   > btrfs_save_ino_cache(btrfs_root, btrfs_trans_handle)
+   - 如果btrfs_root->commit_root不是btrfs_root->node, 根节点已经换了cow.
+   > btrfs_set_root_node(btrfs_root->btrfs_root_item, btrfs_root->extent_buffer)
+   - 使用extent_buffer信息更新tree root中根结点信息.
+   > btrfs_update_root(btrfs_trans_handle, btrfs_fs_info->tree_root, btrfs_root->btrfs_key, btrfs_root->btrfs_root_item)
+
+** btrfs_defrag_root(btrfs_root)
+   - defrag是碎片整理. 使用btrfs_root->defrag_running表示是否在运行. 
+   > btrfs_start_transaction(btrfs_root, 0)
+   > btrfs_defrag_leaves(btrfs_trans_handle, btrfs_root)
+   - 处理不复杂，使用reloc操作
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   > btrfs_btree_balance_dirty(btrfs_fs_info->tree_root)
+   - 循环执行,直到可以停止不返回-EAGAIN
+   > btrfs_defrag_cancelled(btrfs_root->btrfs_fs_info)
+   - 等待任务完成???
+
+** create_pending_sanpshot(btrfs_trans_handle, btrfs_fs_info, btrfs_pending_snapshot)
+   - 创建snapshot? btrfs的命令操作?? 在ioctl中可看到. 这里应该涉及到2个btrfs_root.. 
+   > btrfs_alloc_path()
+   > btrfs_find_free_objectid(btrfs_fs_info->tree_root, objectid)
+   - 创建btrfs_root_item, 为snapshot在tree root中创建一个节点, objectid. 计算预留的空间?
+   > btrfs_reloc_pre_snapshot(btrfs_trans_handle, btrfs_pending_snapshot, to_reserve)
+   > btrfs_block_rsv_add(btrfs_root, btrfs_pending_snapshot->block_rsv, to_reserve, BTRFS_RESERVE_NO_FLUSH)
+   > btrfs_qgroup_inherit(btrfs_trans_handle, btrfs_fs_info, btrfs_root->btrfs_key.objectid, objectid, btrfs_pending_snapshot->inherit)
+   - qgroup???
+   - 准备btrfs_key(BTRFS_ROOT_ITEM_KEY, objectid, -1), btrfs_pending_snapshot->block_rsv, 还有dentry/inode/dir? 创建一个snapshot要先创建一个文件夹..
+   > record_root_in_trans(btrfs_trans_handle, btrfs_inode)
+   - 把btrfs_root添加到btrfs_trans_handle中, 在btrfs_fs_info的radix 中设置对应的标志,在btrfs_trans_handle提交时处理它. 
+   > btrfs_set_inode_index(btrfs_inode, index)
+   > btrfs_lookup_dir_item(NULL, btrfs_inode, btrfs_path, objectid, name, len, 0)
+   - 因为btrfs的subvolume/snapshot是有目录结构的,都是在某个文件夹下面.
+   > btrfs_release_path()
+   > btrfs_run_delayed_items(btrfs_trans_handle, btrfs_root)
+   > record_root_in_trans(btrfs_trans_handle, btrfs_root)
+   - 又记录一遍,针对被snapshot的root?.. 设置btrfs_root_item->last_snapshot
+   > btrfs_set_root_last_snapshot(btrfs_root->btrfs_root_item, btrfs_trans_handle->transid)
+   - 把整个新的btrfs_root_item给btrfs_root?? 原来的呢?
+   > btrfs_check_and_init_root_item(btrfs_root_item)
+   > btrfs_root_flags(btrfs_root_item)
+   > btrfs_set_root_flags(btrfs_root_item, root_flags)
+   - 修改flags, BTRFS_ROOT_SUBVOL_RDONLY, 准备新的uuid
+   > btrfs_set_root_generation_v2(btrfs_root_item, btrfs_trans_handle->transid)
+   > uuid_le_gen(new_uuid)
+   > btrfs_set_root_otransid(btrfs_new_item, btrfs_trans_handle->transid)
+   > btrfs_cow_block(btrfs_trans_handle, btrfs_root, extent_buffer, NULL, 0, extent_buffer)
+   - 这里要复制一个tree, 为何要为原来的tree root做cow呢?设置btrfs_root->force_cow=1... 复制tree根节点..
+   > btrfs_copy_root(btrfs_trans_handle, btrfs_root, extent_buffer, extent_buffer, objectid)
+   > btrfs_set_root_node(btrfs_new_item, extent_buffer)
+   - 给新的btrfs_root_item设置tree根节点extent_buffer, 设置offset为transid
+   > btrfs_insert_root(btrfs_trans_handle, tree_root, btrfs_key, btrfs_root_item)
+   > btrfs_add_root_ref(btrfs_trans_handle, tree_root, objectid, parent_root->root_key.objectid, fileino, index, dentry->name, len)
+   - index是反向索引吗??  创建btrfs_root
+   > btrfs_read_fs_root_no_name(btrfs_root->btrfs_fs_info, btrfs_key)
+   > btrfs_reloc_post_snapshot(btrfs_trans_handle, btrfs_pending_snapshot)
+   > btrfs_run_delayed_refs(btrfs_trans_handle, btrfs_root, -1)
+   > btrfs_insert_dir_item(btrfs_trans_handle, btrfs_root, name, len, parent_inode, btrfs_key, BTRFS_FT_DIR, index)
+   - 使用inode管理subvolume/snapshot, 插入dir index
+   > btrfs_i_size_write(btrfs_inode, btrfs_inode->i_size + nale_len * 2) 
+   - 为何name的2倍? 这个大小很奇怪.. 设置btrfs_inode->i_mtime/ctime
+   > btrfs_update_inode_fallback(btrfs_trans_handle, btrfs_root, btrfs_inode)
+   - 这里为什么没有使用创建目录的操作??!! 因为没有btrfs_inode_item??
+
+** create_pending_snapshots(btrfs_trans_handle, btrfs_fs_info)
+   - 处理btrfs_trans_handle->btrfs_transaction->pending_snapshots队列上的btrfs_pending_snapshot
+   > create_pending_snapshots(btrfs_trans_handle, btrfs_fs_info, btrfs_pending_snapshot)
+
+** update_super_roots(btrfs_root)
+   - 更新btrfs_super_block.  
+   - btrfs_fs_info->chunk_root->btrfs_root_item更新btrfs_super_block->chunk_root_*
+   - btrfs_fs_info->tree_root更新btrfs_super_block->root/generation/root_level
+
+** btrfs_transaction_in_commit(btrfs_fs_info)
+   - 检查btrfs_fs_info当前的btrfs_transaction是否在提交中. 
+   - 返回btrfs_fs_info->running_transaction->in_commit
+
+** btrfs_transaction_blocked(btrfs_fs_info)
+   - 返回btrfs_fs_info->running_transaction->blocked
+
+** wait_current_trans_commit_start(btrfs_root, btrfs_transaction)
+   - 在btrfs_fs_info->transaction_blocked_wait队列上等待，条件是btrfs_transaction->in_commit.  在comit过程中就是开始的意思.
+
+** wait_current_trans_commit_start_and_unblock(btrfs_root, btrfs_transaction)
+   - 等待条件是btrfs_transaction->commit_done || (in_comment=1 && blocked = 0)
+   - 后面2个等待都指定btrfs_transaction
+
+** btrfs_async_commit
+   #+begin_src 
+     btrfs_trans_handle newtrans
+     btrfs_root root 
+     work_struct work
+   #+end_src
+
+** do_async_commit(work_struct)
+   - 使用work queue实现commit操作,work_struct是btrfs_async_commit
+   - 设置current->journal_info是btrfs_async_commit->btrfs_trans_handle, 开始提交这个btrfs_trans_handle使用的btrfs_transaction
+   > btrfs_commit_transaction(btrfs_async_commit->newtrans, btrfs_async_commit->btrfs_root)
+
+** btrfs_commit_transaction_async(btrfs_trans_handle, btrfs_root, wait_for_unblock)
+   - 创建一个btrfs_async_commit, 设置work_struct回调函数是do_async_commit. 这是普通的work_struct.
+   - 为异步提交transaction创建一个新的btrfs_trans_handle
+   > btrfs_join_transaction(btrfs_root)
+   - 释放当前的btrfs_trans_handle, 它可能会提交btrfs_transaction, 但不一定,因为有其他的btrfs_trans_handle在使用它,或许至少不会释放  use_count ++
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 提交work_struct
+   > schedule_work(btrfs_async_commit->work_struct)
+   - 根据wait_for_unblock, 决定如何等待，等待commit start
+   > wait_current_trans_commit_start(btrfs_root, btrfs_transaction)
+   - 或者commit unblock.. 不同的transaction状态..
+   > wait_current_trans_commit_start_and_unblock(btrfs_root, btrfs_transaction)
+   - 最后释放btrfs_transaction
+   > put_transaction(btrfs_transaction)
+
+** cleanup_transaction(btrfs_trans_handle, btrfs_root, err)
+   - 先暂停transaction? 设置btrfs_trans_handle的参数.. 当transaction出问题时使用..
+   > btrfs_abort_transaction(btrfs_trans_handle, btrfs_root, error)
+   - 检查btrfs_transaction->list? 这是哪里的队列?? 如果不在队列中就直接退出
+   > btrfs_end_transaction(btrfs_transaction, btrfs_root)
+   - 如果btrfs_transaction是btrfs_fs_info->running_transaction, 需要取消它和btrfs_fs_info关系,设置btrfs_fs_info->running_transaction为NULL
+   > btrfs_clean_one_transaction(btrfs_trans_handle->btrfs_transaction, btrfs_root)
+   > put_transaction(btrfs_transaction)
+   > btrfs_scrub_continue(btrfs_root)
+   - 继续数据检查功能.. 最后释放这个btrfs_trans_handle??
+
+** btrfs_flush_all_pending_stuffs(btrfs_trans_handle, btrfs_root)
+   - 在提交transaction是刷磁盘?! 应该flush. 但还要看mount option flushoncommit.
+   - 如果有新的snapshot也要flush
+   - 把delalloc的数据写回
+   > btrfs_start_delalloc_inodes(btrfs_root, 1)
+   - 等待数据写完.
+   > btrfs_wait_ordered_extents(btrfs_root, 1)
+   - 写回delayed inode item
+   > btrfs_run_delayed_items(btrfs_trans_handle, btrfs_root)
+   - 也是btrfs_ordered_extent操作,不过上面处理btrfs_fs_info->delalloc_inodes中的,而这里操作btrfs_trans_handle->ordered_operations
+   > btrfs_run_ordered_operations(btrfs_trans_handle, btrfs_root, 1)
+
+** btrfs_commit_transaction(btrfs_trans_handle, btrfs_root)
+   - btrfs_transaction的状态变化
+   - (in_commit=0, blocked=0) => (in_commit=1, blocked=1) => (blocked=0) => (commit_done=1)
+   - 这时最终的commit的实现,里面应该涉及到所有其他的模块
+   - 注意这里的参数是btrfs_trans_handle, 下面的有些操作是btrfs_trans_handle,有些是btrfs_transaction
+   - 首先是btrfs_trans_handle的btrfs_ordered_extent, 等待io完成.
+   > btrfs_run_ordered_operations(btrfs_trans_handle, btrfs_root, 0)
+   - 刷会btrfs_delayed_ref_node
+   > btrfs_run_delayed_refs(btrfs_trans_handle, btrfs_root, 0)
+   - 释放btrfs_block_rsv, 一般是trans_block_rsv
+   > btrfs_trans_release_metadata(btrfs_trans_handle, btrfs_root)
+   - 上面就完成了btrfs_trans_handle的事情.
+   - btrfs_delayed_ref_root->flushing = 1, 表示transaction应该停止使用. 只有在扫面btree时才使用它.
+   - 检查btrfs_trans_handle->new_bgs上的btrfs_block_group_cache, 提交btrfs_block_group_item
+   > btrfs_create_pending_block_groups(btrfs_trans_handle, btrfs_root)
+   - 如果btrfs_transaction->in_commit有效,说明别的任务在commit, 释放这个btrfs_trans_hanle. 
+   - 里面有重复的操作..
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 等待commit完成.  btrfs_transaction->commit_done
+   > wait_for_commit(btrfs_root, btrfs_trans_handle)
+   - 开始提交btrfs_transaction 设置in_commit=1, blocked=1
+   - 唤醒等待in_commit的任务..
+   > wake_up(&root->fs_info->transaction_blocked_wait);
+   - 检查btrfs_fs_info->trans_list上的所有btrfs_transaction, 如果它不是第一个,而且它前面的btrfs_trans_handle没有完成,等待. 又一次transaction串行的地方...
+   > wait_for_commit(btrfs_root, btrfs_trans_handle)
+   - 开始commit, 进入一个循环, 不断的刷会数据. 
+   - 这个刷新的过程也会有btrfs_trans_handle. 如果是join,就会使用当前的btrfs_transaction.
+   > btrfs_flush_all_pending_stuffs(btrfs_trans_handle, btrfs_root)
+   - 等待其他btrfs_trans_handle释放btrfs_transaction, btrfs_transaction->num_writers > 1
+   - 如果btrfs_transaction寿命太短, 等待1s内没有新的join的btrfs_trans_handle
+   - 进入第二个状态,不能再join
+   - btrfs_fs_info->trans_no_join = 1, 等待所有的btrfs_trans_handle都释放btrfs_transaction. 为何不直接锁起来??
+   > wait_event(cur_trans->writer_wait, atomic_read(&cur_trans->num_writers) == 1);
+   - 创建新的snapshot
+   > create_pending_snapshots(btrfs_trans_handle, btrfs_root->btrfs_fs_info)
+   - 提交delayed inode操作
+   > btrfs_run_delayed_items(btrfs_trans_handle, btrfs_root)
+   - 提交btrfs_delayed_ref_node
+   > btrfs_run_delayed_refs(btrfs_trans_handle, btrfs_root, -1)
+   - 更新所有subvolume的根节点
+   > commit_fs_roots(btrfs_trans_handle, btrfs_root)
+   - 释放log??
+   > btrfs_free_log_root_tree(btrfs_trans_handle, btrfs_root->btrfs_fs_info)
+   - 更新tree root的根节点tree block
+   > commit_cowonly_roots(btrfs_trans_handle, btrfs_root)
+   - 更换btrfs_fs_info->freed_extents
+   > btrfs_prepare_extent_commit(btrfs_trans_handle, btrfs_root)
+   - 保存新的tree_root/chunk_root的根节点
+   > switch_commit_root(btrfs_fs_info->tree_root)
+   > switch_commit_root(btrfs_fs_info->chunk_root)
+   > btrfs_set_root_node(btrfs_fs_info->tree_root->btrfs_root_item, btrfs_fs_info->tree_root->extent_buffer)
+   - 更新btrfs_super_block
+   > update_super_roots(btrfs_root)
+   - 还没有写完. 
+   - 计入状态blocked = 0, 等待当前btrfs_transaction的任务可以唤醒
+   - 切换btrfs_fs_info->running_transaction, btrfs_fs_info->trans_no_join = 0
+   > wake_up(btrfs_fs_info->transaction_wait)
+   - 写回btree的脏数据
+   > btrfs_write_and_wait_transaction(btrfs_trans_handle, btrfs_root)
+   - 还有btrfs_super_block
+   > write_ctree_super(btrfs_trans_handle, btrfs_root, 0)
+   - 现在btrfs_transaction才算真正的提交.
+   - 释放之前缓存没有的数据 pinned的数据
+   > btrfs_finish_extent_commit(btrfs_trans_handle, btrfs_root)
+   - commit_done=1 完全完成
+   > put_transaction(btrfs_transaction)
+   - 释放本身
+   - 还有scrub继续
+   > btrfs_scrub_continue(btrfs_root)
+
+** btrfs_clean_old_snapshots(btrfs_rot)
+   - 删除没用的snapshots, 也就是btrfs_fs_info->dead_roots
+   > btrfs_kill_all_delayed_nodes(btrfs_root)
+   - 检查btrfs_root->extent_buffer的索引, 在flags里面
+   > btrfs_drop_snapshot(btrfs_root, NULL, 0, 0)
+
+** 总结
+   - 到这里应该清楚了btrfs_transaction的过程, 它的操作几乎相当于fsync/umount一次文件系统.
+   - btrfs_trans_handle的主要作用是保护btree的操作/metadata操作.使用预留空间实现,如果失败会释放这个btrfs_trans_handle, 应该不会影响它的btrfs_transaction.
+   - 每次创建btrfs_trans_handle, 都会操作btrfs_root->last_trans. 它是轻量级的东西.
+   - 每次结束btrfs_trans_handle, 除了释放它自己的资源,还会检查是否应该提交btrfs_transaction.可能会让transaction_kthread提交它,也可能自己提交它.
+   - btrfs_transaction的状态变化
+   - 创建时的状态, btrfs_trans_handle可以随便join/start.
+   - blocked = 0, in_commit = 0, 开始commit动作. 启动一些写回磁盘的操作,delalloc动作.释放btrfs_delayed_ref_node. 提交btrfs_trans_handle管理的资源.
+   - blocked = 1, in_commit = 1, 这是开始写回数据,等待写操作完成 btrfs_ordered_extent
+   - btrfs_fs_info->trans_no_join=1, 停止使用transaction,现在开始一个新的btrfs_trans_handle是不可能的. 开始提交新的snapshot, 更新btrfs_root/btrfs_super_block的数据.
+   - btrfs_fs_info->trans_no_join = 0, btrfs_transaction->blocked = 0, 新的btrfs_transaction可以创建. 可以使用新的transaction.  对于当前的btrfs_transaction, 开始写回metadata数据.
+   - btrfs_transaction->commit_done = 1, 这个btrfs_transaction操作完全结束,可以释放掉.
+
+   - 等待操作
+   - btrfs_fs_info->transaction_wait队列,等待btrfs_fs_info->running_transaction->blocked=0. 在创建新的btrfs_trans_handle/btrfs_transaction时使用,等待btrfs_transaction的data写回,metadata不一定写回.在提交btrfs_transaction的过程中唤醒.但可以启动新的btrfs_transaction.  running_transaction有效,但不能使用,因为它已经提交in_commit=1.  这个等待就是停止transaction工作.
+   - btrfs_transaction->commit_wait队列, 等待btrfs_transaction->commit_done. 等待btrfs_transaction完全完成,可以释放, 也是最后唤醒.
+   - btrfs_transaction->writer_wait队列, 在btrfs_transaction提交过程中,积累数据时,使用这个队列, 直接使用超时等待. 同时如果还有btrfs_trans_handle使用,也使用这个队列等待. btrfs_transaction->num_writers = 1. 在释放btrfs_trans_handle时唤醒.
+   - btrfs_fs_info->transaction_blocked_wait队列, 等待btrfs_transaction->in_commit!=0, 等待btrfs_transaction开始提交.在异步提交btrfs_transaction中, 如果不需要等待完成,至少要等待它开始提交. 在提交中会唤醒这个队列.
+   - 这里还有btrfs_ordered_extent的提交等待.
+
+   - transaction刷新的数据
+   - btrfs_ordered_extent / delalloc_inodes / 整个数据的IO
+   - btrfs_delayed_ref_root数据 整个extent的管理
+   - trans_block_rsv空间
+   - 新创建的btrfs_block_group_item
+   - 新创建的snapshots
+   - btrfs_delayed_root  暂存的btrfs_inode_item操作,以及inode属性.
+   - btrfs_root的保存
+   - tree_root/chunk_tree/extent_tree/btrfs_super_block
+   - btree的写回操作和btrfs_super_block的写回操作.
+   - btrfs_fs_info->freed_extents的释放操作.
+   - 也不算多!
+

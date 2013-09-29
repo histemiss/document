@@ -1,0 +1,159 @@
+在提前了解时，dm有3部分,刚才看了md.c,觉得就一部分解决了，原来之前看的都是md，这里开始看dm: dm-table.c
+
+dm_table:
+  mapped_device md
+  holder #计数
+  type  # bio_based / request_based
+  depth
+  count[MAX_DEPTH]
+  sector_t index[MAX_DEPTH]
+  num_targets  #dm_table中使用的设备
+  num_allocated  #targets静态数组长度
+  sector_t highs  # 每个dm_target的最大扇区位置..
+  dm_target targets #静态数组
+  target_type immutable_target_type #只读的操作方式??
+  integrity_supported
+  singleton  #只能使用一个设备
+ 
+  fmode_t  #设备打开方式??决定dm_target的打开方式
+  list_head devices  #所有设备
+
+  event_fh(void)
+  event_context   #events
+
+  dm_md_mempools 
+  list_head target_callbacks
+
+target_type
+  features
+  name
+  version[3]
+  dm_ctr_fn ctr
+  dm_dtr_fn dtr
+  dm_map_fn map 
+  dm_map_request_fn map_rq
+  dm_endio_fn end_io 
+  dm_request_endio_fn 
+  dm_presuspend_fn presuspend
+  dm_postsuspend_fn postsuspend
+  dm_resume_fn resume  
+  dm_status_fn status 
+  dm_message_fn message 
+  dm_ioctl_fn  ioctl 
+  dm_merge_fn  merge 
+  dm_busy_fn  busy 
+  dm_iterate_devices_fn iterate_devices 
+  dm_io_hints_fn io_hints
+  list_head list ..
+
+dm_target 
+  dm_table table 
+  target_type type
+  begin, len
+  max_io_len #maximum size of I/O submitted to a target 
+  num_flush_requests 
+  num_discard_requests 
+  num_write_same_requests
+  per_bio_data_size
+  private
+  error
+  flush_suported
+  discards_supported
+  split_discard_requests
+  discard_zeroes_data_unsusported
+
+dm_md_mempools
+  mempool_t io_pool, tio_pool
+  bio_set bs
+
+*. dm_vcalloc(nmemb, elem_size)
+  # 使用vzalloc分配空间???  分配一个数组,长度nmemb, 大小elem_size
+
+* alloc_targets(dm_table, num) 
+  # 先申请内存, 为何预留sector_t呢??? 新的空间分成2部分,前面是highs, dm_table->highs, 后面是dm_table->targets. 把参数中数据拷贝过来. 然后把新申请的内存给dm_table, 原来的释放掉..
+  > dm_vcalloc(num+1, sizeof(dm_target+sector_t))
+  
+* dm_table_create(dm_table, fmode_t, num_targets, mapped_device)
+  # 初始化dm_table的devices/target_callbacks等列表, 还有其他参数...默认num_targets个数KEYS_PER_NODE..
+  > alloc_targets(dm_table, num_targets)
+
+* free_devices(list_head)
+  # 队列是dm_dev_internal, 释放它..
+
+* dm_table_destroy(dm_table)
+  # 释放targets, 释放highs/targets 
+  > dm_target->type->dtr(dm_target)
+  > dm_put_target_type(...)
+  > free_devices(dm_table->devices)
+  
+* find_device(list_head, dev_t)
+  #在list_head中找设备, 数组中是dm_dev_internal, dm_dev_internal->dm_dev.bdev->bd_dev
+
+* open_dev(dm_dev_internal, dev_t, mapped_device)
+  # 打开设备, 先找到dm_dev_internal, 原来打开bdev需要字符串.
+  > blkdev_get_by_dev(dev, dm_dev_internal.mode|FMODE_EXCL, ptr)
+  > bd_link_disk_holder(bdev, dm_disk(mapped_device))
+    #建立sysfs的关系
+
+* close_dev(dm_dev_internal, mapped_device)
+  > bd_unlink_disk_holder(dm_dev_internal->dm_dev.bdev, ...)
+  > blkdev_put(dm_dev_internal->dm_dev.bdev, mode)
+
+
+* device_area_is_invalid(dm_target, dm_dev, start, len, data)
+  # 检查start,len是否合理,比较dm_dev大小, data是queue_limits, 比较queue_limits->logical_block_size, 是否对其..
+  > bdev_get_queue(dm_dev)
+
+* upgrade_mode(dm_dev_internal, fmode_t, mapped_device)
+  # 重新打开,辅助的数据结构是dm_dev_internal
+  > open_dev(..)
+  > close_dev(...)
+
+* dm_get_device(dm_target, char *path, fmode_t, dm_dev)
+  # path可能是包含major/minor的字符串,也可能是路径..
+  > MKDEV(...
+  > lookup_bdev(path)
+  > find_device(dm_target->dm_table->devices, dev)
+    #如果找不到,创建一个,打开放到队列中. 如果找到了,改变打开方式,重新打开
+  > open_dev(dm_dev_internal, dev, mode)
+  > upgrade_mode(dm_dev_internal, mode, mapped_device)
+
+* dm_set_device_limits(dm_target, dm_dev, sector_t start, len, void)
+  # 设置dm_dev的limits
+  > bdev_stack_limits(queue_limits, block_device, start)
+  
+* adjoin(dm_table, dm_target)
+  #检查dm_target->begin, 是否和dm_table->targets中最后dm_target的begin/len相邻..
+
+* realloc_argv(unsigned array_size, char **old_argv)
+  # 重新分配二维数据, 长度是2*array_size或者64
+
+* dm_split_args(int *argc, char **argvp, char *input)
+  # 把input使用空格分开
+
+* validate_hardware_logical_block_alignment(dm_table, queue_limits)
+  # 检查queue_limits->logical_block_size 
+
+
+
+* dm_table_add_target(dm_table, type, start, len, params)
+  # 添加设备,首先准备好dm_target, 设定start,len. 找出type对应的target_type. 检查target_type的要求和dm_table的某些属性一致??  dm_table->highs[num_targets]是第num_targets设备的最大磁盘空间..
+  > dm_get_target_type(type)
+  > dm_split_args(argc, argv, params)
+  > dm_target->target_type->ctr(dm_target, argc, argv)
+
+* dm_table_set_type(dm_table)
+  # 设置dm_table的type?? bio_based / request_based? stackable的queue支持request_based.
+  > dm_target_request_based(dm_target)
+    # 查询dm_target->target_type->map_rq
+  
+
+* dm_table_alloc_md_mempools(dm_table)
+  # 创建dm_table->mempools
+  > dm_alloc_md_mempools(dm_table->type, dm_table->integrity_supported, per_bio_data_size)
+
+* setup_indexes(dm_table)
+  # 构造dm_table->index,是一个CHILDREN_PER_NODE多叉完全数.
+
+* dm_table_build_index(dm_table)
+  #构造index btree,索引dm_target的最大扇区位置, index最下一层是t->highs,上一层节点数减少..  叶子总数就是dm_target的数量.

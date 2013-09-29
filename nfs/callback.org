@@ -1,0 +1,67 @@
+* callback.c
+  - 4.1和4.0使用完全不同的callback,4.1使用backchannel
+  - 对于4.0, 使用普通的svc_xprt / svc_serv等等
+  - backchannel是数据传输和普通的请求使用相同的socket, 他接受的rpc_rqst可能是RPC_CALLBACK, 放到特定的svc_serv中. 他的服务线程处理这个链表的rpc_rqst, 然后把结果使用特定的FSM发送回去
+
+** nfs4_callback_up_net(svc_serv, net)
+   - 创建ipv4和ipv6的svc_xprt
+   > svc_create_xprt(svc_serv, name, net, family, port, flags)
+   - 端口port是系统制定的
+
+** nfs4_callback_svc(void)
+   - 这时nfs4.0的服务线程
+   > svc_recv(svc_rqst, MAX_SCHEDULE_TIMEOUT)
+
+** nfs4_callback_up(svc_serv)
+   - 创建svc_rqst
+
+** nfs41_callback_up_net(svc_serv, net)
+   - 创建svc_xprt,他使用svc_tcp_bc_class, 貌似比普通的简单
+   > svc_create_xprt(svc_serv, name, net, PF_INET, 0, SVC_SOCK_ANONMOUS)
+  
+** nfs41_callback_svc(void)
+   - nfs4.1的服务线程
+   - 循环处理svc_serv->sv_cb_list里面的rpc_sqrt
+   > bc_svc_process(svc_serv, rqc_rqst, svc_rqst)
+   
+** nfs41_callback_up(svc_serv)
+   - 只准备一个svc_rqst
+
+** nfs_minirversion_callback_svc_setup(svc_serv)
+   - 为nfs4.1 callback服务准备
+   > nfs41_callback_up(svc_serv)
+   > nfs41_callback_svc
+
+** nfs_callback_start_svc(miniorversion, rpc_xprt, svc_serv)
+   - 关联rpc_xprt->bc_serv = svc_serv
+   > nfs_callback_bc_serv(minorversion, rpc_xprt, svc_serv)
+   - 构造svc_rqst
+   - 启动线程, 释放上面的2个线程
+   > kthread_run(callback_svc, ...)
+
+** nfs_callback_up_net(minorversion, svc_serv, net)
+   - 创建svc_xprt, svc_sock, 在初始化nfs_client时使用
+   - 对于nfs4.1,里面有效的只有rpc_rqst链表和rpc_task
+   - 对于nfs4.0,可能会创建监听socket等
+
+** nfs_callback_create_svc(minorversion)
+   - 创建svc_serv
+
+** nfs_callback_up(minorversion, rpc_xprt)
+   - svc_serv
+   > nfs_callback_create_svc(miniorversion)
+   - 创建svc_xprt 
+   > nfs_callback_up_net(minorversion, svc_serv, net)
+   - 启动线程
+   > nfs_callback_start_svc(minorversion, rpc_xprt, svc_serv)
+
+** nfs4_callback_program / nfs4_callback_version1 / nfs4_callback_version2
+   - 对于这些rpc_procinfo的回调函数callback_op数组
+
+** callback_op
+   #+BEGIN_SRC 
+	callback_process_op_t process_op;
+	callback_decode_arg_t decode_args;
+	callback_encode_res_t encode_res;
+	long res_maxsize;   
+   #+END_SRC

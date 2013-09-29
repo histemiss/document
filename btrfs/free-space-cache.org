@@ -1,0 +1,688 @@
+* free-space-cache.c
+
+** btrfs_free_space_entry
+   #+begin_src 
+	__le64 offset;
+	__le64 bytes;
+	u8 type;
+   #+end_src
+
+** btrfs_free_space_header
+   #+begin_src 
+   	struct btrfs_disk_key location;
+	__le64 generation;
+	__le64 num_entries;
+	__le64 num_bitmaps;
+   #+end_src
+
+** btrfs_free_space
+   #+begin_src 
+	struct rb_node offset_index;
+	u64 offset;
+	u64 bytes;
+	unsigned long *bitmap;
+	struct list_head list;
+   #+end_src
+
+** btrfs_free_space_ctl
+   #+begin_src 
+	spinlock_t tree_lock;
+	struct rb_root free_space_offset;
+	u64 free_space;
+	int extents_thresh;
+	int free_extents;
+	int total_bitmaps;
+	int unit;    //这个单位是sectorsize, bitmap的每一位对应一个sectorsize..
+	u64 start;
+	struct btrfs_free_space_op *op;
+	void *private;
+   #+end_src
+
+** btrfs_free_cluster
+   #+begin_src 
+	spinlock_t lock;
+	spinlock_t refill_lock;
+	struct rb_root root;
+
+	/* largest extent in this cluster */
+	u64 max_size;
+
+	/* first extent starting offset */
+	u64 window_start;
+
+	struct btrfs_block_group_cache *block_group;
+	/*
+	 * when a cluster is allocated from a block group, we put the
+	 * cluster onto a list in the block group so that it can
+	 * be freed before the block group is freed.
+	 */
+	struct list_head block_group_list;
+   #+end_src
+
+** __lookup_free_space_inode(btrfs_root, btrfs_path, offset)
+   - 在btree中有一种inode存储free space,对于btrfs_block_group_cache,表示空闲空间,对于btrfs_root就是ino的空闲范围
+   - 构造btrfs_key(BTRFS_FREE_SPACE_OBJECTID, 0, offset),找到对应的btrfs_item指向btrfs_free_space_header
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 里面有一个btrfs_key指向btrfs_inode_item.
+   > btrfs_free_space_key(extent_buffer, header, btrfs_key)
+   - 找对应的btrfs_inode,使用ino和btrfs_root区分
+   > btrfs_iget(btrfs_root->btrfs_fs_info->super_block, btrfs_key, btrfs_root, NULL)
+   - 最后设置inode->address_space的mask,去掉__GFP_FS, 不是fs操作?!
+   > mapping_set_gfp_mask(inode->address_space, mapping_gfp_mask() & ~ __GFP_FS)
+
+** lookup_free_space_inode(btrfs_root, btrfs_block_group_cache, btrfs_path)
+   - 检查btrfs_block_group_cache->inode,如果有效,就返回这个
+   > igrab(btrfs_block_group_cache->inode)
+   - 否则创建一个
+   > __lookup_free_space_inode(btrfs_root, btrfs_path, btrfs_block_group_cache->btrfs_key->objectid)
+   - btrfs_inode->flags必须有BTRFS_INODE_NODATASUM|BTRFS_INODE_NODATACOW,不需要cow,不需要checksum? 
+   - 把inode给btrfs_block_group_cache->inode, 设置btrfs_block_group_cache->iref.
+
+** __create_free_space_inode(btrfs_root, btrfs_trans_handle, btrfs_path, ino, offset)
+   - 在btree中创建一个btrfs_inode_item, 保存btrfs_free_space_ctl的数据,只指定ino
+   > btrfs_insert_empty_inode(btrfs_trans_handle, btrfs_root, btrfs_path, ino)
+   - 设置btrfs_inode_item的flags为BTRFS_INODE_NODATASUM|BTRFS_INODE_NODATACOW.
+   - 设置btrfs_inode_item->block_group为offset,应该是btrfs_block_group_cache的起始位置
+   - 然后创建btrfs_key(BTRFS_FREE_SPACE_OBJECTID, 0, offset), 里面有这个btrfs_inode_item的btrfs_key
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, sizeof(btrfs_free_space_header))
+   > btrfs_set_free_space_key(extent_buffer, btrfs_free_space_header, btrfs_key)
+
+** create_free_space_inode(btrfs_root, btrfs_trans_handle, btrfs_block_group_cache, btrfs_path)
+   - 找一个可用的ino, 然后创建对应的inode
+   > btrfs_find_free_objectid(btrfs_root, ino)
+   > __create_free_space_inode(btrfs_root, btrfs_trans_handle, btrfs_path, ino, btrfs_block_group_cache->btrfs_key->objectid)
+
+** btrfs_truncate_free_space_cache(btrfs_root, btrfs_trans_handle, btrfs_path, inode)
+   - 应该是删除inode的数据,需要操作btree, 1个用于释放空间?1个用于修改btrfs_inode_item?
+   > btrfs_calc_trunc_metadata_size(btrfs_root, 1)
+   > btrfs_calc_trans_metadata_size(btrfs_root, 1)
+   - btrfs_trans_handle->block_rsv使用global_block_rsv,检查它的reserved空间超过上面计算的
+   > i_size_read(inode)
+   - 设置inode->i_size为0
+   > btrfs_i_size_write(inode, 0)
+   - 释放pagecache
+   > truncate_pagecache(inode, oldsize, 0)
+   - 删除btree中的btrfs_file_extent_item
+   > btrfs_truncate_inode_items(btrfs_trans_handle, btrfs_root, inode, 0, BTRFS_EXTENT_DATA_KEY)
+   - 保存btrfs_inode_item
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+
+** readahead_cache(inode)
+   - 创建file_ra_state
+   > file_ra_state_init(file_ra_state, inode->address_space)
+   > page_cache_sync_readahead(inode->address_space, file_ra_state, NULL, 0, last_index)
+   - 创建file_ra_state, 然后使用他读回一些数据,应该是根据inode->address_space->backing_dev_info->ra_pages设定数据
+
+** io_ctl
+   #+begin_src 
+   	void *cur, *orig;
+	struct page *page;
+	struct page **pages;
+	struct btrfs_root *root;
+	unsigned long size;
+	int index;
+	int num_pages;
+	unsigned check_crcs:1;
+   #+end_src
+
+** io_ctl_init(io_ctl, inode, btrfs_root)
+   - 初始化io_ctl, io_ctl->num_pages根据inode文件大小设定
+   > i_size_read(inode)
+   - 分配pages数组, 指针指向的page应该是address_space中的page..
+
+** io_ctl_unmap_page(io_ctl)
+   - 释放io_ctl->page的影射..
+
+** io_ctl_map_page(io_ctl, clear)
+   - 处理io_ctl->index页面.. page指向io_ctl->pages[io_ctl->index++], cur就是建立影射的page..
+   - 如果clear有效,清空page..
+
+** io_ctl_drop_pages(io_ctl)
+   > io_ctl_unmap_page(io_ctl)
+   - 释放io_ctl->pages.
+   - io_ctl感觉是遍历一个page数组的辅助结构
+
+** io_ctl_prepare_pages(io_ctl, inode, uptodate)
+   - 从inode中获取io_ct管理的所有page,需要num_pages个page
+   - 从0开始, 把page指针放到io_ctl->pages数组中..
+   > find_or_create_page(inode->address_space, i, mask)
+   - 如果参数update有效,读取page数据
+   > btrfs_readpage(NULL, page)
+   - 锁住page
+   > lock_page(page)
+   - 清除PG_DIRTY,要写回磁盘?
+   > clear_page_dirty_for_io(io_ctl->pages[i])
+   - 设置EXTENT_PAGE_PRIVATE
+   > set_page_extent_mapped(io_ctl->pages[i])
+
+** io_ctl_set_generation(io_ctl, generation)
+   - io_ctl上的数据是有格式的,首先是checksum,后面是generation
+   - 如果需要checksum,PAGECACHE的数据块使用一个,如果没有checksum,就是chunk值.
+   - 把io_ctl的page映射到虚拟地址,可以直接访问
+   > io_ctl_map_page(io_ctl, 1)
+   - 偏移checksum,设置generation,使用io_ctl->cur/size,访问page数组
+
+** io_ctl_check_generation(io_ctl, generation)
+   - 和上面类似,不过这里要读取那个位置的数据,和参数generation比较
+
+** io_ctl_set_crc(io_ctl, index)
+   - checksum是针对每个page的.计算第index个page的checksum,放到checksum数据区的第index个
+   - io_ctl->orig已经建立了page映射,可直接访问
+   > btrfs_csum_data(io_ctl->btrfs_root, io_ctl->orig+offset, crc, PAGE_CACHE_SIZE - offset)
+   - 释放上面的page映射
+   > io_ctl_unmap_page(io_ctl)
+   - 把crc写到pages[0]对应index的地方.针对第0个page,计算时不包括checksum数据块
+
+** io_ctl_check_crc(io_ctl, index)
+   - 和上面一样,这里要计算后比较.
+
+** io_ctl_add_entry(io_ctl, offset, bytes, bitmap)
+   - free space inode的数据是btrfs_free_space_entry数组.  BTRFS_FREE_SPACE_BITMAP/BTRFS_FREE_SPACE_EXTENT什么意思.
+   - io_ctl->cur/size已经准备好,指向要添加的btrfs_free_space_entry,直接往里复制参数
+   - 复制完之后,更新cur/size, 如果剩余空间不满足一个btrfs_free_space_entry,向前移动一个page, io_ctl->index,重新设置io_ctl->cur/size
+   > io_ctl_map_page(io_ctl, 1)
+
+** io_ctl_add_bitmap(io_ctl, bitmap)
+   - 添加bitmap,它是整整的一个page
+   - 首先检查io_ctl->cur是否指向page开始,如果不是直接换下一个page,这不浪费?!
+   > io_ctl_map_page(io_ctl,0)
+
+** io_ctl_zero_remaining_pages(io_ctl)
+   - 清空io_ctl剩余的page内存,并保存对应的checksum.
+   - 先处理当前page
+   > io_ctl_set_crc(io_ctl, io_ctl->index-1)
+   - 后续的所有的page
+   > io_ctl_map_page(io_ctl, 1)
+   - 保存checksum
+   > io_ctl_set_crc(io_ctl, io_ctl->index-1)
+
+** io_ctl_read_entry(io_ctl, btrfs_free_space, type)
+   - 这里io_ctl中是btrfs_free_space_entry数组,使用io_ctl->cur指向的组装btrfs_free_space.
+   > io_ctl_unmap_page(io_ctl)
+
+** io_ctl_read_bitmap(io_ctl, btrfs_free_space)
+   > io_ctl_check_crc(io_ctl, io_ctl->index)
+   - 把io_ctl->cur指向的page复制给btrfs_free_space->bitmap
+   > io_ctl_unmap_page(io_ctl)
+
+** merge_space_tree(btrfs_free_space_ctl)
+   - btrfs_free_space_ctl->free_space_offset管理的是btrfs_free_space, 遍历这些btrfs_free_space, 检查相邻的是否能合并.
+   - bitmap的btrfs_free_space不能合并..
+   - offset + bytes = next offset,可以合并.
+   - 先释放2个btrfs_free_space
+   > unlink_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - 扩大前一个btrfs_free_space->bytes,再放到rb tree中
+   > link_free_space(btrfs_free_space_ctl, btrfs_free_space)
+
+** __load_free_space_cache(btrfs_root, inode, btrfs_free_space_ctl, btrfs_path, offset)
+   - 读取一个btrfs_block_group_cache对应的free space信息,组装btrfs_free_space_ctl.
+   - inode有效,可以直接读取它的数据
+   - 如果文件长度为0,直接返回.
+   > i_size_read(inode)
+   - 构造btrfs_key(BTRFS_FREE_SPACE_OBJECTID, 0, offset),查找btrfs_free_space_header
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0,0)
+   - 获取btrfs_free_space_header的num_entries/num_bitmaps.
+   - 比较btrfs_free_space_header->generation和btrfs_inode->generation,如果不一致,直接返回
+   - 准备io_ctl
+   > io_ctl_init(io_ctl, inode, btrfs_root)
+   - 准备ioctl读取free space对应的inode..
+   > readahead_cache(inode)
+   - 把所有数据都读上来
+   > io_ctl_prepare_pages(io_ctl, inode, 1)
+   - 检查checksum
+   > io_ctl_check_crc(io_ctl, 0)
+   - 检查generation
+   > io_ctl_check_generation(io_ctl, generation)
+   - 读取文件数据,每个btrfs_free_space_entry创建对应的btrfs_free_space
+   - inode的数据中先是num_entries个btrfs_free_space_entry..
+   > kmem_cache_zalloc(btrfs_free_space_cachep, GFP_NOFS)
+   - 获取btrfs_free_space信息
+   > io_ctl_read_entry(io_ctl, btrfs_free_space, type)
+   - 如果type是BTRFS_FREE_SPACE_EXTENT, 就放到btrfs_free_space_ctl的rb tree中.
+   > link_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - 如果是BTRFS_FREE_SPACE_BITMAP, 应该读取bitmap数据,但这里仅仅分配了page. btrfs_free_space_entry和page分开存放
+   > link_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - 增加btrfs_free_space_ctl->total_bitmaps, 重新计算一个阀值
+   > btrfs_free_space_ctl->op->recalc_thresholds(btrfs_free_space_ctl)
+   - 把btrfs_free_space->list放到临时队列中,后面集中处理.
+   > io_ctl_unmap_page(io_ctl)
+   > io_ctl_read_bitmap(io_ctl, btrfs_free_space)
+   - 释放inode的pagecache
+   > io_ctl_drop_pages(io_ctl)
+   - 尝试合并
+   > merge_space_tree(btrfs_free_space_ctl)
+   > io_ctl_free(io_ctl)
+    
+** load_free_space_cache(btrfs_fs_info, btrfs_block_group_cache)
+   - 准备btrfs_block_group_cache->free_space_ctl.
+   - 检查btrfs_block_group_cache->disk_cache_state, 如果不是BTRFS_DC_WRITTEN, 就直接返回.BTRFS_DC_WRITTEN应该是默认的状态
+   > btrfs_alloc_path()
+   - 查找inode
+   > lookup_free_space_inode(btrfs_root, btrfs_block_group_cache, btrfs_path)
+   - 获取btrfs_free_space_ctl数据
+   > __load_free_space_cache(btrfs_fs_info->tree_root, inode, btrfs_free_space_ctl, btrfs_path, btrfs_block_group_cache->btrfs_key->objectid)
+   - 在获取btrfs_free_space_ctl信息时,计算btrfs_free_space_ctl->free_space, 计算它和btrfs_block_group_cache的剩余信息是否相同
+   - btrfs_block_group_cache->btrfs_key->offset - used - bytes_super == btrfs_free_space_ctl->free_space
+   > btrfs_block_group_used(btrfs_block_group_cache->item)
+
+** __btrfs_write_out_cache(btrfs_root, inode, btrfs_free_space_ctl, btrfs_block_group_cache, btrfs_trans_handle, btrfs_path, offset)
+   - 把btrfs_free_space_ctl的数据写回磁盘,这里会不会改变文件大小?
+   - 如果文件大小为0,直接返回
+   > i_size_read(inode)
+   - inode已经打开,可以使用.初始化io_ctl
+   > io_ctl_init(io_ctl, inode, btrfs_root)
+   - 准备inode的page,并不需要读回数据
+   > io_ctl_prepare_pages(io_ctl, inode, 0)
+   - 这里还需要extent_state? 锁住extent
+   > lock_extent_bits(btrfs_inode->io_tree, 0, i_size_read(inode)-1, 0, extent_state)
+   - 开始填充io_ctl,跳过checksum,设置generation
+   > io_ctl_set_generation(io_ctl, btrfs_trans_handle->transid)
+   - 这里涉及到btrfs_free_space和btrfs_free_cluster, 每个btrfs_free_cluster里面管理很多btrfs_free_space
+   - 然后是btrfs_free_space, 他包括btrfs_free_space_ctl里面,还有btrfs_block_group_cache->cluster_list的第一个btrfs_free_chunk里面?
+   > io_ctl_add_entry(io_ctl, btrfs_free_space->offset, bytes, ..)
+   - 处理btrfs_block_group_cache->pinned_extents, extent_io_tree, 遍历里面EXTENT_DIRTY的空间.
+   > find_first_extent_bit(unpin, start, extent_start, extent_end, EXTENT_DIRTY, NULL)
+   - 这是在准备free space过程中释放的空间?! 为何要使用EXTENT_DIRTY?
+   > io_ctl_add_entry(io_ctl, extent_start, len, NULL)
+   - 然后处理bitmap..
+   > io_ctl_add_bitmap(io_ctl, btrfs_free_space->bitmap)
+   > io_ctl_zero_remaining_pages(io_ctl)
+   - 数据已经写到pagecache,设置extent/page的DIRTY,设置EXTENT_DELALLOC/EXTENT_UPTODATE?然后就返回
+   > btrfs_dirty_pages(btrfs_root, inode, io_ctl->pages, io_ctl->num_pages, 0, i_size_read(inode), extent_state)
+   > unlock_extent_cached(extent_io_tree, 0, size, ...)
+   - 使用btrfs_ordered_extent把数据刷到磁盘
+   > btrfs_wait_ordered_range(inode, 0, -1)
+   - 然后更新或创建btrfs_free_space_header, btrfs_key(BTRFS_FREE_SPACE_OBJECTID,0, offset)
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, 0, 1)
+   - 这里找到btrfs_free_space_header, 仅仅更新了num_entries/num_bitmaps, generation, 没有更新btrfs_key
+
+** btrfs_write_out_cache(btrfs_root, btrfs_trans_handle, btrfs_block_group_cache, btrfs_path)
+   - 检查btrfs_block_group_cache->disk_cache_state,必须是BTRFS_DC_SETUP/BTRFS_DC_NEED_WRITE
+   - 找到对应的inode
+   > lookup_free_space_inode(btrfs_root, btrfs_block_group_cache, btrfs_path)
+   - 把数据写回去
+   > __btrfs_write_out_cache(btrfs_root, inode, io_ctl, btrfs_block_group_cache, btrfs_trans_handle, btrfs_path, btrfs_block_group_cache->btrfs_key->objectid)
+   
+** offset_to_bit(bitmap_start, unit, offset)
+   - offset是逻辑地址,先减去bitmap_start, 再除unit
+
+** bytes_to_bits(bytes, unit)
+   - bytes/unit ..
+
+** offset_to_bitmap(btrfs_free_space_ctl, offset)
+   - 计算offset所在的bitmap的开始地址. btrfs_free_space_ctl表示空闲空间的起始位置,肯定不是从0开始的.应该对应btrfs_free_space_catch的开始位置.
+   - offset - btrfs_free_space_ctl->start, 然后对bytes_per_bitmap向下对齐,然后加上btrfs_free_space_ctl->start
+
+** tree_insert_offset(rb_root, offset, rb_node, bitmap)
+   - rb_node是btrfs_free_space, rb_root是btrfs_free_space_ctl.
+   - rb tree使用btrfs_free_space->offset作为索引, 如果两个btrfs_free_space, 一个是bitmap,另一个不是bitmap,可以共存. 但不能都是或都不是.有bitmap的在后面.
+
+** tree_search_offset(btrfs_free_space_ctl, offset, bitmap_only, fuzzy)
+   - 在rb_root中找一个rb_node,根据offset查找 rb node
+   - 如果参数bitmap_only为0,需要返回一个bitmap的btrfs_free_space. 如果上面没有找到offset一致的,返回失败. 如果找到,而且btrfs_free_space->bitmap有效,返回这个结果
+   - 然后检查这个btrfs_free_space的下一个,如果offset一致,它必须是bitmap的.
+   - 如果找到不带bitmap,正好返回
+   - 如果找到带bitmap,检查前一个btrfs_free_space,只要它覆盖btrfs_free_space.(offset, bytes). 使用不是bitmap的,否则返回带bitmap的
+   - 如果没有找到合适的,检查前一个,也就是btrfs_free_space->offset < offset. 如果没有这样的,如果fuzzy=1,返回这个找到的,否则返回NULL
+   - 这时候找到一个btrfs_free_space->offset < offset, 检查它是否覆盖参数offset
+   - 如果是bitmap,先检查前一个不是bitmap的,因为可能重复. btrfs_free_space->offset + bytes > offset,就返回这个. 或者btrfs_free_space->offset + BITS_PER_BITMAP * btrfs_free_space->unit > offset,也可以用
+   - 如果不是bitmap的,直接检查. 如果可以返回.
+   - 现在确定offset不是空闲空间,如果fuzzy=0,返回NULL.
+   - fuzzy表示要分配空间,找一个offset后面的btrfs_free_space.
+
+** __unlink_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - 释放rb tree关系,  io_ctl->free_extents --
+
+** unlink_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   > __unlink_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - btrfs_free_space_ctl->free_space -= btrfs_free_space->bytes
+
+** link_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - btrfs_free_space->bitmap != NULL, 表示它是bitmap; btrfs_free_space->bytes有效,表示它是普通的, 两者不能都无效
+   > tree_insert_offset(btrfs_free_space_ctl->free_space_offset, btrfs_free_space->offset, btrfs_free_space->offset_index, btrfs_free_space->bitmap!=NULL)
+   - btrfs_free_space_ctl->free_extents += btrfs_free_space->bytes / free_extents ++
+
+** recalculate_thresholds(btrfs_free_space_ctl)
+   - 回调函数重新计算btrfs_free_space_ctl->extents_thresh. 这是free space专用的,还有ino专用的.
+   - 每1G空间的btrfs_free_space使用的空间不能超过32k. 先计算它能使用的最大空间 max_bytes
+   - 如果bitmap的btrfs_free_space的总空间已经超过这个阀值,不能再分配extent btrfs_free_space?
+   - (btrfs_free_space_ctl->total_bitmaps + 1) * PAGE_CACHE_SIZE > max_bytes
+   - 这是设置btrfs_free_space->extents_thresh = 0, 返回
+   - 如果还有空间给extent的btrfs_free_space使用.
+   - (max_bytes - btrfs_free_space_ctl->total_bitmaps * PAGE_CACHE_SIZE) / sizeof(btrfs_free_space)
+
+** __bitmap_clear_bits(btrfs_free_space_ctl, btrfs_free_space, offset, bytes)
+   - 分配空间后,从btrfs_free_space中删除
+   - btrfs_free_space->bytes -= bytes
+   - btrfs_free_space_ctl->unit表示一个bit代表的空间
+   - 先加算开始位,再计算位数
+   > offset_to_bit(btrfs_free_space->offset, btrfs_free_space_ctl->unit, offset)
+   > bytes_to_bits(bytes, btrfs_free_space_ctl->unit)
+   - 清除对应的位
+   > bitmap_clear(btrfs_free_space_ctl->bitmap, start, count)
+
+** bitmap_clear_bits(btrfs_free_space_ctl, btrfs_free_space, offset, bytes)
+   > __bitmap_clear_bits(btrfs_free_space_ctl, btrfs_free_space, offset, bytes)
+   - 更新btrfs_free_space_ctl->free_space -= bytes
+
+** bitmap_set_bits(btrfs_free_space_ctl, btrfs_free_space, offset, bytes)
+   - 上面的逆操作, btrfs_free_space->bytes += bytes; btrfs_free_space_ctl->free_space += bytes
+   > offset_to_bit(btrfs_free_space->offset, btrfs_free_space_ctl->unit, offset)
+   > bytes_to_bits(bytes, btrfs_free_space_ctl->unit)
+   > bitmap_set(btrfs_free_space->bitmap, start, count)
+
+** search_bitmap(btrfs_free_space_ctl, btrfs_free_space, offset, bytes)
+   - 从btrfs_free_space的offset开始查找.
+   - 搜索btrfs_free_space的bitmap,找一片连续的位,都是1.连续位数超过bytes
+   > offset_to_bit(btrfs_free_space->offset, btrfs_free_space_ctl->unit, offset)
+   > bytes_to_bits(bytes, btrfs_free_space_ctl->unit)
+   > find_next_zero_bit(btrfs_free_space>bitmap, BITS_PER_BITMAP, i)
+   - 返回的结果经过运算, btrfs_free_space_ctl->unit
+
+** find_free_space(btrfs_free_space_ctl, offset, bytes, align)
+   - 去btrfs_free_space_ctl中分配空间,先找一个btrfs_free_space, 下面fuzzy=1. 下面已经把offset做了校正,让他能指向bitmap的btrfs_free_space
+   > tree_search_offset(btrfs_free_space_ctl, offset_to_bitmap(btrfs_free_space_ctl, offset), 0, 1)
+   - 找到合适的btrfs_free_space,检查它的空闲空间能否满足bytes,如果不能查找下一个.
+   - 对于align,只有bytes>=align时才处理.检查btrfs_free_space->bytes能否满足时,要考虑分配地址的对齐偏移
+   - 如果碰到bitmap的btrfs_free_space, 相当于二层索引,就从bitmap中查找一段空间..
+   - bitmap就没法考虑align了
+   > search_bitmap(btrfs_freee_space_ctl, btrfs_free_space, offset, bytes)
+   - 最后返回分配的长度和地址,在bytes/offset中
+
+** add_new_bitmap(btrfs_free_space_ctl, btrfs_free_space, offset)
+   - 创建一个btrfs_free_space, 带有bitmap. 校正他的起始位置
+   > offset_to_bitmap(btrfs_free_space_ctl, offset)
+   - 设置btrfs_free_space->bytes为0
+   - btrfs_free_space_ctl->total_bitmaps++, btrfs_free_space_ctl->free_space不包括bitmap的空间?!
+   > link_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - 更新btrfs_free_space_ctl->extents_thresh
+   > btrfs_free_space_ctl->op->recalc_thresholds(btrfs_free_space_ctl)
+
+** free_bitmap(btrfs_free_space_ctl, btrfs_free_space)
+   - rb tree删除
+   > unlink_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - 释放btrfs_free_space->bitmap,回收btrfs_free_space
+   - btrfs_free_space_ctl->total_bitmaps -- 
+   > btrfs_free_space_ctl->op->recalc_thresholds(btrfs_free_space_ctl)
+
+** remove_from_bitmap(btrfs_free_space_ctl, btrfs_free_space, offset, bytes)
+   - 从带bitmap的btrfs_free_space中分配一块空间，去bitmap中搜索offset位置,返回的search_start必须是offset? offset地方必须是空闲的?!
+   > search_bitmap(btrfs_free_space_ctl, btrfs_free_space, search_start, search_bytes)
+   - 找到之后在bitmap中标注出来
+   > bitmap_clear_bits(btrfs_free_space_ctl, btrfs_free_space, search_start, search_bytes)
+   - 根据找到的空间,记录在offset,bytes中,如果还需要分配,搜索下一个btrfs_free_space
+   - 检查下一个可使用的btrfs_free_space,它必须是bitmap的,而且搜索的空间地址和上面的连续.
+   - 如果btrfs_free_space->bytes为0,释放这个btrfs_free_space
+   > free_bitmap(btrfs_freee_space_ctl, btrfs_free_space)
+
+** add_bytes_to_bitmap(btrfs_freee_space_ctl, btrfs_freee_space, offset, bytes)
+   > bitmap_set_bits(btrfs_free_space_ctl, btrfs_freee_space, offset, bytes_to_set)
+
+** use_bitmap(btrfs_freee_space_ctl, btrfs_freee_space)
+   - 检查是否需要使用bitmap
+   - btrfs_free_sapce_ctl->free_extents < extents_thresh, 而且btrfs_free_space->bytes很小,就不需要extent btrfs_free_space. 如果btrfs_free_space->bytes很大,可以使用.
+   - btrfs_block_group_cache < 16M,也使用extent btrfs_free_space
+
+** btrfs_free_space_op
+   #+begin_src 
+	.recalc_thresholds	= recalculate_thresholds,
+	.use_bitmap		= use_bitmap,
+   #+end_src
+
+** insert_into_bitmap(btrfs_free_space_ctl, btrfs_free_space)
+   - 创建bitmap的btrfs_free_space,首先检查是否必须使用,如果不需要就退出
+   > btrfs_free_space_ctl->btrfs_free_space_op->use_bitmap(btrfs...)
+   - 插入时,先检查能否和现有的bitmap btrfs_block_group合并.
+   - btrfs_free_space_ctl->private是btrfs_block_group_cache, 检查btrfs_block_group_cache->cluster_list的第一个btrfs_free_cluster, btrfs_free_cluster->root的第一个btrfs_free_space.
+   - 如果btrfs_free_space->offset == 参数btrfs_free_space->offset,先把它的空间放到这个找到的btrfs_free_space中.
+   > add_bytes_to_bitmap(btrfs_free_space_ctl, btrfs_free_space, offset, bytes)
+   - 如果都放进去,就直接退出.
+   - 否则搜索btrfs_free_space_ctl中的,只搜索bitmap的,btrfs_free_space->offset必须一致
+   > tree_search_offset(btrfs_free_space_ctl, offset_to_bitmap(btrfs_free_space_ctl, offset), 1, 0)
+   - 如果找到了,尝试添加进去一些
+   > add_bytes_to_bitmap(btrfs_free_space_ctl, btrfs_freee_space, offset, bytes)
+   - 如果还有一些空间不在任何btrfs_free_space中,就需要创建新的
+   - 如果btrfs_free_space或它的bit位图没准备好,这里先创建,创建后它表示的空闲空间为0
+   > add_new_bitmap(btrfs_free_space_ctl, btrfs_free_space, offset)
+   - 加入新的btrfs_free_space之后,处理的范围没有变化,再跳到上面重新执行,把空间放到新创建的bitmap btrfs_free_space中
+
+** try_merge_free_space(btrfs_free_space_ctl, btrfs_free_space, update_stat)
+   - 这里处理extent的btrfs_free_space的合并
+   - 查找右边btrfs_free_space
+   > tree_search_offset(btrfs_free_space_ctl, offset+bytes, 0, 0)
+   - 查找左边的,或者使用上面查找的结果的左边的.
+   - 检查btrfs_free_space不是bitmap,而且地址连续, 把找到的释放掉,而且修改并添加新的
+
+** __btrfs_add_free_space(btrfs_free_space_ctl, offset, bytes)
+   - 添加到btrfs_free_space_ctl中空闲时间, 先创建btrfs_free_space
+   - 尝试extent的btrfs_free_space是否能合并
+   > try_merge_free_space(btrfs_free_space_ctl, btrfs_free_space, true)
+   - 尝试合并或创建bitmap的btrfs_free_space
+   > insert_into_bitmap(btrfs_free_space_ctl, btrfs_freee_space)
+   - 最后插入extent的btrfs_free_space
+   > link_free_space(btrfs_free_space_ctl, btrfs_freee_space)
+
+** btrfs_remove_free_space(btrfs_block_group_cache, offset, bytes)
+   - 删除btrfs_block_group_cache里面的空间. 
+   - 去btrfs_free_space_ctl中查找对应的btrfs_free_space
+   - 先找一个extent的btrfs_block_group
+   > tree_search_offset(btrfs_free_space_ctl, offset, 0, 0)
+   - 如果没找到查找bitmap的btrfs_block_group,地址做了校正
+   > tree_search_offset(btrfs_freee_space_ctl, offset_to_bitmap(btrfs_freee_space_ctl, offset), 1, 0)
+   - 对于extent的btrfs_free_space,检查如何删除, 如果offset == btrfs_free_space->offset,如果btrfs_free_space范围比参数大,只要修改它,重新放到rb tree中. 如果小,需要把它完全释放,而且修改参数范围,继续删除.
+   > unlink_free_space(btrfs_free_space_ctl, btrfs_freee_space)
+   > link_free_space(btrfs_freee_space_ctl, btrfs_free_space)
+   - 如果offset > btrfs_free_space->offset, 先把前半段不用的,放到rb tree中.剩下的如果比参数范围大,还需要把多余的放回去.
+   > btrfs_add_free_space(btrfs_block_group_cache, offset+bytes, old_end - (offset+bytes))
+   - 如果找到带bitmap的,就从bitmap中删除
+   > remove_from_bitmap(btrfs_freee_space_ctl, btrfs_freee_space, offset, bytes)
+
+** btrfs_dump_free_space(btrfs_block_group_cache, bytes)
+   - 遍历btrfs_block_group_cache->btrfs_free_space_ctl中的所有节点,打印offset/bytes/bitmap信息
+
+** btrfs_init_free_space_ctl(btrfs_block_group_cache)
+   - 根据btrfs_block_group_cache初始化btrfs_free_space_ctl
+   - unit = btrfs_block_group_cache->sectorsize
+   - start是btrfs_key->objecitd
+   - private是btrfs_block_group_cache
+   - btrfs_free_space_op 是 free_space_op
+   - extents_thresh 是 32k的一半,也不管btrfs_block_group_cache的大小了?
+
+** __btrfs_return_cluster_to_free_space(btrfs_block_group_cache, btrfs_free_cluster)
+   - 把btrfs_free_cluster->root中的所有btrfs_free_space释放给btrfs_free_space_ctl中, 把btrfs_free_cluster从btrfs_block_group_cache的队列中释放..
+   - 如果是不带bitmap的,就先合并相邻的btrfs_free_space.
+   > try_merge_free_space(btrfs_free_space_ctl, btrfs_freee_space, NULL)
+   - 无法合并再插入到btrfs_free_space_ctl中
+   > tree_insert_offset(btrfs_free_space_ctl->free_space_offset, offset, bytes, bitmap)
+
+** __btrfs_remove_free_space_cache_locked(btrfs_free_space_ctl)
+   - 释放btrfs_free_space_ctl中的所有btrfs_free_space
+   - 对于extent的btrfs_free_space,直接释放内存
+   > unlink_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - 对于bitmap,需要释放使用的PAGE
+   > free_bitmap(btrfs_free_space_ctl, btrfs_free_space)
+
+** __btrfs_remove_free_space_cache(btrfs_free_space_ctl)
+   > __btrfs_remove_free_space_cache_locked(btrfs_free_space_ctl)
+
+** btrfs_remove_free_space_cache(btrfs_block_group_cache)
+   - 首先释放所有的btrfs_free_cluster
+   > __btrfs_return_cluster_to_free_space(btrfs_block_group_cache, btrfs_free_cluster)
+   - 然后是btrfs_free_space_ctl..
+   > __btrfs_remove_free_space_cache_locked(btrfs_freee_space_ctl)
+
+** btrfs_find_space_for_alloc(btrfs_block_group_cache, offset, bytes, empty_size)
+   - 要分配的空间是bytes+empty_size? 去btrfs_free_space_ctl中查找
+   > find_tree_space(btrfs_free_space_ctl, offset, bytes_search, btrfs_block_group_cache->full_stripe_len)
+   - 如果找到bitmap的,修改返回的btrfs_free_space
+   > bitmap_clear_bits(btrfs_free_space_ctl, btrfs_freee_space, offset, bytes)
+   - 如果找到extent的,在分配时,返回的offset/bytes时经过align校正的,因此可能在extent中间分配.
+   > unlink_free_space(btrfs_freee_space_ctl, btrfs_freee_space)
+   - 对于后面的一段,修改offset/bytes
+   > link_free_space(btrfs_freee_space_ctl, btrfs_freee_space)
+   - 对于前面为了align的一块,添加回去
+   > __btrfs_add_free_space(btrfs_freee_space_ctl, offset, len)
+
+** btrfs_return_cluster_to_free_space(btrfs_block_group_cache, btrfs_free_cluster)
+   - btrfs_free_cluster的btrfs_free_space还给btrfs_free_space_ctl
+   > __btrfs_return_cluster_to_free_space(btrfs_block_group_cache, btrfs_free_cluster)
+   - 前面增加了对btrfs_block_group_cache的计数
+   > btrfs_put_block_group(btrfs_block_group_cache)
+
+** btrfs_alloc_from_bitmap(btrfs_block_group_cache, btrfs_free_cluster, btrfs_free_space, bytes, min_start)
+   - 参数btrfs_free_space是bitmap的,从里面分配一定长度的空间
+   > search_bitmap(btrfs_freee_space_ctl, btrfs_free_space, start, bytes)
+   - 设置这段标志
+   > __bitmap_clear_bits(btrfs_free_space_ctl, btrfs_free_space, ret, bytes)
+
+** btrfs_alloc_from_cluster(btrfs_block_group_cache, btrfs_freee_cluster, bytes, min_start)
+   - 从btrfs_free_cluster中分配空间bytes,而且磁盘偏移大min_start
+   - btrfs_free_cluster->max_size > bytes, 肯定找不到空间.
+   - 遍历btrfs_free_cluster中的所有btrfs_free_space节点, 检查是否满足条件
+   - btrfs_freee_space->bytes > bytes
+   - 对于extent的btrfs_free_space, offset > min_start
+   - 如果找到bitmap的btrfs_free_space, 使用btrfs_free_cluster->window_start作为最小偏移
+   > btrfs_alloc_from_bitmap(btrfs_block_group_cache, btrfs_free_cluster, btrfs_free_space, bytes, btrfs_free_cluster->window_start)
+   - 更新btrfs_free_cluster->window_start 
+   - 如果找到extent的btrfs_free_space, 返回offset, btrfs_free_space->bytes -= bytes
+   - 如果btrfs_free_space->bytes=0, 从btrfs_free_cluster中释放它,彻底释放
+   - btrfs_free_space_ctl->free_space -= bytes
+
+** btrfs_bitmap_cluster(btrfs_block_group_cache, btrfs_free_space, btrfs_free_cluster, offset, bytes, cont1_bytes, min_bytes)
+   - btrfs_free_space首先是在btrfs_free_space_ctl中,是bitmap的. 需要把他移到btrfs_free_cluster中.
+   - 检查btrfs_free_space是否满足分配要求,连续空闲空间超过cont1_bytes,而且总空闲空间超过bytes
+   - 更新btrfs_free_cluster->window_start指向btrfs_free_space的开始空闲空间
+   > tree_insert_offset(btrfs_free_cluster->root, btrfs_free_space->offset, rb_node, 1)
+
+** setup_cluster_no_bitmap(btrfs_block_group_cache, btrfs_free_cluster, list_head, offset, bytes, cont1_bytes, min_bytes)
+   - 从btrfs_free_space_ctl中查找offset附近的btrfs_free_space, 先后遍历所有的btrfs_free_space
+   > tree_search_offset(btrfs_free_space_ctl, offset, 0, 1)
+   - 跳过bitmap的,而且放到参数list_head中,跳过btrfs_free_space->bytes < min_bytes
+   - 遍历所有的btrfs_free_space? 统计满足条件的空间总和window_free,和最大的空闲空间max_extent
+   - 如果window_free > bytes, max_extent > cont1_bytes, 继续处理,否则搜索失败
+   - 然后再次遍历,把这些btrfs_free_space移到btrfs_free_cluster中
+   > tree_insert_offset(btrfs_free_cluster->root, btrfs_free_space->offset, btrfs_free_space->offset_index, 0)
+
+** setup_cluster_bitmap(btrfs_block_group_cache, btrfs_free_cluster, bitmaps, offfset, bytes, cont1_bytes, min_bytes)
+   - 参数list_head中是上面的函数搜索中碰到的bitmap的btrfs_free_space,检查他们是否满足分配要求,添加到btrfs_free_cluster中
+   - 这里首先检查offset对应的bitmap的btrfs_free_space是否在队列中, 如果不在去重新搜索这个btrfs_free_space
+   > offset_to_bitmap(btrfs_free_space_ctl, offset)
+   - 遍历队列上的btrfs_free_space, 但btrfs_free_space->bytes > bytes,才处理他们
+   > btrfs_bitmap_cluster(btrfs_block_group_cache, btrfs_freee_space, btrfs_free_cluster, offset, bytes, cont1_bytes, min_bytes)
+   
+** btrfs_find_space_cluster(btrfs_trans_handle, btrfs_root, btrfs_block_group_cache, btrfs_free_cluster, offset, bytes, empty_size)
+   - 为了分配空间,先去准备btrfs_free_cluster,根据参数条件去准备足够的btrfs_free_space
+   - 当指定mount option时, cont1_bytes/min_bytes是bytes+empty_size, 争取使用大空间
+   - 对于metadata, cont1_bytes是bytes, 必须是一块连续的空间, min_bytes = sectorsize
+   - 对其其他,cont1_bytes是 max(bytes, (bytes+empty_size)/4), min_bytes = sectorsize
+   - btrfs_free_space_ctl->free_space < bytes, 不用搜索,没有这么大空间
+   - 先找extent的btrfs_free_space
+   > setup_cluster_no_bitmap(btrfs_block_group_cache, btrfs_free_cluster, bitmaps, offset, bytes+empty_size, cont1_bytes, min_bytes)
+   - 再找bitmap的btrfs_free_space
+   > setup_cluster_bitmap(btrfs_block_group_cache, btrfs_free_cluster, bitmaps, offset, bytes+empty_size, cont1_bytes, min_bytes)
+   - 如果查找成功,把btrfs_free_cluster->block_group_list放到btrfs_block_group_cache->cluster_list中
+
+** btrfs_free_cluster 
+   #+begin_src 
+	spinlock_t lock;
+	spinlock_t refill_lock;
+	struct rb_root root;   //拥有的btrfs_free_space
+
+	/* largest extent in this cluster */
+	u64 max_size;  //最大的btrfs_free_space,应该是extent的
+
+	/* first extent starting offset */
+	u64 window_start;    //开始空闲空间?
+
+	struct btrfs_block_group_cache *block_group;
+	/*
+	 * when a cluster is allocated from a block group, we put the
+	 * cluster onto a list in the block group so that it can
+	 * be freed before the block group is freed.
+	 */
+	struct list_head block_group_list;      //它的btrfs_free_spac来源
+   #+end_src
+
+** btrfs_init_free_cluster(btrfs_free_cluster)
+   - 初始化btrfs_free_cluster.
+
+** do_trimming(btrfs_block_group_cache, total_trimmed, start, bytes, reserved_start, reserved_bytes)
+   - 这里有2个操作,一个是向底层设备发送discard操作,另一个是释放空闲空间给btrfs_free_space_ctl
+   - 空闲空间是(reserved_start, reserved_bytes)
+   - btrfs_space_info->bytes_reserved / btrfs_block_group_cache->reserved += reserved_bytes
+   - reserved表示空闲空间
+   - 发送discard请求, (start,bytes)和另一个范围什么关系?
+   > btrfs_error_discard_extent(btrfs_fs_info->extent_root, start, bytes, trimmed)
+   - 然后是把空闲空间给free inode.. 
+   > btrfs_add_free_space(btrfs_block_group_cache, reserved_start, reserved_bytes)
+   - btrfs_space_info->bytes_reserved / btrfs_block_group_cache->reserved? 这段空间相当于临时分配出去
+
+** trim_no_bitmap(btrfs_block_group_cache, total_trimmed, start, end, minlen)
+   - 遍历btrfs_block_group_cache->btrfs_free_space_ctl中(start,end)范围内的btrfs_free_space,先trim这段空间,然后再整理它的btrfs_free_space
+   - 循环处理,这里没有遍历,每次都是查找btrfs_free_space
+   > tree_search_offset(btrfs_free_space_ctl, start, 0, 1)
+   - 只处理extent的btrfs_free_space, 从btrfs_free_space_ctl中释放,下面再添加进去
+   > unlink_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - 这样可能会合并,但的确释放了底层的设备
+   > do_trimming(btrfs_block_group_cache, total_trimmed, start, bytes, extent_start, extent_bytes)
+
+** trim_bitmaps(btrfs_block_group_cache, total_trimmed, start, end, minlen)
+   - 处理bitmap的btrfs_free_space.循环时先查找btrfs_free_space
+   > tree_search_offset(btrfs_free_space_ctl, offset, 1, 0)
+   - 如果找到,只处理btrfs_free_space->bytes > min_len的. 查找它的bitmap
+   > search_bitmap(btrfs_free_space_ctl, btrfs_free_space, start, bytes)
+   - 然后把这段空间分配掉
+   > bitmap_clear_bits(btrfs_free_space_ctl, btrfs_free_space, start, bytes)
+   - 如果btrfs_free_space->bytes=0,释放它
+   > free_bitmap(btrfs_free_space_ctl, btrfs_free_space)
+   - trim操作
+   > do_trimming(btrfs_block_group_cache， total_trimmed, start, bytes, start, bytes)
+   - 然后可能检查下一个btrfs_free_space, 修改offset用来查找btrfs_free_space,也可能检查bitmap中的下一块空间,修改start,用来查找bitmap
+   
+** btrfs_trim_block_group(btrfs_block_group_cache, trimmed, start, end, minlen)
+   - 先处理extent
+   > trim_no_bitmap(btrfs_block_group_cache, ...)
+   - 再处理bitmap
+   > trim_bitmaps(...)
+
+** btrfs_find_ino_for_alloc(btrfs_root)
+   - btrfs_root->free_ino_ctl是一个特殊的范围管理,他管理的不是那些空间空闲,而且共享的ino
+   - 获取btrfs_free_space_ctl->free_space_offset的第一个btrfs_free_space, 如果不是bitmap的,就使用btrfs_free_space->offset
+   > unlink_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - 修改btrfs_free_space->offset, 然后调整rbtree的位置. 如果btrfs_free_space->bytes为0,就释放它
+   > link_free_space(btrfs_free_space_ctl, btrfs_free_space)
+   - 如果是带bitmap的btrfs_free_space, 就去bitmap中查找,而且设置对应的bit..
+   > search_bitmap(btrfs_free_space_ctl, btrfs_free_space, offset, count)
+   > bitmap_clear_bits(btrfs_free_space_ctl, btrfs_free_space, offset, 1)
+   
+** lookup_free_ino_inode(btrfs_root, btrfs_path)
+   - 检查btrfs_root->cache_inode, 如果有效有返回它, 否则查找一个新的..
+   > __lookup_free_space_inode(btrfs_root, btrfs_path, 0)
+
+** create_free_ino_inode(btrfs_root, btrfs_trans_handle, btrfs_path)
+   - 在btree中创建一个btrfs_inode_item和对应的btrfs_free_space_header节点..
+   > __create_free_space_inode(btrfs_root, btrfs_trans_handle, btrfs_path, BTRFS_FREE_INO_OBJECTID, 0)
+   
+** load_free_ino_cache(btrfs_fs_info, btrfs_root)
+   - 如果不使用map cache, 就不会有这些东西.
+   > btrfs_test_opt(btrfs_root, INODE_MAP_CACHE)
+   > btrfs_alloc_path()
+   > lookup_free_ino_inode(btrfs_root, btrfs_path)
+   - 找到inode (BTRFS_FREE_SPACE_OBJECTID, 0, 0)
+   > __load_free_space_cache(btrfs_root, inode, btrfs_free_space_ctl, btrf_path, 0)
+   - 把磁盘中的数据放到内存中,也就是btrfs_root->free_ino_ctl中..
+
+** btrf_write_out_ino_cache(btrfs_root, btrfs_trans_handle, btrfs_path)
+   > lookup_free_ino_inode(btrfs_root, btrfs_path)
+   - (BTRFS_FREE_SPACE_OBJECTID, 0, 0)对应的inode..
+   > __btrfs_write_out_cache(btrfs_root, inode, btrfs_free_space_ctl, NULL, btrfs_trans_handle, btrfs_path, 0)
+   - 把btrfs_root->free_ino_ctl写回到这个inode的磁盘数据中.
+
+** 总结
+   - 管理free space的inode的管理,在创建btrfs_block_group_cache时创建,分配空间还是挺大的.
+   - inode的存储和普通文件一样,读写使用io_ctl辅助实现,而且一次性.
+   - btrfs_free_space/btrfs_free_space_ctl/btrfs_free_cluster的管理,分配和释放空闲空间.大部分都是extent-tree.c中使用.
+   - 分配空间是先准备btrfs_free_cluster,然后在里面查找.
+   - btrfs_free_space_ctl的管理,在创建btrfs_block_group_cache时使用.
+   - 最后是free ino的管理
+

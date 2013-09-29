@@ -1,0 +1,331 @@
+1. auth_cred  这个应该是最基本的信息，表示某个用户
+	* uid/gid/group_info
+	* principal   (string, 这个具体会是什么?)
+	* machine_cred
+
+2. rpc_cred 根据auth_cred实现安全机制,管理rpc_credops.  这里竟然仅仅有一个cr_uid
+	* cr_hash: 这个hash表是rpc_auth->au_credcache
+	* cr_lru: cred_unused队列,里面是有效但没有使用的rpc_cred
+	* cl_rcu: 异步释放使用
+	* rpc_auth: 底层的安全机制
+	* rpc_credops cr_ops : 具体操作
+	* cr_expire / cr_flags / cr_count 
+	* cr_uid
+
+rpc_credops: 这里的方法说明了sunrpc如何使用这些安全机制，包括match,validate,wrap等操作,那这个方法的对象应该属于某种机制. 可参考下面rpc_authops中的相关方法.
+  cr_name: auth flavor: 没想到这里和机制相关
+  cr_init(rpc_auth, rpc_cred)
+  crdestroy(rpc_cred)
+  crmatch(auth_cred, rpc_cred, int)
+  rpc_cred crbind(rpc_task, rpc_cred, int)
+  crmarshal(rpc_task, )
+  crvalidate(rpc_task, ..)
+  crwrap_req(rpc_task, kxdreproc_t, ...)
+  crunwrap_resp(rpc_task, ...)
+
+3. rpc_auth 这里管理rpc_cred,关联rpc_authops.
+	* au_cslack, au_rslack, au_verfsize, 表示大小的东西
+	* au_flags
+	* rpc_authops: 这个是下面的回调函数,和其中的某些接口有关
+	* rpc_authflavor_t   包括  RPC_AUTH_NULL, UNIX, GSS, GSS_KRB5
+	* au_count
+	* rpc_cred_cache au_credcache 使用rpc cache.
+
+4. rpc_authops:这个数据结构的对象放在auth_flavors数字中,里面应该包括auth_sys, auth_none, auth_gss等. 当然auth_gss下面再细分. 下面大部分是方法，相当于直接给sunrpc直接调用的.
+    module,  au_name: 模块和名称
+    rpc_authflavor_t au_flavor
+    rpc_auth create(rpc_clnt, rpc_authflavor_t)  根据auth_cred创建rpc_auth
+    destroy(rpc_auth)  销毁rpc_auth
+    rpc_cred lookup_cred(rpc_auth, auth_cred, int)
+    rpc_cred crcreate(rpc_auth, auth_cred, int)
+    int pipes_create(rpc_auth)
+    void pipes_destroy(rpc_auth)
+    list_pseudoflavors(rpc_authflavor_t)
+
+6. rsc 这是rpc cache 使用upcall交换的信息
+	* cache_head h
+	* xdr_netobj handle
+	* svc_cred cred
+	* gss_svc_seq_data seqdata 数据
+	* gss_ctx mechctx
+	* client_name
+
+	rsi 这个应该是gss在rpc传输中使用的数据结构
+	* cache_head
+	* xdr_netobj in_handle, in_token
+	* xdr_netobj out_handle, out_token
+	* major_status, minor_status 
+
+8. nfsv4的SECINFO请求, 请求参数是一个路径(SECINFO)或filehandle(SECINFO_NO_NAME),结果是一个secinfo4的数组
+secinfo4:
+  int flavor: 对于RPCSEC_GSS/RPC_AUTH_GSS,才有nfs4_secinfo_gss数据,其他可能是AUTH_SYS等
+  nfs4_secinfo_gss:
+    nfs4_secinfo_oid sec_oid4:  字符串,参考rfc 2743/2203
+    int qoq4:
+    int service:   null, integrity, privacy
+
+最后这个函数从返回的队列中选择一个认可的，然后返回pseudoflavor
+rpc_authflavor_t nfs4_negotiate_security(inode, qstr)
+  > nfs_find_best_sec(flavor)
+
+9. gss_api_mech: 这个数据结构表示一种gss的安全机制(mechainism),比如krb5.它包含多种服务(none, integrity,privacy).  这里是管理pseudoflavor和gss_api_ops..
+  list_head  gm_list: registered_mechs队列
+  module: 模块
+  xdr_netobj: rfc中注册的数字标识, 比如2a864886f712010202 这个应该也是secinfo中的oid
+  gm_name: 另一个名称,容易记忆,比如 krb5
+  gss_api_ops gm_ops: 这是核心的东西.
+  int gm_pf_num: 提供了集中伪安全机制   pseudoflavors
+  pf_desc gm_pfs: 数组
+  char* gm_upcall_enctypes??
+
+pf_desc: 这个数据结构索引pseudoflavor. 公共管理的只包括oid, 在内核中不同的服务也是不同的安全手段，这里根据oid/service索引到pseudoflavor.
+  int pseudoflavor : 数字标识,参考定义  RPC_AUTH_GSS_KRB5
+  int service
+  char *name, auth_domain_name: 为何还有domain name. name就是krb5,krb5i等
+  
+10. rpcauth_create(rpc_authflavor_t, rpc_clnt) 根据authflavor创建rpc_clnt->rpc_auth
+  > rpc_authops->create(rpc_clnt, pseudoflavor) 如果是gss找出auth_flavors[RPC_AUTH_GSS].
+    > gss_create
+      > gss_mech_get_by_pseudoflavor(flavor) 有查找一遍,这个和上面不一样,因为这里是pseudoflavor
+        > mech_supports_pseudoflavor(gss_api_mech, pseudoflavor) 看一种mech的子机制是否支持
+      > 开始组装gss_auth->rpc_auth, 还有2个pipefs下面的文件,在rpc_client对应的文件夹下面
+      > rpcauth_init_credcache(rpc_auth) 初始化rpc_auth->rpc_cred_cache这是一个hash表,里面是rpc_cred??
+
+11. rpcauth_release(rpc_auth)  根据rpc_auth->au_count计算是否释放
+  > rpc_authops->destroy(rpc_auth)  =  gss_destroy  这是销毁一种验证机制(rpc_auth)，而不是一个验证身份(rpc_cred)
+    > rpcauth_destroy_credcache(rpc_auth)
+      > gss_free_callback(kref) 这里根据gss_auth->kref判断是否释放gss_auth这个模块
+        > gss_free(gss_auth)  释放实现的模块gss_krb5, 还有自己使用的模块, gss_create会占用模块
+
+总结: 现在基本明确上面的这些数据结构. 首先说明这些安全验证机制是基于用于/组属性的,安全是保证数据的所有者是某用户. auth_cred是基本的用户信息的载体,包括uid/gid/pricipal等. 具体的实现机制是rpc_auth/rpc_authops. 所有类型的安全机制都有自己的rpc_authops,放在auth_flavors数组中,这个数据结构一般使用rpc_auth间接使用. 这里特殊的是RPC_AUTH_GSS,它又可分子服务,使用gss_api_mech管理,他的对象在在registered_mechs数组中. rpc_auth的机制如何起作用通过rpc_cred,它和sunrpc交互，它根据auth_cred验证和处理数据，方法在rpc_credops. 这里auth_cred是比较简单的对象，仅仅传递数据,它的信息会保存到rpc_cred中,通过rpc_cred管理这些信息的共享等等,这些rpc_cred在rpc_auth中通过hash管理.
+
+
+5. gss包含上面的一整套rpc_auth/rpc_cred
+  gss_auth 包装rpc_auth, 这个是属于rpc_clnt的,当然也能共享
+    rpc_auth
+    kref , rpc_gss_svc 包括auth, integrity, privacy
+    gss_api_mech 具体的安全机制, 去registered_mechs中找.
+    rpc_gsss_svc : none, integrity, privacy
+    rpc_clnt   用到它的目录
+    rpc_pipe 建立两个文件,  (krb5, gssd), 第一个和之前版本兼容,第二个用于upcall
+
+  gss_cred 包装rpc_cred
+    rpc_cred gc_base
+    rpc_gss_svc 对应上面 null, integrity, privacy
+    gss_cl_ctx:  rpc中使用的procedure,还有再底层的具体实现
+    gss_upcall_msg: upcall使用的数据接口
+    gc_upcall_timestamp
+    char * gc_principal: 现在有uid和principal了
+
+  gss_cl_ctx
+    count, gc_seq, gc_win
+    rpc_gss_proc  gc_proc:  gss使用的rpc请求
+    gss_ctx gc_gss_ctx: 具体机制使用的数据
+    xdr_netobj: gc_wire_ctx
+    gc_expiry
+
+  gss_ctx:
+    gss_api_mech: 反向索引指针
+    void * internal_ctx_id: 这里是指针,对krb5来说就是krb5_ctx指针
+    
+
+下面看rpc_auth_gss的具体实现,上面说了auth_cred/rpc_cred这些接口层的东西，下面看看krb5的实现,先看方法过程
+rpcauth_lookup_credcache(rpc_auth, auth_cred, flag) 这个函数是rpc_clnt根据auth_cred获取rpc_cred的,rpc_cred里面有uid,如何把这个传给server?
+  > rpc_authops->crcreate(rpc_auth, auth_cred, flags) 创建rpc_cred,实际上创建的gss_cred  = gss_create_cred
+
+gss_create_cred()
+  > rpcauth_init_cred(gss_cred->gc_base, auth_cred, rpc_auth, gss_credops) 看来这里还没有对gss_credops根据不同的机制分开,外面还有一层包装
+  > 下面是初始化gss_cred的其他属性
+
+rpc_authops->cr_init(rpc_auth, rpc_cred)
+gss_cred_init(rpc_auth, rpc_cred) 这里使用upcall,请求什么东西..
+  > gss_create_upcall(gss_auth,  gss_cred)
+    > gss_setup_upcall(rpc_clnt, gss_auth, rpc_cred)
+      > gss_alloc_msg(..) 创建gss_upcall_msg
+        > gss_encode_msg(gss_upcall_msg, rpc_clnt, service_name) 
+          > gss_encode_v1_msg(...) 格式化gss_upcall_msg. 从包装来看,就是把uid传给rpcgssd,让它去找uid对应的principal.
+      > gss_add_msg(gss_new) pipefs的操作
+      > rpc_queue_upcall(gss_upcall_msg->pipe, gss_upcall_msg->rpc_pipe_msg)
+等待gss_upcall_msg->waitqueue, 这里是TASK_KILLABLE等待, 使用schedule还会调度回来? 等待gss_upcall_msg->ctx
+
+gss_pipe_downcall 这个回调函数会唤醒上面的等待.
+  > gss_alloc_context()
+  > __gss_find_upcall(pipe, uid)
+  > gss_fill_context(p, end, gss_cl_ctx, gss_api_mech) 这里会获取很多信息,主要的还是填充一个有意义的gss_cl_ctx
+    > gss_import_sec_context(p, len, gss_api_mech, gss_cl_ctx->gc_gss_ctx, GFP_NOFS)
+      > gss_api_mech->gm_ops->gss_import_sec_context(...) 有这里可知,具体的krb5实现和gss关系仅仅是这里的gss_api_ops
+        > gss_import_sec_context_kerberos(...)
+          > gss_import_v2_context(p, len, gss_ctx, gfp_t) 这个函数就是分配一个krb5使用的数据结构,接受downcall的数据,然后把这个指针给gss_cl_ctx->gss_ctx->internal_ctx_id. 把downcall传下来的数据放到krb5_ctx中,根据指定的加密方法初始化对应的密钥.
+            > get_gss_krb5_enctype(...) 这里很多都是加密解密的东西
+
+call_refresh
+  > rpcauth_refreshcred(rpc_task)
+    > rpc_cred->rpc_credops->crrefresh(rpc_task)  = gss_refresh
+      > gss_renew_cred(rpc_task) 创建新的rpc_cred
+      > gss_refresh_upcall(rpc_task)
+        > gss_cred_set_ctx(rpc_cred, gss_cl_ctx) 这里krb5_ctx已经创建起来,而且这个token可以直接对数据处理,verify/wrap,已经和server协商的token.
+
+gss_api_ops
+  gss_import_sec_context(p, len, gss_ctx, gfp_t)
+  gss_get_mic(gss_ctx, xdr_buf, xdr_netobj)
+  gss_verify_mic(gss_ctx, ...)
+  gss_wrap(gss_ctx, ...)
+  gss_unwrap(gss, ...)
+  gss_delete_sec_context(..)
+  
+gss
+      
+对于gss_cred,其他的gss_credops包括:
+gss_marshal: 在发送数据时使用
+gss_refresh: upcall相关
+gss_validate 这里在接受数据后使用
+gss_wrap_req(rpc_task, kxdreproc_t, rqstp, p, obj) 在encode之前调用
+gss_unwrap_resq  在接受数据时调用
+
+call_transmit(rpc_task) rpc中的数据发送阶段
+  > rpc_xdr_encode(rpc_task) 对rpc整个数据包编码
+    > rpc_encode_header(rpc_task) 填充rpc头部6个int, xid,RPC_CALL,RPC_VERSION,prog,ver,proc
+      > rpcauth_marshcred(rpc_task, p)  这里处理cred/verf部分,p是一个输入参数,表示这两部分使用的内存
+        > rpc_credops-> gss_marshal
+          > 先处理cred, RPC_AUTH_GSS,RPC_GSS_VERSION,proc,seq,service,handle. 注意这个handle,它是server分配的,它在server端有意义.这里看不透krb如何传递uid信息.
+          > gss_get_mic(gss_ctx, verf, mic) verf是要校验的数据,从xid到cred结束. mic是后面放到verf区域的数据
+            > gss_api_ops->gss_get_mic(gss_ctx, verf, mic) = gss_get_mic_kerberos
+              > gss_get_mic_v2(gss_ctx->internal_ctx_id, verf, mic)
+              > make_checksum_v2(krb5_ctx, ...) 里面具体使用的加密算法和krb5中的类似
+    > rpcauth_wrap_req(rpc_task, encode, ...) 这里对数据打包
+      > rpc_cred->rpc_credops->crwrap_req(...) gss_wrap_req
+        > gss_wraq_req(encode, rpc_rqst, p, obj) 
+          > gss_wrap_req_encode(..) 
+在client找不到RPC_GSS_RPOC_INIT的打包实现,因为这个请求在rpc.gssd中实现,它没有在内核态实现.通过抓包,可看到这个请求使用的socket和client使用的socket不一样。所以rpc_clnt在和rpc.gssd交互获取handle/token之后,这里的gss krb5 context已经建立起来.
+
+call_decode 受到数据后开始解析
+  > rpc_verify_header(rpc_task)
+    > rpcauth_checkverf(rpc_task, p)  p是要校验的数据,指向verf数据域
+      > rpc_cred->cr_ops->crvalidate() = gss_validate
+        > 果然是只对一个seq数字进行校验,这个数字也就是rpc_rqst->rq_seqno,它在请求的cred域出现
+        > gss_verify_mic(gss_ctx, ...)
+
+这里说一下krb5对uid的使用,在client,uid就是current使用的uid,它给rpc.gssd,获取对应uid所有的principal(/tmp/krb5_xx),然后把这个principal给server. server根据这个pricipal找回对应的uid.通过principal获取对应.
+
+7. service中auth的实现, 这里好像是和rpc客户端的安全验证对应的,给rpc的server端使用,在处理请求时使用
+
+  svc_cred
+    cr_uid / cr_gid 
+    group_info
+  
+  auth_domain: 这个结构表示client使用的domain,基于安全机制划分的
+    kref, hlist_node
+    char *name :安全机制名称?
+    auth_ops
+
+  auth_ops: 下面方法的参数是svc_rqst,应该是在处理这些请求时使用
+    name, module,flavor: 
+    accept(svc_rqst, auth)
+    release(svc_rqst)
+    domain_release(auth_domain)
+    set_client(svc_rqst)
+
+对应客户端实现,这里包括3中, AUTH_SYS,AUTH_NULL,AUTH_GSS,放在authtab数组中. 
+
+  rsi 在验证身份阶段使用. 这里和实现机制krb5没有关系,都在rpc.svcgssd中实现. rsi的管理在rsi_cache中.
+    cache_head h
+    xdr_netobj in_handle, in_token
+    xdr_netobj out_handle, out_token
+    int major_status, minor_status
+
+  rsc 
+    cache_head h:
+    xdr_netobj  handle:              =======>  gss_cl_ctx->gc_wire_ctx
+    svc_cred cred : 这个东西是在rsc_parse是传递下来的    
+    gss_svc_seq_data seqdata               => gss_cl_ctx
+    gss_ctx mechctx: 和client共用          => gss_cl_ctx->gss_ctx
+    
+rsc的管理使用rsc_cache,它主要管理token,这个token是和client端(gss_cred->gss_cl_ctx->krb5_ctx)对应的. 这里应该是rsc->gss_ctx->krb5_ctx. rsc和gss_cl_ctx还是对应的. rsc通过handle索引和标识,这个handle应该是rpc.svcgssd分配的.
+.cache_parse = rsc_parse, 这里是怎么创建krb5_ctx
+  > gss_mech_get_by_name("krb5")   这里会计数模块
+  > gss_import_sec_context(buf, ...)
+    > gss_mech_get(mech)  又增加
+    > gss_import_sec_context_kerberos
+  > gss_mech_put
+
+.cache_put = rsc_put
+  > rsc_free(rsc)
+    > gss_delete_sec_context(gss_ctx)
+      > gss_delete_sec_context_kerberos
+      > gss_mech_put
+
+应该没有module卸载问题,估计是在rsc复制时发生的.
+.update = update_rsc
+
+
+这两个数据结构是为gss_api准备的. 两个都使用了rpc cache, 第一个是auth.rpcsec.init,主要在建立链接时使用,第二个是auth.rpcsec.context,在数据传输时使用.
+
+  gss_svc_data 
+      rpc_gss_wire_cred clcred: 这是在gss rpc中使用的数据结构,在rpc中也用
+      verf_start  内存指针
+      rsc 
+  rpc_gss_wire_cred (gc_ctx)  这是rpc数据包中的gss cred? 为何没有uid？
+      gc_v , gc_proc, gc_seq, gc_svc
+      xdr_netboj gc_ctx  是这个东西?
+  
+svc_authenticate(svc_rqst, int *authp)  authp表示输出,ok/fail/drop
+  > svc_getnl(svc_rqst->rq_arg.head[0]) 先取出flavor
+  > authtab[flavor]->accept(svc_rqst, authp) = svcauthops_gss是gss的实现
+    >accept:  svcauth_gss_accept
+      > 从svc_rqst->rq_arg中取出一些rpc数据头放到 gss_svc_data->rpc_gss_wire_cred中。 下面根据rpc_gss_wire_cred->gc_proc分别处理,主要分成2类,一类是RPC_GSS_PROC_DATA,传输数据,另一类是验证建立链接 RPC_GSS_PROC_INIT/RPC_GSS_PROC_CONTINUE_INIT
+      > svcauth_gss_handle_init(svc_rqst, rpc_gss_wire_cred, authp) 如果是建立链接,使用这个东西
+        > 继续从rpc数据包中取出handle,token,填充给rsi... 
+        > gss_read_verf(rpc_gss_wire_cred, argv, p, rsi) 从rpc数据包中获取cred(的gss handle),还有最后的token. 也就是 rsi的 in_handle, in_token.
+        > rsi_lookup() 调用upcall,和rpc.svcgssd沟通,返回out_handle,out_token
+        > gss_write_init_verf(...) 填充rep包, 这里返回一个针对seq window的校验数据 GSS_SEQ_WIN, 这个数字在后面的token中
+          > gss_write_verf(...)
+            > gss_get_mic(gss_ctx, ...)
+        > gss_write_resv(resv, ...) 这里包装token, out_token,krb5验证的结果.
+          > 简单顺序编码这些东西： 结果,out_handle,major,minor status, seq window, out_token.
+      > gss_svc_searchbyctx(gss_svc_data->rpc_gss_wire_cred) :根据rpc_gss_wire_cred->gc_ctx) 找到rsc, 这个gc_ctx好像是一个id,就是rsc->handle.  如果是传输数据 RPC_GSS_RPC_DATA...
+      > gss_verify_header(svc_rqst, rsc, p, gss_svc_data->rpc_gss_wire_cred, result)
+        > 先获取rpc数据包中的verifier段的数据
+        > gss_verify_mic(rsc->gss_ctx, xdr_buf, checksum)  checksum是verify段的数据  xdr_buf是rpc头部的数据.
+          > gss_verify_mic_v1(krb5_ctx, message, token) gss_ctx->internal_ctx_id是krb5_ctx..  仅仅对头部数据进行验证
+      > unwrap_integ_data(..) 如果是krb5i 对数据解码
+      > unwrap_priv_data(...) 如果是krb5p
+  
+svc_program->pg_authenticate / svc_set_client 这个函数是设置客户端身份
+  svc_rqst->rq_authop(auth_ops)->set_client(svc_rqst)   
+    > svcauth_gss_set_client(就是找到krb5这个auto_domain
+
+svc_authorise(svc_rqst)
+  > auth_ops->release(svc_rqst)
+    > svcauth_gss_release
+      > 获取gss_svc_data = svc_rqst->rq_auth_data
+      > svcauth_gss_wrap_resp_integ(svc_rqst) 当使用krb5i时调用
+      > svcauth_gss_wrap_resp_priv(svc_rqst)  当使用krb5p时调用
+      > cache_put(gss_svc_data->rsci)
+
+上面这3个函数在svc_process_common中是连续的
+
+1. rfc2203解释rpcsec_gss的协议,rpc的数据包包含特定的数据域给auth使用,request包中有cred/verf两个数据域,在response有verf数据域
+带gss的rpc过程包含3个阶段:context create, data, context destroy.
+cred:
+  type
+  data
+对于rpcsec_gss, type=6, data是rpc_gss_cred_t
+  union switch(unsigned int version)  {
+    case PRCSEC_GSS_VERS_1:  实际上只有v1
+      struct rpc_gss_cred_vers_1_t:
+        rpc_gss_proc_t gss_proc:  RPCSEC_GSS_{DATA,INIT,CONTINUE_INIT,DESTROY}
+        unsigned int seq_num:  sequence number
+        rpc_gss_service_t service:  none/integrity/privacy
+        opaque handle<> : context handle,唯一表示某个auth mech context, rsc
+
+handle serve as the identifier for the context. 
+对于建立context阶段,在call_body里面是rpc_gss_init_arg. 这时使用NULLPROC,所以本该没有call_body. handle是空.
+rpc_gss_init_arg:
+  opaque gss_token<>
+gss_token是GSS_Init_sec_context返回的
+
+context的reponse是rpc_gss_init_res,放在call_body中
+  opaque handle<>
+  int gss_major, gss_minor,seq_window
+  opaque gss_token<>
+verf不是空,set to the checksum of the seq_window. 它是GSS_GetMIC()返回的,他对rpc header和cred数据段做校验.  校验使用MIC函数,对数据加密使用wrap函数.

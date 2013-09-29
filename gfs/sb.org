@@ -1,0 +1,1254 @@
+* ops_fstype.c
+
+** gfs2_sbd
+   #+begin_src 
+	struct super_block *sd_vfs;
+	struct gfs2_pcpu_lkstats __percpu *sd_lkstats;
+	struct kobject sd_kobj;
+	unsigned long sd_flags;	/* SDF_... */
+	struct gfs2_sb_host sd_sb;
+
+	/* Constants computed on mount */
+
+	u32 sd_fsb2bb;      //fs block to basic block?  xfs?
+	u32 sd_fsb2bb_shift;
+	u32 sd_diptrs;	/* Number of pointers in a dinode */
+	u32 sd_inptrs;	/* Number of pointers in a indirect block */
+	u32 sd_jbsize;	/* Size of a journaled data block */
+	u32 sd_hash_bsize;	/* sizeof(exhash block) */
+	u32 sd_hash_bsize_shift;
+	u32 sd_hash_ptrs;	/* Number of pointers in a hash block */
+	u32 sd_qc_per_block;
+	u32 sd_blocks_per_bitmap;
+	u32 sd_max_dirres;	/* Max blocks needed to add a directory entry */
+	u32 sd_max_height;	/* Max height of a file's metadata tree */
+	u64 sd_heightsize[GFS2_MAX_META_HEIGHT + 1];
+	u32 sd_max_jheight; /* Max height of journaled file's meta tree */
+	u64 sd_jheightsize[GFS2_MAX_META_HEIGHT + 1];
+
+	struct gfs2_args sd_args;	/* Mount arguments */
+	struct gfs2_tune sd_tune;	/* Filesystem tuning structure */
+
+	/* Lock Stuff */
+
+	struct lm_lockstruct sd_lockstruct;
+	struct gfs2_holder sd_live_gh;
+	struct gfs2_glock *sd_rename_gl;
+	struct gfs2_glock *sd_trans_gl;
+	wait_queue_head_t sd_glock_wait;
+	atomic_t sd_glock_disposal;
+	struct completion sd_locking_init;
+	struct completion sd_wdack;
+	struct delayed_work sd_control_work;
+
+	/* Inode Stuff */
+
+	struct dentry *sd_master_dir;
+	struct dentry *sd_root_dir;
+
+	struct inode *sd_jindex;
+	struct inode *sd_statfs_inode;
+	struct inode *sd_sc_inode;
+	struct inode *sd_qc_inode;
+	struct inode *sd_rindex;
+	struct inode *sd_quota_inode;
+
+	/* StatFS stuff */
+
+	spinlock_t sd_statfs_spin;
+	struct gfs2_statfs_change_host sd_statfs_master;
+	struct gfs2_statfs_change_host sd_statfs_local;
+	int sd_statfs_force_sync;
+
+	/* Resource group stuff */
+
+	int sd_rindex_uptodate;
+	spinlock_t sd_rindex_spin;
+	struct rb_root sd_rindex_tree;
+	unsigned int sd_rgrps;
+	unsigned int sd_max_rg_data;
+
+	/* Journal index stuff */
+
+	struct list_head sd_jindex_list;
+	spinlock_t sd_jindex_spin;
+	struct mutex sd_jindex_mutex;
+	unsigned int sd_journals;
+
+	struct gfs2_jdesc *sd_jdesc;
+	struct gfs2_holder sd_journal_gh;
+	struct gfs2_holder sd_jinode_gh;
+
+	struct gfs2_holder sd_sc_gh;
+	struct gfs2_holder sd_qc_gh;
+
+	/* Daemon stuff */
+
+	struct task_struct *sd_logd_process;
+	struct task_struct *sd_quotad_process;
+
+	/* Quota stuff */
+
+	struct list_head sd_quota_list;
+	atomic_t sd_quota_count;
+	struct mutex sd_quota_mutex;
+	wait_queue_head_t sd_quota_wait;
+	struct list_head sd_trunc_list;
+	spinlock_t sd_trunc_lock;
+
+	unsigned int sd_quota_slots;
+	unsigned int sd_quota_chunks;
+	unsigned char **sd_quota_bitmap;
+
+	u64 sd_quota_sync_gen;
+
+	/* Log stuff */
+
+	spinlock_t sd_log_lock;
+
+	struct gfs2_trans *sd_log_tr;
+	unsigned int sd_log_blks_reserved;
+	unsigned int sd_log_commited_buf;
+	unsigned int sd_log_commited_databuf;
+	int sd_log_commited_revoke;
+
+	atomic_t sd_log_pinned;
+	unsigned int sd_log_num_buf;
+	unsigned int sd_log_num_revoke;
+	unsigned int sd_log_num_rg;
+	unsigned int sd_log_num_databuf;
+
+	struct list_head sd_log_le_buf;
+	struct list_head sd_log_le_revoke;
+	struct list_head sd_log_le_databuf;
+	struct list_head sd_log_le_ordered;
+	spinlock_t sd_ordered_lock;
+
+	atomic_t sd_log_thresh1;
+	atomic_t sd_log_thresh2;
+	atomic_t sd_log_blks_free;
+	wait_queue_head_t sd_log_waitq;
+	wait_queue_head_t sd_logd_waitq;
+
+	u64 sd_log_sequence;
+	unsigned int sd_log_head;
+	unsigned int sd_log_tail;
+	int sd_log_idle;
+
+	struct rw_semaphore sd_log_flush_lock;
+	atomic_t sd_log_in_flight;
+	struct bio *sd_log_bio;
+	wait_queue_head_t sd_log_flush_wait;
+	int sd_log_error;
+
+	unsigned int sd_log_flush_head;
+	u64 sd_log_flush_wrapped;
+
+	spinlock_t sd_ail_lock;
+	struct list_head sd_ail1_list;
+	struct list_head sd_ail2_list;
+
+	/* Replay stuff */
+
+	struct list_head sd_revoke_list;
+	unsigned int sd_replay_tail;
+
+	unsigned int sd_found_blocks;
+	unsigned int sd_found_revokes;
+	unsigned int sd_replayed_blocks;
+
+	/* For quiescing the filesystem */
+	struct gfs2_holder sd_freeze_gh;
+
+	char sd_fsname[GFS2_FSNAME_LEN];
+	char sd_table_name[GFS2_FSNAME_LEN];
+	char sd_proto_name[GFS2_FSNAME_LEN];
+
+	/* Debugging crud */
+
+	unsigned long sd_last_warning;
+	struct dentry *debugfs_dir;    /* debugfs directory */
+	struct dentry *debugfs_dentry_glocks;
+	struct dentry *debugfs_dentry_glstats;
+	struct dentry *debugfs_dentry_sbstats;   
+   #+end_src
+
+** gfs2_bitmap
+   #+begin_src 
+	struct buffer_head *bi_bh;
+	char *bi_clone;
+	unsigned long bi_flags;
+	u32 bi_offset;
+	u32 bi_start;
+	u32 bi_len;   
+   #+end_src
+
+** gfs2_rgrpd
+   - resouce group
+   #+begin_src 
+	struct rb_node rd_node;		/* Link with superblock */
+	struct gfs2_glock *rd_gl;	/* Glock for this rgrp */
+	u64 rd_addr;			/* grp block disk address */
+	u64 rd_data0;			/* first data location */
+	u32 rd_length;			/* length of rgrp header in fs blocks */
+	u32 rd_data;			/* num of data blocks in rgrp */
+	u32 rd_bitbytes;		/* number of bytes in data bitmaps */
+	u32 rd_free;
+	u32 rd_reserved;                /* number of blocks reserved */
+	u32 rd_free_clone;
+	u32 rd_dinodes;
+	u64 rd_igeneration;
+	struct gfs2_bitmap *rd_bits;
+	struct gfs2_sbd *rd_sbd;
+	struct gfs2_rgrp_lvb *rd_rgl;
+	u32 rd_last_alloc;
+	u32 rd_flags;
+#define GFS2_RDF_CHECK		0x10000000 /* check for unlinked inodes */
+#define GFS2_RDF_UPTODATE	0x20000000 /* rg is up to date */
+#define GFS2_RDF_ERROR		0x40000000 /* error in rg */
+#define GFS2_RDF_MASK		0xf0000000 /* mask for internal flags */
+	spinlock_t rd_rsspin;           /* protects reservation related vars */
+	struct rb_root rd_rstree;       /* multi-block reservation tree */   
+   #+end_src
+
+** gfs2_inum_host
+   #+begin_src 
+	u64 no_formal_ino;
+	u64 no_addr;   
+   #+end_src
+
+** gfs2_sb_host
+   #+begin_src 
+	u32 sb_magic;
+	u32 sb_type;
+	u32 sb_format;
+
+	u32 sb_fs_format;
+	u32 sb_multihost_format;
+	u32 sb_bsize;
+	u32 sb_bsize_shift;
+
+	struct gfs2_inum_host sb_master_dir;
+	struct gfs2_inum_host sb_root_dir;
+
+	char sb_lockproto[GFS2_LOCKNAME_LEN];
+	char sb_locktable[GFS2_LOCKNAME_LEN];   
+   #+end_src
+
+** init_sbd(super_block)
+   - 创建gfs2_sbd, 给super_block->s_fs_info
+
+** gfs2_check_sb(gfs2_sbd, silent)
+   - 检查gfs2_sb_host->magic/sb_type/sb_fs_format/sb_multihost_format
+
+** end_bio_io_page(bio, error)
+   - bio的回调, 设置PG_uptodate
+
+** gfs2_meta_header
+   #+begin_src 
+	__be32 mh_magic;
+	__be32 mh_type;
+	__be64 __pad0;		/* Was generation number in gfs1 */
+	__be32 mh_format;
+	/* This union is to keep userspace happy */
+	union {
+		__be32 mh_jid;		/* Was incarnation number in gfs1 */
+		__be32 __pad1;
+	};   
+   #+end_src
+
+** gfs2_sb
+   - 磁盘上的格式
+   #+begin_src 
+	struct gfs2_meta_header sb_header;
+
+	__be32 sb_fs_format;
+	__be32 sb_multihost_format;
+	__u32  __pad0;	/* Was superblock flags in gfs1 */
+
+	__be32 sb_bsize;   //file system block size
+	__be32 sb_bsize_shift;
+	__u32 __pad1;	/* Was journal segment size in gfs1 */
+
+	struct gfs2_inum sb_master_dir; /* Was jindex dinode in gfs1 */
+	struct gfs2_inum __pad2; /* Was rindex dinode in gfs1 */
+	struct gfs2_inum sb_root_dir;
+
+	char sb_lockproto[GFS2_LOCKNAME_LEN];
+	char sb_locktable[GFS2_LOCKNAME_LEN];
+
+	struct gfs2_inum __pad3; /* Was quota inode in gfs1 */
+	struct gfs2_inum __pad4; /* Was licence inode in gfs1 */
+#define GFS2_HAS_UUID 1
+	__u8 sb_uuid[16]; /* The UUID, maybe 0 for backwards compat */   
+   #+end_src
+
+
+** gfs2_sb_in(gfs2_sbd, buf)
+   - buf里面是gfs2_sb, 也就是磁盘中sb数据
+   - 根据gfs2_sb设置gfs2_sbd->gfs2_sb_host
+   - gfs2_sb有用的只有sb_bsize, 给gfs2_sbd->sb_bsize
+
+** gfs2_read_super(gfs2_sbd, sector, silent)
+   - 使用bio读回数据
+   - bio->bi_bdev = super_block->s_bdev,  bio->bi_secotr = sector * sb->s_blocksize >> 9
+   - 读回一个page
+   > bio_add_page(bio, page, PAGE_SIZE, 0)
+   > submit_bio(READ_SYNC|REQ_META, bio)
+   - 为何不用PG_uptodate, 而使用PG_locked??
+   > wait_on_page_locked(page)
+   - 获取sb 
+   > gfs2_sb_in(gfs2_sbd, p)
+   > gfs2_check_sb(gfs2_sbd, silient)
+
+** gfs2_read_sb(gfs2_sbd, silent)
+   - 先读回sb, gfs2_sbd->sd_fsb2bb是谁设定??  
+   - gfs2的super block的偏移是128 basic block,  64K
+   > gfs2_read_super(gfs2_sbd, GFS2_SB_ADDR>>gfs2_sbd->sd_fsb2bb_shift, silent)
+   - 读回来的gfs2_sb给gfs2_sbd->gfs2_sb_host, 设置gfs2_sbd其他成员
+   - inode使用的直接指针的数量
+   - gfs2_sb->sd_diptrs = (gfs2_sb_host->sb_bsize - sizeof(gfs2_dinode)) / sizeof(u64)
+   - inode使用的间接指针的数量
+   - gfs2_sb->inptrs = (gfs2_sb_host->sb_bsize - sizeof(gfs2_meta_header)) / sizeof(u64)
+   - 一个block的位图表示的块数
+   - gfs2_sbd->sd_blocks_per_bitmap = (gfs2_sbd_host->sb_bsize - sizeof(gfs2_meta_header)) * GFS2_NBBY
+   
+** gfs2_args
+   - mount参数
+
+** init_names(gfs2_sbd, silent)
+   - 获取gfs2_args->ar_lockproto / ar_locktable
+   - 如果没有指定,使用gfs2_sb中的
+   - 放到gfs2_sbd->sd_proto_name / sb_table_name
+
+** gfs2_holder
+   #+begin_src 
+	struct list_head gh_list;
+
+	struct gfs2_glock *gh_gl;
+	struct pid *gh_owner_pid;
+	unsigned int gh_state;
+	unsigned gh_flags;
+
+	int gh_error;
+	unsigned long gh_iflags; /* HIF_... */
+	unsigned long gh_ip;   
+   #+end_src
+
+** init_locking(gfs2_sbd, gfs2_holder, undo)
+   - 构造一个gfs2_glock? id是GFS2_MOUNT_LOCK ???
+   > gfs2_glock_nq_num(gfs2_sbd, GFS2_MOUNT_LOCK, gfs2_nondisk_glops, MS_ST_EXCLUSIVE, LM_FLAG_NOEXP | GL_NOCACHE, mount_gh)
+   - 然后是GFS2_LIVE_LOCK
+   - 获取一个gfs2_glock?  GFS2_RENAME_LOCK, GFS2_TRANS_LOCK
+   > gfs2_glock_get(gfs2_sbd, GFS2_RENAME_LOCK, gfs2_nondisk_glops, CREAT, gfs2_sbd->sd_rename_gl)
+
+** gfs2_lookup_root(super_block, dentry, no_addr, name)
+   - 构造一个inode, 对应no_addr
+   > gfs2_inode_lookup(super_block, DT_DIR, no_addr, 0, 0)
+   - 关联dentry 
+   > d_make_root(inode)
+
+** init_sb(gfs2_sbd, silent)
+   - 构造GFS2_SB_LOCK对应的gfs2_glock?
+   > gfs2_glock_nq_num(gfs2_sbd, GFS2_SB_LOCK, gfs2_meta_glops, LM_ST_SHARED, 0, gfs2_holder)
+   - 读取gfs2_sb 
+   > gfs2_read_sb(gfs2_sbd, silent)
+   - 设置super_block->s_blocksize 
+   > sb_set_blocksize(super_block, size)
+   - 获取root的ino, gfs2_sbd->sd_sb->sb_root_dir->no_addr
+   - 构造dentry , 给gfs2_sbd->sd_root_dir
+   > gfs2_lookup_root(super_block, dentry, no_addr, "root")
+   - 构造master inode  gfs2_sbd->gfs2_sb_host->sb_master_dir->no_addr
+   - 如果gfs2_args->ar_meta ==1, 设置super_block->s_root = master_dir, 否则是root_dir
+   - 释放gfs2_glock
+   > gfs2_glock_dq_uninit(gfs2_holder)
+
+** gfs2_jdesc
+   #+BEGIN_SRC 
+	struct list_head jd_list;
+	struct list_head extent_list;
+	struct work_struct jd_work;
+	struct inode *jd_inode;
+	unsigned long jd_flags;
+#define JDF_RECOVERY 1
+	unsigned int jd_jid;
+	unsigned int jd_blocks;
+	int jd_recover_error;   
+   #+END_SRC
+
+** gfs2_journal_extent
+   - 映射逻辑磁盘空间和物理磁盘空间, 逻辑空间就是文件的偏移
+   #+BEGIN_SRC 
+	struct list_head extent_list;
+
+	unsigned int lblock; /* First logical block */
+	u64 dblock; /* First disk block */
+	u64 blocks;   
+   #+END_SRC
+
+** map_journal_extents(gfs2_sbd)
+   - journal extent?
+   - 构造extent? 映射磁盘空间，给journal使用. 
+   - 映射gfs2_sbd->gfs2_jdesc->inode 文件的所有filesystem block的其实位置
+   > i_size_read(gfs2_jdesc->jd_inode) >> gfs2_sbd->sb_bsize_shift
+   - 使用buffer_head获取磁盘地址
+   > gfs2_block_map(gfs2_jdesc->i_inode, logic_block, buffer_head, 0)
+   - 磁盘地址是 db = buffer_head->b_blocknr
+   - 如果db不是连续的  db != prev_db +1, 使用gfs2_journal_extent建立索引
+   - 把gfs2_journal_extent->extent_list放到gfs2_jdesc->extent_list中
+
+** gfs2_others_may_mount(gfs2_sbd)
+   - 发送kobject event? 
+   > gfs2_sbd->sd_lockstruct.ls_ops->lm_first_done(gfs2_sbd)
+
+** gfs2_jindex_hold(gfs2_sbd, gfs2_holder)
+   - 获取index对应的glock?
+   - 获取锁
+   > gfs2_glock_nq_init(gfs2_inode->i_gl, LM_ST_SHARED, 0, gfs2_holder)
+   - 检查gfs2_sbd->sd_journals对应的文件是否存在?  journal%u
+   > gfs2_disk_hash(name)
+   > gfs2_dir_check(gfs2_sbd->gfs2_jindex/inode, name, NULL)
+   - 如果不存在返回0, 而且不释放锁? 
+   - 如果存在释放锁
+   > gfs2_glock_dq_uninit(gfs2_holder)
+   - 如果存在,构造新的gfs2_jdesc
+   - 获取上面的name对应的inode, 给gfs2_jdesc
+   > gfs2_lookupi(gfs2_sdb->gfs2_jindex, name, 1)
+   - 把新的gfs2_jdesc->jd_list放到gfs2_sbd->sd_jindex_list中
+   - 设置gfs2_jdesc->jd_jid = gfs2_sbd->sd_journals ++
+
+** init_journal(gfs2_sbd, undo)
+   - 初始化journal, 似乎站很大的工作量
+   - 根据gfs2_sdb->sd_master_dir->d_inode找到journal的文件夹, 给gfs2_sbd->sd_jindex
+   > gfs2_lookup_simple(inode, "jindex")
+   - 构造gfs2_holder? 
+   > gfs2_jindex_hold(gfs2_sbd, gfs2_holder)
+   - 检查journal的大小
+   > gfs2_jindex_size(gfs2_sbd)
+   - 如果为0,失败返回
+   - gfs2_args->ar_spectator表示只读操作?
+   > gfs2_jdesc_find(gfs2_sbd, 0)
+   - 否则需要做recover操作
+   - 获取gfs2_jdesc 
+   > gfs2_jdesc_find(gfs2_sbd, gfs_sbd->sd_lockstruct->ls_jid)
+   - 锁住什么? 
+   > gfs2_glock_nq_num(gfs2_sbd, gfs2_sbd->sd_lockstruct->ls_jid, gfs2_journal_glops, LM_ST_EXCLUSIVE, LM_FLAG_NOEXP, gfs2_sbd->sd_journal_gh)
+   - 再获取inode的lock?? 
+   > gfs2_glock_nq_init(gfs2_inode->i_gl, LM_ST_SHARED, LM_FLAG_NOEXP|GL_EXACT|GL_NOCACHE, gfs2_sbd->sd_jinode_gh)
+   - 检查inode信息
+   > gfs2_jdesc_check(gfs2_jdesc)
+   - 获取journal文件的磁盘地址
+   > map_journal_extents(gfs2_sbd)
+   - 如果gfs2_sbd->sd_lockstruct->ls_first !=0, recover所有的journal 
+   > gfs2_recover_journal(gfs2_jdesc_find(gfs2_sbd, x))
+   - 发送kevent?? 
+   > gfs2_others_may_mount(gfs2_sbd)
+   - 如果不是spectator挂载,recover自己的journal 
+   > gfs2_recover_journal(gfs2_sbd->sd_jdesc)
+   - 释放什么锁? 
+   > gfs2_glock_dq_uninit(gfs2_holder)
+
+** init_inodes(gfs2_sbd, undo)
+   - 初始化journal 
+   > init_journal(gfs2_sbd, undo)
+   - 找到statfs使用的inode 
+   > gfs2_lookup_simple(gfs2_sbd->sd_master_dir->d_inode, "statfs")
+   - 找到rindex使用的inode 
+   > gfs2_lookup_simple(gfs2_sbd->sd_master_dir->d_inode, "rindex")
+   - quota文件
+   - resource group 
+   > gfs2_rindex_update(gfs2_sbd)
+
+** init_per_node(gfs2_sbd, undo)
+   - 找到per_node代表的文件夹,下面是每个node使用的journal信息
+   > gfs2_lookup_simple(gfs2_sbd->sd_master_dir->d_inode, "per_node")
+   - 找到gfs2_sbd->gfs2_jdesc->jd_jid使用的statfs文件
+   > gfs2_lookup_simple(inode, 'statfs_change journalid')
+   - quota_change jd_jid文件
+   - 获取gfs2_sbd->sd_sc_inode的锁, 这时什么文件? 
+   > gfs2_glock_nq_init(gfs2_inode->i_gl, LM_ST_EXCLUSIVE, 0, gfs2_sbd->sd_sc_gh)
+   - 然后是gfs2_sbd->sd_qc_inode对应的glock 
+   > gfs2_glock_nq_init(gfs2_inode->i_gl, LM_ST_EXCLUSIVE, 0, gfs2_sbd->sd_qc_gh)
+
+** init_threads(gfs2_sbd, undo)
+   - 启动gfs2_logd线程, gfs2_sbd->sd_logd_process
+   - gfs2_quotad线程, gfs2_sbd->sd_quotad_process
+
+** lm_lockops
+   #+begin_src 
+	const char *lm_proto_name;
+	int (*lm_mount) (struct gfs2_sbd *sdp, const char *table);
+	void (*lm_first_done) (struct gfs2_sbd *sdp);
+	void (*lm_recovery_result) (struct gfs2_sbd *sdp, unsigned int jid,
+				    unsigned int result);
+	void (*lm_unmount) (struct gfs2_sbd *sdp);
+	void (*lm_withdraw) (struct gfs2_sbd *sdp);
+	void (*lm_put_lock) (struct gfs2_glock *gl);
+	int (*lm_lock) (struct gfs2_glock *gl, unsigned int req_state,
+			unsigned int flags);
+	void (*lm_cancel) (struct gfs2_glock *gl);
+	const match_table_t *lm_tokens;   
+   #+end_src
+
+** gfs2_lm_mount(gfs2_sbd, silent)
+   - 处理mount过程中的lock参数, 如果proto_name是lock_dlm, 启动gfs2_dlm_ops
+   - 使用gfs2_dlm_ops->lm_tokens处理挂载参数gfs2_sbd->gfs2_args
+   - 找到lm_lockstruct->ls_jid / lm_lockstruct->ls_first
+   > gfs2_dlm_ops->lm_mount(gfs2_sbd, gfs2_sbd->sd_table_name)
+
+** gfs2_lm_unmount(gfs2_sbd)
+   > gfs2_dlm_ops->lm_unmount(gfs2_sbd)
+
+** fill_super(super_block, gfs2_args, silent)
+   - 构造gfs2_sbd
+   > init_sbd(gfs2_sbd)
+   - 获取gfs2_args里面的proto,locktable, 如果没有指定需要读取设备的super_block获取
+   > init_names(gfs2_sbd, silent)
+   - gfs2_sbd->sd_fsname就是gfs2_sbd->sd_table_name
+   - 创建sysfs文件夹
+   > gfs2_sys_fs_add(gfs2_sbd)
+   - debugfs 文件夹
+   > gfs2_create_debugfs_file(gfs2_sbd)
+   - gfs2_dlm_ops操作
+   > gfs2_lm_mount(gfs2_sbd, slient)
+   - 构造一个glock? 或者锁住super_block?
+   > init_locking(gfs2_sbd, gfs2_holder, undo)
+   - 读取磁盘的gfs2_sbd->gfs2_sb_host
+   > init_sb(gfs2_sbd, silent)
+   - 谁启动journal , 等待gfs2_sbd->sd_flags的SDF_NONOURNALID
+   > wait_on_journal(gfs2_sbd)
+   - gfs2_sbd->lm_lockstruct->ls_jid表示dlm的结果?? 
+   - 初始化metadata的inode 
+   > init_inodes(gfs2_sbd, do)
+   - 每个node的文件
+   > inode_per_node(gfs2_sbd, do)
+   - statfs文件
+   > gfs2_statfs_init(gfs2_sbd)
+   - 启动2个线程
+   > init_threads(gfs2_sbd, do)
+   - 释放上面的mount_gh gfs2_holder 
+   > gfs2_glock_dq_uninit(gfs2_holder)
+   - 发送uevent 
+   > gfs2_online_uevent(gfs2_sbd)
+
+** set_gfs2_super(super_block, data)
+   - 创建super_block->s_bdi, 他没有创建,使用了block_dev的
+   > bdev_get_queue(super_block->block_device)->backing_dev_info
+   - 奇怪??
+
+** gfs2_mount(file_system_type, flags, dev_name, data)
+   - 打开block_device
+   > blkdev_get_by_path(dev_name, mode, fs_type)
+   - 构造super_block 
+   > sget(fs_type, test_gfs2_super, set_gfs2_super, flags, block_device)
+   - 构造gfs2_args
+   > gfs2_mount_args(gfs2_args, data)
+   - 设置blocksize? 根据磁盘而定
+   > sb_set_blocksize(super_block, block_size(block_device))
+   - 启动gfs2 
+   > fill_super(super_block, gfs2_args, MS_SILENT)
+   - 设置block_device->bd_super = super_block. 原来所有的文件系统都会这样设置?!
+
+** gfs2_mount_meta(file_system_type, flags, dev_name, data)
+   - 打开block_device 
+   > kern_path(dev_name, LOOKUP_FOLLOW, path)
+   - 创建super_block 
+   > sget(gfs2_fs_type, test_gfs2_super, set_meta_super, flags, s_bdev)
+   - 这时gfs2的整个文件系统应该是挂载的??
+   - 返回gfs2_sbd->sd_master_dir
+     
+
+* meta_io.c
+  - 这里定义address_space_operation gfs2_meta_ops, 给gfs2_glock的address_space使用
+
+** gfs2_aspace_writepage(page, writeback_control)
+   - 写回page数据
+   - 准备bio的flags, REQ_META|REQ_PRIO, 如果writeback_control->sync_mode == WB_SYNC_ALL, 使用WRITE_SYNC, 否则使用WRITE
+   - 检查PG_locked, 而且page有buffer_head
+   - 遍历所有的buffer_head
+   - 检查BH_Mapped, 怎么使用?
+   - 如果是同步操作, writeback_control->sync_mode != WB_SYNC_NONE, 获取或等待PG_Locked 
+   > lock_buffer(buffer_head)
+   - 否则, 尝试锁住buffer_head
+   > trylock_buffer(buffer_head)
+   - 如果锁不住,其他人在写回
+   > redirty_page_for_writeback(writeback_control, page)
+   - 设置BH_Async_Write, 没有提交bio?
+   > mark_buffer_async_write(buffer_head)
+   - 然后提交bio, 确认没有PG_Writeback
+   - 再遍历一遍buffer_head, 把带有BH_Async_Write的buffer_head写回
+   > submit_bh(write_op, buffer_head)
+   - 这个是gfs2_meta_ops->writepage
+
+** gfs2_meta_sync(gfs2_glock)
+   - 写回gfs2_glock->address_space的数据
+   > filemap_fdatawrite(address_space)
+   > filemap_fdatawait(address_space)
+
+** gfs2_getbuf(gfs2_glock, blkno, create)
+   - 获取buffer_head, blkno单位是gfs2_sb_host->sb_bsize, 根据他找到page
+   - 如果create ==1, 从address_space中创建page
+   > grab_cache_page(address_space, index)
+   - 否则只是查找
+   > find_lock_page(address_space, index)
+   - 构造buffer_head 
+   > create_empty_buffers(page, gfs2_sb_host->sb_bsize, 0)
+   - 找到blkno对应的buffer_head, 建立和磁盘的映射,并不是映射内存
+   > map_bh(buffer_head, super_block, blkno)
+   > mark_page_accessed(page)
+
+** meta_prep_new(buffer_head)
+   - 这里buffer_head建立内存映射, 直接访问buffer_head->b_data数据
+   - 每个buffer_head头部是gfs2_meta_header
+   - 设置gfs2_metadata_header->mh_magic = GFS2_MAGIC
+   - 去掉BH_Dirty, 设置BH_Uptodate
+
+** gfs2_meta_new(gfs2_glock, blkno)
+   - gfs2_glock是什么锁? 他有整个设备的address_space
+   > gfs2_getbuf(gfs2_glock, blkno, CREATE)
+   > meta_prep_new(buffer_head)
+
+** gfs2_meta_read(gfs2_glock, blkno, flags, buffer_head)
+   - 读取blkno只想的block
+   - 获取buffer_head 
+   > gfs2_getbuf(gfs2_glock, blkno, CREATE)
+   - 如果有BH_Uptodate, 不需要读
+   - 设置buffer_head->b_end_io = end_buffer_read_sync, 他会唤醒下面的等待
+   > submit_bh(READ_SYNC|REQ_META|REQ_PRIO, buffer_head)
+   - 如果flags & DIO_WAIT ==0, 直接返回
+   - 否则等待BH_Locked
+   > wait_on_buffer(buffer_head)
+
+** gfs2_meta_wait(gfs2_sbd, buffer_head)
+   - 等待buffer_head读完成
+   > wait_on_buffer(buffer_head)
+   - 如果唤醒后没有BH_Uptodate, 调用错误处理, 就是退出dlm
+   > gfs2_io_error_bh(gfs2_sbd, buffer_head)
+   
+** gfs2_remove_from_journal(buffer_head, gfs2_trans, meta)
+   - 处理BH_Pinned, 他表示在trans? 
+   - 释放buffer_head->bd_list链表, 这是什么链表?
+   - 修改统计数 gfs2_trans->tr_num_buf_rm / tr_num_databuf_rm
+   - 如果buffer_head->bd_tr有效, 放到gfs2_sbd的管理中? 
+   > gfs2_trans_add_revoke(gfs2_sbd, buffer_head)
+   - 去掉BH_Dirty, BH_Uptodate
+
+** gfs2_meta_wipe(gfs2_inode, bstart, blen)
+   - 标记buffer_head, 不再dirty/pinned这些buffer_head??
+   > 遍历(bstrtt, blen)范围的buffer_head 
+   > gfs2_getbuf(gfs2_inode->i_gl, bstart, NO_CREATE)
+   - 从journal中删除
+   > gfs2_remove_from_journal(buffer_head, current->journal_info, 1)
+
+** gfs2_meta_indirect_buffer(gfs2_inode, height, num, buffer_head)
+   - height是什么? metadata也有间接指针?
+   - 读取数据
+   > gfs2_meta_read(gfs2_glock, num, DIO_WAIT, buffer_head)
+   - 检查mtype/height, gfs2_meta_header->mh_type == mtype, GFS2_METATYPE_IN/GFS2_METATYPE_DI
+   > gfs2_metatype_check(gfs2_sbd, buffer_head, mtype)
+   
+** gfs2_meta_ra(gfs2_glock, dblock, extlen)
+   - readahead
+   - 首先获取第一个buffer_head
+   > gfs2_getbuf(gfs2_glock, dblock, CREATE)
+   - 如果他是BH_Uptodate, 不再处理
+   - 读取buffer_head , 虽然是READ_SYNC,但在下面等待
+   > ll_rw_block(READ_SYNC|REQ_META, 1, buffer_head)
+   - 然后遍历(dblock,extlen)范围内
+   > gfs2_getbuf(gfs2_glock, dblock, CREATE)
+   - 如果buffer_head没有PG_Uptodate, 读取数据, 这里是异步的
+   > ll_rw_block(READ|REQ_META, 1, buffer_head)
+   - 在遍历的时候,也会检查第一个buffer_head的BH_Uptodate, 如果第一个buffer_head数据得到, 退出循环
+   - 最后如果都提交了bio, 等待第一个buffer_head完成
+   > wait_on_buffer(first_bh)
+
+* rgrq.c
+
+** gfs2_rqrpd
+   #+begin_src 
+	struct rb_node rd_node;		/* Link with superblock */
+	struct gfs2_glock *rd_gl;	/* Glock for this rgrp */
+	u64 rd_addr;			/* grp block disk address */
+	u64 rd_data0;			/* first data location */
+	u32 rd_length;			/* length of rgrp header in fs blocks */
+	u32 rd_data;			/* num of data blocks in rgrp */
+	u32 rd_bitbytes;		/* number of bytes in data bitmaps */
+	u32 rd_free;
+	u32 rd_reserved;                /* number of blocks reserved */
+
+	u32 rd_free_clone;
+	u32 rd_dinodes;
+	u64 rd_igeneration;
+	struct gfs2_bitmap *rd_bits;
+	struct gfs2_sbd *rd_sbd;
+	struct gfs2_rgrp_lvb *rd_rgl;
+	u32 rd_last_alloc;
+	u32 rd_flags;
+#define GFS2_RDF_CHECK		0x10000000 /* check for unlinked inodes */
+#define GFS2_RDF_UPTODATE	0x20000000 /* rg is up to date */
+#define GFS2_RDF_ERROR		0x40000000 /* error in rg */
+#define GFS2_RDF_MASK		0xf0000000 /* mask for internal flags */
+	spinlock_t rd_rsspin;           /* protects reservation related vars */
+	struct rb_root rd_rstree;       /* multi-block reservation tree */   
+   #+end_src
+
+** gfs2_rgrp_lvb 
+   #+begin_src 
+	__be32 rl_magic;
+	__be32 rl_flags;
+	__be32 rl_free;
+	__be32 rl_dinodes;
+	__be64 rl_igeneration;
+	__be32 rl_unlinked;
+	__be32 __pad;   
+	// 这会保存到磁盘上?
+   #+end_src
+
+** gfs2_bitmap
+   #+begin_src 
+	struct buffer_head *bi_bh;
+	char *bi_clone;
+	unsigned long bi_flags;
+	u32 bi_offset;  //表示bitmap在buffer_head中的偏移
+	u32 bi_start;   //表示block索引的偏移?和bi_offset对应.
+	u32 bi_len;     //bitmap数据的长度 
+	//保存一块bitmap数据, buffer_head->b_data可访问数据. 
+   #+end_src
+
+** gfs2_rgrp
+   #+begin_src 
+	struct gfs2_meta_header rg_header;
+
+	__be32 rg_flags;
+	__be32 rg_free;
+	__be32 rg_dinodes;
+	__be32 __pad;
+	__be64 rg_igeneration;
+
+	__u8 rg_reserved[80]; /* Several fields from gfs1 now reserved */   
+   #+end_src
+
+** gfs2_rbm
+   #+begin_src 
+	struct gfs2_rgrpd *rgd;
+	struct gfs2_bitmap *bi;	/* Bitmap must belong to the rgd */
+	u32 offset;		/* The offset is bitmap relative */   
+	//这是一个包装数据结构, offset表示block的偏移
+   #+end_src
+
+** gfs2_setbit(gfs2_rbm, do_clone, new_state)
+   - 操作bitmap中的位, gfs2_rbm->offset索引的位.
+   - bitmap的数据在gfs2_rbm->gfs2_bitmap->buffer_head中.
+   - 定位到字节,获取原来的数据,使用2次抑或操作对应的字节
+   - 如果do_clone !=0, 而且gfs2_bitmap->bi_clone != NULL, 修改clone对应的数据
+
+** gfs2_testbit(gfs2_rbm)
+   - 获取对应的bit值
+
+** gfs2_bit_search(ptr, state)
+   - 检查ptr指向的64bit数据中是否有state. 
+   - 使用位图操作, 抑或state对应的值,然后奇偶位相与,如果还是1,就说明存在
+
+** gfs2_blkreserv
+   #+begin_src 
+	/* components used during write (step 1): */
+	atomic_t rs_sizehint;         /* hint of the write size */
+
+	struct gfs2_holder rs_rgd_gh; /* Filled in by get_local_rgrp */
+	struct rb_node rs_node;       /* link to other block reservations */
+	struct gfs2_rbm rs_rbm;       /* Start of reservation */
+	u32 rs_free;                  /* how many blocks are still free */
+	u64 rs_inum;                  /* Inode number for reservation */
+
+	/* ancillary quota stuff */
+	struct gfs2_quota_data *rs_qa_qd[2 * MAXQUOTAS];
+	struct gfs2_holder rs_qa_qd_ghs[2 * MAXQUOTAS];
+	unsigned int rs_qa_qd_num;   
+   #+end_src
+
+** rs_cmp(blk, len, gfs2_blkreserv)
+   - gfs2_blkreserv是write操作中用来预留空间使用的.
+   - 检查(blk, len)是否在预留的空间范围内
+   - gfs2_rbm->offset表示开始地址, gfs2_blkreserv->rs_free表示结束地址
+   > gfs2_rbm_to_block(gfs2_blkreserv->gfs2_rbm)
+   
+** gfs2_bitfit(buf, len, goal, state)
+   - 从buf指向的bitmap数据中查找state的bit
+   - goal表示查找的起始位置, 并不是从buf开始查找?
+   - 找到之后,返回state与buf地址的距离
+
+** gfs2_rbm_from_block(gfs2_rbm, block)
+   - 查找block的信息? 找到对应的gfs2_bitmap, 给gfs2_rmb
+   - gfs2_rgrpd->rd_data0, rd_data表示最大block索引, 如果block超出范围,返回-E2BIG
+   - 一个gfs2_rgrpd使用多个gfs2_bitmap, gfs2_rgrpd->rd_bits表示
+   - 设置gfs2_rbm->offset = block - gfs2_rgrpd->rd_data0, block偏移.
+   - 如果block属于第一个gfs2_bitmap, 可以返回
+   - 否则,需要找到对应的gfs2_bitmap, 计算相关的offset. 
+   - gfs2_bitmap偏移是offset / gfs2_sbd->sd_blocks_per_bitmap
+
+** gfs2_unaligned_extlen(gfs2_rbm, n_unaligned, len)
+   - 遍历n_unaligned个block对应的state, 检查是否存在non_free的block
+   - 检查函数使用
+   > gfs2_testbit(gfs2_rbm)
+   - 向前循环的函数使用
+   > gfs2_rbm_to_block(gfs2_rbm)
+   > gfs2_rbm_from_block(gfs2_rbm, block+1)
+
+** gfs2_free_extlen(gfs2_rbm, len)
+   - 检查gfs2_rbm覆盖的block中free block的长度?
+   - 开始block = gfs2_rbm->offset, 长度是len
+   - 如果gfs2_rbm->offset 不是 4对齐,先检查这些不对齐的
+   > gfs2_unaligned_extlen(gfs2_rbm, 4-n_unaligned, len)
+   - 如果上面存在non_free的,直接返回0
+   - 然后开始字节查找,每个自己对应4个block
+   - start = gfs2_rbm->gfs2_bitmap->buffer_head->b_data + gfs2_bitmap->bi_offset + gfs2_rbm->offset / GFS2_NBBY
+   - bytes是min(len, buffer_head len)
+   - 查找start指向的内存是否有非0
+   > memchr_inv(start, 0, bytes)
+   - 如果找到非0,或者扫描长度超过len, 退出循环
+   - 最后返回扫面的长度
+
+** gfs2_bitcount(gfs2_rqrpd, buffer, buflen, state)
+   - 统计(buffer, buflen)中state的block的数量
+   - 这里使用位遍历
+
+** gfs2_rgrp_verify(gfs2_rgrpd)
+   - 验证gfs2_rgrpd的一致性
+   - 统计gfs2_rgrpd所有的gfs2_bitmap的state的block的数量
+   - count[0] 对应gfs2_rgrpd->rd_free, 是空闲的block
+   - count[1] 对应gfs2_rgrpd->rd_data - rd_free - rd_dinodes, 表示普通文件数据
+   - count[2] + count[3] 对应gfs2_rgrpd->rd_dinodes, 对应所有的inode个数
+
+** rgrp_contains_block(gfs2_rgrpd, block)
+   - 验证block在gfs2_rgrpd范围内
+   - 范围是(gfs2_rgrpd->rd_data0, gfs2_rgrpd->rd_data)
+
+** gfs2_blkrgrpd(gfs2_sbd, blk, exact)
+   - 查找block对应的gfs2_rgrpd
+   - gfs2_sbd->sd_rindex_tree里面是gfs2_rgrpd->rd_node
+   - 这里查找时为何又使用gfs2_rgrpd->rd_addr
+
+
+** gfs2_rgrpd_get_first(gfs2_sbd)
+   - 获取gfs2_sbd->sd_rindex_tree中第一个gfs2_rgrpd
+
+** gfs2_rgrpd_get_next(gfs2_rgrpd)
+   - 找到gfs2_sbd->sd_rindex_tree中,gfs2_rgrpd下一个. 如果它是最后一个,就返回第一个
+
+** gfs2_free_clones(gfs2_rgrpd)
+   - 释放gfs2_rgrpd关联的所有的gfs2_bitmap->bi_clone
+
+** gfs2_rs_alloc(gfs2_inode)
+   - 构造gfs2_inode->gfs2_blkreserv
+
+** dump_rs(seq_file, gfs2_blkreserv)
+   - 格式化输出gfs2_blkreserv的信息
+
+** __rs_deltree(gfs2_blkreserv)
+   - 检查gfs2_blkreserv是否在gfs2_rgrpd中
+   > gfs2_rs_active(gfs2_blkreserv)
+   - 释放gfs2_blkreserv->rs_node的rb tree关系
+   - 释放预留的空间 gfs2_blkreserv->gfs2_rbm->gfs2_rgrpd->rd_reserved -= gfs2_blkreserv->rs_free
+
+** gfs2_rs_deltree(gfs2_blkreserv)
+   > __rs_deltree(gfs2_blkreserv)
+
+** gfs2_rs_delete(gfs2_inode)
+   - 释放gfs2_inode->gfs2_blkreserv
+   > gfs2_rs_deltree(gfs2_blkreserv)
+
+** return_all_reservations(gfs2_rgrpd)
+   - 释放gfs2_rgrpd->rq_rstree中所有的gfs2_blkreserv
+
+** gfs2_clear_rgrpd(gfs2_sbd)
+   - 释放gfs2_sbd->sd_rindex_tree中所有的gfs2_rgrpd
+   - 首先释放关联的gfs2_glock
+   > gfs2_glock_add_to_lru(gfs2_glock)
+   > gfs2_glock_put(gfs2_glock)
+   - 释放clone的空间
+   > return_all_reservations(gfs2_rgrpd)
+
+** gfs2_rindex_print(gfs2_rgrpd)
+   - 格式化输出gfs2_rgrpd信息
+
+** compute_bitstructs(gfs2_rgrpd)
+   - 构造gfs2_rgrpd->rd_bits, 里面是gfs2_bitmap数组
+   - 数组长度是长度是gfs2_rgrpd->rd_length, bit数据长度是gfs2_rgrpd->rd_bitbytes
+   - 在磁盘中,整个bitmap数据块使用1块或多块block, 在第1个block的头部是gfs2_rgrp, 其他的block头部是gfs2_metaheader
+   - 初始化gfs2_bitmap, 设置bi_offset是block内部的bitmap数据偏移,可能是sizeof(gfs2_rgrp),也可能是sizeof(gfs2_metaheader)
+   - bi_start是bitmap表示的block空间,可能是0,也可能是 sizeof(gfs2_rgrp) +  x * (gfs2_sbd->sb_bsize - sizeof(gfs2_meta_header)), 这里的单位是字节,每个自己表示4个block
+   - bi_length是bitmap长度,一般都是sb_bsize - sizeof(gfs2_meta_header)
+
+** gfs2_rindex 
+   #+begin_src 
+	__be64 ri_addr;	/* grp block disk address */
+	__be32 ri_length;	/* length of rgrp header in fs blocks */
+	__u32 __pad;
+
+	__be64 ri_data0;	/* first data location */
+	__be32 ri_data;	/* num of data blocks in rgrp */
+
+	__be32 ri_bitbytes;	/* number of bytes in data bitmaps */
+
+	__u8 ri_reserved[64];   
+   #+end_src
+
+** gfs2_ri_total(gfs2_sbd)
+   - gfs2_sbd->sd_rindex文件, 保存resource group信息, 里面是gfs2_rindex数组
+   - 根据gfs2_rindex数据,计算文件系统空间
+   - 遍历文件的数据
+   > gfs2_internal_read(gfs2_inode, buf, pos, sizeof(gfs2_rindex)
+   - 累加gfs2_rindex->ri_data
+
+** rgd_insert(gfs2_rgrpd)
+   - 把gfs2_rgrpd->rd_node放到gfs2_sbd->sd_rindex_tree中, 按照gfs2_rgrpd->rd_addr排序
+
+** read_rindex_entry(gfs2_inode)
+   - gfs2_inode是rindex文件?
+   - 从里面读取一个gfs2_rindex, 位置是gfs2_sbd->sd_rgrps
+   > gfs2_internal_read(gfs2_inode, gfs2_rindex, pos, sizeof(gfs2_rindex)
+   - 根据gfs2_rindex构造gfs2_rgrpd
+   - 构造gfs2_bitmap 
+   > compute_bitstructs(gfs2_rgrpd)
+   - 构造gfs2_glock 
+   > gfs2_glock_get(gfs2_sbd, gfs2_rgrpd->rd_addr, gfs2_rgrp_glops, CREATE, gfs2_rgrpd->gfs2_holder)
+   - 他的gfs2_glock使用的lvb是gfs2_rgrp_lvb, gfs2_glock->dlm_lksb->sb_lvbptr
+   - 把新的gfs_rgrpd放到gfs2_sbd中
+   > rgd_insert(gfs2_sbd)
+   
+** gfs2_ri_update(gfs2_inode)
+   - 读取rindex文件
+   > read_rindex_entry(gfs2_inode)
+   - 读取完成后,设置gfs2_sbd->sd_rindex_uptodate = 1
+
+** gfs2_rindex_update(gfs2_sbd)
+   - 从rindex文件更新内存的数据
+   - 如果gfs2_sbd->sd_rindex_uptodate ==0, 才需要操作
+   - 检查自己是否锁住文件, gfs2_holder->gh_pid和自己的一样??
+   > gfs2_glock_is_locked_by_me(gfs2_gock)
+   - 如果没有,获取LM_ST_SHARED锁
+   > gfs2_glock_nq_init(gfs2_glock, LM_ST_SHARED, 0, gfs2_holder)
+   - 读取数据
+   > gfs2_ri_update(gfs2_inode)
+
+** gfs2_rgrp_in(gfs2_rgrpd, buf)
+   - buf是gfs2_rgrp, 设置gfs2_rgrpd
+
+** gfs2_rgrp_out(gfs2_rgrpd, buf)
+   - 保存数据
+
+** gfs2_rgrp_lvb_valid(gfs2_rgrpd)
+   - 检查gfs2_rgrp_lvb是否有效, 也就是gfs2_rgrpd->rd_rgl
+   - 从gfs2_rgrpd的第一个gfs2_bitmap中获取gfs2_rgrp
+   - gfs2_rgrp_lvb->rl_flags == gfs2_rgrp->rg_flags
+   - gfs2_rgrp_lvb->rl_free == rg_free
+   - rl_dinodes = rg_dinode, rg_igeneration == rl_igeneration
+
+** gfs2_rgrp_ondisk2lvb(gfs2_rgrp, buf)
+   - buf是gfs2_rgrp_lvb, 根据gfs2_rgrp设置gfs2_rgrp_lvb
+
+** update_rgrp_lvb_unlinked(gfs2_rgrpd, change)
+   - 设置gfs2_rgrp_lvb->rl_unlinked += change
+
+** count_unlinked(gfs2_rgrpd)
+   - 统计unlinked的文件数量
+   - 遍历gfs2_rgrpd的所有的gfs2_bitmap, 查找bit中和GFS2_BLKST_UNLINKED相同的
+   > gfs2_bitfit(buffer, gfs2_bitmap->bi_len, goal, GFS2_BLKST_UNLINKED)
+
+** gfs2_rgrp_bh_get(gf2_rgrpd)
+   - 读取gfs2_rgrpd的header和bitmaps
+   - gfs2_rgrpd->rd_addr是block为单位的数据位置, 读取所有的buffer_head/block, 长度是gfs2_rgrpd->rd_length
+   - 数据读取怎么使用gfs2_rgrpd->gfs2_glock?
+   - gfs2_meta_read(gfs2_glock, gfs2_sbd->rd_addr + x, 0, gfs2_bitmap->buffer_head)
+   - 等待读完成
+   > gfs2_meta_wait(gfs2_sbd, gfs2_bitmap->buffer_head)
+   - 检查block的gfs2_meta_header数据
+   - 首先是gfs2_rgrp, 如果gfs2_rgrpd->rd_flags & GFS2_RDF_UPTODATE !=0, 不再处理
+   - 这些是flags, free, dinodes, igeneration等
+   > gfs2_rgrp_in(gfs2_rgrpd, buf)
+   - 然后是gfs2_rgrp_lvb, 和上面一样的数据??  rl_unlinked需要统计
+   > gfs2_rgrp_ondisk2lvb(gfs2_rgrpd->gfs2_rgrp_lvb, buf)
+   
+** update_rgrp_lvb(gfs2_rgrpd)
+   - 如果gfs2_rgrpd->rd_flags & GFS2_RDF_UPTODATE !=0, 不需要再处理
+   - 如果gfs2_rgrp_lvb->rl_magic != GFS2_MAGIC, 读取数据
+   > gfs2_rgrp_bh_get(gfs2_rgrpd)
+   - 如果不需要读取数据, 使用gfs2_rgrp_lvb更新gfs2_rgrpd
+
+** gfs2_rgrp_go_lock(gfs2_holder)
+   - 如果gfs2_holder->gh_flags & GL_SKIP & gfs2_sbd->gfs2_args->ar_rgrplvb !=0, 不需要获取数据??
+   - 获取rindex数据
+   > gfs2_rgrp_bh_get(gfs2_holder->gfs2_glock->gfs2_rgrpd)
+
+** gfs2_rgrp_go_unlock(gfs2_holder)
+   - 释放gfs2_rgrpd->gfs2_bitmap的buffer_head
+
+** gfs2_rgrp_send_discards(gfs2_sbd, offset, buffer_head, gfs2_bitmap, minlen, ptrimmed)
+   - 遍历gfs2_bitmap中offset开始的bitmap, 不过使用gfs2_bitmap->bi_clone的数据, clone
+   - 同时获取参数buffer_head中的数据是orig
+   - 如果clone !=0, orig == 0, 对应的block需要释放?
+   - 如果相邻的block会一块发送
+   > sb_issue_discard(super_block, start, nr_blks, GFS_NOFS, 0)
+
+** gfs2_fitrim(file, args)
+   - file是gfs2中的任务文件, 这里操作的是gfs2_sbd
+   - 先读取rindex数据
+   > gfs2_rindex_update(gfs2_sbd)
+   - 参数是fstrim_range, 他决定了操作block的范围
+   - 范例这些范围内的gfs2_rgrpd, 使用rb_root遍历函数
+   > gfs2_rgrpd_get_next(gfs2_rgrpd)
+   - 对于每一个gfs2_rgrpd, 获取LM_ST_EXCLUSIVE 
+   > gfs2_glock_nq_init(gfs2_rgrpd->gfs2_glock, LM_ST_EXCLUSIVE, 0, gfs2_holder)
+   - 发送trim请求
+   > gfs2_rgrp_send_discards(gfs2_sbd, gfs2_rgrpd->rd_data0, NULL, gfs2_bitmap, minlen, amt)
+   - 修改gfs2_rgrpd->rd_flags, 添加GFS2_RGF_TRIMMED
+   > gfs2_trans_begin(gfs2_sbd, RES_RG_HDR, 0)
+   - 因为这里修改了gfs2_rgrpd, 所以把第一个block放到trans中
+   > gfs2_trans_add_meta(gfs2_rgrpd->gfs2_glock, buffer_head)
+   - 把gfs2_rgrpd的数据写回磁盘
+   > gfs2_rgrp_out(gfs2_rgrpd, buffer_head->b_data)
+   - 再给gfs2_rgrp_lvb
+   > gfs2_rgrp_ondisk2lvb(gfs2_rgrpd->gfs2_rgrp_lvb, buffer_head->b_data)
+   > gfs2_trans_end(gfs2_sbd)
+
+** rs_insert(gfs2_inode)
+   - 把gfs2_inode->gfs2_blkreserv放到gfs2_rgrpd管理中
+   - 计算gfs2_blkreserv表示的空间起始位置
+   > gfs2_rbm_to_block(gfs2_blkreserv->gfs2_rbm)
+   - 检查gfs2_rbm正常使用
+   > gfs2_rs_active(gfs2_blkreserv)
+   - 把gfs2_blkreserv放到gfs2_sbd->rd_rstree中,根据上面计算的磁盘位置排序
+   - 最后设置gfs2_rgrqd->rd_reserved += gfs2_blkreserv->rs_free
+
+** rg_mblk_search(gfs2_rgrpd, gfs2_inode, requested)
+   - 在gfs2_rqrdb中查找空闲的block块
+   - 首先计算空间大小, 如果是dir, 就是1个,否则是max(request, gfs2_blkreserv->rs_sizehint)
+   - 检查gfs2_rgrpd->rd_reserved > gfs2_rgrpd->rd_free_clone, reserve的太多,不再分配
+   - 如果gfs2_rgrpd->rd_free_clone - rd_reserved < request, 空间不够
+   - 检查gfs2_blkreserv->i_goal是否在gfs2_rgrpd中
+   > rgrp_contains_block(gfs2_rgrp, gfs2_inode->i_goal)
+   - 如果不在, 使用gfs2_rgrpd->rd_last_alloc的位置
+   - 准备gfs2_rbm 
+   > gfs2_rbm_from_block(gfs2_rmb, goal)
+   - 查找连续的空间
+   > gfs2_rbm_find(gfs2_rbm, GFS2_BLKST_FREE, request, gfs2_inode, true)
+   - 根据结果设置gfs2_blkreserve
+
+** gfs2_next_unreserved_block(gfs2_rgrpd, block, length, gfs2_inode)
+   - 在gfs2_rgrpd中查找一块block空间,他不合已有的gfs2_blkreserv重叠
+   - 在rb_tree中搜索,查找是否存在重叠
+   > rs_cmp(block, length, gfs2_blkreserv)
+   - 如果存在,就检查后续的gfs2_blkreserv
+   > gfs2_rbm_to_block(gfs2_blkreserv->gfs2_rbm) + gfs2_blkreserv->rs_free
+
+** gfs2_reservation_check_and_update(gfs2_rbm, gfs2_inode, minext)
+   - 如果minext !=0， 计算gfs2_rbm的bitmap中,是否满足要求
+   > gfs2_free_extlen(gfs2_rbm, len)
+   - 检查空间是否和其他gfs2_blkreserv重叠
+   > gfs2_next_unreserved_block(gfs2_rgrpd, block, extlen, gfs2_inode)
+
+** gfs2_rbm_find(gfs2_rbm, state, minext, gfs2_inode, nowrap)
+   - 在gfs2_rgrpd中查找一块状态为state的block空间
+   - 遍历gfs2_rgrpd的所有的gfs2_bitmap
+   - 如果查找GFS2_BLKST_FREE, 而且gf2_bitmap没有空闲空间, 跳到下一个gfs2_bitmap
+   > test_bit(GBF_FULL, gfs2_rbm->gfs2_bitmap->bi_flags)
+   - 准备内存地址  
+   - 如果是GFS2_BLKST_UNLINKED, gfs2_bitmap->buffer_head->b_data + gfs2_bitmap->bi_offset
+   - 否则是gfs2_bitmap->bi_clone + gfs2_bitmap->bi_offset
+   - 找到开始的位置
+   > gfs2_bitfit(buffer, gfs2_rbm->gfs2_bitmap->bi_len, offset, state)
+   - 然后检查这段空间是否满足minext 
+   > gfs2_reservation_check_and_update(gfs2_rbm, gfs2_inode, minext)
+   - 如果找不到,跳到下一个gfs2_bitmap
+
+** try_rgrp_unlink(gfs2_rgrpd, last_unlinked, skip)
+   - 查找GFS2_BLKST_UNLINKED的block空间
+   - 构造gfs2_rbm, 使用第一个gfs2_bitmap, offset=0
+   - 循环查找
+   > gfs2_rbm_find(gfs2_rbm, GFS2_BLKST_UNLINKED, 0, NULL, true)
+   - 如果找到检查block位置
+   > gfs2_rbm_to_block(gfs2_rbm)
+   - 如果block == skip, 或者block < *last_unlinked, 重新查找
+   - 根据block构造gfs2_glock, 为何这个是inode的gfs2_glock? block位置就是i_num?
+   > gfs2_glock_get(gfs2_sbd, block, gfs2_inode_glops, CREATE, gfs2_glock)
+   - 然后gfs2_glock->gfs2_inode存在,不需要释放这个锁, 否则这里要释放它
+   > queue_work(gfs2_delete_workqueue, gfs2_glock->gl_delete)
+   - queue_work什么时候返回0?  这里应该是检查block上的inode是否还在使用中
+
+** gfs2_rgrp_congrested(gfs2_rgrpd, loops)
+   - 根据统计参数,计算一个resource group是否被多个node竞争使用
+   - gfs2_glock->gfs2_lkstats
+
+** gfs2_rgrp_used_recently(gfs2_blkreserv, msecs)
+   - 根据gfs2_rgrpd->gfs2_glock->gl_dstamp, 检查最近他是否使用过
+   - ktime_get_real() - gl_dstamp > msecs * 1000 * 1000
+
+** gfs2_orlov_skip(gfs2_inode)
+   - 产生一个随机数?
+   > get_random_bytes(skips, sizeof(skip))
+
+** gf2_select_rgrp(gfs2_rgrpd pos, gfs2_rgrpd begin)
+   - 遍历所有的gfs2_rgrpd 
+   > gfs2_rgrpd_get_next(gfs2_rgrpd)
+   > gf2_rgrpd_get_first(gfs2_sbd)
+
+** gfs2_inplace_reserve(gfs2_inode, requested, aflags)
+   - 为gfs2_inode预留空间. 
+   - 如果gfs2_inode->gfs2_blkreserv还在gfs2_rgrpd的rb_tree中,说明它还可继续使用
+   - 否则先确定gfs2_blkreserv->gfs2_rbm->gfs2_rgrpd
+   > rgrpd_contains_block(gfs2_inode->gfs2_rgrpd, gfs2_inode->i_goal)
+   > gfs2_blk2rgrpd(gfs_rgrpd, gfs2_inode->i_goal, 1)
+   - 如果是inode是dir, 而且参数aflags 包含GFS2_AF_ORLOV, 需要随机选一个? 
+   > gfs2_orlov_skip(gfs2_inode)
+   - 首先要锁住gfs2_rgrpd 
+   > gfs2_glock_is_locked_by_me(gfs2_blkreserv->gfs2_rbm->gfs2_rgrpd->gfs2_glock)
+   - 检查resource group是否有竞争或频繁使用
+   > gfs2_rgrp_used_recently(gfs2_blkreserv, 1000)
+   > gfs2_rgrp_congrested(gfs2_rgrpd, loops)
+   - 获取LM_ST_EXCLUSIVE锁
+   > gfs2_glock_nq_init(gfs2_rgrpd->gfs2_glock, LM_ST_EXCLUSIVE, flags, gfs2_blkreserv->rs_rgd_gh)
+   - 更新gfs2_rgrp_lvb 
+   > update_rgrp_lvb(gfs2_blkreserv->gfs2_rbm->gfs2_rgrpd)
+   - 还要从磁盘上更新lvb? 
+   > gfs2_rgrp_bh_get(gfs2_blkreserv->gfs2_rbm->gfs2_rgrpd)
+   - 查找block空间
+   > rg_mblk_search(gfs2_rgrpd, gfs2_inode, requested)
+   - 如果查找成功,直接返回, 也没有释放锁?
+   - 如果查找不成功,检查unlink的block
+   > try_rgrp_unlink(gfs2_rgrpd, last_unlinked, gfs2_inode->i_no_addr)
+   - 如果多次查找不成功,回收log空间
+   > gfs2_log_flush(gfs2_rgrpd, NULL)
+
+** gfs2_inplace_release(gfs2_inode)
+   - 释放gfs2_blkreserv->gfs2_holder的gfs2_glock锁
+   > gfs2_glock_dq_uninit(gfs2_holder)
+
+** gfs2_get_block_type(gfs2_rgrpd, block)
+   - 检查block的状态? 
+   - 构造gf2_rbm = {gfs2_rgrpd, }
+   - 找到gfs2_bitmap
+   > gfs2_rbm_from_block(gfs2_rbm, block)
+   - 获取state
+   > gfs2_testbit(gfs2_rbm)
+
+** gfs2_alloc_extent(gfs_rbm, dinode, n)
+   - 在定位到分配空间之后的动作?
+   - 把gfs2_bitmap->buffer_head放到gfs2_trans中
+   > gfs2_trans_add_meta(gfs2_rbm->gfs2_rgrpd->gfs2_glock, buffer_head)
+   - 修改bitmap, 修改状态位. 先处理第一个block, 可能用于inode, 可能用于数据
+   > gfs2_setbit(gfs2_rbm, true, dinode? GFS2_BLKST_DINODE:GFS2_BLKST_USED)
+   - 然后是后续的block, 一共n个block
+
+** rgblk_free(gfs2_sbd, bstart, blen, new_state)
+   - 修改bitmap时,先把原来的bitmap数据备份到clone上面
+   > gfs2_rbm_from_block(gfs2_rbm, start)
+   > gfs2_trans_add_meta(gfs2_glock, buffer_head)
+   > gfs2_setbit(gfs2_rbm, false, new_state)
+
+** gfs2_adjust_reservation(gfs2_inode, gfs2_rbm, len)
+   - 把分配空间的空间给gfs2_blkreserv
+   - 检查原来的gfs2_inode->gfs2_blkreserv是否使用参数gfs2_rbm
+   > gfs2_rs_active(gfs2_blkreserv)
+   > gfs2_rmb_eq(gfs2_blkreserv->gfs2_rbm, gfs2_rbm)
+   - 直接使用原来的
+   > 修改gfs2_blkreserv->rs_free, gfs2_rgrpd->rd_reserved
+   - 否则就释放原来的gfs2_blkreserv
+   > __rs_deltree(gfs2_blkreserv)
+
+** gfs2_alloc_blocks(gfs2_inode, bn, nblocks, dinode, generation)
+   - 首先准备gfs2_blkreserv, 使用gfs2_inode->gfs2_blkreserv
+   > gfs2_rs_active(gfs2_inode->gfs2_blkreserv)
+   - 如果gfs2_blkreserv有效,使用他的其实地址
+   > gfs2_rbm_to_block(gfs2_inode->gfs2_blkreserv->gfs2_rbm)
+   - 否则, 如果gfs2_rgrpd包含gfs2_inode->i_goal, 使用它
+   > rgrp_contains_block(gfs2_rgrpd, gfs2_inode->i_goal)
+   - 否则使用gfs2_rgrpd->rd_last_alloc + gfs2_rgrpd->rd_data0
+   - 根据goal准备gfs2_rbm, 这个不是gfs2_rsvblock的
+   > gfs2_rbm_from_block(gfs2_rbm, goal)
+   - 查找GFS2_BLKST_FREE的block空间
+   > gfs2_rbm_find(gfs2_rbm, GFS2_BLKST_FREE, 0, gfs2_inode, false)
+   - 如果找不到,可能因为gfs2_inode的原因,重新查找,而且参数gfs2_inode = NULL
+   - 修改gfs2_bitmap
+   > gfs2_alloc_extent(gfs2_rbm, dinode, nblocks)
+   - 修改gfs2_rgrpd->rd_last_alloc
+   - 修改gfs2_blkreserv??
+   > gfs2_adjust_reservation(gfs2_inode, gfs2_rbm, nblocks)
+   - 如果dinoe !=0, 他已经有block装gfs2_inode, 读取数据, 修改gfs2_inode->di_goal_meta
+   > gfs2_meta_inode_buffer(gfs2_inode, buffer_head)
+   > gfs2_trans_add_meta(gfs2_inode->gfs2_glock, gfs2_dinode)
+   - gfs2_inode->i_goal = block + ndata -1, 也就是刚才分配的结束地址, 设置gfs2_dinode->di_gaol_meta = di_goal_data
+   - 修改统计数 gfs2_rgrpd->rd_free -= nblocks, gfs2_rgrpd->rd_dinodes ++, gfs2_rgrpd->rd_igenertion给参数
+   - 既然gfs2_rgrpd的参数改变,也要把gfs2_rgrd放到trans中
+   > gfs2_trans_add_meta(gfs2_rgrpd->gfs2_glock, gf2_rgrpd->gfs2_bitmap[0]->buffer_head)
+   - 更新buffer_head上的gfs2_rgrp
+   > gfs2_rgrp_out(gfs2_rgrpd, buf)
+   - 更新gfs2_rgrp_lvb写到磁盘的gfs2_rgrp中
+   > gfs2_rgrp_ondisk2lvb(gfs2_rgrpd, buf)
+ 
+** __gfs2_free_blocks(gfs2_inode, bstart, blen, meta)
+   - 释放block空间, 修改bitmap
+   > rgblk_free(gfs2_rgrpd, bstart, blen, GFS2_BLKST_FREE)
+   - 设置gfs2_rgrpd->rd_free += blen, 去掉gfs2_rgrpd->rd_flags的GFS2_RGF_TRIMMED
+   - 把gfs2_rgrp的buffer_head放到trans中
+   > gfs2_trans_add_meta(gfs2_rgrpd, buffer_head)
+   - 更新gfs2_rgrp 
+   > gfs2_rgrp_out(gfs2_rgrpd, buf)
+   > gfs2_rgrp_ondisk2lvb(gfs2_rgrpd, buf)
+
+
+** gfs2_free_meta(gfs2_inode, bstart, blen)
+   - 释放block给gfs2_rgrpd
+   > __gfs2_free_blocks(gfs2_inode, bstart, blen, 1)
+   - statfs, Quota
+
+** gfs2_unlink_di(inode)
+   - 释放一个block 
+   > rgblk_free(gfs2_rgrpd, blkno, 1, GFS2_BLKST_UNLINKED)
+   - gfs2_trans 
+   > gfs2_trans_add_meta(gfs2_glock, buffer_head)
+   - 写gfs2_rgrp 
+   > gfs2_rgrp_out(..)
+   > gfs2_rgrp_ondisk2lvb( ..)
+   - 更新gfs2_rgrp_lvb->rl_unlinked
+   > update_rgrp_lvb_unlinked(gfs2_rgrpd, 1)
+
+** gfs2_free_uninit_di(gfs2_rgrpd, blkno)
+   - 什么是uninitialized?? 
+   > rgblk_free(gfs2_rgrpd, blkno, 1, GFS2_BLKST_FREE)
+   - 更新统计数  gfs2_rgrpd->rd_dinodes --, gfs2_rgrpd->rd_free ++
+   - 修改gfs2_rgrp, gfs2_rgrp_lvb等等
+
+** gfs2_free_di(gfs2_rgrpd, gfs2_inode)
+   - i_no_addr果然是block地址
+   > gfs2_free_uninit_di(gfs2_rgrpd, gfs2_inode->i_no_addr)
+
+** gfs2_check_blk_type(gfs2_sbd, no_addr, type)
+   - 检查gfs2_bitmap中block的状态?
+   - 找到gfs2_rgrpd
+   > gfs2_blk2rgrpd(gfs2_sbd, no_addr, 1)
+   - 锁住gfs2_rgrpd 
+   > gfs2_glock_nq_init(gfs2_rgrpd->gfs2_glock, LM_ST_SHARED, 0, gfs2_holder)
+   - 获取type 
+   > gfs2_get_block_type(gfs2_rgrpd, no_addr)
+
+** gfs2_rgrp_list 
+   #+BEGIN_SRC 
+	unsigned int rl_rgrps;		//表示数组中有效指针的长度
+	unsigned int rl_space;		//表示数组的长度
+	struct gfs2_rgrpd **rl_rgd;
+	struct gfs2_holder *rl_ghs;   
+   #+END_SRC
+
+** gfs2_rlist_add(gfs2_inode, gfs2_rgrp_list, blick)
+   - 根据block找到gfs2_rgrpd , 可能使用gfs2_inode->gfs2_rgrpd
+   > rgrp_contains_block(gfs2_inode->gfs2_rgrpd, block)
+   > gfs2_blk2rgrpd(gfs2_rgrpd, block, 1)
+   - 把gfs2_rgrpd放到gfs2_rgrp_list->gfs2_rgrpd的数组中,但不能重复
+
+** gfs2_rlist_alloc(gfs2_rgrp_list, state)
+   - 构造gfs2_rgrp_list->rg_ghs数组, 获取对应的gfs2_rgrpd的锁
+   - 请求的锁是state
+   > gfs2_holder_init(gfs2_rgrpd->gfs2_glock, state, 0, gfs2_holder)
+
+** gfs2_rlist_free(gfs2_rgrp_list)
+   - 释放锁,释放数组

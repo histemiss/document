@@ -1,0 +1,210 @@
+* file-item.c
+
+** btrfs_file_extent_item
+   #+begin_src 
+   	/*
+	 * transaction id that created this extent
+	 */
+	__le64 generation;
+	/*
+	 * max number of bytes to hold this extent in ram
+	 * when we split a compressed extent we can't know how big
+	 * each of the resulting pieces will be.  So, this is
+	 * an upper limit on the size of the extent in ram instead of
+	 * an exact limit.
+	 */
+	__le64 ram_bytes;
+
+	/*
+	 * 32 bits for the various ways we might encode the data,
+	 * including compression and encryption.  If any of these
+	 * are set to something a given disk format doesn't understand
+	 * it is treated like an incompat flag for reading and writing,
+	 * but not for stat.
+	 */
+	u8 compression;
+	u8 encryption;
+	__le16 other_encoding; /* spare for later use */
+
+	/* are we inline data or a real extent? */
+	u8 type;
+
+	/*
+	 * disk space consumed by the extent, checksum blocks are included
+	 * in these numbers
+	 */
+	__le64 disk_bytenr;
+	__le64 disk_num_bytes;
+	/*
+	 * the logical offset in file blocks (no csums)
+	 * this extent record is for.  This allows a file extent to point
+	 * into the middle of an existing extent on disk, sharing it
+	 * between two snapshots (useful if some bytes in the middle of the
+	 * extent have changed
+	 */
+	__le64 offset;
+	/*
+	 * the logical number of file blocks (no csums included).  This
+	 * always reflects the size uncompressed and without encoding.
+	 */
+	__le64 num_bytes;
+
+   #+end_src
+
+** btrfs_csum_item
+   #+begin_src 
+        //太简单了..
+   	u8 csum;
+   #+end_src
+
+** btrfs_sector_sum
+   #+begin_src 
+	/* bytenr on disk */
+	u64 bytenr;
+	u32 sum;
+   #+end_src
+
+** btrfs_ordered_sum 
+   #+begin_src 
+	/* bytenr is the start of this extent on disk */
+	u64 bytenr;
+
+	/*
+	 * this is the length in bytes covered by the sums array below.
+	 */
+	unsigned long len;
+	struct list_head list;
+	/* last field is a variable length array of btrfs_sector_sums */
+	struct btrfs_sector_sum sums[];
+   #+end_src
+	
+** btrfs_insert_file_extent(btrfs_trans_handle, btrfs_root, objectid, pos, disk_offset, disk_num_bytes, num_bytes, offset, ram_bytes, compressed, encryption, other_encoding)
+   - 先btree中插入btrfs_file_extent_item, 使用btrfs_key(objectid, BTRFS_EXTENT_DATA_KEY, pos)
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, sizeof(btrfs_file_extent_item))
+   - 根据参数填充btree item: disk_offset/disk_num_bytes/offset/num_bytes/ram_bytes/compression, generation是btrfs_trans_handle->transid
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - 这个函数的调用者仅指定num_bytes, 其他都是0?
+
+** btrfs_lookup_csum(btrfs_trans_handle, btrfs_root, btrfs_path, bytenr, cow)
+   - checksum size是固定的, 32位/64位.
+   > btrfs_super_csum_size(btrfs_root->btrfs_fs_info->btrfs_super_block)
+   - checksum是对一个block的数据计算crc32值(32位), 使用btrfs_csum_item存储.应该是一个extent对应btrfs_item, 它指向btrfs_csum_item数组. 在csum tree中存储btrfs_csum_item数据.
+   - 创建btrfs_key(BTRFS_EXTENT_CSUM_OBJECTID, BTRFS_EXTENT_CSUM_KEY, bytenr)
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, 0, cow)
+   - 找到的btrfs_key不一定正好, btrfs_key->offset<bytenr, 根据bytenr - btrfs_key.offset做偏移.  offset >> super_block->s_blocksize_bits * csum_size.  最后返回的btrfs_csum_item偏移.
+   - 返回之前先计算btrfs_item是否包含足够的btrfs_csum_item,  
+   - item_size / csum_size <= (bytenr - btrfs_key.offset) >> s_blocksize_bits
+   - 上面的super_block->s_blocksize_bits根据btrfs_super_block->sectorsize计算.
+
+** btrfs_lookup_file_extent(btrfs_trans_handle, btrfs_root, btrfs_path, objectid, offset, mod)
+   - 创建btrfs_key(objectid, BTRFS_EXTENT_DATA_KEY, offset), 去btree中查找btrfs_file_extent_item
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, len, cow)
+
+** btrfs_file_extent_length(btrfs_path)
+   - btrfs_path指向btrfs_file_extent_item, 获取extent的长度, 不是磁盘extent的长度,而是文件使用的extent的长度.
+   > btrfs_item_ptr(btrfs_path->nodes[0], btrfs_path->slots[0], btrfs_file_extent_item)
+   - 获取btrfs_file_extent_item的type: BTRFS_FILE_EXTENT_INLINE, BTRFS_FILE_EXTENT_REG, BTRFS_FILE_EXTENT_PREALLOC. 
+   - 对于REG/PREALLOC: btrfs_file_extent_item->num_bytes
+   - 对于inline, 就是btrfs_file_extent_item->ram_bytes
+
+** __btrfs_lookup_bio_sums(btrfs_root, inode, bio, logical_offset, dst, dio)
+   - 获取bio操作的数据对应的checksum
+   - 获取checksum的单位
+   > btrfs_super_csum_size(btrfs_fs_info->btrfs_super_block)
+   - 特殊inode, 它和普通文件一样分配磁盘空间.
+   > btrfs_is_free_space_inode(inode)
+   - 根据bio->bi_sector获取磁盘地址, 根据bio->bi_vec获取数据的文件偏移, 如果dio,文件偏移使用参数logical_offset
+   - 先去ordered data中查找btrfs_csum_data, 如果找到直接返回.
+   > btrfs_find_ordered_sum(inode, offset, disk_bytenr, btrfs_csum_data)
+   - 如果没有找到,去btree中查找,
+   > btrfs_lookup_csum(NULL, btrfs_root->btrfs_fs_info->csum_root, btrfs_path, disk_bytenr, 0)
+   - 如果在查找过程中有错误,需要设置这个extent没有checksum, extent_state
+   - 如果找到,上面返回精确对应的,但这里没有用.
+   - 如果找到,btrfs_item包含多个btrfs_csum_item,它很可能和后面共享btrfs_item,获取btrfs_key/item_size,计算这次查找支持的范围,以后就重复使用它. 
+   - 又根据磁盘偏移重新计算btrfs_csum_item指针,读取数据.
+   > read_extent_buffer(btrfs_path->nodes[0], sum, item+diff, csum_size)
+   - 如果参数dst有效,就把checksum放到数组中, 否则给extent_state, 在readpage的bio回调中,会使用它.
+   > set_extent_bits(extent_io_tree, offset, end, EXTENT_NODATASUM, GFP_NOFS)
+   - 继续循环, 这里为什么假定一个bio_vec就是一个sectorsize? 根据bio_vec->bv_len增加disk_bytenr/offset
+
+** btrfs_lookup_bio_sums(btrfs_root, inode, bio, dst)
+   - 非dio, 对于compressed的情况,dst是有效的,其他情况不是.
+   > __btrfs_lookup_bio_sums(btrfs_root, inode, bio, 0, dst, 0)
+
+** btrfs_lookup_bio_sums_dio(btrfs_root, ...)
+   - 这里的bio的作用是数据地址不是文件偏移,而是参数offset. ????
+   > __btrfs_lookup_bio_sums(btrfs_root, inode, bio, offset, NULL, 1)
+
+** btrfs_lookup_csums_range(btrfs_root, start, end, list_head, search_commit)
+   - 从checksum tree中获取数据,填充到ordered data中. 对每个btrfs_item,构造一个btrfs_ordered_sum, 里面为每个sector的数据准备btrfs_sector_sum. 这里面的都是连续的,可以推算地址,为何btrfs_sector_num还需要磁盘地址?
+   - 创建btrfs_key(BTRFS_EXTENT_CSUM_OBJECTID, BTRFS_EXTENT_CSUM_KEY, start), 遍历checksum tree
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 获取btrfs_key/btrfs_item, 以及对应的btrfs_csum_item数组. 这里还有一个优化,btrfs_ordered_sum不能超过PAGESIZE.
+   - 把创建的btrfs_ordered_sum放到参数list_head队列中.
+
+** btrfs_csum_one_bio(btrfs_root, inode, bio, file_start, contig)
+   - 根据bio的数据,构造一个btrfs_ordered_sum.
+   - bio中有数据磁盘位置和内存地址..磁盘位置是bio->bi_sector, 内存地址是bio->bi_vec数组
+   - 根据bio的数据量,计算btrfs_ordered_sum中的btrfs_sector_sum数量.
+   > btrfs_ordered_sum_size(btrfs_root, bio->bi_size)
+   - 首先计算磁盘起始位置bio->bi_sector<<9, 文件起始偏移, 如果contig有效file_start, 否则使用bio_vec->page计算.
+   - 找一个btrfs_ordered_extent?
+   > btrfs_lookup_ordered_extent(inode, offset)
+   - btrfs_ordered_extent->start和bio->bi_sector什么关系?
+   - 这里遍历bio->bi_vec数组，计算checksum
+   > btrfs_csum_data(btrfs_root, data+bv_offset, btrfs_csum_item->sum, bio_vec->bv_len)
+   - btrfs_sector_sum->bytenr使用bio的位置.
+   - 继续循环,增加bio_index/bio_vec, offset/disk_bytenr增加bio_vec->bv_len.
+   - 在遍历过程中,检查bio是否跨越btrfs_ordered_extent, 这就需要构造新的btrfs_ordered_sum
+   - 根据offset文件偏移判断 offset >= btrfs_ordered_extent->file_offset + len || offset < file_offset
+   - 更新btrfs_ordered_sum->len, 着需要循环累加. 把它给btrfs_ordered_extent
+   > btrfs_add_ordered_sum(inode, btrfs_ordered_sum, btrfs_ordered_sum)
+   - btrfs_ordered_extent等待这个checksum的计算过程,它唤醒下一步bio. 所以这是writepage使用的
+   - 然后查找新的btrfs_ordered_extent, 根据剩余的数据构造新的btrfs_ordered_sum
+   > btrfs_lookup_ordered_extent(inode, offset)
+
+** truncate_one_csum(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, bytenr, len)
+   - 去checksum tree中删除(bytenr,len)范围内的btrfs_csum_item, 不保证整个btrfs_item就对应这个范围
+   - btrfs_path中指向btrfs_csum_item数组,可以直接修改btrfs_csum_item的大小.. 这里还是使用btrfs_super_block->s_blocksize_bits计算btrfs_csum_item应该的大小..
+   - 根据btrfs_item/btrfs_key, 计算它覆盖的范围(btrfs_key->offset, item_size/csum_size*sectorsize) => (csum_start, csum_end)
+   - 如果csum_start < bytenr && csum_end < end_byte), 只要删除btrfs_item的后半部分, 计算newsize
+   > btrf_truncate_item(btrfs_trans_handle, btrfs_root, btrfs_path, new_size, 1)
+   - 如果csum_start >= bytenr && csum_end > end_byte && csum_start < end_byte, 只删除前半部分
+   > btrfs_truncate_item(..)
+   - 还得更新btrfs_key
+   > btrfs_set_item_key_safe(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key)
+
+** btrfs_del_csums(btrfs_trans_handle, btrfs_root, bytenr, len)
+   - 上面的删除操作是为这里服务的. 这里会循环删除,不再细看.
+   - 先找到对应的btrfs_csum_item,构造btrfs_key(BTRFS_EXTENT_DATA_KEY,BTRFS_EXTENT_CSUM_KEY, -1)
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, -1, 1)
+   - 根据btrfs_item(btrfs_csum_item数组), 计算覆盖的数据量, size << blocksize_bits... 如果这个checksum在(byte, len)的范围之类,删除整个btrfs_item
+   > btrfs_del_item(btrfs_trans_handle, btrfs_root, btrfs_path)
+   - 否则需要分割处理.. 这里的处理做的简化。 分割需要分成3段，两端的留着,中间的留着。但这里仅仅把后面一段截断，然后重新循环，这样就会处理前半段，只要作简单的截断。
+   > btrfs_split_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, offset)
+   - 最后剩下交叉的情况, 只需要去掉btrfs_item的一头..
+   > truncate_one_csum(btrfs_trans_handle, btrfs_root, ...)
+
+** btrfs_sector_sum_left(btrfs_ordered_sum, btrfs_sector_sum, total_bytes, sectorsize)
+   - btrfs_sector_sum表示一些sector数据的checksum,这里他们在磁盘中不一定连续存放. 
+   - 从第一个btrfs_sector_num开始查找,找一片位置连续的btrfs_sector_sum, 总数据量不超过btrfs_ordered_sum->len - total_bytes
+   - btrfs_sector_sum->bytenr + sectorsize == next->bytenr
+
+** btrfs_csum_file_blocks(btrfs_trans_handle, btrfs_root, btrfs_ordered_sum)
+   - 把btrfs_ordered_sum写回btree, 首先根据btrfs_sector_sum->bytenr查找对应的btrfs_csum_item, 如果找到就覆盖掉,否则扩展btrfs_item,或者插入新的btrfs_item.
+   - 使用第一个btrfs_sector_sum->bytenr查找btrfs_csum_item, 构造btrfs_key(BTRFS_EXTENT_CSUM_OBJECT, BTRFS_EXTENT_CSUM_KEY, bytenr)
+   > btrfs_lookup_csum(btrfs_trans_handle, ...)
+   - 下面各种检查,如果要插入一个现有的btrfs_item,必须保证要插入的和原来的位置连续. 每次只扩展1个
+   > btrfs_extent_item(btrfs_trans_handle, ...)
+   - 否则插入一个新的btrfs_item, 先找能放一块的btrfs_sector_sum
+   > btrfs_sector_sum_left(btrfs_ordered_sum, btrfs_sector_sum, ...)
+   - 然后写入btrfs_sector_sum->sum
+   > btrfs_mark_buffer_dirty(extent_buffer)
+
+** 总结
+   - 这里主要是计算和组织checksum. checksum是为extent data使用的,以sectorsize为单位.
+   - 开始还有添加和查找btrfs_file_extent_item的操作.
+   - 为读去btree中查找checksum, 在readpage之前操作, 放到extent_state中
+   - 为写计算checksum, 在写之前计算,在读io之前计算,然后把checksum给ordered_extent管理, 它会唤醒btrfs_ordered_extent->wait队列.
+   - 对checksum tree的操作, 插入或删除btrfs_csum_item,以及btrfs_ordered_extent的管理
+   - 对插入btree操作在btrfs_ordered_data中,删除在extent的释放中.

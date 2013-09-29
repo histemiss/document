@@ -1,0 +1,382 @@
+* lockspace.c
+
+** dlm_control_store(dlm_ls, buf, len)
+   - buf中是0或1, 对应操作dlm_ls的命令
+   - 根据dlm_ls->ls_local_handle查找lslist链表中的dlm_ls. 
+   - 参数可能会不在链表中?
+   > dlm_find_lockspace_local(dlm_ls->ls_local_handle)
+   - 如果n==0, 停止dlm_ls
+   > dlm_ls_stop(dlm_ls)
+   - 否则启动它
+   > dlm_ls_start(dlm_ls)
+
+** dlm_event_store(dlm_ls, buf, len)
+   - buf是用数字表示的命令, 给dlm_ls->ls_uevent_result
+   - 设置dlm_ls->ls_flags的LSFL_UEVENT_WAIT
+   - 唤醒dlm_ls->ls_uevent_wait队列
+
+** dlm_id_show(dlm_ls, buf)
+   - 把dlm_ls->ls_global_id放到buf中
+
+** dlm_id_store(dlm_ls, buf, len)
+   - 把buf设置到dlm_ls->ls_global_id
+
+** dlm_nodir_show(dlm_ls, buf)
+   - 检查dlm_ls->ls_flags的LSFL_NODIR
+
+** dlm_nodir_store(dlm_ls, buf, len)
+   - 和上面相反
+
+** dlm_recover_status_show(dlm_ls, buf)
+   - 操作dlm_ls->ls_recover_status 
+
+** dlm_recover_nodeid_show(dlm_ls, buf)
+   - 处理dlm_ls->ls_recover_nodeid
+
+** dlm_attr
+   #+begin_src 
+	struct attribute attr;
+	ssize_t (*show)(struct dlm_ls *, char *);
+	ssize_t (*store)(struct dlm_ls *, const char *, size_t);   
+	//这个数据结构给config文件使用,设置dlm_ls的属性
+   #+end_src
+   
+
+** do_uevent(dlm_ls, in)
+   - 发送uevent事件?
+   - 如果in !=0, 发送KOBJ_ONLINE事件, 否则是KOBJ_OFFLINE
+   > kobject_uevent(dlm_ls->ls_kobj, KOBJ_ONLINE)
+   - dlm_controld会监控uevent? 这里等待dlm_controld的反馈
+   > wait_event_interruptible(dlm_ls->ls_uevent_wait, test_and_clear_bit(LSFL_UEVENT_WAIT, dlm_ls->ls_flags))
+   - 最后返回dlm_ls->ls_uevent_result??
+
+** dlm_uevent(kset, kobject, kobj_uevent_env)
+   - kobject是dlm_ls->ls_kobj, 增加uevent事件?
+   > add_uevent_var(kobj_uevent_env, "LOCKSPACE=dlm_ls->name")
+
+** kobj_uevent_env
+   #+begin_src 
+	char *envp[UEVENT_NUM_ENVP];
+	int envp_idx;
+	char buf[UEVENT_BUFFER_SIZE];
+	int buflen;   
+   #+end_src
+
+** kset_uevent_ops 
+   #+begin_src 
+	int (* const filter)(struct kset *kset, struct kobject *kobj);
+	const char *(* const name)(struct kset *kset, struct kobject *kobj);
+	int (* const uevent)(struct kset *kset, struct kobject *kobj,
+		      struct kobj_uevent_env *env);   
+   #+end_src
+
+** dlm_lockspace_init()
+   - 创建kset? dlm_uevent_ops只使用uevent = dlm_uevent, 他会增减一个kobj_uevent_env
+   > kset_create_and_add("dlm", dlm_uevent_ops, kernel_kobj)
+
+** dlm_lockspace_exit()
+   - 注销dlm_kset
+
+** find_ls_to_scan()
+   - 遍历lslist链表上的dlm_ls, 检查dlm_ls->ls_scan_time
+   - 找一个无效的dlm_ls??  dlm_ls->ls_scan_time < jiffies, 说明他长时间没有反映!
+   > time_after_eq(jiffies, dlm_ls->ls_scan_time + dlm_config->ci_scan_secs * HZ)
+
+** dlm_scand(data)
+   - 后台任务,监控dlm_ls? 通过dlm_ls->ls_scan_time
+   - 在无线循环中,查找需要处理的dlm_ls
+   > find_ls_to_scan()
+   - 如果找到了,去执行recovery动作??
+   > dlm_lock_recovery_try(dlm_ls)
+   - 如果recovery没有问题, 检查他的rsb
+   - 首先设置dlm_ls->ls_scan_time = jiffies, 更新scan事件
+   > dlm_scan_rsbs(dlm_ls)
+   - timeout?
+   > dlm_scan_timeout(dlm_ls)
+   - waiter??
+   > dlm_scan_waiters(dlm_ls)
+   - 如果有问题,仅仅更新dlm_ls->ls_scan_time += HZ, 等1s再处理.
+   - 没处理一遍等待一段事件
+   > schedule_timeout_interruptible(dlm_config->ci_scan_secs * HZ)
+
+** dlm_scand_start()
+   - 启动dlm_scand
+
+** dlm_scand_stop()
+   
+
+** dlm_find_lockspace_globak(id)
+   - 根据dlm_ls->ls_global_id查找
+
+** dlm_find_lockspace_local(dlm_lockspace_t)
+   - 根据dlm_ls->ls_local_handle查找lslist链表中的dlm_ls
+
+** dlm_find_lockspace_device(minor)
+   - 根据dlm_ls->dlm_device->minor
+
+** dlm_put_lockspace(dlm_ls)
+   - -- dlm_ls->ls_count 
+
+** remove_lockspace(dlm_ls)
+   - 这里处理dlm_ls->ls_list链表
+   - 但还是使用无线循环等待dlm_ls->ls_count ==0
+
+** threads_start()
+   - 启动dlm_scand
+   > dlm_scand_start()
+   - 启动监听端口?
+   > dlm_lowcomms_start
+
+** threads_stop()
+   - 和上面对应
+
+** dlm_rsbtable
+   #+begin_src 
+	struct rb_root		keep;
+	struct rb_root		toss;
+	spinlock_t		lock;
+	uint32_t		flags;   
+   #+end_src
+
+** new_lockspace(name, char *cluster, flags, lvblen, dlm_lockspace_ops, ops_args, ops_result, dlm_lockspace_t)
+   - 创建一个dlm_ls
+   - 首先检查参数, name长度, lvblen %8 == 0
+   - 检查userspace的服务已经启动, 服务启动会通过文件操作修改全局变量
+   > dlm_user_daemon_available()
+   - dlm cluste是什么?
+   - 一个lockspace只是一个域,可以使用他创建资源,以及针对资源的锁
+   - 创建dlm_ls, 设置name,lvblen,ls_flags等
+   - 创建dlm_ls->ls_rsbtbl, dlm_rsbtable 是什么东西??
+   - 大量的初始化
+   - 这里有callback?
+   > dlm_callback_start(dlm_ls)
+   - 启动recover?? 
+   > dlm_recoverd_start(dlm_ls)
+   - 等待结果? 
+   > wait_event(dlm_ls->ls_recover_lock_wait, test_bit(LSFL_RECOVER_LOCK, dlm_ls->ls_flags)
+   - 创建kobject
+   > kobject_init_and_add(dlm_ls->ls_kobj, dlm_ktype, NULL, dlm_ls->ls_name)
+   - 发送事件
+   > kobject_uevent(dlm_ls->ls_kobj, KOBJ_ADD)
+   - 还有? 
+   > do_uevent(dlm_ls, 1)
+   - 等待用户的返回? 
+   > wait_for_completion(dlm_ls->ls_members_done)
+   - 创建debug文件
+   > dlm_create_debug_file(dlm_ls)
+
+** dlm_new_lockspace(name, cluster, ...)
+   - 如果是第一次创建,先启动scand那些,以及本地需要的监听端口
+   > threads_start
+   - 创建dlm_ls
+   > new_lockspace(name, ...)
+
+** lkb_idr_is_local(id, dlm_lkb, data)
+   - 检查dlm_lkb->lkb_nodeid
+
+** lkb_idr_is_any(id, dlm_lkb, data)
+   - 返回1  
+
+** dlm_idr_free(id, dlm_lkb, data)
+   - 释放dlm_lkb
+   > dlm_free_lkb(dlm_lkb)
+
+** lockspace_busy(dlm_ls, force)
+   - 检查dlm_ls是否有使用者? 使用idr,还有别的可用?
+   - 遍历idr中的指针,他们是dlm_lkb
+   - 如果force == 0
+   > idr_for_each(dlm_ls->ls_lkbidr, lkb_idr_is_any, dlm_ls)
+   - 只要存在一个dlm_lkb就返回1,不能使用更简单的遍历?
+   - 如果force ==1
+   > idr_for_each(dlm_ls->ls_lkbidr, lkb_idr_is_local, dlm_ls)
+
+** release_lockspace(dlm_ls, force)
+   - 释放dlm_ls
+   - 检查busy 
+   > lockspace_busy(dlm_ls, force)
+   - 使用dlm_ls->ls_create_count表示使用计数
+   - 释放misc文件
+   > dlm_device_deregister(dlm_ls)
+   - recover 
+   > dlm_recoverd_stop(dlm_ls)
+   - callback
+   > dlm_callback_stop(dlm_ls)
+   - 还有dlm_rsb, dlm_lkb等等
+
+** dlm_release_lockspace(lockspace, force)
+   - lockspace是dlm_ls->ls_local_handle, 先找到dlm_ls
+   > dlm_find_lockspace_local(dlm_lockspace_t)
+   - 释放dlm_ls 
+   > release_lockspace(dlm_ls, force)
+
+** dlm_stop_lockspace()
+   - 关闭所有的dlm_ls
+
+* member.c
+
+** dlm_member
+   #+begin_src 
+	struct list_head	list;
+	int			nodeid;
+	int			weight;
+	int			slot;
+	int			slot_prev;
+	int			comm_seq;
+	uint32_t		generation;   
+   #+end_src
+
+** dlm_header
+   #+begin_src 
+	uint32_t		h_version;
+	uint32_t		h_lockspace;
+	uint32_t		h_nodeid;	/* nodeid of sender */
+	uint16_t		h_length;
+	uint8_t			h_cmd;		/* DLM_MSG, DLM_RCOM */
+	uint8_t			h_pad;   
+   #+end_src
+
+** dlm_slots_version(dlm_header)
+   - 根据dlm_header->h_version & 0x0000ffff, 返回0或1
+
+** dlm_slot_save(dlm_ls, dlm_rcom, dlm_member)
+   - dlm_rcom里面包装rcom_config
+   - 设置dlm_member->slot = rcom_config->rf_our_slot, generation = rf_generation
+
+** dlm_slot
+   #+begin_src 
+	int nodeid; /* 1 to MAX_INT */
+	int slot;   /* 1 to MAX_INT */
+   #+end_src
+
+** dlm_slots_copy_out(dlm_ls, dlm_rcom)
+   - 把dlm_ls->ls_slots中的dlm_slot放到dlm_rcom中.
+
+** log_debug_slots(dlm_ls, gen, num_slots, rcom_slot, dlm_slot, array_size)
+   - 参数rcom_slot和dlm_slot数组里面的内容是一样的. 格式化打印
+
+** dlm_slot_copy_in(dlm_ls)
+   - dlm_rcom接受后给dlm_ls->ls_recover_buf
+   - 根据dlm_rcom设置dlm_ls, dlm_ls->ls_generation
+   - 根据dlm_slot设置dlm_member.  dlm_slot->ro_slot == dlm_member->slot
+
+** dlm_slots_assign(dlm_ls, num_slots, slots_size, dlm_slot, gen_out)
+   - 根据dlm_ls->ls_nodes构造一个dlm_slot数组.
+   - 如果存在dlm_member->slot == -1, 这个dlm_ls不支持slot
+   - 如果存在dlm_member->slot ==0, 也需要为他分配一个.
+   - 遍历所有的dlm_member, 对于slot!=0, 把(nodeid,slot)放到dlm_slot数组中
+   - 遍历所有slot==0的dlm_member, 在dlm_slot数组中找一个空的, 设置dlm_member/dlm_slot
+   - 最后把generation/dlm_slot数组给参数返回
+
+** add_ordered_member(dlm_ls, dlm_member)
+   - 把dlm_member放到dlm_ls->ls_nodes链表中, 而且根据dlm_member->nodeid排序
+
+** dlm_config_node
+   #+begin_src 
+	int nodeid;
+	int weight;
+	int new;
+	uint32_t comm_seq;   
+   #+end_src
+
+** dlm_add_member(dlm_ls, dlm_config_node)
+   - dlm_config_node是configfs中一个节点的信息
+   - 创建socket链接
+   > dlm_lowcomms_connect_node(dlm_config_node->nodeid)
+   - 把dlm_member添加到dlm_ls中
+   > add_ordered_member(dlm_ls, dlm_member)
+   - 每个dlm_ls都维护一个组,包括使用这个ls的节点
+
+** find_memb(list_head, nodeid)
+   - 根据nodeid查找dlm_member
+
+** dlm_is_member(dlm_ls, nodeid)
+   - nodeid是否在dlm_ls->ls_nodes中
+   > find_memb(dlm_ls->ls_nodes, nodeid)
+
+** dlm_is_removed(dlm_ls, nodeid)
+   - 在dlm_ls->ls_nodes_gone链表中查找
+
+** clear_memb_list(list_head)
+   - list_head里面是dlm_member, 释放这些dlm_member
+
+** dlm_clear_members(dlm_ls)
+   - 释放dlm_ls 
+   > clear_memb_list(dlm_ls->ls_nodes)
+   - dlm_ls->ls_num_nodes = 0
+
+** dlm_clear_members_gone(dlm_ls)
+   - 操作dlm_ls->ls_nodes_gone
+
+** make_member_array(dlm_ls)
+   - 根据dlm_member->weight, 构造一个数组. 也不怕weight太大?
+   - dlm_ls->ls_node_array
+   - 数组长度是weight总和,每个nodeid占用一段数组成员
+
+** ping_members(dlm_ls)
+   - 遍历每个dlm_member, 发送status请求
+   - 如果recover是停止的, 不再操作? dlm_ls->ls_flags & LSFL_RECOVER_STOP
+   > dlm_recovery_stopped(dlm_ls)
+   - 发送status请求
+   > dlm_rcom_status(dlm_ls, dlm_member->nodeid, 0)
+
+** dlm_lsop_recover_perp(dlm_ls)
+   - 调用recover操作? 
+   > dlm_ls->ls_ops->recover_prep(dlm_ls->ls_ops_arg)
+
+** dlm_lsop_recover_slot(dlm_ls, dlm_member)
+   - dlm_comm是节点的地址信息
+   - 检查dlm_comm->seq == dlm_member->comm_seq, 直接返回
+   - 否则需要recover?  使用dlm_slot(nodeid, slot)
+   > dlm_ls->ls_ops->recover_slot(dlm_ls->ls_ops_arg, dlm_slot)
+
+** dlm_lsop_recover_done(dlm_ls)
+   - 准备dlm_slot数组,包装dlm_ls->ls_nodes中的dlm_member
+   > dlm_ls->ls_ops->recover_done(dlm_ls->ls_ops_arg, slots, num, slot, generation)
+
+** dlm_recover 
+   #+begin_src 
+	struct list_head	list;
+	struct dlm_config_node	*nodes;
+	int			nodes_count;
+	uint64_t		seq;   
+   #+end_src
+
+** find_config_node(dlm_recover, nodeid)
+   - 从dlm_recover->dlm_config_node数组中查找nodeid对应的
+
+** dlm_recover_members(dlm_ls, dlm_recover, neg_out)
+   - 遍历dlm_ls->ls_nodes, 把失效的dlm_member放到dlm_ls->ls_nodes_gone
+   - 根据dlm_member->new ==0, 决定他失效
+   - 遍历dlm_recover->dlm_config_node数组,把没有在dlm_ls->ls_nodes中的nodeid, 创建对应的dlm_member
+   > dlm_add_member(dlm_ls, dlm_config_node)
+   - 更新weight数组
+   > make_member_array(dlm_ls)
+   - 发送status信息
+   > ping_members(dlm_ls)
+
+** dlm_ls_stop(dlm_ls)
+   - 设置dlm_ls->ls_flags的LSFL_RECOVER_STOP标志
+   - 清除dlm_ls->ls_flags的LSFL_RUNNING标志
+   > test_and_clear_bit(LSFL_RUNNING, dlm_ls->ls_flags)
+   - 如果原来有,会唤醒recover??
+   - 设置dlm_ls->ls_flags的LSFL_RECOVER_DOWN
+   > wake_up_process(dlm_ls->ls_reocverd_task)
+   - 等待recover结束
+   > wait_event(dlm_ls->ls_recover_lock_wait, test_bit(LSFL_RECOVER_LOCK, dlm_ls->ls_flags)
+   - 停止recover 
+   > dlm_recoverd_suspend(dlm_ls)
+   - 释放dlm_ls->ls_slots, dlm_slot信息
+   - 回复recover 
+   > dlm_recoverd_resume(dlm_ls)
+   - recover?? 
+   > dlm_lsop_recover_prep(dlm_ls)
+
+** dlm_ls_start(dlm_ls)
+   - 获取config信息
+   > dlm_config_nodes(dlm_ls->ls_name, dlm_config_node, count)
+   - 检查dlm_ls->ls_flags的LSFL_RUNNING, 这是必须是停止的
+   - 创建dlm_recover, 把它给dlm_ls->ls_recover_args. 原来recover使用他
+   - 设置dlm_ls->ls_flags的LSFL_RECOVER_WORK
+   > wake_up_process(dlm_ls->ls_recoverd_task)
+   - 使用recover启动dlm_ls的工作
+     

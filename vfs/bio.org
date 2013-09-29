@@ -1,0 +1,798 @@
+* mpage.c
+  - 这里处理bio完成后的回调. bio中的bio_vec必须使用整个page,除了end_of_file
+  - 如果不是整个page, 使用block_read_full_page, 处理buffer_head. 所谓block模式
+  - 对于page模式,不会创建buffer_head, 只使用一个临时的buffer_head向get_block_t索取磁盘位置
+  - 对于block模式,先创建buffer_head, 先检查BH_Uptodate, BH_Dirty.
+
+** mpage_end_io(bio, err)
+   - 根据bio设置page的状态. 遍历bio_vec, 处理所有的page 
+   - 如果是读IO, 根据BIO_UPTODATE, 设置PG_uptodate, 或者PG_error , 释放PG_locked 
+   > unlock_page(page)
+   - 对于写IO,如果bio没有BIO_UPTODATE, 设置PG_error
+   > end_page_writeback(page)
+
+** mpage_bio_submit(rw, bio)
+   - 设置bio->bi_end_io = mpage_end_io, 提交bio
+   > submit_bio(rw, bio)
+
+** mpage_alloc(block_device, first_sector, nr_vecs, gfp_flags)
+   - 创建bio, 设置磁盘信息
+   > bio_alloc(gfp_flags, nr_vecs)
+   - 设置bio->bi_bdev = bdev, bi_sector = first_sector
+
+** map_buffer_to_page(page, buffer_head, page_block)
+   - buffer_head不是page中的,这里要跳到buffer模式,所以创建buffer_head
+   - 如果page没有buffer_head, PG_private
+   > page_has_buffers(page)
+   - 检查buffer_head的i_blkbits == PAGE_CACHE_SHIFT, 把buffer_head的BH_uptodate给PG_uptodate. 只有一个block
+   > buffer_uptodate(buffer_head)
+   > SetPageUptodate(page)
+   - 否则创建buffer_head 
+   > create_empty_buffers(page, inode->i_blkbits, 0)
+   - 参数page_block是page内部偏移, 找到对应的buffer_head
+   - 根据参数buffer_head, 设置page的buffer_head, b_state/b_dev/b_blocknr
+
+** do_mpage_readpage(bio, page, nr_pages, last_block_in_bio, buffer_head, first_logical_block, get_block_t get_block)
+   - 在读操作中,获取block的磁盘地址,创建bio. 如果地址不连续,会跳到block模式
+   - 如果page有buffer_head, 就像最开始说的,使用buffer模式
+   - 当然先检查PG_uptodate, 如果有,不用继续读操作
+   > unlock_page(page)
+   - 否则使用block模式
+   > block_read_full_page(page, get_block)
+   - 处理整个page, 这个参数buffer_head是辅助的,不再创建page的所有buffer_head
+   - 处理单位是block, inode->i_blkbits. 先找到位置的文件偏移,以block为单位
+   - 起始位置是block_in_file = page->index << (PAGE_CACHE_SHIFT - blkbits), 长度是nr_pages * blocks_per_page, 但不能超过文件大小 last_block_in_file.
+   - 首先检查buffer_head中的信息, 如果有了磁盘信息,检查是否可用于当前page
+   > buffer_mapped(buffer_head)
+   - 而且他表示的文件范围(first_logical_block, buffer_head->b_size)覆盖block_in_file, 使用他的磁盘信息.  这是上次使用get_blocks获取的
+   - 遍历buffer_head和当前page重合的范围, 计算每个block的磁盘地址
+   - blocks[page_block] = buffer_head->b_blocknr + map_offset + relative_block, map_offset就是block_in_file - last_block_in_bio, relative_block就是范围内部偏移. 当然page_block ++. 同时记录buffer_head->b_dev
+   - 如果buffer_head的长度不足以覆盖整个page, 他的映射信息用完, 去掉BH_mapped标志
+   > clear_buffer_mapped(buffer_head)
+   - 开来buffer_head和last_logical_block是对应的,磁盘地址和文件偏移地址
+   - 上面已经获取了一些block的地址信息, 在blocks数组中. 下面调用get_blocks重新计算磁盘映射信息
+   - 还是使用buffer_head传递映射信息, 设置buffer_head->page = page, buffer_head->b_size = (last_block - block_in_file) << blkbit. 
+   > get_block(inode, block_in_file, buffer_head, 0)
+   - block_in_file表示当前block的文件偏移, 如果获取成功, 设置first_logical_block = block_in_file. 
+   - 如果不成功,跳到buffer模式
+   - 检查buffer_head的BH_mapped 
+   > buffer_mapped(buffer_head)
+   - 如果没有映射信息, 就是hole? 直接处理下一个block 
+   - 检查buffer_head的BH_uptodate, get_blocks竟然会读出数据?? 同样跳到buffer模式
+   > buffer_uptodate(buffer_head)
+   > map_buffer_to_page(page, buffer_head, page_block)
+   - 检查host, 已经连续block的磁盘地址
+   - 如果hole的block在中间,或者buffer_head->b_blocknr和之前的blocks地址不连续,跳转到buffer模式
+   - 和上面一样,把buffer_head的地址给blocks数组
+   - 最后遍历完所有的block, 可能获取了所有block的地址,也可能后半部分是hole, 但不可能中间是hole. 而且blocks数组中是每个block的磁盘地址,而且连续
+   - 如果hole != blocks_per_page, 把page清0. hold的后半部分 
+   > zero_user_segment(page, first_hole << blkbits, PAGE_CACHE_SIZE)
+   - 如果first_hole ==0, 设置PG_uptoate, 释放page, 整个page都是hole!
+   > SetPageUptodate(page)
+   > unlock_page(page)
+   - 如果全部都映射了,设置PG_mappedtodisk 
+   > SetPageMappedToDisk(page)
+   - 然后开始发送bio, 首先是参数bio,它的最后磁盘地址是last_block_in_bio, 如果和blocks数组不连续,先提交这个bio
+   > mpage_bio_submit(READ, bio)
+   - 循环处理page的block, 底层block_device可能无法全部处理这些bio
+   > mpage_alloc(bdev, blocks[0] << (blkbits - 9), nr_pages, GFP_KERNEL)
+   - nr_pages只是一个提示性的变量,这里只处理一个page
+   - 把page放到bio中
+   > mpage_bio_submit(READ, bio)
+   - 检查这个bio是否可以再次使用,如果不能,这里提交bio
+   - 对于boundary的,不能再次使用,或者有hole的
+   - buffer_boundary(buffer_head)
+   - 如果可以再次使用,设置last_block_in_bio = blocks[blocks_per_page -1 ]
+
+** mpage_readpages(address_space, list_head, nr_pages, get_block)
+   - 这个函数只在readahead中调用,其他情况都是同步读,没空多读一些数据. 而且只处理pagecache中没有的page.
+   - 遍历page,首先获取page的每个block的磁盘信息,然后提交bio,读取page.
+   - 他使用上面的函数,所以有3中情况不会处理.
+   - page中有buffer不会处理
+   - page中间有hole, 不会处理
+   - page的block的磁盘地址不连续,也不会处理.
+   - 对于上面出现的BH_Boundary, 是get_block中使用的,获取映射信息需要读取block, 如果映射信息所在的磁盘和当前读的磁盘位置很近,可以直接提交当前的bio, 下次获取映射信息时有利于合并bio. 至少注释是这么解释的.
+   - 准备一个buffer_head, 用来获取映射信息, 这里会重用bio, first_logical_block
+   - 遍历list_head链表中的page
+   > add_to_page_cache_lru(page, address_space, page->index, GFK_KERNEL)
+   - 读回page
+   > do_mpage_readpage(bio, page, nr_pages - page_idx, last_block_in_bio, buffer_head, first_logical_block, get_block)
+   - 最后提交bio 
+   > mpage_bio_submit(READ, bio)
+
+** mpage_readpage(page, get_block)
+   - 和上面一样,不过只处理一个page
+   - 构造buffer_head 
+   > do_mpage_readpage(bio, page, 1, last_block_in_bio, buffer_head, first_logical_block, get_block)
+   > mpage_bio_submit(READ, bio)
+
+** mpage_data 
+   #+BEGIN_SRC 
+	struct bio *bio;
+	sector_t last_block_in_bio;
+	get_block_t *get_block;
+	unsigned use_writepage;   
+   #+END_SRC
+
+** 总结PG_locked
+   - 读肯定会锁住它,使用它唤醒异步的等待
+   - 写分成2个过程,一个是写到pagecache中,对于nfs来说是锁住page操作.
+   - 另一个是bdi启动bio, 同样锁住page一段时间,修改PG_dirty, PG_writeback
+
+** 总结PG_dirty 
+   - 在write_end(page)时设置PG_dirty, 在提交bio之前,去掉PG_dirty.
+   - 但设置PG_dirty是多种多样, nfs/cifs使用__set_page_dirty_nobuffers, btrfs比较怪, xfs使用了buffer_head的方法
+   - 对于writpage, 也有buffer方式
+   - 第一种是扫面page, 获取磁盘地址,发射bio 
+   - 第二种是使用address_space_opearations->writepage(page, writeback_control)
+   - 对于第二种,gfs2的writepage还是先尝试__mpage_writepage, 当然会失败, 然后使用buffer方式.
+
+** __mpage_writepage(page, writeback_control, data)
+   - data是mpage_data参数, 包装get_block_t
+   - 如果page有buffer_head,检查是否满足page模式.
+   > page_has_buffers(page)
+   - 遍历buffer_head
+   - 如果buffer_head没有BH_Mapped, 有BH_Dirty, 跳转到第二种方式
+   - 这是__set_page_dirty_buffers导致的,所以page肯定有buffer_head
+   - 这时page已经去掉PG_dirty, 但page被锁住, PG_locked. 
+   - 没有BH_Mapped的buffer_head, 就是hole? hole后面不能有mapped的buffer_head, 跳到第二种方式
+   - 如果buffer_head已经映射,但没有BH_Drity和BH_Uptodate, 使用第二种方式. 第二种方式直接忽略它.
+   - 检查buffer_head->b_blocknr是否和前面的磁盘地址连续. 如果不连续,跳到第二种方式.
+   - 如果buffer_head有BH_Boundary, 记录地址
+   - 最后如果page有buffer_head, 但都没有mapped,跳转到buffer模式??
+   - 如果page没有buffer_head, 查找磁盘地址. 文件偏移是page->index<<(PAGE_CACHE_SHIFT - blkbits)
+   - page没有创建buffer_head, 只是使用数组blocks记录每个buffer_head的磁盘位置.
+   - 构造buffer_head, 设置buffer_head->b_size = 1<<blkbits
+   > mpage_data->get_block(inode, block_in_file, buffer_head, 1)
+   - 如果找到的buffer_head有BH_New, 写回它之前的数据
+   > unmap_underlying_metadata(buffer_head->b_bdev, buffer_head->b_blocknr)
+   - 如果有BH_Boundary, 记录位置,下面发送bio时使用
+   - 比较buffer_head->b_blocknr和前面的block是否连续, 如果不连续,跳到第二种方式
+   - 最后超过文件边界的page清0
+   - 提交bio, 使用mpage_data->bio重复使用, mpage_data->last_bio_in_bio表示bio的结束物理地址
+   - 如果mpage_data->last_block_in_bio和blocks不连续,先提交它
+   > mpage_bio_submit(WRITE, bio)
+   - 如果bio无效,构造新的
+   > mpage_alloc(bdev, blocks[0] <<(blkbits-9), bio_get_nr_vecs(bdev), GFS_NOFS|__GFP_HIGH)
+   - 把page放到bio中
+   > bio_add_page(bio, page, length, 0)
+   - 提交完成bio,清除BH_Dirty, 设置PG_writeback, 其他任务开始等.
+   - 如果page有buffer_head, 遍历清除标志
+   > page_has_buffers(page)
+   > clear_buffer_dirty(buffer_head)
+   - 如果buffer_head太多,释放他们 ,buffer_heads_over_limit
+   > try_to_free_buffers(page)
+   - 其他处理这些数据的任务开始等待.
+   > set_page_write(page)
+   > unlock_page(page)
+   - 处理BH_Boundary标志, 和上面read类似
+   > write_boundary_block(blockdary_bdev, boundary_block, 1<<blkbits)
+   - 最后如果bio可以继续使用,设置mpage_data->last_block_in_bio = blocks[blocks_per_page-1]
+   - 如果使用第二种方式
+   > address_space_operations->writepage(page, writeback_control)
+
+** mpage_writepages(address_space, writeback_control, get_block_t)
+   - 如果get_block_t != NULL, 使用标准操作
+   > generic_writepages(address_space, writeback_control)
+   - 否则构造mpage_data. 使用一个包装函数写回
+   > write_cache_pages(addres_space, writeback_control, __mpage_writepage, mpage_data)
+   
+** mpage_writepage(page, get_block_t, writeback_control)
+   - 构造一个bio, 然后直接提交
+   > __mpage_writepage(page, writeback_control, mpage_data)
+   > mpage_bio_submit(WRITE, bio)
+
+** 总结
+   - 这里实现一套writepages/readpaes, 好像没有人使用
+
+* buffer.c
+
+** buffer_head 
+   #+BEGIN_SRC 
+	unsigned long b_state;		/* buffer state bitmap (see above) */
+	struct buffer_head *b_this_page;/* circular list of page's buffers */
+	struct page *b_page;		/* the page this bh is mapped to */
+
+	sector_t b_blocknr;		/* start block number */
+	size_t b_size;			/* size of mapping */
+	char *b_data;			/* pointer to data within the page */
+
+	struct block_device *b_bdev;
+	bh_end_io_t *b_end_io;		/* I/O completion */
+ 	void *b_private;		/* reserved for b_end_io */
+	struct list_head b_assoc_buffers; /* associated with another mapping */
+	struct address_space *b_assoc_map;	/* mapping this buffer is
+						   associated with */
+	atomic_t b_count;		/* users using this buffer_head */   
+   #+END_SRC
+
+** init_buffer(buffer_head, bh_end_io_t handle, private)
+   - 设置buffer_head 
+
+** touch_buffer(buffer_head)
+   - 操作对应的page, 设置PG_referenced
+   > mark_page_accessed(page)
+
+** sleep_on_buffer(void *)
+   > io_schedule()
+
+** __lock_buffer(buffer_head)
+   - 等待buffer_head的BH_Lock, 最后还会锁住它
+   > wait_on_bit_lock(buffer_head->b_state, BH_Lock, sleep_on_buffer, TASK_UNINTERRUPTIBLE)
+
+** unlock_buffer(buffer_head)
+   - 去掉buffer_head->b_state的BH_Lock, 唤醒等待的任务
+
+** buffer_check_dirty_writeback(page, bool *dirty, bool *writeback)
+   - 检查page中的buffer是否writeback/dirty, 通过两个参数返回
+   - 如果page没有buffer_head, 返回
+   > page_has_buffers(page)
+   - 如果page有PG_writeback, 设置参数writeback. 
+   - 遍历page的buffer_head, 如果有一个buffer_head有BH_Dirty,设置dirty, 如果有BH_Lock, 设置writeback
+
+** __wait_on_buffer(buffer_head)
+   - 刚开始看以为他和__lock_buffer一样,但仅仅等待
+   > wait_on_bit( ### )
+
+** __clear_page_buffers(page)
+   - 设置page->private = 0, 去掉PG_private标志
+
+** buffer_io_error(buffer_head)
+   - 打印错误信息
+
+** __end_buffer_read_notouch(buffer_head, uptodate)
+   - read的bio的回调操作
+   - 如果update !=0, 设置BH_Uptodate, 否则清除BH_Uptodate
+   > unlock_buffer(buffer_head)
+
+** end_buffer_read_sync(buffer_head, uptodate)
+   - 这时同步操作? 唤醒等待的任务
+   > __end_buffer_read_notouch(buffer_head, uptodate)
+   > put_bh(buffer_head)
+
+** end_buf_write_sync(buffer_head, uptodate)
+   - 写bio也使用uptodate? 
+   - 如果uptodate!=0, 设置BH_Uptodate
+   > set_buffer_uptodate(buffer_head)
+   - 否则设置BH_Write_EIO, 去掉BH_Uptodate
+   - 唤醒等待的任务
+   > unlock_buffer(buffer_head)
+   > put_bh(buffer_head)
+
+** __find_get_block_slow(block_device, sector_t)
+   - 这里获取sector_t对应的buffer_head
+   - 操作的文件是block_device->bd_inode, sector_t就是磁盘文件偏移.
+   - 获取pagecache的page, 如果没有直接退出
+   > find_get_page(address_space, index)
+   - 如果page没有buffer_head, 直接退出
+   - 遍历buffer_head, 找到buffer_head->b_blocknr == block的, 这些buffer_head都是直接映射.
+   - 如果找不到会是什么样? 但这里还有buffer_head没有BH_Mapped的??
+
+** free_more_memory()
+   - 启动bdi线程写回数据
+   > wakeup_flusher_threads(1024, WB_REASON_FREE_MORE_MEM)
+   - 遍历cpu,zone等,释放cache的page 
+   > try_to_free_pages(node_zonelist(nid, GFP_NOFS), 0, GFP_NOFS, NULL)
+
+** end_buffer_async_read(buffer_head, uptodate)
+   - 异步bio的结束处理
+   - 首先根据uptodate修改buffer_head->b_state的BH_Uptodate
+   - 去掉BH_Async_Read, BH_Lock 
+   > unlock_page(buffer_head)
+   - 然后处理他所在的page, 遍历buffer_head
+   - 如果还有buffer_head在async read过程中, 有BH_Async_Read, 直接退出,不处理page
+   - 如果所有的buffer_head都有BH_Uptodate, 设置page的PG_uptodate
+   - 如果所有的buffer_head都完成,唤醒等待page的任务
+   - 对于buffer_head的遍历检查使用一个bit spin lock保护,他是page第一个buffer_head->b_state的BH_Uptodate_Lock位.
+   > bit_spin_lock(BH_Uptodate, buffer_head->b_state)
+   > SetPageUptodate(page)
+   > unlock_page(page)
+
+** end_buffer_async_write(buffer_head, uptodate)
+   - 这里的异步表示等待的距离很远,在page层等待. 同步表示等待bio的结果?
+   - 根据uptodate更新buffer_head的BH_Uptodate, 如果出错就是BH_Write_EIO, PG_Error, 还有address_space->flags的AS_EIO
+   > set_buffer_uptodate(buffer_head)
+   - 然后去掉buffer_head的BH_Async_Write, 表示这个buffer_head完成
+   - 遍历page的buffer_head, 检查是否都完成
+   > buffer_async_write(buffer_head)
+   - 使用page第一个buffer_head->b_state的BH_Uptodate_Lock保护,和上面一样
+   - 如果page的buffer_head都完成,去掉PG_wirteback
+   > end_page_writeback(page)
+
+** mark_buffer_async_read(buffer_head)
+   - 设置buffer_head->b_end_io = end_buffer_read_sync 
+   - 设置buffer_head的BH_Async_Read 
+
+** mark_buffer_async_write_endio(buffer_head, bh_end_io_t)
+   - 设置回调函数和BH_Async_Write
+
+** mark_buffer_async_write(buffer_head)
+   - 使用上面的回调函数. 上面的没有用,使用的回调函数都是这一个.
+   > mark_buffer_async_write_endio(bh, end_buffer_async_write)
+
+** __remove_assoc_queue(buffer_head)
+   - 释放buffer_head->b_assoc_buffers链表, 它在address_space->private_list中.
+   - inode的数据使用pagecache, 但还需要许多block存储磁盘映射信息,如果这些数据使用buffer_head, 他们就在block_device->bd_inode->address_space中. 同时他们还在对应文件的address_space中
+   - 设置buffer_head->b_assoc_map = NULL 
+
+** inode_has_buffers(inode)
+   - 表示inode的metadata是否使用buffer? 
+   > list_empty(inode->address_space->private_list)
+
+** osync_buffers_list(lock, list_head)
+   - O_SYNC操作时使用, 这里等待list_head链表中的buffer_head的写完成.
+   - 遍历list_head链表中的page
+   > wait_on_buffer(buffer_head)
+
+** do_thaw_one(super_block, unused)
+   - 冻住block_device 
+   > thaw_bdev(super_block->s_bdev)
+
+** do_thaw_all(work_struct)
+   - 冻住所有的super_block 
+   > iterate_supers(do_thaw_one, NULL)
+   - 释放work_struct 
+
+** emergency_thaw_all(void)
+   - 调度执行do_thaw_all 
+   > schedule_work(work_struct)
+
+** sync_mapping_buffers(address_space)
+   - 写回assocate buffers,使用address_space->private_data->private_list管理?
+   - 为何使用间接的address_space?
+   > fsync_buffers_list(address_space->private_lock, address_space->private_list)
+
+** write_boundary_block(block_device, bblock, blocksize)
+   - 写回bblock+1指向的buffer_head. 奇怪
+   - 找到buffer_head,它属于block_device
+   > __find_get_block(block_device, bblock+1, blocksize)
+   - 如果有BH_Dirty, 发送bio. 在发送buffer_head时会锁住buffer_head
+   > ll_rw_block(WRITE, 1, buffer_head)
+
+** mark_buffer_dirty_inode(buffer_head, inode)
+   - buffer_head里面是inode使用的metadata
+   - 首先设置buffer_head的BH_Dirty,还可能有PG_dirty
+   > mark_buffer_dirty(buffer_head)
+   - 设置inode->i_mapping->private_data = buffer_head->page->address_space
+   - 把buffer_head放到inode的address_space->private_list中
+
+** __set_page_dirty(page, address_space, warn)
+   - 设置address_space的PAGECACHE_TAG_DIRTY, 还有inode
+   > __mark_inode_dirty(address_space->host, I_DIRTY_PAGES)
+
+** __set_page_dirty_buffers(page)
+   - 首先设置page所有的buffer_head的BH_Dirty
+   - 设置PG_dirty, 如果之前没有,设置pagecache和inode 
+   > __set_page_dirty(page, address_space, 1)
+
+** fsync_buffers_list(lock, list_head)
+   - 遍历list_head链表中的buffer_head, 写回其中的数据
+   - 第一次遍历把BH_Dirty或者BH_Locked的放到临时队列, 如果有BH_Dirty, 发起sync bio
+   > __remove_assoc_queue(buffer_head)
+   > write_dirty_buffer(buffer_head, WRITE_SYNC)
+   - 第二次遍历临时队列,把带有BH_Dirty的放回到private_list中
+   - 等待IO中的buffer_head 
+   > wait_on_buffer(buffer_head)
+   - 最后还要再等待一边?? 
+   > osync_buffers_list(lock, list)
+
+** invalidate_inode_buffers(inode)
+   - 删除inode的特殊buffer_head, inode->address_space->private_list, 而不是pagecache 
+   > inode_has_buffers(inode)
+   - 直接释放链表关系
+   > __remove_assoc_queue(BH_ENTRY(list->next))
+
+** remove_inode_buffers(inode)
+   - 释放没有脏数据的metadata buf 
+   > inode_has_buffers(inode)
+   - 遍历address_space->private_list, 检查BH_Dirty 
+   > buffer_dirty(buffer_head)
+   - 如果是干净的,直接释放链表关系
+   > __remove_assoc_queue(buffer_head)
+
+** alloc_page_buffers(page, size, retry)
+   - 创建page的buffer_head, 但没有设置buffer_head->b_state? 但设置buffer_head->b_data??
+   > alloc_buffer_head(GFP_NOFS)
+   > set_bh_page(buffer_head, page, offset)
+   - 如果分配失败，释放内存 
+   > free_more_memory()
+
+** link_dev_buffers(page, buffer_head)
+   - 把buffer_head给page->private 
+
+** blkdev_max_block(block_device, size)
+   - 获取block_device的大小
+
+** init_page_buffers(page, block_device, block, size)
+   - 设置buffer_head的磁盘信息, 根据page状态设置buffer_head的状态.
+   - 跳过已经映射的buffer_head
+   > buffer_mapped(buffer_head)
+   > init_buffer(buffer_head, NULL, NULL)
+   - 设置BH_Uptodate, 还有BH_Mapped
+   
+** grow_dev_page(block_device, sector_t, pgoff_t, size, sizebits)
+   - 构造block_device文件的pagecache 
+   > find_or_create_page(block_device->bd_inode->address_space, index, __GFP_MOVABLE)
+   - 处理page的buffer_head. 应该不存在page中只有一部分buffer_head.
+   - 如果有buffer_head 
+   > page_has_buffers(page)
+   - 如果buffer_head->b_size ==size, 直接设置磁盘信息. 这里是直接映射
+   > init_page_buffers(page, block_device, index<<sizebits, size)
+   - 否则释放原来的buffer_head, 重新分配
+   > try_to_free_buffers(page)
+   > alloc_page_buffers(page, size, 0)
+   - 关联buffer_head和page 
+   > link_dev_buffers(page, buffer_head)
+   > init_page_buffers(page, bdev, index<<sizebits, size)
+
+** grow_buffers(block_device, block, size)
+   - 根据block计算page索引, 然后创建page/buffer_head 
+   > grow_dev_page(block_device, block, index, size, sizebits)
+
+** __getblk_slow(block_device, sector_t, size)
+   - 找到一个buffer_head, 它所在的page属于block_device文件
+   > __find_get_block(block_device, block, size)
+   > grow_buffers(block_device, block, size)
+
+** mark_buffer_dirty(buffer_head)
+   - 设置BH_Dirty, 同时设置PG_dirty
+   > __set_page_dirty(page, address_space, 0)
+
+** __brelse(buffer_head)
+   > put_bh(buffer_head)
+
+** __bforget(buffer_head)
+   - 去掉BH_Dirty, 而且释放buffer_head->b_assoc_map链表
+   > __brelse(buffer_head)
+
+** __bread_slow(buffer_head)
+   - 先锁住buffer_head, 如果有BH_Uptodate不用读
+   - 设置buffer_head->b_end_io = end_buffer_read_sync, 然后提交bio 
+   > submit_bh(READ, buffer_head)
+   - 等待结果, 这也就是所谓同步等待
+   > wait_on_buffer(buffer_head)
+   - 还得检查BH_Uptodate
+
+** lookup_bh_lru(block_device, sector_t, size)
+   - 在cpu变量bh_lrus中查找对应的buffer_head
+
+** __find_get_block(block_device, sector_t, size)
+   - 先去lru查找, 如果找不大就去pagecache查找
+   > __find_get_block_slow(block_device, block)
+   - 把它放到lru中
+   > bh_lru_install(buffer_head)
+   - 修改PG_referenced 
+   > touch_buffer(buffer_head)
+
+** __getblk(block_device, block, size)
+   - 首先只是查找 
+   > __find_get_block(block_device, block, size)
+   - 如果找不到创建buffer_head 
+   > __getblk_slow(block_device, block, size)
+
+** __breadahead(block_device, block, size)
+   - 获取buffer_head 
+   > __getblk(block_device, block, size)
+   - 读取数据, 使用READA模式?? 
+   > ll_rw_block(READA, 1, buffer_head)
+   > brelse(buffer_head)
+
+** __bread(block_device, block, size)
+   - 普通读模式, 而且是同步模式.等待读结果
+   > __getblk(block_device, block, size)
+   > __bread_slow(buffer_head) 
+
+** invalidate_bh_lru(arg)
+   - 释放lru队列
+
+** set_bh_page(buffer_head, page, offset)
+   - highmem的话, b_data = offset, 否则计算page地址
+   > page_address(page)
+
+** discard_buffer(buffer_head)
+   - 去掉buffer_head的各种标志
+
+** block_invalidatepage(page, offset, length)
+   - 遍历(offset,length)范围内的buffer_head, 释放他们的映射信息,状态标志.
+   - 他们对应的磁盘空间要释放掉!
+   > discard_buffer(buffer_head)
+   - 如果offset ==1, 释放page?? address_space_operations->releasepage()
+   > try_to_release_page(page, 0)
+
+** create_empty_buffers(page, blocksize, b_state)
+   - 首先构造page的buffer_head
+   > alloc_page_buffers(page, blocksize, 1)
+   - 遍历buffer_head, 根据PG_dirty和PG_uptodate, 设置BH_Dirty,BH_Uptodate
+   - 设置page->private
+   > attach_page_buffers(page, buffer_head)
+
+** unmap_underlying_metadata(block_device, block)
+   - 释放buffer_head? 
+   > __find_get_block_slow(block_device, block)
+   - 首先去掉BH_Dirty, 等待bio, 获取BH_Lock
+   > wait_on_buffer(buffer_head)
+   - 去掉buffer_head的BH_Req?? 上面返回的时候不一定io操作唤醒的?? 
+   > __brelse(buffer_head)
+
+** block_size_bits(blocksize) 
+   >ilog2(blocksize)
+
+** create_page_buffers(page, inode, b_state)
+   - 如果page没有buffer_head
+   > create_empty_buffers(page, ###)
+   > page_buffers(page)
+
+** __block_write_full_page(inode, page, get_block_t, writeback_control, handler)
+   - 首先构造page的buffer_head, 而且设置标志BH_Dirty和BH_Uptodate?? 因为page的数据是有效的?
+   > create_page_buffers(page, inode, BH_Dirty|BH_Uptodate)
+   - 遍历buffer_head, 准备磁盘信息
+   - 如果block超过文件大小, 去掉BH_Dirty, 添加BH_Uptodate
+   - 如果没有BH_Mapped, 而且有BH_Dirty, 需要写回??  BH_Delay是延时分配??
+   > get_block_t(inode, block, buffer_head, 1)
+   - 如果有BH_New, 说明刚刚分配的磁盘空间?? 刷新旧的数据 
+   > unmap_underlying_metadata(buffer_head->block_device, block)
+   - 重新遍历,如果需要写回设置BH_Async_Write
+   - 如果writeback_control->sync_mode != WB_SYNC_NONE, 需要等待写回. 这里先等待BH_Lock
+   > lock_buffer(buffer_head)
+   - 其他情况下，就尝试获取锁，如果锁不住，别人再用，就redirty page?? 
+   > redirty_page_for_writeback(writeback_control, page)
+   - 如果有BH_Dirty, 设置BH_Async_Write
+   - 设置page的PG_writeback, 其他人需要等待这里.
+   - 第三次遍历,对于需要写回的buffer_head, 发送bio 
+   > submit_bh(write_op, buffer_head)
+   - 最后释放PG_locked
+
+** page_zero_new_buffers(page, from, to)
+   - 对应page的buffer_head, 如果有BH_New, 设置BH_Uptodate, BH_Dirty
+   - 清空buffer_head对应的page空间. 在后面会写回磁盘.
+
+** __block_write_begin(page, pos, len, get_block_t)
+   - 为写操作准备,需要知道buffer_head的映射信息, 而且确保buffer_head的BH_Uptodate, 可能发起读操作,获取数据
+   - 遍历(pos, len)范围内的buffer_head, 如果没有BH_Mapped
+   > get_block_t(inode, block, buffer_head, 1)
+   - 如果是BH_New, 释放之前的数据?? 而且清除写范围外的数据
+   > unmap_underlying_metadata(buffer_head->block_device, buffer_head->b_blocknr)
+   - 根据PG_uptodate, 设置BH_Uptodate
+   - 如果没有BH_Uptodate, 读回数据
+   > ll_rw_block(READ, 1, buffer_head)
+   - 最后等待读的结果
+   > wait_on_buffer(buffer_head)
+
+** __block_commit_write(inode, page, from, to)
+   - 这是在写操作中,数据放到page后的操作. 设置BH_Uptodate和BH_Dirty
+   - 遍历buffer_head, 对于范围外的,检查BH_Uptodate
+   - 对于范围内的,设置BH_Uptodate|BH_Dirty
+   > clear_buffer_new(buffer_head)
+   - 最后如果所有的buffer_head都有BH_Uptodate, 设置PG_uptodate
+
+** block_write_begin(address_space, pos, len, flags, page, get_block)
+   - 先获取pagecache 
+   > grab_cache_page_write_begin(address_space, index, flags)
+   - 然后准备buffer_head 
+   > __block_write_begin(page, pos, len, get_block_t)
+
+** block_write_end(file, address_space, pos, len, copied, page, fsdata)
+   - 如果写的数据和期望的一样, copied < len, 需要清空page?? 
+   > page_zero_new_buffers(page, start+copied, start+len)
+   - 修改buffer_head状态
+   > __block_commit_write(inode, page, start, end)
+
+** generic_write_end(file, address_space, pos, len, copied, page, fsdata)
+   > block_write_end(file, address_space, pos, len, copied, page, fsdata)
+   - 如果超过文件长度,修改inode 
+   > i_size_write(inode, pos+copied)
+   - 释放PG_locked
+   - 如果修改文件时间,设置脏标志, metadata需要写会
+   > mark_inode_dirty(inode)
+
+** block_is_partially_uptodate(page, read_descriptor_t, from)
+   - 检查(from, to)覆盖的buffer_head是否都有BH_Uptodate
+
+** block_read_full_page(page, get_block_t)
+   - 先准备buffer_head
+   > create_page_buffers(page, inode, 0)
+   - 和写操作类似,这里依靠BH_Uptodate,判断是否去读
+   - 第一遍遍历buffer_head, 如果没有BH_Mapped, 获取磁盘信息
+   > get_block_t(inode, block, buffer_head, 0)
+   - 如果还是没有BH_Mapped, 这就是hole, 清空page, 设置BH_Uptodate
+   - 同时记录没有BH_Uptodate的buffer_head
+   - 第二遍,锁住buffer_head, 设置BH_Async_Read
+   - 第三遍，发送bio 
+   > submit_bh(READ, buffer_head)
+
+** generic_cont_expand_simple(inode, size)
+   - 在truncate操作中,如果增长文件时的操作. 使用write模仿??
+   - 调用write_begin?? 为何不是上面的generic_write_begin??
+   > pagecache_write_begin(NULL, address_space, 0, AOP_FLAG_UNINTERRUPTIBLE|AOP_FLAG_CONT_EXPAND, page, fsdata)
+   > pagecache_write_end(NULL, ###)
+
+** cont_expand_zero(file, address_space, pos, bytes)
+   - 不支持hole的文件系统,使用0填充page
+   
+** cont_write_begin(file, address_space, pos, len, flags, page, fsdata, get_block_t, bytes)
+   - 如果写的pos超过文件大小,先用0填充
+   > cont_expand_zero(file, address_space, pos, bytes)
+   > block_write_begin(address_space, pos, len, flags, ##)
+
+** block_commit_write(page, from, to)
+   > __block_commit_write(inode, page, from, to)
+
+** __block_page_mkwrite(vm_area_struct, vm_fault, get_block_t)
+   - 时刻检查文件大小. 如果vm_fault->page超过,返回-EFAULT
+   - 怎么这里也有write操作? 
+   > __block_write_begin(page, 0, end, get_block_t)
+   > block_commit_write(page, 0, end)
+   - 最后设置PG_dirty, 而且等待写回. 
+   > wait_for_stable_page(page)
+
+** block_page_mkwrite(vm_area_struct, vm_fault, get_block_t)
+   - 更新文件时间
+   > file_uptodate_time(vma->vm_file)
+   > __block_page_mkwrite(vma, vm, get_block_t)
+
+** end_buffer_read_nobh(buffer_head, uptodate)
+   - 这里不会释放buffer_head?
+   > __end_buffer_read_notouch(buffer_head, uptodate)
+
+** attach_nobh_buffers(page, buffer_head)
+   - 把buffer_head链表给page
+   > attach_page_buffers(page, buffer_head)
+
+** nobh_write_begin(address_space, pos, len, flags, page, fsdata, get_block_t)
+   - 和上面block_write_begin有什么区别?
+   > grab_cache_page_write_begin(address_space, index, flags)
+   - 如果有block_buffer, 直接跳转
+   > page_has_buffers(page)
+   > __block_write_begin(page, pos, len, get_block_t)
+   - 如果page有PG_mappedtodisk, 直接跳出
+   - 否则需要创建buffer_head, 但这里创建的buffer_head链表没有和page关联!!
+   > alloc_page_buffers(page, blocksize, 0)
+   - 遍历buffer_head, 获取映射信息 
+   > get_block_t(inode, block_in_file,###)
+   - 如果还是没有BH_Mapped, 也不管??
+   - 如果有BH_New 
+   > unmap_underlying_metadata(block_device, blocknr)
+   - 根据PG_uptodate设置BH_Uptodate, 如果有BH_New,清除数据
+   - 最后如果没有BH_Uptodate, 读数据, 回调函数是end_buffer_read_nobh
+   > submit_bh(READ, buffer_head)
+   - 最后等待读完成
+   > wait_on_buffer(buffer_head)
+   - 这里fsdata是buffer_head 
+
+** nobh_write_end(file, address_space, pos, len, copied, page, fsdata)
+   - 奇怪,为何page不使用buffer_head??  fsdata是head链表
+   - 如果copied < len, 算是错误处理
+   > attach_page_buffers(page, head)
+   > generic_write_end(file, address_space, pos, len, copied, page, fsdata)
+   - 否则单独处理page, PG_uptodate, PG_dirty, inode
+   > i_size_write(inode, pos+copied)
+   > mark_inode_dirty(inode)
+   > unlock_page(page)
+   - 释放buffer_head链表
+   > free_buffer_head(buffer_head)
+
+** nobh_writepage(page, get_block_t, writeback_control)
+   - 如果page超过文件大小,先清空数据??
+   - 如果完全超过, 释放page
+   > address_space_operations->invalidatepage(page, offset)
+   > unlock_page(page)
+   - 否则把后一半数据清空
+   > zero_user_segment(###)
+   - 使用mapge方式 
+   > mpage_writepage(page, get_block_t, writeback_control)
+   - 如果失败,再使用block方式
+   > __block_write_full_page(inode, page, get_block_t, writeback_control, end_buffer_async_write)
+
+** nobh_truncate_page(address_space, from, get_block_t)
+   - truncate操作要清除block的数据!!相当于写0??
+   - 找到page 
+   > grab_cache_page(address_space, index)
+   - 如果有buffer_head, 使用block方式?? 
+   > page_has_buffers(page)
+   > unlock_page(page)
+   > block_truncate_page(address_space, from, get_block_t)
+   - 如果没有, 找到对应的buffer_head, 获取映射信息
+   > get_block_t(inode, block, buffer_head, 0)
+   - 如果没有映射信息,不用管.
+   - 如果有, 保证page有PG_uptodate
+   > address_space_operations->readpage(NULL, page)
+   - 等page数据
+   > lock_page(page)
+   - 写数据
+   > zero_user(###)
+   > set_page_dirty(page)
+
+** block_truncate_page(address_space, from, to)
+   - truncate操作把范围之外的空间写0. 
+   > grag_cache_page(address_space, index)
+   - 如果没有buffer_head, 构造一些
+   > page_has_buffers(page)
+   > create_empty_buffers(page, blocksize, 0)
+   - 获取映射信息
+   > buffer_mapped(buffer_head)
+   > get_block_t(inode, block, buffer_head, 0)
+   - 如果buffer_head没有BH_Uptodate, 读回来一部分
+   > ll_rw_block(RW, 1, buffer_head)
+   > wait_on_buffer(buffer_head)
+   > zero_user(page, offset, length)
+   > mark_buffer_dirty(buffer_head)
+
+** block_write_full_page_endio(page, get_block_t, writeback_control, handle)
+   - 如果page没有跨越文件, full page .
+   > __block_write_full_page(inode, page, get_block_t, writeback_control, handler)
+   - 如果全部超过, 释放page 
+   > do_invalidatepage(page, 0, PAGE_CACHE_SIZE)
+   > unlock_page(page)
+   - 如果是一部分, 先清空后半部分 
+   > zero_user_segment(###)
+   > __block_write_full_page(inode, page, get_block_t, writeback_control, handler)
+
+** block_write_full_page(page, get_block, writeback_control)
+   > block_write_full_page_endio(###)
+
+** generic_block_bmap(address_space, block, get_block_t)
+   - 创建临时buffer_head, 获取映射信息 
+   > get_block_t(inode, block, buffer_head, 0)
+
+** end_bio_bh_io_sync(bio, error)
+   - 这是bio的回调, 处理错误
+   > buffer_head->b_end_io(buffer_head, bio->bi_flags & BIO_UPTODATE)
+   - 释放bio 
+   > bio_put(bio)
+
+** guard_bh_eod(rw, bio, buffer_head)
+   - block_device大小的处理
+
+** _submit_bh(rw, buffer_head, bio_flags)
+   - 首先检查buffer_head中的状态, 必须有BH_Lock, BH_Mapped, buffer_head->b_end_io
+   - 必须没有BH_Unwritten, BH_Delay
+   - 构造bio， 填充block_device, 位置, bio_vec, 设置回调end_bio_bh_io_sync
+   > bio_alloc(GFP_NOIO, 1)
+   - 检查block跨越设备大小,修改bio的数量. 如果是读,还要清空一部分
+   > guard_bh_eod(rw, bio, buffer_head)
+   - BH_Meta转化为REQ_META, BH_Prio是REQ_PRIO
+   > submit_bio(rw, bio)
+   
+** submit_bh(rw, buffer_head)
+   > _submit_bh(rw, buffer_head, 0)
+
+** ll_rw_block(rw, nr, buffer_head)
+   - 先锁住buffer_head
+   > trylock_buffer(buffer_head)
+   - 对于写,检查BH_Dirty , 设置回调
+   > test_clear_buffer_dirty(buffer_head)
+   - 对于读，检查BH_Uptodate 
+   > test_clear_buffer_dirty(buffer_head)
+   > submit_bh(rw, buffer_head)
+
+** write_dirty_buffer(buffer_head, rw)
+   - 上面锁不住不会操作,但这里会等待 
+   > lock_buffer(buffer_head)
+   - 其他一样
+
+** __sync_dirty_buffer(buffer_head, rw)
+   - 提交bio后等待BH_Locked
+
+** buffer_busy(buffer_head)
+   - buffer_head->b_count > 0, 或者有BH_Dirty, BH_Lock
+
+** drop_buffers(page, buffer_head)
+   - 遍历buffer_head链表,如果有一个不能释放,都不释放 
+   > buffer_busy(buffer_head)
+   - 释放buffer_head->b_assoc_buffers链表
+   > __remove_assoc_queue(buffer_head)
+   - 这里没有释放,释放指针传递出去. 但释放和page关系
+   > __clear_page_buffers(page)
+
+** try_to_free_buffers(page)
+   - 如果page有PG_writeback, 不再操作
+   - 释放buffer_head 
+   > drop_buffers(page, buffer_head)
+   - 最后释放所有的buffer_head 
+   > free_buffer_head(buffer_head)
+
+** 总结
+   - 这里大量的buffer_head操作,应该是实现了最简单的文件系统，只要提供get_block_t就可以!
+   - 有2中buffer_head, 一种来源于block_device->bd_inode, 一种来自于普通file
+   - 第一种在释放inode时删除, 回收内存时应该也自动删除.
+   - 第二种就没什么特殊的, 完全跟着page变化

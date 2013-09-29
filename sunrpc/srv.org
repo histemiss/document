@@ -1,0 +1,664 @@
+(net/sunrpc/svc.c)
+1. 数据结构
+    svc_serv
+        * svc_program
+        * svc_stat
+        * sv_lock
+        * sv_nrthreads      线程数
+        * sv_maxconn  最大支持的链接数,0表示与线程数成正比, nfs好像没有设置它.
+        * sv_max_payload   一次rpc请求中的负载的数据量, 使用创建svc_create时的传入参数
+        * sv_max_mesg  rpc请求中包含xdr的数据量, 就是 sv_max_payload+PAGE_SIZE
+        * sv_xdrsize 根据svc_procedure而确定,那nfsv4为例就是一个nfsd4_compoundargs的大小,它还包括8个子请求使用的nfsd4**args的结构大小. 对于read/write等,数据并没有在这些请求结构中.
+        * sv_permsocks      创建的svc_xprt->xpt_list      
+        * sv_tempsocks      通过监听创建的svc_xprt->xpt_list
+        * sv_tmpcnt         临时svc_xprt的数量
+        * timer_list sv_temptimer
+        * sv_name
+        * sv_nrpools  在创建svc_serv是指定(__svc_create), 实际上也是sunrpc内部计算的,根据nr_oneline_nodes,可以是cpu数量或numa node数量. 
+        * sv_pools  svc_pool的数组
+        * sv_shutdown(svc_serv, net)
+        * sv_thread_fn  处理请求的函数
+        * list_head sv_cb_list sv_cb_waitq
+        * svc_xprt  sv_bc_xprt
+
+    svc_pool 又是好大的数据结构
+        * sp_id     pool id 
+        * sp_lock   
+        * list_head sp_threads  关联svc_rpqst->rq_list, 表示休息的线程对应的svc_rqst, 它等待socket.
+        * sp_sockets            关联svc_xprt 表示有数据需要处理的socket, 它等待任务.
+        * sp_nrthreads          这是空闲的线程数
+        * sp_all_threads        关联svc_rqst->rq_all队列,所有的服务线程.
+        * svc_pool_stats
+
+    svc_rqst 它和一个固定的服务线程关联
+        * rq_list       放到svc_pool->sp_threads队列中
+        * rq_all        svc_pool->sp_all_threads
+        * svc_xprt
+        * sockaddr_storage  rq_addr rqlen       # peer address
+        * sockaddr_storage  rq_daddr rq_daddrlen    #这是什么地址?
+        * svc_serv  rq_server
+        * svc_pool  rq_pool
+        * svc_procedure rq_procinfo  这个应该是在接受到sock时设定
+        * auth_ops  rq_authop
+        * rq_flavor
+        * svc_cred
+        * rq_xprt_ctxt
+        * svc_deferred_req rq_deferred
+        * rq_usedeferral
+        * rq_xprt_hlen
+        * xdr_buf rq_arg, rq_res 这两个在接受和发送数据是使用,它只是一个存储的包装，它具体使用的内存是rq_pages中的内存, 它会限制sv_max_payload
+        * page rq_pages[RPCSVC_MAXPAGES]
+        * page rq_respages
+        * rq_resused
+        * kvec rq_vec[RPCSVC_MAXPAGES]
+        * rq_xid
+        * rq_prog, rq_vers, rq_proc, rq_prot 为何这里有protocol?
+        * rq_secure
+        * rq_argp, rq_resp 这里是内存指针,大小是sv_xdrsize,xdr_dec/enc把xdr数据包解压到这里，或从上面组装.而且服务的处理函数的参数就是这些指针.
+  * rq_auth_data
+        * rq_reserved 表示svc_rqst处理的请求需要发送空间,它会累加到svc_xprt->xpt_reserved. 它的初置也是sv_max_mesg.
+        * cache_req rq_chandle 只有在service端才使用cache?
+        * rq_dropme
+        * auth_domain rq_client,rq_gssclient
+        * rq_cachetype
+        * svc_cacherep  rq_cacherep
+        * rq_splice_ok
+        * wait_queue_head_t rq_wait
+        * task_struct   rq_task 每个svc_rqst都对应一个task_struct, 在创建svc_rqst时,创建线程,执行的函数是svc_serv->sv_function.
+
+ 需要说一下xdr_buf这个数据结构
+  * kvec head[1]  包含rpchead, 还有non-page数据, 什么是non-page??
+   tail[1] page数据之后的数据?? 需要根据具体使用而看
+  * pages page指针数组
+  * page_base 表示数据的偏移??
+  * page_len  决定pages的大小?
+  * buflen  xdr_buf使用的存储空间
+  * len 数据长度
+ 
+    svc_deferred_req
+        * prot  
+        * svc_xprt xprt
+        * sockaddr_storage  addr / addrlen
+        * sockaddr_storage  daddr / daddrlen
+        * cache_deferred_req    handle
+        * xprt_hlen
+        * argslen
+        * args[0]   
+    svc_program
+        * svc_program next
+        * pg_prog
+        * pg_lovers, pg_hivers, pg_nvers
+        * svc_version   pg_vers
+        * pg_name
+        * pg_class  #class name 认证相关?
+        * svc_stat  pg_stats
+        * pg_authenticate(svc_rqst)
+    svc_version
+        * vs_vers, vs_nproc
+        * svc_procedure vs_proc
+        * vs_xdrsize
+        * vs_hidden 不要向rpcbind注册,只有nfsacl使用
+        * vs_dispatch(svc_rqst, be32)
+    svc_procedure
+        * svc_procfunc(svc_rqst, argp, resp)
+        * pc_decode, cp_encode, pc_release
+        * pc_argsize, pc_ressize, pc_count
+        * pc_cachetype, pc_xdrreszie
+
+    svc_pool_map
+        * count, mode   POOL_GLOBAL, POOL_PERCPU, POOL_PERNODE
+        * npool 
+        * pool_to   maps pool id to cpu or node
+        * to_pool   maps cpu or node to pool id
+    svc_pool_map是对svc_pool的索引,svc_serv表示一个rpc服务,它包含多个服务任务(svc_rqst), 每个svc_serv包含多个svc_pool, 每个svc_pool管理一定数量的任务. 如果系统有多个node,使用POOL_PERNODE,如果系统有2个以上cpu，使用POOL_PERCPU, 否则POOL_GLOBAL.这个数据结构的作用是把node与pool互相映射，node表示online cpu/node的索引, pool索引是从1开始的计数. 这个数据结构是全局的.
+
+1. 关于svc_pool_map的操作
+    a. 创建销毁等
+        param_set_pool_mode 设置svc_pool_map
+        param_get_pool_mode 获取svc_pool_map
+        svc_pool_map_choose_mode  系统自动选择pool mode
+        svc_pool_map_alloc_arrays 创建svc_pool_map的to_pool和pool_to
+        svc_pool_map_init_percpu(svc_pool_map)  根据pool mode初始化to_pool和pool_to数组
+        svc_pool_map_init_pernode(svc_pool_map) 和上面一样
+        svc_pool_map_get()  如果svc_pool_map->count=0,初始化svc_pool_map, 综合上面的实现
+        svc_pool_map_put()  递减svc_pool_map->count,如果减到0, 销毁svc_pool_map,他是全局变量，只销毁to_pool和pool_to
+    b. svc_pool_map_set_cpumask(task_struct, pidx)
+        pidx是svc_pool的id, task_struct是在svc_pool管理下,设置cpu mask设为pidx对应的,让它只能在某些cpu上执行, 在创建任务时设置.
+        -> set_cpus_allowed_ptr(task_struct, mask)
+    c. svc_pool_for_cpu(svc_serv, cpu)
+        找到cpu索引对应的pool索引, 然后返回svc_serv->sv_pools[pidx%sv_npools], svc_serv->sv_npools决定sv_pools的数据。
+
+2.下面是server使用rpcbind服务的操作
+    a. svc_rpcb_setup(svc_serv, net)
+        创建使用rpcbind服务的rpc_clnt(欧欧？,可以参考rpcb_clnt.c),创建svc_serv之前，删除rpcbind中已经注册的服务.
+        -> rpcb_create_local(net)
+        -> svc_unregister(svc_ser, net)
+    b. svc_rpcb_cleanup(svc_serv, net)
+        释放svc_serv时使用,注销rpcbind中的服务,释放rpcb_clnt.
+        -> svc_unregister(svc_serv, net)
+        -> rpcb_put_local(net)
+    c. svc_uses_rpcbind(svc_serv)
+        判断rpc_program是否需要向rpcbind服务. 使用svc_version->vs_hidden. 遍历svc_serv->svc_program中的所有svc_version, 只要有一个可见，整个rpc_program都可见. svc_serv可以管理多个svc_program? 他们的progno一样吗?
+
+3. 创建和释放svc_serv
+    a. __svc_create(svc_program, bufsize, npools, shutdown )      
+        创建svc_serv和svc_pool, 做简单的初始化, 包括:
+        * sv_name = svc_program->pg_name
+        * sv_program = svc_program
+        * sv_nrthreads = 1
+        * sv_stats = svc_program->svc_stats
+        * sv_max_payload = bufsize  如果函数参数为0，使用4096 这个值限制什么?
+        * sv_max_mesg = sv_max_payload, 它是sv_max_payload对PAGE_SIZE向上对齐
+        * sv_shutdown = shutdown 回调函数,如果参数无效使用svc_rpcb_cleanup, 只是反注册一下
+        * sv_xdrsize  遍历所有svc_program的所有svc_version,找svc_version->vs_xdrsize
+        * 链表
+        * sv_nrpools = npools 使用>svc_pool_map_get
+        * svc_pool, 创建npools个svc_pool, 对每个初始化
+        -> svc_uses_rpcbind(svc_serv) 
+        -> svc_rpcb_setup(svc_serv, net) 清楚rpcbind中的相关注册信息
+      svc_create(svc_program, bufsize, shutdown)
+      对上面进行包装,默认npools是1, 使用者调用,还有下面的函数, 先计算一个nr_pools数量.
+    b. svc_create_pooled(svc_program, bufsize, shutdown, svc_thread_fn, module)
+        同样对上面进行包装，npools从svc_pool_map获取
+        -> svc_pool_map_get()
+        -> __svc_create(svc_program, bufsize, npool, shutdown)
+        然后设置svc_serv->sv_function和svc_serv->sv_module
+    c. svc_destory(svc_serv)
+        -> svc_sock_update_bufs(svc_serv) 当svc_serv->sv_nrthreads不为0, 添加svc_sock标志XPT_CHNGBUG.
+        -> del_timer_sync(svc_serv->sv_temptimer)   
+        -> svc_close_all(svc_serv)      关闭svc_xprt
+        -> svc_serv->sv_shutdown(svc_serv, net) 
+        -> cache_clean_deferred(svc_serv)       为何这里使用cache?
+        -> svc_serv_is_pooled()     只要sv_function有效时,才使用pool_map这个结构. 因为它使用的svc_create_pooled, 它使用了(分配)svc_pool_map_get. 而且设定了sv_function.
+        -> svc_pool_map_put     释放svc_pool_map
+        释放svc_serv->sv_pools和svc_serv使用的内存.
+下面是创建和销毁svc_rqst
+    a. svc_init_buffer(svc_rqst, size, node)
+        -> svc_is_backchannel(rpc_rqst) back channel 使用fore channel buffers, 不用分配内存
+        分配size数量的page,把这些page放到svc_rqst->rq_pages
+        -> alloc_pages_node(node, GFP_KERNEL, 0)
+    b. svc_release_buffer(svc_rqst)
+        释放svc_rqst->rq_pages中的所有page
+    c. svc_prepare_thread(svc_serv, svc_pool, node)
+        创建rpc_rqst, 一个rpc_rqst对应一个thread. 递增svc_serv->sv_nrthreads和svc_serv->sv_nrthreads, 给svc_rqst->rq_argp和rq_resp分配内存,大小为svc_serv->sv_xdrsize. 关联svc_pool,svc_serv,svc_rqst.
+        -> init_waitqueue_head(svc_rqst->rq_wait)
+        -> kmalloc_node(svc_serv->sv_xdrsize, node)给svc_rqst->rq_argp/resp
+        -> svc_init_buffer(svc_rqst, svc_serv->sv_max_mesg, node)
+    d. choose_pool(svc_serv, svc_pool, state)
+        如果svc_pool有效,返回它,否则svc_serv->sv_pools[state % svc_serv->sv_nrpools], 递增state.在遍历中使用的辅助函数.
+    e. choose_victim(svc_serv, svc_pool, state)
+        找一个thread返回. 先选一个pool, 它的svc_pool->sp_all_threads不为空, 这个队列是svc_rqst队列,把队列上的第一个rpc_rqst取出来,把它从队列中释放,返回svc_rqst->rq_task. 要杀死这个svc_rqst/任务.
+    f. svc_set_num_threads(svc_serv, svc_pool, nrservs)
+        使svc_serv管理的svc_rqst达到一定数量.通过创建或结束线程(svc_rqst),使svc_serv->sv_nrthreads=nrservs，如果svc_pool有效，尽在这个pool中添加和删除,否则均匀的添加或删除所有svc_pool的进程.
+        如果要创建线程
+        -> choose_pool(svc_serv, svc_pool, state)  如果svc_pool有意义，就用它，否则使用state对应的.
+        -> svc_pool_map_get_node(svc_pool->sp_id)
+        -> svc_prepare_thread(svc_serv, svc_pool, node)  node主要用来分配内存,创建svc_rqst
+        -> kthread_create_on_node(svc_serv->sv_function, svc_rqst, node, svc_serv->sv_name)
+        -> svc_pool_map_set_cpumask(svc_rqst->rq_task, svc_pool->sp_id)
+        -> svc_sock_update_bufs(svc_serv)
+        -> wake_up_process(task_struct)
+        如果要删除线程
+        -> choose_victim(svc_serv, svc_pool, state)
+        -> send_sig(SIGINT, task_struct, 1)
+    g. svc_exit_thread(svc_rqst)
+        释放svc_rqst->rq_pages, rq_argp, rq_resp, rq_auth_data. 把它从svc_pool->sp_all_threads中释放, 释放它自己
+        -> svc_destroy(svc_serv)
+
+这里和开始的函数应该放在一块,向rpcbind注册服务
+    a. __svc_rpcb_register4(net, program, version, protocol, port)
+        先创建一个sockaddr,使用INADDR_ANY+port
+        -> rpcb_v4_register(net, program, version, sockaddr, netid)
+        -> rpcb_register(net, program, version, protocol, port) 如果rpcv4不支持
+    b. __svc_rpcb_register6(net, program, version, protocol, port)
+        -> rpcb_v4_register(net, program, version, sockaddr_in6, netid6)  netid6是字符串
+    c. __svc_register(net, progname, program, version, family, protocol, port)
+        封装上面两个函数,为何这里注册没有svc_program的任何事情? 这里只需要注册服务对应的port,给client提供查询操作.
+    d. svc_register(svc_serv, net, family, proto, port)
+        向local的rpcbind注册svc_serv. 这里svc_serv->svc_program中可能有多个svc_program. 遍历所有的rpc_version. 不同的rpc_program使用不同的progno. 在svcsock中建立监听端口后使用, 它里面应该会注册port信息.
+        -> __svc_register(net, progname, program, version, i, family, protocol, port)
+    e. __svc_unregister(net, program, version, progname)
+        通过注册一个空的svc_program,取代之前的服务
+        -> rpcb_v4_register(net, program, version, NULL, 0)
+    f. svc_unregister(svc_serv, net)
+        对svc_serv->svc_program中所有svc_version，调用
+        -> __svc_unregister(net, program, version, ...)
+
+    g. svc_process_common(svc_rqst, kvec argv, kvec resv)
+        这是rpc请求的共用处理过程, 为server提供的服务回调函数做准备. argv/resv参数是kvec,就是svc_rqst->rq_arg/rq_res->head[0], 就是xdr_buf开始的一页. 这时数据就在这些xdrbuf中,这里需要解析参数,检查有效性,同时组装一些. 这里主要处理这些头部数据,剩下的交给svc_procedure. 这里可能没有svc_rqst->rq_argp/rq_resp的事情.
+  >>>> 填充rq_res(xdrbuf), <<<< 解析rq_arg(xdrbuf)
+        > svc_rqst->svc_xprt->xpt_ops->xpo_prep_reply_hdr(svc_rqst) 对于tcp来说就是放一个总数据量的长度, 等发送的时候,从xdrbuf中拿出数据长度,再填充上. 但udp就不使用这个东西??
+
+        > svc_putu32(resv, svc_rqst->rq_xid) 这个rq_xid什么时候找到的?
+  < svc_getnl(rq_argp) 获取rpc版本,必须是2
+        > svc_putnl(REPLY 1  calldir) 
+        > status  => 把位置记录在一个变量中,默认是0 ACCEPT
+        < prog, vers, proc <= 从argv中获取
+        > RPC_SUCCESS   在执行完后才知道结果，这里先放上RPC_SUCCESS
+        * 从svc_rqst->svc_serv->sv_program中取出与prog对应的svc_program
+        -> svc_authenticate(svc_rqst, auth_stat) 对svc_rqst做验证工作
+        -> svc_program->pg_authenticate(svc_rqst)   
+        * 获取rpc_procinfo:svc_rqst->rq_procinfo = svc_serv->svc_program->svc_version->svc_procedure
+        * 初始化svc_rqst->rq_argp,rq_resp两块内存
+        * -> svc_reserve_auth(svc_rqst, svc_procedure->pc_xdrressize<<2) 在resp中预留认证需要的空间???
+        * 如果svc_procedure->vs_dispatch有效,调用它，否则调用下面过程
+            * svc_procedure->pc_decode(svc_rqst, argv->iov_base, svc_rqst->rq_argp) 解码参数, 只处理rq_arg->head[0]?? 给rq_argp
+            * svc_procedure->pc_func(svc_rqst, svc_rqst->rq_argp, svc_rqst->rq_resp) 执行服务, 使用的参数是rq_argp/rq_resp
+            * svc_procedure->pc_encode(svc_rqst, resv->iov_base_len, svc_rqst->rq_resp) 编码参数, 也是只处理rq_res->head[0]
+            * svc_procedure->pc_release(svc_rqst, NULL, svc_rqst->rq_resp) 释放服务使用的内存
+            * svc_authorise(svc_rqst) 验证通过，释放验证资源之类的 
+            如果过程中出现错误,同样会组好包，放到resv中。 rq_argp/rq_resp都是在创建svc_rqst是分配的,但不会小? 而xdr_buf都只有使用head[0],会不会不够?而且resv使用那些内存
+        这里没有发送功能，而且服务的完成分成两种，一种是间接dispatch,一种直接调用. 返回结果为1,表示request正常处理可以发送.
+
+    h. svc_process(svc_rqst)
+        这个函数是nfsd中使用的服务函数, 功能是为了svc_process_common准备好resv, argv已经在svc_recv中填充了数据. 上面在decode和encode时使用中转空间是rq_argp, rq_resp. 这里argv就是svc_rqst->rq_arg.head[0], 但svc_rqst->rq_res还不能用，使用svc_rqst->rq_respages初始化它,第一页给svc_rqst->rq_res.head[0], tail[0]为空, rq_res.pages使用rq_respages的第二页. rq_respages是哪里分配的? 在svc_tcp_recvfrom中rq_respages使用rq_pages. 这里需要注意svc_rqst->rq_res的初始化, 只有xdrbuf->head[0]有实际的page, xdrbuf->pages虽然指向对应的pages数组,但xdrbuf->page_len=0, xdrbuf->len=0, xdrbuf->buflen=PAGE_SIZE...
+        -> svc_process_common(svc_rqst, argv, resv)
+        -> svc_send(svc_rqst)
+        最后的发送动作使用了xprt支持，但接受数据在哪里? 根据nfs的情况,它的服务函数中实现接受数据功能,但有没有调度管理?
+   i. bc_svc_process(svc_serv, rpc_rqst, svc_rqst)
+        和上面类似，不过多了一个rpc_rqst参数,而且最后把结果通过bc发出去,关联rpc_rqst->rpc_xprt = svc_serv->sv_bc_xprt, rpc_rqst->rq_server = svc_serv. 把rpc_rqst->rq_rcv_buf/rq_snd_buf给svc_rqst->rq_arg/rq_res，这些都是xdr_buf,
+        -> svc_process_common(svc_rqst, argv, resv) 这些都是svc_rqst的, 把svc_rqst->rq_res给rpc_rqst->rq_snd_buf.
+        -> bc_send(rpc_rqst)
+(net/sunrpc/svc_xprt.c)
+又是一个大头。。好像还不算多，比rpc_xprt少点吧. 上面的貌似比较独立,虽然它需要网络层支持,接口好像比较简单(svc_recv/svc_send, 建立端口操作在哪里?)
+1. 数据结构
+    svc_xprt_class
+        * xcl_name      xcl_name
+        * module        xcl_owner
+        * svc_xprt_ops  xcl_ops
+        * list_head xcl_list
+        * xcl_max_payload  这个单位是什么?
+    svc_xprt_ops
+        * xpo_create(svc_serv, net, sockaddr, int, int) 地址啥用? 返回svc_xprt
+        * xpo_accept(svc_xprt) 返回svc_xprt
+        * xpo_has_wspace(svc_xprt)
+        * xpo_recvfrom(svc_rqst)
+        * xpo_prep_reply_hdr(svc_rqst)
+        * xpo_sendto(svc_rqst)
+        * xpo_relese_rqst(svc_rqst)
+        * xpo_detach(svc_xprt)
+        * xpo_free(svc_xprt)
+        这里面有的参数svc_xprt,有的是svc_rqst，比较奇怪啊？
+    svc_xprt
+        * svc_xprt_class
+        * svc_xprt_ops 重复了
+        * kref xpt_ref 貌似很重要的东西
+        * lsit_head xpt_list 放在svc_serv->sv_permsocks队列中.
+        *           xpt_ready   放在rpc_pool->sp_sockets队列中
+        * flags
+        * svc_resv xpt_server
+        * xpt_reserved    当svc_rqst使用svc_xprt时，它会累加svc_rqst->rq_reserved. 表示它需要的空间,然后它会和sock的发送空间比较,判断是否可用它处理请求并发送数据. 当svc_rqst释放不再使用它时,减去这些值.  能多个svc_rqst处理一个svc_xprt??
+        * xpt_auth_cache
+        * xpt_deferred
+        * sockaddr_storage  xpt_local/len
+        * sockaddr_storage  xpt_remote/len
+        * rpc_wait_queue    xpt_bc_pending 也有这个东西?
+        * list_head xpt_users  nfsv4中使用了...
+        * net xpt_net
+  * rpc_xprt xpt_bc_xprt  nfs4.1 backchannel
+
+    svc_xpt_user
+        * list_head list
+        * callback(svc_xpt_user)  嵌在其他数据结构里面，提供回调功能
+        操作:
+            * unregister_xpt_user
+            * register_xpt_user 只有链表操作，但注册时保证svc_xprt->xpt_flags不是XPT_CLOSE
+
+1. svc_xprt_class相关操作
+    a. svc_reg_xprt_class(svc_xprt_class) / svc_unreg_xprt_class(svc_xprt_class)
+        所有svc_xprt_class在svc_xprt_class_list中，使用xpl_name区分
+2. svc_xprt创建辅助操作 很显然svc_xprt使用了kref
+    a. svc_xprt_free(kref)
+        -> svcauth_unix_info_release(svc_xprt)
+        -> put_net
+        -> xprt_put(svc_xprt->xpt_bc_xprt)
+        -> svc_xprt->svc_xprt_ops->xpo_free(svc_xprt)
+    b. svc_xprt_put(svc_xprt)
+        -> kref_put(svc_xprt->kref, svc_xprt_free) kref方式的释放资源
+    c. svc_xprt_init(net, svc_xprt_class, svc_xprt, svc_serv)
+        初始化svc_xprt,包括 xpt_class, xpt_ops, kref, xpt_server, 各种list, xpt_bc_pending, net,还有把svc_xprt->xpt_flags设为XPT_BUSY
+    d. __svc_xpo_create(svc_xprt_class, svc_serv, net, family, port, flags)
+        偶，这里啥都没有，构造一个sockaddr,但使用INADDR_ANY, 这个实现简单的包装,创建svc_xprt使用svc_ser和svc_xprt_class就够了，这里还有protocol/port. 这个在svc_tcp_init使用. 在后面介绍如何创建svc_xprt,因为对tcp来说，server有两种socket, 这里是监听的sock. 这里准备的只是把svc_xprt和svc_serv/svc_xprt_class关联起来.
+        -> svc_xprt_class->xcl_ops->xpo_create(svc_serv, net, sockaddr, len, flags)
+    e. svc_create_xprt(svc_serv, xprt_name, net, family, port, flags)
+        遍历svc_xprt_class_list,找一个svc_xprt_class, 封装上面的函数. 这个port好像是最重要的,层层调用,port参数是必不可少的.
+        -> __svc_xpo_create(svc_xprt_class, svc_serv, net, family, port, flags)
+        然后是一些关系，把svc_xprt添加到svc_serv->sv_permsocks队列中,这里返回监听的端口号. 这里创建的svc_xprt是监听作用,去掉svc_xprt->xpt_flags的XPT_TEMP. 一个svc_serv使用多个svc_xprt,建立多个socket通讯,svc_serv使用多个svc_rqst执行任务,svc_xprt和svc_rqst是怎么对应的? 基本上是svc_xprt执行的任务是循环的，每个循环都去svc_pool中取一个svc_xprt,然后取它的数据，执行任务. 但在取svc_xprt数据时会有几种情况,使用了监听的svc_xprt,那就接受新的svc_xprt,把它给svc_serv;使用一般svc_xprt从它的cache_buf中取数据,执行任务;使用一般的svc_xprt,从socket中取数据，执行任务. 这两个函数基本上
+
+下面应该是svc_xprt的接受/排队操作
+    a. svc_xprt_copy_addrs(svc_rqst, svc_xprt)
+        地址拷贝 svc_rqst->rq_addr = svc_xprt->xpt_remote, svc_rqst->rq_daddr = svc_xprt->xpt_local. 对svc_rqst来说,也有两个地址，rq_addr是client地址,rq_daddr是server地址. 虽然是本地地址，但端口号是有区别的. 在svc_xprt接受到数据后使用.
+    b. svc_thread_enqueue(svc_pool, svc_rqst) / svc_thread_dequeue(svc_pool, svc_rqst)
+        把svc_rqst添加到svc_pool->sp_threads，看来一个svc_rqst对应一个thread, 浪费吧
+    c. svc_xprt_has_something_to_do(svc_xprt)
+        如果svc_xprt->xpt_flags包含XPT_CONN,XPT_CLOSE,返回true,否则如果包含XPT_DATA,XPT_DEFERRED, 如果xprt有数据/缓存数据,要检测它使用的socket是否有足够的发送空间.
+        -> svc_xpt->xpt_ops->xpo_has_wspace(svc_xprt)
+        这个函数在后面经常用，当svc_xprt有事要做的时候，找个svc_rqst处理它,如果找不到把它放到队列中.
+    d. svc_xprt_enqueue(svc_xprt)
+        这里把rpc_xprt给rpc_pool管理，应该是建立connect,可传输数据. 如果有空闲的svc_rqst,取出一个和svc_xprt关联起来，并唤醒这个thread.否则把svc_xprt放到svc_pool->sp_sockets队列上等待.
+        -> svc_xprt_has_something_to_do(svc_xprt) 表示svc_xprt有事要做
+        如果svc_xprt->xpt_flags带有XPT_BUSY,则退出.
+        根据当前cpu获取一个svc_pool, 从svc_pool->sp_threads中取出一个svc_rqst, 只是简单的设置svc_rqst->rq_xprt, 还是设置svc_rqst->rq_reserved..
+        -> svc_thread_dequeue(svc_pool, svc_rqst) 然后把svc_rqst和rpc_xprt关联起来
+        -> wake_up(svc_rqst->rq_wait) 唤醒svc_rqst关联的任务
+        如果svc_pool->sp_threads空了，把svc_xprt放到svc_pool->sp_sockets队列上，没有等待操作.
+        还有不明白svc_xprt->xprt_reserved += rpc_rqst->rq_reserved. 这是什么变量? 还不清楚哪里调用这个函数,监听socket的地方应该使用?
+    e. svc_xprt_dequeue(svc_pool)
+        从svc_pool->sp_sockets队列上取出一个svc_xprt(->xpt_ready)，这是所有等待的svc_xprt
+    f. svc_xprt_received(svc_xprt)
+  在svc_xprt接到了收据,处理完成一个请求之后的释放操作,去除svc_xprt->xpt_flags上的XPT_BUSY标志，封装上面的操作, 在svc_recv中使用. 这个应该没有实质的东西.  如果它没有其他操作就释放了??
+        -> svc_xprt_enqueue(svc_xprt)
+    g. svc_reserve(svc_rqst, space)
+        每个svc_rqst在svc_xprt上预留一段内存给reply使用. 如果svc_xprt->xpt_reserved大于space, 减小xpt_reserved. 这个在svc_serv的服务过程中使用. 这里可能会把rpc_rqst使用的rpc_xprt挂起来,因此可能多个rpc_rqst同时使用一个rpc_xprt.肯定有多个request从一个socket上发送过来(rpc_task), 多个请求会同时执行吗?  改变svc_rqst->rq_reserved, 如果它要求的空间没有超过界限,则把它交给svc_pool处理..., 如果超过呢?..
+        -> svc_xprt_enqueue(svc_xprt)
+    h. svc_xprt_release(svc_rqst)
+        svc_rqst服务完成,释放svc_xprt.
+        -> svc_rqst->rq_xprt->xpt_ops->xpo_release_rqst(svc_rqst)
+        释放svc_rqst->rq_deferred, 这是缓存的cache_deferred
+        -> svc_free_res_pages(svc_rqst)释放svc_rqst->rq_respages, 为何但释放它呢?, 它是否就是svc_rqst->rq_pages??
+        -> svc_reserve(svc_rqst, 0) 修改svc_rqst->rq_reserved, 然后把它占用的svc_xprt->xpt_reserved. 释放svc_xprt..
+        -> svc_xprt_put(svc_xprt)
+    i. svc_wake_up(svc_serv)
+        唤醒每个svc_serv->sv_pools的第一个svc_rqst.
+    j. svc_check_conn_limits(svc_serv)
+        链接数不要太大,上限是svc_serv->sv_maxconn, 如果为0，改为 (svc_serv->sv_nrthreads+3)*20. 如果svc_serv->sv_tmpcnt超过这个限制,从svc_serv->sv_tempsocks队列上取出一个svc_xprt, 设置XPRT_CLOSE给svc_xprt->xpt_flags. 看来处理完的svc_xprt并没有立即释放.. 而是放到这个队列中,等一段时间有人检查是否太多sock..
+        -> svc_xprt_enqueue(svc_xprt) 这里看起来没有道理,肯定不会把svc_xprt放到等待队列中
+
+下面是接受svc_xprt, 和发送数据,还没看出如何接受svc_xprt的数据
+    a. svc_recv(svc_rqst, timeout)
+        接受rpc request, 因为在svc_serv->sv_function中使用,作用是接受request, 这是在一个服务thread中，所以它必须关联一个rpc_rqst.  首先给svc_rqst->rq_pages分配内存，内存大小是svc_rqst->sv_max_mesg. 怎么又分配svc_rqst->rq_pages.
+        -> alloc_page(GFP_KERNEL) 如果分配失败，等待500msec
+        准备svc_rqst->rq_arg, rq_arg->head[0]使用svc_rqst->rq_pages[0],rq_arg->page使用其他page,但预留一个page. svc_rqst->rq_arg(xdr_buf)->len = PAGE_SIZE * pagenum. 这里就设置了len/page_len,但没有buflen..
+        从svc_rqst->svc_pool中取一个xprt_xprt,如果有把它和svc_rqst关联，如果没有把它放到svc_pool上. rpc_rqst->rq_reserved = svc_serv->sv_max_mesg, 把它加到svc_xprt->xpt_reserved.
+        -> svc_xprt_dequeue(svc_pool)
+        如果svc_pool上没有等待的svc_xprt,则把它放到svc_pool等待队列上，让这个任务在svc_rqst->rq_wait上等待. 睡醒的时候,svc_rqst和svc_xprt应该建立联系，如果没有把svc_rqst继续放到svc_pool上, 退出函数,说明无法申请到svc_xprt, 没事可做. 如果没有svc_xprt会等待一段时间,对于nfs就是1小时,反正有事会把它唤醒.
+        当申请到svc_xprt检查svc_xprt->xpt_flags的XPT_CLOSE,如果它要关闭, 看来释放svc_xprt也是这里的工作.
+        -> svc_delete_xprt(svc_xprt)
+        如果svc_xprt带有XPT_LISTENER, 这个svc_xprt就复杂了:
+            -> svc_xprt->xpt_ops->xpo_accept(svc_xprt) 如果收到新的svc_xprt, 添加标志XPT_TEMP, 把它放到svc_serv->sv_tempsocks队列. 为svc_serv建立timer, 回调函数是svc_age_temp_xprts,过一段时间把这种socket释放掉,时间是svc_conn_age_period.
+            -> svc_xprt_received(svc_xprt), 把新的svc_xprt给svc_pool
+        如果svc_xprt不带XPT_LISTENER标志, 而且有空间...,好象是接受数据
+            -> svc_xprt->xpt_ops->xpo_has_wspace(svc_xprt) 这是什么东西？
+            -> svc_deferred_dequeue(svc_xprt) 取出什么东西来?
+            -> svc_deferred_recv(svc_rqst)
+   -> svc_xprt->xpt_ops->xpo_recvfrom(svc_xprt) 接受数据..
+        最终接受这个svc_xprt
+        -> svc_xprt_received(svc_xprt)  最后把svc_xprt放回去...
+    b. svc_drop(svc_rqst)
+        在svc_process使用,如果接受的请求要扔掉,表示svc_rqst释放掉svc_xprt.
+        -> svc_xprt_release(svc_rqst)
+    c. svc_send(svc_rqst)
+        这个面熟，发送数据的接口
+        -> svc_xprt->svc_xprt->xpt_ops->xpo_release_rqst(svc_rqst) 发送数据之前，释放svc_rqst使用的数据，应该是服务使用的内存.  为何要释放这个?
+  要发送的数据总量svc_rqst->rq_res.len是svc_rqst->rq_res -> head[0].iov_len + page_len, tail[0].iov_len. 当然发送这个xdr_buf的数据.
+        检查svc_xprt->xpt_flags的XPT_DEAD, 如果死掉返回-ENOTCONN
+        -> svc_xprt->xpt_ops->ops_send(svc_rqst) 发送数据..
+        -> rpc_wake_up(svc_xprt->xpt_bc_pending) 唤醒这个做什么?
+        -> svc_xprt_release(rpc_rqst)
+
+下面是释放svc_xprt
+    a. svc_age_temp_xprts(closuere)
+        svc_serv->sv_temptimer的回调函数，关闭多余的socket. 遍历svc_serv->sv_tempsocks上的所有svc_xprt, 如果没有设置XPT_OLD标志，下次再释放它，添加XPT_OLD标志. 如果svc_xprt->kref->refcount>1或带有XPT_BUSY标志,也不能释放它. 如果能释放，添加标志XPT_CLOSE, XPT_DETACHED. 这里释放的个数没有指定.
+        使用一下函数释放所有满足条件的svc_xprt, 添加svc_xprt->xpt_flags的XPT_CLOSE,然后放到svc_pools中，让svc_serv->sv_function释放他们
+        -> svc_xprt_enqueue(svc_xprt)
+        -> svc_xprt_put(svc_xprt)
+        最后修改计时器
+    b. call_xpt_users(svc_xprt)
+        调用svc_xprt上所有注册的使用者回调函数，遍历svc_xprt->xpt_users, 触发svc_xpt_user->callback
+    c. svc_delete_xprt(svc_xprt)
+        删除svc_xprt, 它必须不带标志XPT_DEAT
+        -> svc_xprt->xpt_ops->xpo_detach(svc_xprt)
+        还有考虑XPT_DETACHED和svc_xprt->xpt_list. XPT_TEMP
+        -> svc_deferred_dequeue(svc_xprt) 这是什么?
+        -> call_xpt_users(svc_xprt)
+    
+    d. svc_close_xprt(svc_xprt)
+        设置XPT_CLOSE，检查XPT_BUSY, 如果没有，删除它
+        -> svc_delete_xprt(svc_xprt)
+    e. svc_close_list(list_head xprt_list)
+        对xprt_list上所有svc_xprt设置标志XPT_CLOSE, XPT_BUSY)
+    f. svc_close_all(svc_serv)
+        -> svc_close_all() 把sv_tempsocks和sv_permsocks队列的svc_xprt都删除.
+        把svc_pool上的所有svc_xprt都释放, 然后释放svc_serv的两个队列
+        -> svc_delete_xprt(svc_xprt)
+下面是cache_defer相关的
+    cache_req
+        * cache_deferred_req * defer (cache_req)
+        * thread_wait
+    cache_deferred_req
+        * hlist_head hash
+        * list_head recent  svc_xprt->xpt_deferred是cache_deferred_req->recent的队列
+        * cache_head item
+        * owner
+        * revisit
+    svc_deferred_req
+        * prot   protocol
+        * svc_xprt 
+        * sockaddr_storage  addr / daddr
+        * cache_deferred_req  handle
+        * xprt_hlen, argslen
+        * args  存储请求
+    a. svc_resivit(cache_deferred_req, too_many)
+        cache_deferred_req不熟悉，好象是把svc_xprt上发送的请求数据放到这些cache中,然后在让svc_rqst处理. 这个函数是cache_defered_req.revisit回调函数.
+        从cache_deferred_req中获取关联的svc_xprt, 设置XPT_DEFERRED. 然后把cache_deferred_req放到svc_xprt->xpt_deferred队列上.
+        -> svc_xprt_enqueue(svc_xprt)
+        -> svc_xprt_put(svc_xprt)
+    b. svc_defer(cache_req)
+        把一个请求保存起来, 返回cache_deferred_req. 检查是否可以延时处理。。。
+        如果svc_rqst->rq_deferred有效,使用这个svc_deferred_req, 否则分配一个，同时要分配svc_rqst->rq_arg的内存. 把svc_rqst->rq_arg给cache_deferred_req->args. 同时把cache_deferred_req关联svc_xprt. 这里需要看看接受数据的实现,看看怎么把数据放到deferred_cache_req. 但这里好像还得再看看cache.c
+    c. svc_deferred_recv(svc_rqst)
+        这在svc_recv中，申请svc_xprt时使用,如果svc_xprt->rq_deferred有效,则使用它的数据,否则接受数据.
+        把cache_deferred_req给svc_rqst拷贝回去, svc_rqst->rq_arg.head[0] = svc_deferred_req->args
+    d. svc_deferred_dequeue(svc_xprt)
+        svc_xprt上面有cache_deferred_req，必须带标志XPT_DEFERRED, 从svc_xprt->xpt_deferred队列上取出一个cache_deferred_req. 如果svc_xprt->xpt_deferred队列空,则去掉XPT_DEFERED标志. 这个函数和上面的一块工作,它的返回给给svc_deferred_recv做函数参数.
+    e. svc_find_xprt(svc_serv, xcl_name, net, sa_family_t, port)
+        从svc_serv->sv_persocks上找一个svc_xprt,对应参数与函数参数相同.
+哇上面都是些什么东西? 虽然都是svc_xprt_*相关操作,但真是没有逻辑性.
+下面是打印统计数的操作，不看了，这里看得最晕乎...
+
+(net/sunrpc/svcsock.c)
+这里该和rpcsock.c类似，但这里好像少一些,这里只看TCP实现的,为何同样发送和接受数据,实现差别这么大?
+svc_sock 果然比rpc_sock小
+    * svc_xprt
+    * socket
+    * sock
+    * sk_ostate(sock)
+    * sk_odata(sock, bytes)
+    * sk_owspace(sock)
+    * sk_reclen / sk_tcplen
+    * page sk_pages[RPCSVC_MAXPAGES]
+搬数据
+    a. svc_release_skb(svc_rqst)
+        svc_rqst->rq_xprt_ctx 是 sk_buff,  svc_rqst->svc_xprt=>svc_sock. 这个有些抽象,在发送数据时(svc_send),
+        -> skb_free_datagram_locked(svc_sock->sock, sk_buff) 做一些sock的释放动作
+    b. svc_set_cmsg_data(svc_rqst, cmsghdr)  udp使用的
+        使用sendmsg时，设置发送的辅助信息，就是把本地ip放里面.
+    c. svc_send_common(socket, xdr_buf, headpage, headoffset, tailpage, tailoffset)
+        这个函数发送xdr_buf，分别发送head[0], pages, tail[0]. headpage/headoffset和head[0]重复,head[0]长度是head[0]->len,,在headpage上.page长度是xdrbuf->page_len, 数据在xdrbuf->pages. tail[0]长度是tail[0]->len, 在tailpage上面
+    d. svc_sendto(svc_rqst, xdr_buf)
+        使用上面的函数发送数据,这里还使用cmsghdr结构,下面可以查看head/tail的关系. 为何这里不直接使用xdr, 而是使用svc_rqst->rq_respages[0]??
+        -> svc_send_common(socket, xdr_buf, svc_rqst->rq_respages[0], headoff, svc_rqst->rq_respages[0], tailoff) 
+        
+      svc_one_sock_name(svc_sock, buf, remaining) 
+      svc_sock_names(svc_serv, buf, buflen, toclose)
+        遍历svc_serv->sv_permsocks中的所有svc_xprt, 获取svc_sock, 打印ip地址和协议, 如果toclose有效，找到对应的svc_sock,把它关掉
+        -> svc_one_sock_name
+        -> svc_close_xprt(svc_sock->svc_xprt)
+
+    e. svc_recv_available(svc_sock)
+        返回输入队列中还未读取的字符数
+        -> kernel_sock_ioctl(svc_sock->sock, TIOCINQ, avail) 这是什么IOCTL？
+    f. svc_recvfrom(svc_rqst, kvec, nr, buflen)
+        构造msghdr, 把收到的数据放到kvec数组中. 
+        -> kernel_recvmsg(svc_sock->socket, msg, iov, nr, buflen ...)
+    g. svc_partial_recvfrom(svc_rqst, kvec, nr, buflen, base)
+        接受的数据放到kvec中，但是存储位置有偏移, 从base开始存储.这里处理一下,把一部分kvec去掉.包装上面的函数
+    h. svc_sock_setbufsize(socket, snd, rcv)
+        设置svc_sock->sock->sk_sndbuf / recbuf 
+        svc_sock->sock->sk_write_space(svc_sock->sock)
+    7. svc_udp_data_ready(sock, count)
+       svc_udp_get_dest_address4(svc_rqst)
+       svc_udp_get_dest_address6(svc_rqst)
+       svc_udp_get_dest_address(svc_rqst)
+       svc_udp_recvfrom(svc_rqst)
+       svc_udp_sendto(svc_rqst)
+       svc_udp_create(svc_serv, net, sockaddr, salen, flags)
+       svc_udp_init(svc_sock, svc_serv)
+    i. svc_write_space(sock)
+        当sock有空间时，唤醒sock->sk_wq队列.sock->sk_user_data就是svc_sock. 应该是在发送数据时,没有足够的空间.
+        -> svc_xprt_enqueue(svc_sock->svc_xprt) 为何又放到队列中?  这个函数是什么时候调用的?
+        -> wake_up_interruptible(sock->sk_wq)  竟然开始使用sock的东西？
+    j. svc_tcp_write_space(sock)
+        这是sock->sk_write_space的回调函数, 先判断sock上的空间.., 实在不懂
+        -> sk_stream_wspace(sock)   >= sk_stream_min_wspace(sock)
+        -> svc_write_space(sock)  同时还要去掉 sock->socket的SOCK_NOSPACE标志
+    k. svc_tcp_listen_data_ready(sock, count_unused)
+        这是sock->sk_data_ready回调函数, 这里主要用于监听的socket, 对于一般的socket怎么办? 监听的端口收到data_ready事件，表示connect等待处理. 注释说当connect建立起来时,这个函数会调用两次，父socket的data_ready和子socket的data_ready都会被调用. 这里只考虑sock->sk_state ==TCP_LISTEN的情况, sock->sk_user_data为svc_sock,设置svc_sock->svc_xprt->xpt_flags的XPT_CONN
+        -> svc_xprt_enqueue(svc_xprt) 服务处理函数会特殊处理XPT_CONN的socket
+        -> wake_up_interruptible_all(sock->sk_wq->wait) 谁要在上面睡眠?
+    l. svc_tcp_state_change(sock)
+        sock->sk_state_change使用的回调函数,svc_xprt要死掉? 设置sock=>svc_sock->svc_xprt->xpt_flags的XPT_CLOSE
+        -> svc_xprt_enqueue(svc_sock->svc_xprt)
+        -> wake_up_interruptible(sock->sk_wq)
+    m. svc_tcp_data_ready(sock, count)
+        这是普通socket的sock->sk_data_ready回调函数,设置svc_xprt->xpt_flags的XPT_DATA
+        -> svc_xprt_enqueue(svc_sock->svc_xprt)
+        -> wake_up_interruptible(sock->sk_wq)
+ 上面这些函数都是设置svc_xprt->xpt_flags的状态,比如XPT_DATA, XPT_CONN, XPT_CLOSE, 都会把svc_xprt放到svc_pool中.
+
+下面是svc_xprt_ops的成员函数,上面是sock的回调函数,他们处理的不多,都是设置一些XPT_*标志，然后把svc_xprt放到队列上.
+    a. svc_tcp_accept(svc_xprt)
+        这个函数在svc_recv中使用,获取新的svc_xprt. accept connect, 返回一个svc_xprt.清楚svc_xprt->xprt_flags的XPT_CONN,
+        -> kernel_accept(socket, socket, O_NONBLOCK) 接受socket
+        设置svc_xprt->xpt_flags的XPT_CONN. 它在recv时,不会有人考虑它? 获取socket两端的地址,给svc_xprt.
+        -> kernel_getpeername(sock, sockaddr) client sockaddr
+        -> svc_setup_socket(svc_serv, socket, err, SVC_SOCK_ANONYMOUS|SVC_SOCK_TEMPORARY) 创建一个svc_xprt.
+        -> svc_xprt_set_remote(svc_sock->svc_xprt, sockaddr)
+        -> kernel_getsockname(socket, sockaddr) server sockaddr
+        -> svc_xprt_set_local(svc_sock, sockaddr)
+   
+    b. svc_tcp_restore_pages(svc_sock, svc_rqst)
+        把svc_sock->sk_pages的数据page给svc_rqst->rq_pages. 释放svc_rqst->rq_pages原有的. 页数根据svc_sock->sk_tcplen决定. svc_rqst->rq_arg.head[0]是svc_rqst->rq_pages[0], 但是没保证xdr_buf中的其他变量?. 在tcp_recvfrom中使用
+    c. svc_tcp_save_pages(svc_sock, svc_rqst)
+        把svc_rqst->rq_pages给svc_sock->sk_pages, 用来接受数据? 需要的page根据svc_sock->sk_tcplen设置.
+    d. svc_tcp_clear_pages(svc_sock)
+        释放svc_sock->sk_pages使用的page. 刚才找一下，没发现什么地方向sk_pages搬运数据. 在svc_delete_xprt时,释放svc_xprt,也就是释放svc_sock, 如果它还有关联的page, 释放它们.
+
+    e. svc_tcp_recv_record(svc_sock, svc_rqst)
+        只接受一个record的头,也就是接受rpc_fraghdr,4个字节，还要处理许多，或多次接受, 这个长度需要带标志RPC_LAST_STREAM_FRAGMENT
+        -> svc_recvfrom(svc_rqst, kvec, ...), 接受的数据量在svc_sock->sk_tcplen, 接受到rpc_fraghdr给svc_sock->sk_reclen. 它表示rpc数据包的长度, 而svc_sock->sk_tcplen是已经收到的数据长度,还包括一个表示长度的头.
+
+    f. recevive_cb_reply(svc_sock, svc_rqst)
+        svc_rqst接受到数据包，根据xid从svc_sock->svc_xprt->xpt_bc_xprt中找到rpc_rqst, 把rpc_rqst->rq_rcv_buf拷贝给rpc_rqst->rq_private_buf,把svc_rqst->rq_arg拷贝给rpc_rqst->rq_private_buf
+        -> xprt_complete_rqst(rpc_rqst->rpc_task, svc_sock->sk_reclen)
+   
+    g. copy_pages_to_kvecs(kvec, page, len)
+        把pages封装成多个kvec
+    h. svc_tcp_recvfrom(svc_rqst)
+        这是svc_recv中使用的数据接受函数, 应该是把数据放到svc_rqst->rq_arg(xdr_buf)中。
+        -> svc_tcp_recv_record(sock, svc_rqst) 接受数据长度,给svc_sock->sk_reclen.
+        -> svc_tcp_restore_pages(svc_sock, svc_rqst) 这里应该不会有数据转移,tcplen=4(没超过rpc_fraghdr).把svc_sock->sk_pages数据给svc_rqst. 也可能是接受了一部分,把已有的数据给svc_rqst->rq_pages.
+        -> copy_pages_to_kvecs(svc_rqst->rq_vec, svc_rqst->rq_pages, svc_sock->sk_reclen) 把svc_rqst->rq_pages包装成svc_rqst->rq_vec, 需要长度是svc_sock->sk_reclen. 剩余的svc_sock->rq_pages给svc_rqst->rq_respages. 这是已经知道接受的rpc数据包,所以其他的page都给结果使用.
+        -> svc_partial_recvfrom(svc_rqst, vec, num ...)  
+        增加svc_sock->sk_tcplen, 它表示收到的数据. 如果上面没有收全数据则函数退出，表示出错.这是把svc_rqst->rq_pages再给svc_sock->sk_pages, 等待下一次再接受?
+        根据svc_sock->sk_reclen,修改svc_rqst->rq_arg的长度参数. svc_rqst->rq_arg.len = svc_sock->sk_reclen, rq_arg->head[0]的长度还是PAGE_SIZE, 这里要根据sk_reclen修改(如果PAGE_SIZE不超过sk_reclen),同时修改page_len, page_base=0, 数据是整齐的放在svc_rqst->rq_pages上的.
+        -> receive_cb_replay(svc_sock, svc_rqst) 这是什么东西?
+        -> svc_recv_available(svc_sock) 如果还有数据,设置svc_rpst->xpt_flags的XPT_DATA标志. 在函数退出后,会把它放到svc_pool,所以一个svc_xprt会连续接受的. 也就是会有多个任务处理一个svc_xprt,但是用svc_xprt->xpt_flags的XPT_BUSY维持串行.
+        -> svc_xprt_copy_addrs(svc_rqst, svc_xprt) 把svc_xprt的地址给svc_rqst.. 现在svc_rqst->rq_arg/rq_pages放到是输入数据,rq_respages是给结果预留的空间.
+    
+    i. svc_tcp_sendto(svc_rqst)
+        这是发送的回调函数.先封装svc_rqst->rq_res.原地封装，修改svc_rqst->rq_res->head[0]的开始4个字节,表示长度. 在svc_recv中使用. 在svc_send中使用
+        -> svc_sendto(svc_rqst, xdr_buf) 如果出错，好像就关闭svc_rqst    >svc_send_common..
+        -> svc_xprt_enqueue(svc_xprt) 发送完成后释放svc_xprt.  
+    j. svc_tcp_prep_hdr(svc_rqst)
+        这是svc_xprt_ops->xpo_prep_reply_hdr.
+        设置svc_rqst->rq_res.head[0]的头4字节为0. 填充fraghdr长度.
+    k. svc_tcp_has_wspace(svc_xprt)
+        如果svc_xprt->xpt_flags带有XPT_LISTENER, 则它是监听的,不考虑. 这应该检查发送空间. 
+        -> sk_stream_wspace(svc_sock->sock) 获取它的空间？ 和svc_xprt->xpt_reserve+svc_serv->sv_max_mesg比较, 如果空间不够，设置socket->flags的SOCK_NOSPACE. 在接受时使用它判断sock的空间是否足够,使用这个判断岂不经常阻塞??  sv_max_mesg太大了..
+    l. svc_tcp_create(svc_serv, net, sockaddr, len ...)
+        这是svc_xprt_ops->xpo_create, 使用svc_serv/sockaddr创建svc_xprt,实际上是创建svc_sock. 这里创建的是监听的svc_xprt.
+        -> svc_create_socket(svc_serv, IPPROTO_TCP, ...)
+最后定义svc_tcp_ops,还有svc_tcp_class，下面是一些初始化函数
+    a. svc_tcp_init(svc_sock, svc_serv)
+        初始化svc_xprt
+        -> svc_xprt_init(svc_sock->socket->sock->net, svc_tcp_class, svc_sock->svc_xprt, svc_serv)
+        设置svc_sock->svc_xprt的XPT_CACHE_AUTH. 
+        如果sock->sk_state=TCP_LISTEN, 设置svc_xprt->xprt_flags的XPT_LISTENER和XPT_CONN, 还有一个回调函数sock->sk_data_ready=svc_tcp_listen_data_ready.  否则设置三个回调函数, 还有XP_DATA. 如果sock->sk_state不是TCP_ESTABLISHED, 设置XPT_CLOSE.
+    
+    b. svc_sock_update_bufs(svc_serv)
+        设置svc_serv->sv_permsocks和sv_tempsocks队列上所有svc_sock(svc_xprt)的XPT_CHNGBUF, 和XPT_CHANBUG 标志. 只有udp使用
+    c. svc_setup_socket(svc_serv, socket, err, flags) 
+        创建svc_sock, 共用的创建svc_xprt(svc_sock). 这里socket已经创建完成. 应该是在accept中收到的socket.
+        -> svc_register(svc_serv, net, family, protocol, port) 向rpcbind注册, 只有flags不包含SVC_SOCK_ANONMOUS才注册
+        初始化svc_sock 这里的udp省掉, 各种回调函数,还有sk_sock/sk_sk
+        -> svc_sock_setbufsize(svc_sock->socket, 4*svc_serv->sv_max_mesg, 4*svc_serv->sv_max_mesg) 看来足够接受4个rpc消息.
+        -> svc_tcp_init(svc_sock, svc_serv) 针对listen/data设置不同的回调函数...
+    d. svc_addsock(svc_serv, fd, name, len)
+        这些函数在哪里用? 添加监听端口,竟然只在nfsd中使用. 这是一个sysctl参数,应该是用户层,创建sock(fd)然后传递进来,监听这些端口. 那原来的listener的端口干什么?
+        -> sockfd_lookup(fd, err) 根据fd获取socket
+        -> sock_setup_socket(serv_sock, sockek ...)
+        -> kernel_getsockname(svc_sock->socket, sockaddr ...)
+        -> svc_xprt_set_local(svc_xprt, socket ...) 根据上面获取的地址，设置本地地址，监听的端口只有本地地址, 清楚XPT_TEMP, 把svc_xprt->xpt_list加到svc_serv->sv_permsocks队列.
+        -> svc_xprt_received(svc_sock->svc_xprt)
+    e. svc_create_socket(svc_serv, protocol, net, sockaddr, len ...)
+        共用的创建svc_sock的函数,首先创建socket，再执行bind/listen.
+        -> __sock_create(net, family, type ...)
+        -> kernel_bind(sock, sockaddr, len)
+        -> kernel_listen(sock, 64) 监听64个?
+        -> svc_setup_socket(...) 返回创建的svc_sock
+    f. svc_sock_detach(svc_xprt)
+        释放socket和svc_sock的关系,去掉svc_sock->sock的一些回调函数
+        -> wake_up_interruptible(sock->sk_sleep) 唤醒等待队列
+    g. svc_tcp_sock_detach(svc_xprt) 包装上面的, 在svc_delete_xprt时使用.
+        -> svc_sock_detach(svc_xprt)
+        如果不是监听端口，还有清楚数据
+        -> svc_tcp_clear_pages(svc_sock)  svc_sock->sk_pages
+        -> kernel_sock_shutdown(svc_sock->socket, SHUT_RDWR)
+    8. svc_sock_free(svc_xprt)  在svc_xprt_free时使用, 这是最后的释放
+        释放svc_sock的socket.两种情况释放，一种根据sockfd,另一种是没有sockfd时
+        -> sockfd_put(svc_sock->socket)
+        -> sock_release(svc_sock->socket)
+
+1. 数据流，以及内存的分配
+    * svc_prepare_thread(svc_serv, svc_pool, node) 创建svc_rqst,同时创建svc_rqst->rq_argp/rq_resp使用的内存, 
+    * svc_init_buffer(svc_rqst, size, node) 创建svc_rqst->rq_pages. svc_serv->sv_xdrsize/sv_max_mesg,在创建svc_serv时,根据参数创建..
+    * svc_procinfo->pc_decode(svc_rqst, kvec->iov_base, rq_argp) 数据解包, svc_rqst->rq_arg => svc_rqst->rq_argp
+    * svc_procinfo->pc_encode(svc_rqst, kvec->iov_base, rq_resq) 数据打包, svc_rqst->rq_res <= svc_rqst->rq_resp
+上面这两个打包只能处理不超过1页的数据,而nfs都是自己的dispatch函数, 应该看看怎么打包,比如READ操作,这些打包的肯定不含数据.
+    * svc_process 把svc_rqst->rq_respages给svc_rqst的rq_res.tail[0]和pages
+ * svc_recv 把数据从svc_sock->rq_pages给svc_rqst->rq_pages(这个实际上是接受涵数), 把svc_rqst->rq_pages一部分给svc_rqst->rq_respages.
+ 
+2. socket的创建和断开
+    在创建svc_xprt时创建,好像也可以通过sysctl创建,还有accept创建,使用svc_serv->timer销毁socket.
+
+3. service thread的执行过程
+    循环执行:
+        * svc_recv
+        * svc_process_common
+  * svc_send
+
+4. svc_serv/svc_rqst/svc_xprt
+    1. svc_serv/svc_pool
+        * svc_create_pooled(svc_program, bufsize, shutdown, svc_thread_fh)
+        * __svc_create(svc_program, bufsize, 1, shutdown)
+        * svc_create(svc_program, bufsize, shutdown)
+        * svc_destroy(svc_serv)
+    2. svc_rqst
+        * svc_prepare_thread / svc_init_buffer
+        * svc_release_buf
+        * svc_exit_thread 退出service线程，同时也清空svc_rqst
+    3. svc_xprt
+        * svc_xprt_free(kref) / svc_xprt_put 这里主要是释放socket
+        * svc_xprt_init(net, svc_xprt_class, svc_xprt, svc_serv) 各种关系
+        * __svc_xpo_create / svc_create_socket 创建socket
+        * svc_setup_socket  准备socket,其他关系
+5. svc_xprt->xpt_flags
+    * XPT_BUSY  
+        在svc_pool->sp_sockets中，设置这个标志
+        当svc_xprt被svc_rqst使用时取消这个标志
+        到底能不能多个svc_rqst使用一个svc_xprt呢? 可以，因为在处理数据时回调用这个函数.所以可能处理时把它放到队列中.
+    * XPT_CONN  listener socket
+    * XPT_CLOSE 关闭端口
+    * XPT_DATA 有数据需要接受
+    * XPT_TEMP accept创建的svc_sock..

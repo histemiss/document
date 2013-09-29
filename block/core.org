@@ -1,0 +1,593 @@
+据说block模块分成bio，request，io-schedule这三部分。 这里和block_device, hd_struct, gen_disk有相关性
+这里主要函盖 blk-core.c blk-merge.c blk-timeout.c, 还有blk-softirq.c
+
+request_queue数据结构
+  * list_head  queue_head  这是request->queuestlist)队列, elevator操作它
+  * request *last_merge  最后一个合并操作的request,当再有bio合并时，先使用它
+  * elevator_queue *elevator  使用的elevator结构
+  * int nr_rqs[2]   统计参数？  应该是request的统计数,这个request表示已经分配/构造的. 和request_list->count一样. request_list是request_queue中的.
+  * int nr_rqs_elvpriv  request不一定全部使用elevator管理,这个计数表示elevator管理的request
+  * request_list root_rl  它管理request的分配,还有等待队列，等待什么? 在分配request时,如果太多,需要等待其他request的释放.
+ 一些回调函数
+  * request_fn_proc  : void request_fn(request_queue *)  这个函数是底层驱动使用的函数，它会循环处理request_queue中的request. 
+  * make_request_fn  :  void make_request_fn(request_queue, bio) 这个应该是添加bio请求
+  * prep_rq_fn : int prep_rq_fn(request_queue, request)
+  * unprep_rq_fn ： void unprep_rq_fn(request_queue, request)
+  * merge_bvec_fn ：int merge_bvec_fn(request_queue, bvec_merge_data, bio_vec)
+  * softirq_done_fn : void softirq_done_fn(request)  在softirq中调用..
+  * rq_timed_out_fn : blk_eh_timer_return rq_timed_out_fn(request) 如果有request处理超时调用
+  * dma_drain_needed_fn : int dma_drain_needed(request)
+  * lld_busy_fn : int lld_busy_fn(request_queue)
+ dispatch queue sorting??  
+  * sector_t end_sector 当前在处理的request的最后一个扇区位置
+  * request *boundary_rq   这里的boundary是什么意思?  REQ_SOFTBARRIER? 还是最后一个.
+
+  * delayed_work delay_work  它的回调函数调用__blk_run_queue(request_queue) -> request_queue->request_fn(request_queue). delay_work使用的工作队列是kblockd_workqueue. 驱动层的工作是在kblockd_workqueue中完成的?
+  * backing_dev_info backing_dev_info  这不是指针，所以块设备上的super_block使用的backing_dev_info在这里
+
+  * queuedata : 私有数据, 这是底层驱动指针.
+  * queue_flags : ???
+ QUEUE_FLAG_QUEUE tag request???
+ QUEUE_FLAG_STOPPED 表示request_queue开始工作
+ QUEUE_FLAG_NOMERGE  不能合并
+  * id   使用ida索引request_queue
+  * gfp_t bounce_gfp 
+  * spinlock_t  __queue_lock / queue_lock  后者是前者的指针
+  * kobject kobj
+ 配置参数,统计参数,后面在创建request时用到,
+  * long nr_requests  系统参数,限制request_queue上的request数量.
+  * int nr_congestion_on  [off,on]是这个范围, [13/16*nr_requests, 7/8*nr_requests]
+  * int nr_congestion_off
+  * int nr_batching 和ioc相关???
+  
+  * int dma_drain_size
+  * void dma_drain_buffer
+  * int dma_pad_mask 在包装成sg时,需要一定的地址对齐,这个是对齐长度
+  * int dma_alignment 
+
+ tag?
+  * blk_queue_tag *queue_tags  ???scsi使用的. request_queue包含blk_queue_tag,里面都request的指针数组
+  * list_head tag_busy_list 它是request队列，这些request是带tag的,使用request->queuelist? 这些request就不会到request_queue->queue_head.
+
+  * nr_sorted  使用elevator处理的request计数,处理完后递减
+  * in_flight[2] 从request_queue中取出来,给驱动函数处理的request个数, 同样也是elevator处理的东西，当完成时递减 (elv_completed_request)
+ 
+ timeout?
+  * rq_timeout  这个和request->timeout相关,表示request的请求时间
+  * timer_list timeout 它处理timeout_list队列，使用的函数是blk_rq_timed_out_timer, 它会处理超时的request.
+  * list_head timeout_list 队列中是request,使用request->timeout_list.
+
+  * list_head icq_list 队列中是io_cq->ioc_node
+
+  * queue_limits limits  限制
+
+  * flush_flags 磁盘刷新操作   如果为0,说明磁盘不支持刷新操作.
+  * flush_not_queueable / flush_queue_delayed / flush_pending_idx / flush_running_idx / flush_pending_since
+  * list_head  flush_queue, flush_data_in_flight
+  * request  flush_rq  这个不是指针..
+
+  * bypass_depth 和REQUEST_FLAG_BYPASS
+
+request 数据结构
+  * list_head queuelist
+  * call_single_data csd
+    . list_head list
+    . void smp_call_func_t(void *)
+    . void * info
+    . flags
+    . priv
+  * request_queue 
+  * cmd_flags 包括RW等 
+    * REQ_SORTED表示elevator处理的
+    * REQ_STARTED表示驱动第一次处理它
+
+  * rq_cmd_type_bits cmd_type 表示request的属性类型?  REQ_TYPE_FS/REQ_TYPE_BLOCK_PC等等
+  * atomic_flags
+  * cpu
+  * int __data_len 请求的数据长度
+  * sector_t __sector  请求磁盘位置，使用sector表示
+ 下面和bio->bi_next构成一个单链表
+  * bio *bio
+  * bio *biotail
+  * hlist_node hash ???
+
+  * rb_node rb_node 在elevator调度结构中使用
+  * void *completion_data
+
+ elv
+  * io_cp  *icp
+  * void *priv[2]
+ flush
+  * seq
+  * list_head list
+  * rq_end_io_fn saved_end_fio   void(rq_end_io_fn)(request, int)
+
+  * gendisk *rq_disk 磁盘
+  * hd_struct *part  应该表示磁盘分区
+  * long start_time 创建request的时间
+
+ cgroup
+  * request_list rl
+  * long start_time_ns  开发中..
+  * long io_start_time_ns
+
+  * nr_phys_segments 表示所有的bio的数据段数  bi_phys_segment
+ 
+  * nr_integrity_segments   bio_integrity_payload...
+
+  * short ioprio  bio->bi_rw中保存请求的优先级..
+  * int ref_count
+
+  * void *special 
+  * char *buffer  请求数据的地址,使用bio中的iov计算地址,bio包括多个iov,但有一个是当前处理的iov
+
+  * int tag, errors
+
+ bio里面是命令，而不是数据
+  * char __cmd[BLK_MAX_CDB]
+  * char *cmd, cmd_len  ??? 什么命令?
+
+  * int extra_len 在dma/sg包装时的地址对其工作.
+  * sense_len, resid_len, void *sense
+
+  * long deadline, list_head timeout_list, int timeout, retries  这个和request_queue->rq_timeout一块使用, 如果timeout没有设置, 使用request_queue->rq_timeout...  deadline表示时间限制.
+
+ bio完成的回调函数?
+  * rq_end_io_fn end_io 完成之后的回调函数, 应该是处理所有的bio.
+  * end_io_data
+
+  * request * next_rq
+
+request_list数据结构  这个是管理request的?  下面数据长度为2，应该包含BLK_RW_SYNC/BLK_RW_ASYNC.  
+  * request_queue *q
+  * blkcg_gp *blkg
+  * count[2]
+  * starved[2]
+  * mempool_t rq_pool
+  * wait_queue_head_t wait[2]
+  * flags
+
+bio_vec数据结构
+  * page *bv_page
+  * int bv_len, bv_offset
+
+bio数据结构
+  * sector_t bi_sector  数据的开始扇区位置
+  * bio *bi_next
+  * block_device bi_bdev  它对应blk_fs中的某个块设备文件.
+  * bi_flags, bi_rw  
+  * bi_vcnt bio_vec的数量
+  * bi_idx 当前处理的bio_vec
+  * bi_phys_segments 物理地址段数?  physical address coalescing?? 应该是连续的物理内存的地址.
+  * bi_size  剩余的数据量?
+  * bi_seg_front_size / bi_seg_back_size 啥意思?  是头和尾连续内存的大小?! 为方便合并
+  * bi_max_vecs 最大的bi_vec数量, 在创建bio时就指定
+  * bi_cnt  pin count??  atomic_t
+  * bio_vec bi_io_vec
+  * bio_end_io_t bi_end_io   void(bio, int)
+  * bi_private 属性数据
+  * io_context bi_ioc 下面两个是cgroup使用的
+  * cgroup_subsys_state *bi_css
+  * bio_destructor_t *bi_destructor  void(bio)
+  * bio_vec bi_inline_vecs[0]  分配内存时把io_vec放在bio的后面一块分配
+ 
+blk_plug数据结构, 和task_struct->plug, 积累提交的io.
+  * magic
+  * list_head list, cb_list
+  * should_sort
+
+blk_plug_cb 数据结构  什么回调函数?
+  * list_head list
+  * blk_plug_cb_fn callback
+  * data
+ 
+blk-core.c 下面挑一些函数记录一下
+1. drive_stat_acct(request, int new_io)  应该是增加统计数据
+ 但操作是在hd_struct上面,先定位request的位置,在哪个hd_struct上面.然后增加相应的计数.. new_io表示合并还是新的request. hd_struct->disk_stats,里面有一下统计数
+ sectors / ios / merges / ticks 都包含read/write, io_ticks / time_in_queue..
+ 如果是合并,则增加merge,否则增加.  time_in_queue表示所有的请求使用的时间总和,对,有重复. io_ticks表示磁盘的io时间.
+ hd_struct->in_flight计数是什么?
+ > part_inc_in_flight(hd_struct, rw) 修改上面的计数.
+ 在插入bio时调用，或者合并，或者插入新的.
+
+2. blk_queue_congestion_threshold(request_queue)
+ 根据nr_requests设置request_queue的nr_congestion_on/nr_congestion_off. 在blk_init_allocated_queue中使用, 在创建request_queue中使用.
+
+3. backing_dev_info blk_get_backing_dev_info(block_device)
+ block_device => bd_disk(gendisk) => request_queue => backing_dev_info
+
+4. blk_rq_init(request_queue, request)
+ 使用request_queue初始化request, 除了设置request->q = request_queue,其他都是初始化为0
+
+5. req_bio_endio(request, bio, nbytes, error)
+ 这是io结束后的回调函数,没想到device也会接触bio, 这里修改的是bio的属性数据.最后调用 -> bio_endio(bio, error).  bio需要有标志BIO_UPTODATE,否则error有表示有错误. 这里主要修改bio->bi_size / bi_sector. 当bi_size=0时,调用 bio_endio(bio, error)
+
+6. blk_start_queue(request_queue)
+ 开始request_queue，外部调用的函数  -> __blk_run_queue(request_queue)  -> request_queue->request_fn(request_queue)去掉标志QUEUE_FLAG_STOPPED
+
+7. blk_stop_queue(request_queue)
+ 停止request_queue, 也就是取消request_queue->delay_work, 设置QUEUE_FLAG_STOPPED. 这个和上面一个函数都是底层设备驱动使用的函数
+
+8. blk_sync_queue(request_queue) 这个函数和上面的一样，取消request_queue->timeout / delay_work.  这个计时器处理队列上执行中的request.
+
+9. __blk_run_queue(request_queue) / blk_run_queue_async(request_queue) 两种方法出发request_queue->request_fn, 一种是同步，直接调用，另一种使用delay_work
+ blk_run_queue 包装上面的
+
+这些都是出发request_queue开始执行的函数，在底层驱动层调用.
+
+10. blk_drain_queue(request_queue, drain_all) 这个函数和上面类似，也是触发request_queue开始处理IO. 
+ -> elv_drain_elevator(request_queue)  elevator操作?
+ -> blkcg_drain_queue(request_queue) cgroup
+ -> __blk_run_queue(request_queue)  当然必须是request_queue->queue_head不是空,如果为空只要等待就可以,不用启动.
+ -> 检查request_queue还有request
+ * request_queue->nr_rqs_elvpriv
+ * 如果drain_all为1,说明要处理所有的request,不仅仅elevator的 nr_rqs[], in_flight[], 
+ * flush_queue队列 在blk_flush中使用这个东西,队列中也是request->flush.list
+ 如果这些表示还有request,则等待10ms继续执行,否则退出
+ -> 最后处理request_list, 等待request_list->wait??? 这个等待的是什么东西?
+
+11. blk_queue_bypass_start(request_queue) 使用request_queue的bypass模式, 好像就是FIFO,没有特殊的elevator算法的使用.
+ 设置QUEUE_FLAG_BYPASS,  增加request_queue->bypass_depth
+ 如果request_queue->bypass_depth=0时,调用-> blk_drain_queue(q, false), 把elevator处理的request都刷掉.以后的IO就没有elevator介入.
+ 在cgroup中调用这个函数,在切换elevator算法时,也使用.
+
+12. blk_queue_bypass_end(request_queue)
+ 检查request_queue->bypass_depth, 如果为0，则去掉QUEUE_FLAG_BYPASS
+
+13. blk_cleanup_queue 关闭request_queue
+ 减小request_queue->bypass_depth, 设置一些标志QUEUE_FLAG_BYPASS, NOMERGES, NOXMERGES, DEAD, 关闭计时器和delay_work
+ -> blk_drain_queue(request_queue, true) 完成所有的request
+ -> blk_sync_queue(request_queue) 撤销workqueue/timer
+
+14. blk_init_rl(request_list, request_quue, gfp_t), blk_exit_rl
+ 初始化和注销request_list
+
+15. blk_alloc_queue 创建一个request_queue
+ -> blk_alloc_queue_node
+
+  blk_init_queue(request_fn_proc, lock) 
+  -> blk_init_queue_node(rfn, lock, -1) 初始化仅仅提供一个函数
+    -> blk_alloc_queue_node(GFP_KERNEL, node_id)
+   -> request_queue->timeout = blk_rq_timed_out_timer.. 这个是超时处理函数
+    -> blk_init_allocated_queue(request_queue, request_fn_proc, lock)
+      -> blk_init_rl(request_queue->root_rl, ...)
+      -> blk_queue_make_request(request_queue, blk_queue_bio)  blk-settings, 设置make_request_fn, 这是文件系统使用的提交bio的方法, 这里使用blk_queue_bio, 还有其他参数, nr_requests, ..
+      -> elevator_init(q, NULL)  
+   -> blk_queue_congestion_threshold(q) 配置threshold参数
+   -> blk_queue_bypass_end(q) 结束bypass模式? 进入正常工作状态. 在初始化时设置depth=1,这里会减小depth.
+
+16. ioc_batching(request_queue, io_context） / ioc_set_batching(request_queue, io_context)
+ 这里使用io_context的参数，如果使用cgroup,它属于bio,否则,它属于current.. 这里先不看. 检查ioc是否批处理? 应该优先处理..
+
+    ioc_set_batching(request_queue, io_context)  初始化io_context? 设置 io_context->nr_batch_requests / last_waited.
+
+17. __freed_request(request_list, sync) 根据request的参数,改变request_queue的状态
+ -> count[] 和 request_queue->nr_congestion_off, 清楚bdi->state的BDI_async_congested.原来改哪里了!!
+ -> 如果count小于request_queue->nr_request, 则唤醒request_list->wait队列, 同时清楚request_queue->flags的BLK_RL_SYNCFULL, 如果它满了，估计有东西等待它.  -> blk_clear_rl_full(request_list, sync)
+  request_list里面管理什么? request.  request_list->rq_pool是管理request的.
+  freed_request(request_list, flags) 这个函数在释放request时调用__blk_put_request,减小request_queue中相应的计数.  request_queue->nr_rqs[sync] / request_list->count[], sync表示read和sync write.. 如果flags带有REQ_ELVPRIV,表示elevator管理的,减小 nr_rqs_elvpriv..
+ -> __freed_request(request_list, sync)
+ -> request_list->starved[]标志 ???
+
+18 __get_request(request_list, rw_flags, bio, gfp_mask) 开始处理request_queue和request, request应该是先使用bio创建，然后添加到request_queue,然后driver操作这个请求，然后返回.
+ -> elv_may_queue elevator操作?  >request_queue->elevator_queue->type->ops->elevator_may_queue_fn(request_queue, rw)
+ -> 检查request_list中的分配的请求数量，是否达到request_queue的界限值 > queue_congestion_on_threshold(request_queue). 这个就是request_queue->nr_congestion_on. 如果request_list->count[sync]+1>=request_queue->nr_requests, 说明再分配request_queue就会堵塞, 这是检查request_list是否BLK_RL_SYNCFULL, 如果已经设置,检查ioc是否是batching操作,需要优先级的,如果不是返回NULL, 如果request_list不是FULL,设置request_list的FULL标志. batch是不是多个bio使用一个request? 应该是. 设置ioc的batching操作.
+ -> blk_set_queue_congested(request_queue, is_sync) 设置bdi的相关..
+ -> 增加request_queue->nr_rqs[sync], request_list->count[sync]
+ -> blk_rq_should_init_elevator(bio) bio是否需要elevator, 如果是FLUSH/FUA操作,不需要elevator.  增加request_queue->nr_rqs_elvpriv
+ -> ioc_lookup_icq(io_context, request_queue) 获取一个io_cq???
+ -> mempool_alloc(request_list->rq_pool, gfp_mask) 分配request
+ -> blk_rq_init 初始化request,关联request_queue
+ -> blk_rq_set_rl 关联request_list
+ -> 如果使用elevator调度，关联io_cq, >ioc_create_icq(io_context, request_queue ..) 如果前面没有找到,创建一个. 而且会把这个io_cq给request_queue->elevator_queue.icq?? 一个request_queue使用一个io_cq???
+ -> elv_set_request(request_queue, request, bio, gfp_mask) 这个函数分配内存???
+ 对于一个request,可见和bio/elevator/request_queue有联系, request_list属于这个request_queue, 如果不是用elevator, 为何没看到把bio和request关联起来??? 在下吗?
+
+  get_request(request_queue, rw_flags, bio, gfp_mask) 对上面包装
+ -> blk_get_rl(request_queue, bio) 由于group, request_list不那么单纯，cgroup在这里限制request?
+ -> __get_request(request_list, rw_flags, bio, gfp_mask) 这个函数会返回NULL.
+ -> 如果gfp_mask包含__GFP_WAIT, 等待request_list->wait. 被唤醒后变成batch的ioc? 什么意思? 因为batching的bio有优先级. 但这里是current->io_context.
+
+  blk_get_request(request_queue, rw, gfp_mask) 继续包装? 这里都没有bio..
+ -> 先创建一个ioc, 这是为当前任务创建的current->io_context, 不大明白. >create_io_context
+ -> get_request(request_queue, rw_flags, NULL， gfp_mask) 使用NULL的bio
+
+  blk_make_request(request_queue, bio, gfp_mask) 继续包装, 这里的bio是一个bio-chain
+ -> blk_get_request 先创建一个request
+ -> 遍历bio-chain上的bio, 如果bio的数据使用的page不能和底层driver传递数据，需要搬数据到合适的page上，这个现在应该没用的了，效率太低！！
+ -> blk_queue_bounce(request_queue, bio)
+ -> blk_rq_append_bio(request_queue, bio) 这里会有合并的一些操作,是bio和request合作完成的. 这个操作在blk-map中? 这里添加的bio应该是地址连续的？或者地址在前面bio的后面.所以就直接放bio队列后面.
+   -> ll_back_merge_fn(request_queue, request, bio) 这个函数做了大量的检查，判断bio是否能添加到request中, 包含request_queue->limit参数,计算bio的物理地址段数, 修改request的nr_phys_segments += bio_phys_segment(request_queue, bio)  // bi_phys_segment.
+   -> 把bio添加到request的bio队列中, 修改request->__data_len += bio->bi_size.
+
+这些竟然也是底层使用的,scsi.
+
+18. blk_requeue_request(request_queue, request) 重新提交request, 也是driver做的事情
+ -> blk_delete_timer(request) 把request从request_queue->timeout_list队列中删除.
+ -> blk_clear_rq_complete(request) 清除request的标志REQ_ATOM_COMPLETE
+ -> blk_queue_end_tag(request) 把request从request_queue中取出来, tag的request..
+ -> elv_requeue_request(request_queue, request) 这是入队操作？
+
+19. add_acct_request(request_queue, request, where) 这好像不仅仅是一个统计函数. 这里的参数是request, 在创建一个新的request使用的计数.
+ -> 修改驱动层的磁盘操作计数 >drive_stat_acct(request, 1), 开始的函数
+ -> __elv_add_request(request_queue, request, where) 还是通过elevator添加队列
+   * 这里把request添加到requeue_queue队列中(queuelist / queue_head) 通过代码，发现插入方式有很多种,在elevator中继续学习.
+
+20. part_round_stats_single(cpu, hd_struct, now) 修改磁盘分区的计数? 这里修改的应该是时间长度等等. disk_stats. 这里是磁盘操作计数的函数,它是在一定间隔后出发,比较简单，修改part->stat->time_in_queue / io_ticks.
+ part_round_stats  以后再看统计数据
+ time_in_queue是请求在queue中的时间, io_ticks是磁盘io操作的累计时间.
+
+21. __blk_put_request(request_queue, request) 开始释放request??  request->ref_count统计使用计数
+ -> elv_completed_request(request_queue, request) 做一些回调操作
+ -> 检查request->cmd_flags的REQ_ALLOCED标志, 有了这个标志，说明它需要释放其他结构的内存.
+ -> blk_rq_rl(request) 获取分配request使用的request_list,  (request->rl)
+ -> blk_free_request(request_list, request) 看上面,做elevator/io_cp相关的释放，然后释放内存给request_list->rq_pool
+ -> freed_request(request_list, flags) 减小request_list/request_queue的计数, 通过如果request_queue不再阻塞，唤醒等待request_list->wait[sync]上的任务
+
+ blk_put_request(request)  这个函数还是底层驱动在使用.
+
+22. blk_add_request_payload(request, page, len) 这个是底层scsi驱动调用的. 这个。。要看看怎么使用它. 使用page/len填充request->bio.
+
+23. bio_attempt_back_merge(request_queue, request, bio)  这里的函数还是太上层，看不到数据结构的成员都干什么事。 这个函数应该是合并bio到request?
+ -> ll_back_merge_fn(request_queue, request, bio) 这才是底层的函数
+ -> blk_rq_set_mixed_merge(request)  什么是mixed??? 应该看看REQ_FAILFAST_MASK是什么???
+ -> 把bio添加到request->biotail链表末尾,为何还是merge?? 上面的合并只是检查是否可行,这里才是真正添加bio队列
+ -> ioprio_best(request->ioprio, bio->prio) 
+ -> drive_stat_acct(req, 0)
+
+24. bio_attemp_front_merge(request_queue, request, bio)
+ -> ll_front_merge_fn(request_queue, request, bio) 又是底层函数?
+ -> 和上面的函数类似，不过是把bio放到request_queue->bio队列头
+
+25. attempt_plug_merge(request_queue, bio, request_count) 把bio合并到current->blk_plug队列上某个request
+ -> blk_rq_merge_ok(request, bio)  检查是否可merge,条件并不复杂
+ -> blk_try_merge(request, bio)  返回根据数据所在sector位置，返回ELEVATOR_FRONT_MERGE/ELEVATOR_BACK_MERGE,或者ELEVATOR_NO_MERGE不能合并
+ -> bio_attempt_back_merge(request_queue, request, bio)
+ -> bio_attempt_front_merge(request_queue, request, bio)
+
+26. init_request_from_bio(request, bio) 使用bio初始化request,就是初始化request的属性, 包括 cmd_flags, 
+ * __sector 磁盘位置
+ * ioprio
+ * nr_phys_segments / buffer / __data_len 数据
+ * bio/biotail
+ * rq_disk = bio->bi_bdev->bd_disk
+
+27. blk_queue_bio(request_queue, bio) 
+ -> blk_queue_bounce(request_queue, bio) 为底层移动数据
+ -> 如果bio是特殊的，REQ_FLUSH/REQ_FUA, 需要新建一个request.
+ -> attemp_plug_merge(request_queue, bio, request_count) 看是否能插入一些缓存的request中,如果能插入,不再继续处理
+ -> elv_merge(request_queue, request, bio) 根据elevator算法,找一个合适的request, 这里返回的是elevator的合并方法, ELEVATOR_BACK_MERGE/FRONT_MERGE
+ -> 一系列的合并操作 bio_attemp_back_merge(request_queue, request, bio), 操作request的合并
+ -> elv_bio_merged(request_queue, request, bio) elevator_queue->type->ops->elevator_bio_merged_fn合并后的回调函数???
+ -> attempt_back_merge(request_queue, request) 这里没有bio参数,应该是检查request是否能和其他的request合并.  blk-merge.c
+ -> elv_merged_request(request_queue, request, el_ret)  如果上面不能合并? 使用elevator算法检查合并.
+ -> bio_attempt_front_merge(request_queue, request, bio) 需要两次插入操作，先修改request, 然后elevator中的操作，上面是后合并,这里前合并
+ -> 如果不能合并，创建一个新的request  > get_request(request_queue, rw_flags, bio, GFP_NOIO) .. 
+ -> 如果创建失败,结束这个bio bio_endio(bio, -ENODEV)   request_queue死了?!
+ -> init_request_from_bio(request_bio) 根据bio初始化request
+ -> 检查current->plug,这就是request缓存,如果plug存在,把新创建的request添加到plug->list中,如果队列太大,提交上面的操作
+ -> blk_flush_plug_list(plug, false)  plug->should_sort表示request属于多个request_queue. 如果plug中request太多,刷新队列.  BLK_MAX_REQUEST_COUNT
+ -> 如果plug不存在,直接提交request, 
+  > add_acct_request(request_queue, request, where) 这个函数真的是入队操作?
+  -> __blk_run_queue(request_queue) 提交workqueue
+这个函数只有dm在使用.
+   
+28. blk_partition_remap(bio) 如果bio操作的对象属于磁盘的某个分区,需要重新计算它的扇区位置,bio操作的数据所在的扇区是连续的? 这里只修改bio->bi_sector, 先判断磁盘是否子分区
+ -> bio->bi_bdev 和 bio->bi_bdev->bd_contains
+ -> bio->bio_sector += bio->bi_bdev->bd_part
+ 
+29. bio_check_eod(bio, nr_sectors)  检查end of disk..  磁盘对应bdev文件系统的某个inode, 根据inode获取磁盘大小
+ -> i_size_read(bio->bi_bdev->bd_inode) >> 9  512是固定了!!
+
+30. generic_make_request_checks(bio) 这里应该为了提交bio到request而做一些检查准备
+ -> bio_check_eod(bio, nr_sectors)
+ -> blk_partition_remap(bio)
+ -> create_io_context(GFP_ATOMIC, request_queue->node), 创造一个io_context,给current
+ -> blk_throtl_bio(request_queue, bio) throttle操作?
+ 
+31. generic_make_request(bio) bio包含一些缓存数据,还有操作的磁盘对象信息. 这个函数没有返回,io结果通过bio->bi_end_io返回. 给外部模块使用的函数,提交bio
+ -> generic_make_request_checks(bio)
+ -> bdev_get_queue(bio->bi_bdev) 获取request_queue
+ -> request_queue->make_request_fn(request_queue, bio) 通过这个函数提交bio? 
+ 这里还有一些疑惑，这个函数可能会并行调用提交bio,但不允许,所以使用current->bio_list缓存bio. 这个函数在底层和submit_bio中使用.
+
+32. submit_bio(rw, bio) 包装上面的实现
+ -> count_vm_events(PGPGOUT, count), count是扇区数, 如果读PGPGIN/PGPGOUT, 为何是vm统计???
+ -> task_io_account_read(bio->bi_size) 这是task_struct的统计数
+ -> generic_make_request(bio)
+
+33. blk_rq_check_limits(request_queue, request) 检查工作?
+
+34. blk_insert_cloned_request(request_queue, request) 为dm准备的辅助函数,这里就是包含多个价差函数
+ -> blk_rq_check_limits(request_queue, request)
+ -> should_fail_request(request->rq_disk->part0, blk_rq_bytes(request))
+ -> add_acct_request(request_queue, request, where) 这个函数有添加队列的功能
+ -> 如果request是REQ_FLUSH/REQ_FUA, 出发bio操作 > __blk_run_queue(request_queue)
+
+  blk_rq_err_bytes(request)  failfast
+
+35. blk_account_io_completion(request, bytes) 统计part相关的计数
+ -> part_stat_add(cpu, part, sectors[rw], bytes>>9)  sectors[rw]应该就是简单的读或写. 这里是修改partition的相应计数.
+
+36. blk_account_io_done(request)
+ -> blk_do_io_stat(request) 是否需要统计
+ -> part_stat_inc(cpu, part, ios[rw])  io次数
+ -> part_stat_add(cpu, part, ticks[rw], duration)  分区的IO操作的时间.
+ -> part_round_stats(cpu, part) 周期的统计操作.
+ -> part_dec_in_flight(part, rw) 这个明白了 part->in_flight[rw] request_queue和hd_struct也是一一对应的. 这是一个工作中request计数.
+
+37. blk_peek_request(request_queue) 从request_queue中取出一个request, 底层驱动使用的函数
+ -> __elv_next_request(request_queue) 取出一个request, 但不一定满足条件，需要再次执行, 这个函数是inline函数,在blk.h中
+  -> 从request_queue->queue_head队列中取出一个request.
+  -> 如果队列为空,查看flush操作, 一些列的request_queue的flush参数. 如果flush操作在执行,退出NULL，说明没有request可执行
+  -> request_queue->elevator_queue->type->ops->elevator_dispatch_fn(request_queue, 0)  使elevator算法发射request
+ -> elv_activate_rq(request_queue, request) elevator_queue->type->ops->elevator_activate_req_fn(request_queue, request)  
+ -> 设置request_queue->boundary_rq ???
+ -> 准备request  REQ_DONTPREP > request_queue->prep_rq_fn(request_queue, request). 还可能返回BLKPREP_DEFER, 则函数退出NULL
+
+38. blk_dequeue_request(request) 把request从request_queue中取出来,驱动开始处理
+ -> list_del_init(request->queuelist)
+ -> blk_account_rq(request)  修改统计数, request_queue->in_flight[sync] ++, request->io_start_time_ns = now...
+
+ blk_start_request(request) 包装上面的函数, 开始处理request, 把它从request_queue中取出来,设置request->resid_len
+ -> blk_dequeue_request(request)
+ -> 修改属性数据  request->resid_len = blk_rq_bytes(request)
+ -> 设置超时计时器   blk_add_timer(request), timer使用blk_rq_timed_out_timer
+
+ blk_fetch_request(request_queue) 先找一个request, 然后开始处理它
+ -> blk_peek_request(request_queue)
+ -> blk_start_request(request)
+
+39. blk_update_request(request, error, nr_bytes) 也是为dm准备的函数,在request只完成一部分数据操作时使用. request包含bio-chain, 它挨个处理bio, 同时bio中包括连续的sector, bio也挨个处理这些iovec. 这个函数返回请求完成的数据量,如果表明当前bio完成,回调通知函数. 如果bio没有完成，更新操作数据位置.
+ -> blk_account_io_completion(request, nr_bytes) 更新统计数,part相关的
+ -> 如果nr_bytes超过request->bio->bi_size, 说明完成了不止一个bio, 使request->bio指向bio->bi_next
+ -> req_bio_endio(request, bio, nbytes, error) 这个函数减小bio->bi_size, 增大bio->bi_sector, 这两个数据是动态的?!   一个是数据量，一个是数据起始位置.
+  -> bio_endio(bio, error) 如果这个bio数据全部处理完,回调通知函数
+ -> 如果nr_bytes没有超过bio的大小,检查nr_bytes是否超过iovec的大小. bio->bi_idx表示当前处理iovec,比较nr_bytes和bio_iovec_idx(bio, bio->bi_idx)->bv_len. 
+ -> 计算总的io数量,request->__data_len减去这个数据,它表示剩余的数据量. request->__sector. 更新request->buffer = bio_data(request_bio), 如果操作多个sector, 它们的page不连续,地址有何用?
+ -> 即使bio没有全部完成,也会更新数据 > req_bio_endio(request, bio, bio_nbytes, error), 然后更新bio->bi_idx, iovec->nr_bytes, iovec->by_len.
+ -> blk_recalc_rq_segments(request) 重新计算段数
+
+40. blk_update_bidi_request(request, error, nr_bytes, bidi_bytes) 这里有两个数量，bidi_bytes是什么? 好像是给dm这样的磁盘驱动使用的,dm会下发给底层驱动bio,它可能没有bio
+ -> blk_update_request(request, error, nr_bytes) 返回FALSE
+ -> blk_update_request(request->next_rq, error, bidi_bytes) 还有next_rq? dm使用的?
+
+41. blk_unprep_request(request)  在request完成之前的操作? 与REQ_DONTPREP相关
+ -> request->unprep_rq_fn(request_queue, request)
+
+42. blk_finish_request(request, error)
+ -> blk_delete_timer(request)
+ -> blk_unprep_request(request)
+ -> blk_account_io_done(request)
+ -> request->end_io(request, error)
+ -> blk_bidi_rq(request)  如果request->next_rq有意义,则它具有特殊意义?
+ -> __blk_put_request(request->next_rq->q, request->next_rq) 而且释放了两次request
+ -> __blk_put_request(request->q, request)
+
+43. blk_end_bidi_request(request, error, nr_bytes, bidi_bytes)
+ -> blk_update_bidi_request(request, error, nr_bytes, bidi_bytes) 如果返回true,说明request只完成一部分
+ -> blk_finish_request(request, error) 只有在全部完成时,才能有这步操作
+
+ __blk_end_bidi_request(request, error, nr_bytes, bidi_bytes) 和上面一样
+ blk_end_request(request, error, nr_bytes) 包装上面,不过bidi_bytes=0
+ blk_end_request_all(request, error) 包装,这里会处理request->next_rq)
+ blk_end_request_cur(request, error) 包装
+ 
+44. blk_rq_bio_prep(request_queue, request, bio) 使用bio初始化request
+ -> bio_has_data(bio) 如果bio有iovec, 初始化request->nr_phys_segments/request->buffer
+ -> request->__data_len / request->bio/bio_tail 单链表
+
+45. 下面是request复制 
+ blk_rq_unprep_clone(request) 释放request->bio指向的bio-chain.
+ -> bio_put(bio)
+
+ __blk_rq_prep_clone(request dst, request src) 赋值一部分属性, __sector, nr_phys_segments等
+
+ blk_rq_prep_clone(request, request, bio_set, gfp_mask, ...) 复制request,它必须在原来的request完成之前完成.
+ -> bio_alloc_bioset(gfp_mask, bio_src->bi_max_vecs, bio_set) 挨个复制bio-chain上的bio, 创建对应的bio, 添加到request的单链表中
+ -> __bio_clone(bio, bio_src) 复制相关属性
+ -> bio_integrity_clone(bio, bio_src, gfp_mask, bio_set)
+ -> __blk_rq_prep_clone(request, request)
+
+46. plug io, task_struct缓存request
+ blk_start_plug(blk_plug) 初始化blk_plug,给current使用
+
+47. queue_unplugged(request_queue, depth, from_schedule) 这个函数是启动request_queue
+ -> blk_run_queue_async(request_queue) 如果from_schedule=1, 异步方式启动?
+ -> __blk_run_queue(request_queue) 同步方式启动
+
+48. flush_plug_callbacks(blk_plug, from_schedule) 遍历blk_plug->cb_list上的blk_plug_cb,执行它的回调函数. blk_plug_cb->callback
+ -> blk_plug_cb->callback(blk_plug_cb, from_schedule)
+
+49. blk_check_plugged(blk_plug_cb_fn, data, size) 创建一个blk_plug_cb,放到current->blk_plug队列中, 如果碰到相同的blk_plug_cb_fn，不再插入
+ 
+50. blk_flush_plug_list(blk_plug, from_schedule) 刷新blk_plug,处理这些request和callback
+ -> flush_plug_callbacks(blk_plug, from_schedule) 调用回调函数
+ -> 处理current->blk_plug->list队列,队列上是request. 进行队列排序,按照request->request_queue的指针大小排序.
+ -> queue_unplugged(request, depth, from_schedule) 同时启动request_queue, 这个depth表示request_queue上request的个数
+ -> __elv_add_request(request_queue, request, ELEVATOR_INSERT_SORT_MERGE)
+这个函数的主要作用就是把request添加到request_queue中, 同时启动request_queue开始执行.
+
+51. blk_finish_plug(blk_plug) 包装上面的函数,同时删current->plug, 哪里释放它?
+ -> blk_flush_plug_list(blk_plug, false)
+
+52. blk_dev_init 最后一个函数,它做一些全局初始化工作，创建kblockd工作对列,和kmem_cache
+这就看完了block-core,对整个block层的操作有了一些概念，其实这一层比较简单，就是为驱动层的每个块设备，维护一个队列，让驱动取request,回调通知文件系统层结果。让文件系统层插入request.在request_queue中有elevator调度算法.. 后面应该看看fs/bio.c, 只看这个是不够的,还要挑一种文件系统, xfs或者btrfs. 刚才搜了一些,发现btrfs夸的太多，就拿着它看看吧.
+
+没想到这里的函数大部分还是底层调用的,不会现在了解一个bio如何被底层驱动去执行,可以尝试去看看scsi驱动和flash磁盘驱动.
+
+下面看看blk-merge和blk-timeout的实现.
+1. __blk_recalc_segments(request_queue, bio) 计算bio-chain包含的内存端的长度. 在request支持cluster的时候, request_queue->limit.cluster, 连续的内存地址段才有效.
+ * request_queue->limits->max_segment_size 表示最大连续内存地址段长度
+ * request_queue->limits->seg_boundary_mask 表示界限,一个内存端不能跨这个界限
+ * bio->bi_seg_front_size / bi_seg_back_size表示bio中第一个和最后一个连续地址段的长度. 为后面的合并使用.
+
+    blk_reclac_rq_segments(request) 包装上面,设置request->nr_phys_segmensts, 计算request->bio上的地址段数.
+
+    blk_recount_segments(request_queue, bio) 计算bio自己的段数, 设置bio->bi_flags的BIO_SEG_VALID标志
+
+2. blk_phys_contig_segment(request_queue, bio, bio next) 计算bio/next是否可为了连续的内存地址而合并?
+ * blk_queue_cluster(request_queue)
+ * 检查bio->bi_seg_back_size 和 next->bi_seg_front_size, 如果两者大于一个request_queue的界限,是没法合并的. 所以bio合并之后,地址段没有减少,就没有合并的意义.
+ * bio_has_data(bio) 如果bio没有数据，可以合并..
+ * BIOVEC_PHYS_MEGEABLE  bio的最后一个vec和next的第一个vec物理地址连续
+ * BIO_SEG_BOUNDARY(request_queue, ...) 物理地址没有跨越某个斜线,可能为了dma.
+
+3. __blk_segment_map_sg(request_queue, bio_vec, scatterlist sglist, scatterlist sg.., bio_vec prevec.) 把bio_vec添加到sg队列中,如果bio_vec和prevec物理内存地址连续,直接修改sg中的数据长度,反正物理地址连续,估计磁盘地址也连续. 否则需要创建一个scatterlist, 如果sg提供了,则使用下一个scatterlist,然后设置page/offset/len.  
+ -> sg_next(*sg)
+ -> sg_set_page(sg...)
+scatter list就是内存地址连续,而且设备地址连续的一段数据，用于dma中使用.
+
+4. blk_rq_map_sg(request_queue, request, scatter_list) 除了包装数据,还要准备额外的工作,地址对齐等
+ -> rq_for_each_segment(..) 遍历每个bio_vec??对,因为下面的包装函数，会检查地址是否连续,如果连续就修改数据段长度
+ -> __blk_segment_map_sg(request_queue, ....) 把request转换成sg链表..
+ -> request->dma_pad_mask
+ -> 这里还要处理dma_drain? 就是添加一个假的sc,使用request_queue->dma_drain_size/dma_drain_needed,应该是刷新dma缓存?
+
+5. blk_bio_map_sg(request_queue, bio, scatterlist) 把bio-chain包装成scatterlist.
+
+6. ll_new_hw_segment(request_queue, request, bio) 在合并bio时,希望减少需要的连续地址段的数量,这个函数就是检查是否能减少. 和上面计算段数的检查类似
+ * queue_max_segment(request)
+ * request->nr_phys_segments += bio_phys_segments(request, bio) ...
+
+7. ll_back_merge_fn(request_queue, request, bio) 把bio合并到request的最后.
+ * request支持的sector数量有效   > queue_max_hw_sectors(request) / queue_max_sectors(queue)  如果request->cmd_type 是REQ_TYPE_BLOCK_PC, 使用hw.., 这是scsi命令? 为何???
+ -> ll_new_hw_segment(request_queue, request_bio) 只修改request的数据块数量.
+http://blog.csdn.net/xushiyan/article/details/6941640 好文章，但解释决为何用hw?? 
+应该是对于命令,数据界限就是底层使用的,但对于其他的,可能是其他的限制.
+
+    ll_front_merge_fn(request_queue, request, bio)和上面的有啥区别?
+
+8. ll_merge_requests_fn(request_queue, request, request next) 合并两个request, 这里的操作只是修改rh_phys_segments.. 做一些检查, 两者衔接的地方,必须是可合并的vec
+ * blk_rq_sector / queue_max_sectors 
+ * queue_max_segments / request->nr_phys_segments
+9. attempt_merge(request_queue, request, request nxt) 合并两个request
+ -> rq_mergeable
+ -> REQ_DISCARD / REQ_SECURE
+ -> 磁盘位置连续   blk_rq_pos / blk_rq_sectors
+ -> ll_merge_requests_fn(request, req, next)  检查是否可合并,修改nr_phys_segment
+ -> bio chain, __data_len, ioprio
+ -> elv_merge_requests(request_queue, request ...)
+ -> __blk_put_request(request_queue, next) 释放后面的
+
+10. attempt_back_merge(request_queue, request) 找后面相邻的request
+ -> elv_latter_request(request_queue, request) elevator_queue->type->ops->elevator_latter_req_fn(...) 如果没有elevator算法? 不会有这种情况.
+ -> attempt_merge(request_queue, request ...)
+
+    attempt_front_merge(request_queue, request ...) 
+
+11. blk_rq_merge_ok(request, bio) request是否能够合并bio
+ blk_try_merge(request, bio)  检查request能如何和并bio, ELEVATOR_BACK_MERGE/ELEVATOR_FRONT_MERGE
+
+blk-timeout.c 这个函数主要是处理request->timeout / request_queue->timeout_list. 计时器触发函数是
+  blk_rq_timed_out_timer(request_queue) 它遍历request_queue->timeout_list, 检查request->deadline. 处理超时的request, 如果有剩余的,就继续添加计时器.
+ -> blk_mark_rq_complete(request) REQ_ATOM_COMPLETE, 如果request已经完成,不再处理.
+ -> blk_rq_timed_out(request)
+  -> request_queue->rq_timed_out_fn(request)
+  -> blk_add_timer(request) 可能需要重新进入超时队列
+  -> __blk_complete_request(request) 如果request处理完成,把它放到一个全局队列,使用softirq处理它 
+  软终端是BLOCK_SOFTIRQ,处理函数是blk_done_softirq, 它处理队列blk_cpu_done, 对队列的每一个调用
+  -> request->request_queue->softirq_done_fn(request)
+
+
+总结,这里的函数虽然都是辅助函数,但大体能看出request的过程,从上面看首先submit_bio提交bio,使用request_queue->make_request_fn,它可能创建新的request,或者合并, 创建之后放到哪里? 这里没看出来,应该是交给elevator.  __elv_add_request(request_queue, request, where) 然后是驱动的workqueue,不断从request_queue中取出request, 它从request_queue->headlist,但应该还有请求在elevator中, (blk_peek_request), 然后request给了底层驱动,完成的时候会回调softirq, 使用request_queue->softirq_done_fn, 它处理request, 其实它还是调用bio的回调函数. 另一种是timeout.. 这里在merge上有很多工作,首先sector位置必须相邻,然后是物理内存地址连续,才合并!

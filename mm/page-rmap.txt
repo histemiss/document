@@ -1,0 +1,150 @@
+mmap.c / rmap.c
+rmap是reverse map,表示把page的物理地址映射为虚拟地址.物理地址就是页号,但虚拟地址就比较多,这里还提供追踪anon/file page的使用者,应该是vma/mm或address_space.
+这里还没有专门讲vma,memory.c/mmap.c中应该会有mm_struct,可能会有vma
+
+1. anon_vma
+这个数据结构很简单，解释说它用来管理vm_area_struct, 但是vm_area_struct要不断的split,merge,所以不好追踪,这个数据结构追踪关联某个page的vma. 这里也列一下vm_area_struct.
+
+vm_area_struct:
+    mm_struct vm_mm
+    vm_start / vm_end  这是虚拟地址
+    vm_next, vm_prev (为何不用list_head??
+    pgprot_t vm_page_prot 保护属性
+    vm_flags
+    rb_node   mm使用rbtree管理vma
+    - vm_set * list_head list
+             * void *parent
+             * vm_area_struct *head
+    - raw_prio_tree_node prio_tree_node   这个union是用来和address_space交互,remap操作会把地址映射搞乱，因此使用两个??
+    list_head anon_vm_chain  这个是vma使用的page所关联的anon_vma
+    anon_vma* anon_vma 如果anon_vma代表某个page,那这个在这里什么意思? 它对于vma是唯一的? anon_vma肯定不是针对某个page,那太浪费资源,多个page和多个vma可以使用多个anon_vma_chain. 在anon_vma_fork中，为vma创建新的anon_vma, 注释说our new (COWed) pages go to this anon_vma.
+    vm_operations_struct vm_ops, 东西挺多的,处理fault,还有set_policy, migrate
+    vm_pgoff 给文件映射使用
+    file  竟然不使用inode,而使用file
+    vm_private_data
+    mempolicy
+
+然后看一下这里使用的东西
+anon_vma
+    anon_vma root 这个root在哪里？
+    mutex / refcount
+    list_head
+
+anon_vma_chain
+    vm_area_struct vma
+    anon_vma anon_vma
+    list_head same_vma
+    list_head same_anon_vma
+首先vma只能属于一个mm_struct/thread,但是anon_vma不一定了?
+    
+2. anon_vma/vma/anon_vma_chain的联系
+    anon_vma_chain使用vma/anon_vma分别关联anon_vma和vm_area_struct.而且anon_vma_chain分别在anon_vma->head/vma->anon_vma_chain的队列中 (anon_vma_chain_link
+    看来是anon_vma_china联系anon_vma和vma, 每个vma有专门的anon_vma_chain.
+    anon_vma_prepare(vm_area_struct) 准备vma, 如果它没有关联anon_vma,则找一个合适的,或创建一个anon_vma,然后使用anon_vma_chain把两者关联起来
+
+anon_vma是从page->mapping获取的,说明anon_vma是属于某个page,而vma关联多个page.所以vma和anon_vma是n-n关系,并通过anon_vma_chain关联. page->index是page在vma中的偏移,如果page属于多个vma,那么index通用吗?那些vma在某一相对位置使用的page全部相同?
+为何有anon_vma,主要是为了追踪谁在使用这种anonymous page,如果是file page,可以通过address_space追踪到(mmap/mremap). 所以多个vma使用各不相同的page.但使用相同page的,这个page都在相同的相对位置. 使用相通vma的page,就不用说了. 这样,找一个page在mm中的地址,就比较确定了. 通过anon_vma->head,这是一个关联相通page的所有vma使用的anon_vma_chain的队列,通过vma->anon_vm_chain,是所有关联一个vma的anon_vma使用的anon_vma_chain的队列.vma通过它使用的所有page也可以找到这个队列,但是它不一定有充足的page,可能有些地址没有映射page.
+
+
+mmap.c
+接着整理vma的组织,同属于一个mm的vma在一个链表中,使用vma->next/pre组成链表,同时使用vm_rb组吃一个rbtree,使用vma->vm_end作为tree的key.
+如果vma关联文件,还需要把它加入到address_space->i_mmap/i_mmap_nonlinear中。如果vma->vm_flags带有VM_NONLINEAR,则把它放到i_mmap_nonlinear中,否则放到i_mmap.
+
+    copy_vma
+    -> find_vma_prepare(mm, addr, prev_vma, rb_link, rb_parent)
+    -> vma_merge(mm, vma_prev, address, address_len, vm_flags, anon_vma, file, pgoff, mem_policy)
+    -> 如果上面失败,创建一个vma
+    -> anon_vma_clone(vma, vma) 分配新的aon_vma_chain,关联vma的所有anon_vma.
+    -> vma_link
+
+    insert_vm_struct(mm_struct, vm_area_struct)
+    这个比较简单,就是插入一个vma
+    -> find_vma_prepare
+    -> vma_link 
+
+    exit_mmap(mm_struct)
+    -> lru_add_drain 还要触发这个?
+    -> remove_vma  遍历所有的mm_struct->mmap
+
+    do_brk(addr,len)
+    -> find_vma_prepare
+    -> do_munmap(mm,addr,len) 如果这段地址正在使用，把映射去掉
+    -> vma_merge(mm, vma, addr, addr+len, flags, NULL,NULL, pgoff, NULL)
+    -> 如果上面不成功,创建一个 vma_link 好像没有anon_vma的事情.
+
+    vm_munmap(addr, len)
+    -> do_munmap(mm, addr, len)
+        -> find_vma(mm, start) 这个函数经常用
+        -> 先检查是否需要分裂已有的vma __split_vma
+        -> detach_vmas_to_be_unmapped(mm_struct, vm_area_struct, vm_area_struct, end)把一系列连续的vma从队列和rbtree中释放
+        -> unmap_region(mm_struct, vma, prev, start, end)
+            -> lru_add_drain
+            -> unmap_vmas(mmu_gather, vm_area_struct, start_end, end_addr, nr_accounted, zap_detail) 这是memory.c中的实现
+                -> unmap_single_vma(mmu_tlb, vma, start_addr, end_addr, nr_accounted, details)
+                    -> unmap_page_range(mmu_tlb, vma, start, end, details)
+        -> remove_vma_list(mm_struct, vm_area_struct)
+            -> remove_vma
+                -> vma->vm_ops->close(vma)  关闭vma
+                -> kmem_cache_free(vm_area_cachep, vma) 释放内存
+    通过这里的操作，可看出映射撤销需要的工作,它主要是释放使用的page, 释放pte，还有对应的swap和file操作. 当然还有vma的操作,rmap工作和page释放工作一块.
+
+    unmap_page_range是memory.c中的实现,它主要用于pte的操作，同时会释放page.
+    -> zap_pud_range(mmu_gather, vma, ...)
+        -> zap_pmd_range(mmu_gather, vma ...)
+            -> zap_pte_range(mmu_gather, vma, ...)
+                -> page_remove_rmap(page) 只有page在内存中才使用
+                -> __tlb_remove_page(mmu_gather, page) 这里面包含释放page操作
+                    -> free_page_and_swap_cache(page)
+
+    __split_vma(mm_struct, vm_area_struct, addr, new_below)
+    -> 创建新的vma, 并把参数vma复制过来
+    -> anon_vma_clone(vma, vma)  复制anon_vma_chain,为何要把所有page的anon_vma复制过来?
+    -> get_file(vma->vm_file)
+    -> vma->vm_ops->open
+    -> vma_adjuest(vma, start, end, pgoff_t, vma) 这个函数比较怪，裁剪第一个vma,把剩余的一块给第二个vma
+    
+    mmap_pgoff(addr, len, prot, flags, fd, pgoff) 这个syscall,创建mmap
+    -> do_mmap_pgoff(file, addr, len, prot, flags, pgoff)
+
+    vm_mmap (file, addr, len, prot, flags, offset)
+    -> do_mmap(file, addr, len, prot, flag, offset)
+        -> do_mmap_pgoff(file, addr, len, prot, flag, offset)
+
+    do_mmap_pgoff(file, addr, len, prot, flags, pgoff) 这里主要检查参数
+    -> get_unmapped_area(file, addr, len, pgoff, flags) 检查addr是否合适
+    -> mmap_region(file, addr, len, flags, vm_flags, pgoff)
+        -> find_vma_prepare(mm_struct, addr, vma, rb_node, rb_node)
+        -> do_munmap(mm_struct, addr, len) 如果这段地址已经映射,释放映射
+        -> vma_merge(mm_struct, prev_vma, addr, addr_len, vm_flags, NULL, file, pgoff_t, NULL)
+        -> 如果上面没有成功，创建一个新的vma
+        -> file->f_op->mmap(file, vma)
+        -> vma_link(mm_struct, vma, prep, rb_node, rb_node) 添加vma
+        -> make_pages_present(addr, addr_len) 填充page,在memory.c的实现
+    这里面看不出来有效的操作,肯全部是vma的操作,还有填充修改page标志等，应该还有rmap和address_space等.
+
+
+    make_pages_present(addr, end) 创建vma之后,分配page? 这是memory.c的实现
+    -> get_user_pages(current, mm_struct, addr, len, write, ...)
+        -> __get_user_pages(task, mm, start, nr_pages, flags ...)
+            -> 如果地址没有对应的vma,则使用gate area,这应该是系统使用的地址段
+            -> vm_normal_page(vma, start, pte)根据pte获取page,实际上根据pfn
+            -> get_page(page) 这是什么意思? 就是增加一下page的使用计数?!
+            -> find_extend_vma(mm_struct, start) 找一个vma,这个vma不一定包含这个地址.
+            -> follow_page(vma, addr, flags) 找一个vma
+            -> set_page_dirty(page) 如果找到,设置page相关标志
+            -> mark_page_accessed(page)  这是swap中的实现
+
+
+    vma_merge(mm_struct, prev_vma, addr, end, vm_flags, anon_vma, file, pgoff, policy)
+    -> can_vma_merge_after(vma, vm_flags, anon_vma, file, pgoff) 这里检查file是否合适merge,anon_vma是否合适merge, pgoff和vma的地址空间是否连续
+        -> is_mergeable_vma(vma,file, vm_flags) vm_flags相同, file相同,vma->vm_ops->close为空
+        -> is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma) vma->anon_vma_chain为单,它是有一个anon_vma_chain,这有什么意义吗? 难道不是它的page数量决定这个链表个数?  如果两个vma使用一个vma,也可merge. 看来anon_vma不是属于某个page的.
+
+    -> can_vma_merge_before(vma, vm_flags, anon_vma, file, pgoff) 和上面的检查类似,但vma是在pgoff的后面
+    -> vma_adjuest(prev, start, end, pgoff, ...) 调整vma,这里是要merge,所以直接修改已经存在的vma的界限
+    这个函数功能应该是要添加新的vma,但先尝试着使用原有的vma,调整她们的大小,而不是添加新的. anon_vma还不清楚如何使用.
+
+    vma_adjuest(vm_area_struct, start, end, pgoff_t, vma)
+    这里还比较复杂，如何调整需要考虑各种条件，可能需要合并next vma,可能需要调整vma的边界。在合并下一个vma时,需要复制anon_vma,如果使用了address_space->i_mmap,而且调整了大小,需要把改动大小的(和需要删除)的vma从address_space->i_mmap中删除,然后把新的vma添加进去. 这里对anon_vma还是比较模糊.
+
+好了memory就算整个看完了,后面是整理的问题. 这里好乱，主要还是讲vma,但如果不看task如何使用vma和file的话，这部分也就这样. 主要还是追踪任何和文件和内存的各种关系. 任务的创建主要通过复制实现,同样vma/anon_vma也是，而且它们会共用page，甚至file. 这些和文件的io关系不大，先不深看.

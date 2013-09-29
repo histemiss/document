@@ -1,0 +1,155 @@
+因为有太多的等待队列操作，所以必须整理一下这里的实现. 但发现的确比较简单，自己把他想复杂了。估计真正复杂的任务（队列）管理，而且任务状态和小的嵌入式系统一点都不一样！
+代码：kernel/sched/core.c；kernel/wait.c 好奇怪 （wakeup在core.c中)
+
+1. 数据结构
+__wait_queue  / wait_queue_t  这是等待队列上的表示一个任务的单位
+    * flags  可能是WQ_FLAG_EXCLUSIVE  互斥等待,唤醒一个还是全部唤醒
+    * private  回调函数使用的参数,后来发现一般都是task_current
+    * wait_queue_func_t func(wait_queue_t, mode, flags, key)   唤醒操作使用的回调函数. mode表示唤醒什么状态的任务（TASK_INTERRUPTIBLE/TASK_UNINTERRUPTIBLE), key是唤醒任务使用的数据结构。
+    * list_head task_list  等待队列
+wait_bit_key 这在sleep和wake中都使用的数据结构，实现wake_on_bit
+    * flags  
+    * bit_nr 
+wait_bit_queue
+    对wait_queue_t的包装，包含了wait_bit_key
+__wait_queue_head  wait_queue_head_t 这表示一个等待队列,好简单，怪不得等待队列到处都是，内存很小.
+    * lock
+    * list_head  
+
+操作
+1. init_waitqueue_entry / init_waitqueue_func_entry
+    初始化一个wait_queue_t, 第一个使用默认的回调函数default_wake_function, 而且指定参数，一般是task_struct;, 第二个制定回调函数，但没制定参数。一般情况下，第一种初始化是常用的，但后一种后面介绍一下.
+
+2. waitqueue_active(wait_queue_head_t)
+    判断这个waitqueue是否是启动的，也就是队列中有wait_queue_t. 而看以前的小操作系统，都是把等待任务放到某些计时器队列或某个等待队列，然后在时钟处理中判断是否有任务有效，然后把任务放到就绪队列。而这里是只修改任务状态.
+
+3. __add_wait_queue_t(wait_queue_head_t, wait_queue_t) / __add_wait_queue_exclusive / __add_wait_queue_tail / __add_wait_queue_tail_exclusive / __remove_wait_queue
+    做队列操作，如果是互斥等待，则把自己的标志加上WQ_FLAG_EXCLUSIVE
+
+下面是任务等待唤醒的处理，很多重复的东西，这里先挑一个最简单的介绍
+4. __wake_up_common(wait_queue_head_t, mode, nr_exclusive, wake_flags, key)
+    对wait_queue_head_t队列中的所有wait_queue_t, 触发它的回调函数，最多唤醒nr_exclusive个互斥等待。如果不是互斥的，唤醒下一个.
+    -> wait_queue_t->func(wait_queue_t, mode, wake_flags, key)
+    mode对应任务状态， wake_flags对应唤醒的类型，下面有WF_SYNC
+    __wake_up(wait_queue_head_t, mode, nr, key)
+    锁住一个队列
+    -> __wake_up_common(...)
+
+5. __wake_up_locked(wait_queue_head_t, mode) / __wake_up_locked_key (wait_queue_head_t, mode, key)
+    传入参数不同, 直接调用__wake_up_common
+
+6. __wake_up_sync_key(wait_queue_head_t, mode, nr_exclusive, key) / __wake_up_sync(wait_queue_head_t, mode, nr_exclusive)
+    这里看到wake_flags的标志，使用WF_SYNC, 还有其他标志WF_FORK / WF_MIGRATED
+    -> __wake_up_common(wait_queue_head_t, mode, nr_exclusive, WF_SYNC, key)
+
+7. bit_waitqueue(word, bit)
+    word所在的zone中的一个等待队列, 经常是一个page的某一位
+
+8. __wake_up_bit(wait_queue_head_t, word, bit)  / wake_up_bit(work, bit)
+    构造一个wait_bit_key，然后调用__wake_up
+    __wake_up(wait_queue_head_t, TASK_NORMAL, 1, key) 只唤醒一个互斥任务.
+
+许多宏对上面的函数进行包装
+wake_up         唤醒TASK_NORMAL任务，只唤醒一个互斥任务
+wake_up_nr      ~~~~~~~~                   nr个
+wake_up_all     ~~~~~~                     所有任务
+wake_up_locked  ~~~~ 这个函数调用不加锁
+TASK_NORMAL包括TASK_INTERRUPTIBLE 和TASK_UNINTERRUPTIBLE
+
+wake_up_interruptible         唤醒任务状态是TASK_INTERRUPTIBLA        
+wake_up_interruptible_nr      
+wake_up_interruptible_all     
+wake_up_interruptible_sync
+
+wake_up_poll(x, m) 调用是使用m作为key
+wake_up_locked_poll(x, m)
+wake_up_interruptible_poll
+wake_up_interruptible_sync_poll
+
+上面的几乎全部就是唤醒，还是比较简单，就是触发一个回调函数，因为在内核态，所以不用担心执行上下文状态, 下面是wait实现，wait实现几乎使用宏实现，第一个原因是等待结束标志使用布尔表达式，它通过宏传递。 下面都没介绍wait的过程，一般都是
+for ()
+  prepare_to_wait
+  判断条件回调函数
+  schedule / schedule_timeout
+finish_wait
+
+1. __init_waitqueue_head(wait_queue_head_t, name, lock_class_key)
+    这里除了初始化队列，还有lockdep的初始化，不清楚这是做什么的. 刚才看了一点，没看懂，太复杂.
+
+2. add_wait_queue(wait_queue_head_t, wait_queue_t) / add_wait_queue_exclusive
+    锁住wait_queue_head_t->lock, 使用spin_lock_irqsave . 第一个不是互斥等待，第二个是，需要改变标志, 而且互斥等待需要在队尾等待.这里为何使用spin_lock_irqsave? 锁太麻烦了。
+    -> __add_wait_queue_tail 
+
+3. remove_wait_queue(wait_queue_head_t, wait_queue_t)
+    加锁保护，可恶的锁
+
+4. prepare_to_wait(wait_queue_head_t, wait_queue_t, state)
+    这里除了链表操作，还有设置任务状态
+    -> __add_wait_queue(wait_queue_head_t, wait_queue_t)
+    -> set_current_state(state)
+
+    prepare_to_wait_exclusive(wait_queue_head_t, wait_queue_t)
+    互斥等待
+
+5. finish_wait(wait_queue_head_t, wait_queue_t)
+    结束等待，这些都是等待任务执行的函数
+    -> __set_current_state(TASK_RUNNING)  
+    -> list_del_init(wait_queue_t->task_list)
+    
+6. abort_exclusive_wait(wait_queue_head_t, wait_queue_t, mode, key)
+    从wait_queue_head_t中释放wait_queue_t,取消等待操作，这里要考虑wait_queue_t是否在执行唤醒操作，如果是需要再次触发，否则在互斥等待中会无法唤醒下一个等待的任务. 从wait_queue_t->wait_list看是否是已经被唤醒.
+    -> __wake_up_locked_key(q, mode, key)  wait_queue_t已经从queue中脱离，所以再次调用唤醒
+
+7. autoremove_wake_function(wait_queue_t, mode, sync, key)
+    -> default_wake_function(wait_queue_t, mode, sync, key) 这个函数再后面，直接调用try_to_wake_up
+    -> list_del_init(wait_queue_t->task_list)
+
+8. wake_bit_function(wait_queue_t, mode, sync, arg)
+    这应该是bit等待使用的默认回调函数，比较wait_bit_queue->key和arg的flags,bit_nr,还有arg的对应位为0
+    -> autoremove_wake_function(wait_queue_t, mode, symc, key)
+    这里最后使用了try_to_wake_up，其他地方也使用这个唤醒任务
+
+9. __wait_on_bit(wait_queue_head_t, wait_bit_queue, action, mode)
+    这里循环睡眠，直到等待的位变成0, 这里wait_bit_queue已经初始化，不清楚回调函数是什么？
+    -> prepare_to_wait(queue, wait, mode)
+    -> action(key.flags)
+    -> finish_wait(wq, q)
+    
+10. out_of_line_wait_on_bit(word, bit, action, mode)
+    这里初始化一个wait_bit_queue,回调函数是wake_bit_function,就是上面没看懂的函数，private是current.
+    -> __wait_on_bit(bit_waitqueue(word,bit), wait_bit_queue, action, mode)
+
+11. __wait_on_bit_lock / out_of_line_wait_on_bit_lock(word, bit, action, mode)
+    无锁操作
+
+12. init_wait(wait)
+    初始化一个wait_queue_t, 使用默认的回调函数，private也是current，这里默认的回调函数就是autoremove_wake_function
+ 
+13. DEFINE_WAIT_FUNC(name, func)
+    同样构造一个wait_queue_t,使用func
+
+14. __wait_event(wq, condition)
+    构造一个wait_queue_t, 在wq上等待, 然后周期判断condition. 在prepare时，把任务状态改为TASK_INTERRUPTIBLE, schedule之后，应该不会再执行，只有别人唤醒.
+    -> prepare_to_wait(wq, wait_queue_t, TASK_INTERRUPTIBLE)
+    -> finish_wait(wq, wait_queue_t)
+
+15. wait_event(wq, condition)
+    -> __wait_event(wq, condition)
+
+16. __wait_event_timeout(wq, condition, ret)
+    和上面类似，但这里没有使用schedule, 而是使用schedule_timeout(ret), schedule_timeout中除了设置任务状态，还使用try_to_wake_up.
+
+遗漏 kernel/sched.c
+default_wake_function(wait_queue_t *curr, unsigned mode, int wake_flags,void *key)
+    -> try_to_wake_up(curr->private, mode, wake_flags);
+
+完了？ 不靠谱啊,这么少！
+
+的确就这些，尝试做点总结：
+1. 睡眠分wait和wake_up操作。
+2. 整个等待操作过程是使用等待队列和队列节点，这里完全没有task_struct的操作，当然task_struct中可能会有wait_queue_t。 好像task不参与其中。使用某个wait_queue_t, 这个变量可以是外部变量，也可以是临时变量，因为wait操作基本上是宏，所以任务的执行范围不会跑出这个域,临时变量在睡醒后就不用了。但是wait_queue_head_t必须是全局/外部变量，而且需要其他任务管理它，唤醒它队列上的任务。
+3. wait操作是把任务改为特定状态TASK_INTERRUPTIBLE/TASK_UNINTERRUPTIBLE,然后调用schedule/schedule_timeout，让出处理器，操作完成。但这里必须注册回调函数。linux的wait操作都是循环的，也就是它唤醒时要检测等待条件是否满足，如果不满足，需要再睡眠。所以被唤醒时，不一定是等掉条件触发的.
+4. wake up操作是简单的触发回调函数，而且把等待使用的wait_queue_t从wait_queue_head_t中释放，然后其他事情交给睡眠的任务。 回调函数一般是把任务的状态改为TASK_RUNNING,把任务放到就绪队列中。回调函数使用的参数就是wait_queue_t->private,这个参数目前来看都是current.
+5. 这里提供了两种很方便的等待wait_enent和wait_on_bit, 前者使用默认的唤醒回调函数autoremove_wake_function，后者等待内存中的某一位,同样使用固定的唤醒回调函数.
+6. 唤醒方式有SYNC, 和限时等待操作。
+7. 刚才看到wait_queue_t的初始化，然后看到别人怎么使用，发现wait的另一中使用（应该是），它可以没有wait操作，只是把wait_queue_t放到wait_queue_head_t中，在wake_up操作中调用这些回调函数。不过这算什么东西！！

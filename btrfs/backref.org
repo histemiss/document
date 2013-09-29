@@ -1,0 +1,392 @@
+* backref.c
+** extent_inode_elem
+   #+begin_src 
+	u64 inum;
+	u64 offset;
+	struct extent_inode_elem *next;
+	//表示一个文件的某个extent
+   #+end_src
+
+** btrfs_file_extent_item
+   #+begin_src 
+	/*
+	 * transaction id that created this extent
+	 */
+	__le64 generation;
+	/*
+	 * max number of bytes to hold this extent in ram
+	 * when we split a compressed extent we can't know how big
+	 * each of the resulting pieces will be.  So, this is
+	 * an upper limit on the size of the extent in ram instead of
+	 * an exact limit.
+	 */
+	__le64 ram_bytes;
+
+	/*
+	 * 32 bits for the various ways we might encode the data,
+	 * including compression and encryption.  If any of these
+	 * are set to something a given disk format doesn't understand
+	 * it is treated like an incompat flag for reading and writing,
+	 * but not for stat.
+	 */
+	u8 compression;
+	u8 encryption;
+	__le16 other_encoding; /* spare for later use */
+
+	/* are we inline data or a real extent? */
+	u8 type;
+
+	/*
+	 * disk space consumed by the extent, checksum blocks are included
+	 * in these numbers
+	 */
+	__le64 disk_bytenr;
+	__le64 disk_num_bytes;
+	/*
+	 * the logical offset in file blocks (no csums)
+	 * this extent record is for.  This allows a file extent to point
+	 * into the middle of an existing extent on disk, sharing it
+	 * between two snapshots (useful if some bytes in the middle of the
+	 * extent have changed
+	 */
+	__le64 offset;
+	/*
+	 * the logical number of file blocks (no csums included).  This
+	 * always reflects the size uncompressed and without encoding.
+	 */
+	__le64 num_bytes;
+   #+end_src
+
+** check_extent_in_eb(btrfs_key, extent_buffer, btrfs_file_extent_item, extent_item_pos, extent_inode_elem)
+   - extent_buffer是btree_leaf, 取出里面的btrfs_file_extent_item数据: extent_offset, extent_num_bytes. 
+   - extent_item_pos表示extent内部偏移. 如果不在(extent_offset, extent_num_bytes)内部,就退出.
+   - 构造extent_inode_elem, 使用next指针构成单链表.
+   - inum是inode objectid, 使用参数btrfs_key->objectid, btrfs_key是btrfs_file_extent_item
+   - offset是btrfs_key->offset - offset + extent_item_pos, 是文件偏移.表示索引extent偏移的文件位置
+
+** find_extent_in_eb(extent_buffer, wanted_disk_byte, extent_item_pos, extent_inode_elem eie)
+   - 查找文件的btrfs_file_extent_item,它使用extent的偏移extent_item_pos.
+   - 一个文件应该只有一个. 有没有可能多个呢? 
+   - 把对应的文件和偏移信息放到extent_inode_elem队列中. 肯定有多个snapshot的文件使用一个extent.
+   - extent_buffer是btrfs_leaf,遍历它的btrfs_item,查找指向BTRFS_FILE_EXTENT_KEY的btrfs_item
+   > btrfs_header_nritems(extent_buffer)
+   - 而且是非inline的
+   > btrfs_file_extent_type(extent_buffer, btrfs_file_extent_item)
+   - extent的位置是wanted_disk_byte
+   > btrfs_file_extent_disk_bytenr(extent_buffer, btrfs_file_extent_item)
+   - 使用参数的extent_inode_elem链表存储
+   > check_extent_in_eb(btrfs_key, extent_buffer, btrfs_file_extent_item, extent_item_pos, extent_inode_elem)
+
+** __prelim_ref
+   #+begin_src 
+   	struct list_head list;
+	u64 root_id;
+	struct btrfs_key key_for_search;
+	int level;
+	int count;
+	struct extent_inode_elem *inode_list;
+	u64 parent;
+	u64 wanted_disk_byte;
+   #+end_src
+
+   - backref分成4种: shared tree; indiect tree; shared data; indirect data, 和之前分类是一样的.
+
+** __add_prelim_ref(list_head, root_id, btrfs_key, level, parent, wanted_disk_byte, count)
+   - 构造__prelim_ref, 把参数填进去, 放到list_head队列中
+
+** add_all_parents(btrfs_root, btrfs_path, ulist, level, btrfs_key, time_seq, wanted_disk_byte, extent_item_pos)
+   - ulist是unique list, 相当于一个字典的数据结构,实际上是{key:value}的静态数组.
+   - key是extent的逻辑地址,在这里就是btrfs_node/btrfs_leaf使用的extent.
+   - value对于btrfs_node是0; 对于btrfs_leaf,是extent_inode_elem链表,它里面表示某个文件索引了特定的extent
+   - 遍历btrfs_path/level指向的extent_buffer
+   - 对于btrfs_node(level > 0), 把extent的逻辑地址放到ulist中. 这是tree block的backref.
+   > ulist_add(ulist, btrfs_path->nodes[level]->start, 0, GFP_NOFS)
+   - 对于btrfs_leaf(level = 0),就是找索引btrfs_extent_item的btrfs_file_extent_item,需要遍历整个btree的所有btrfs_leaf,当然在特定的inode的btrfs_key的范围内.
+   > btrfs_next_old_leaf(btrfs_root, btrfs_path, time_seq)
+   - 对于btrfs_leaf,遍历每个btrfs_item, 检查每个btrfs_file_extent_item
+   - btrfs_key != (key_for_search->objectid,BTRFS_EXTENT_DATA_KEY, *), 结束循环, 只处理特定inode的btrfs_file_extent_item. 遍历是有目的的
+   - 对于btrfs_file_extent_item, 获取disk_bytenr, 如果是wanted_disk_byte, 而且extent_item_pos有效,检查它是否索引了这个extent的extent_item_pos位置,创建一个链表
+   > check_extent_in_eb(btrfs_key, extent_buffer, btrfs_file_extent_item, extent_item_pos, extent_inode_elem)
+   - 如果找到之后放到ulist中. 
+   - 如果没有指定extent_item_pos,就直接把这个btrfs_leaf添加到ulist,这里就不是精确查找.只要找到它包含一个btrfs_file_extent_item索引extent
+   > ulist_add(ulist, extent_buffer->start, extent_inode_elem, GFP_NOFS)
+   - 遍历下一个btrfs_item或btrfs_leaf
+   > btrfs_next_old_item(btrfs_root, btrfs_path, time_seq)
+
+** __resolve_indirect_ref(btrfs_fs_info, search_commit_root, time_seq, __prelim_ref, ulist, extent_item_pos)
+   - 根据__prelim_ref,查找btrfs_root中索引extent的btrfs_node/btrfs_leaf.
+   - 先构造root的btrfs_key(__prelim_ref->root_id, BTRFS_ROOT_ITEM_KEY, -1), 找到btrfs_root
+   > btrfs_read_fs_root_no_name(btrfs_fs_info, btrfs_key)
+   - 检查__prelim_ref->level是否有效,它不能高于btrfs_root_item->level
+   > btrfs_old_root_level(btrfs_root, time_seq)
+   > 构造btrfs_path, btrfs_path->lowest_level = __prelim_ref->level. 下面查找的btrfs_key指向什么??查找结果btrfs_path->nodes会指向空的extent_buffer??
+   > btrfs_search_old_slot(btrfs_root, __prelim_ref->btrfs_key, btrfs_path, time_seq)
+   - 收集索引信息
+   > add_all_parents(btrfs_root, btrfs_path, ulist, level, __prelim_ref->btrfs_key, time_seq, __prelim_ref->wanted_disk_byte, extent_item_pos)
+   - 把索引信息放到ulist中
+
+** __resolve_indirect_refs(btrfs_fs_info, search_commit_root, time_seq, list_head, extent_item_pos)
+   - list_head里面是__prelim_ref->list,遍历每个__prelim_ref,查找对应的索引信息,使用ulist存放.
+   - 对于__prelim_ref->parent有效,不再遍历,这是直接的backref
+   - __prelim_ref->count==0,这一层索引计数已经无效,需要删除.
+   - 收集__prelim_ref的索引信息,放到parents中.
+   > __resolve_indirect_ref(btrfs_fs_info, search_commit_root, time_seq, __prelim_ref, parents, extent_item_pos)
+   - 遍历parents里面的ulist_node, 它指向0或extent_inode_elem. 
+   - 对于第一个ulist_node, 更新当前遍历的__prelim_ref
+   - 对于其他的ulist_node, 创建一个__prelim_ref, 放到参数head队列中.
+   - 设置__prelim_ref->parent是索引的btree节点块地址,__prelim_ref->inode_list是NULL或extent_inode_elem. 他们虽然在head队列中,但他们不会再被处理,因为__prelim_ref->parent有效.
+   - 对于tree block的backref,这里不可能找到新的__prelim_ref,对于extent data的backref,可能找到新的
+
+** ref_for_same_block(__prelim_ref ref1, __prelim_ref ref2)
+   - 比较2个__prelim_ref, 包括level, root_id, key_for_search(inode), parent..
+
+** __add_missing_keys(btrfs_fs_info, list_head)
+   - list_head里面是__prelim_ref队列,检查它是否缺失btrfs_key. 这些__prelim_ref指向tree block.
+   - __prelim_ref->parent有效,无需设置,它已经有了索引信息.
+   - __prelim_ref->key_for_search->type不是0,已经包含了有效的btrfs_key,不用再查找
+   - __prelim_ref->wanted_disk_byte不能是0,它指向btree中一个节点.读对应的节点数据
+   > read_tree_block(btrfs_fs_info->tree_root, __prelim_ref->wanted_disk_byte, leafsize, 0)
+   - 看来__prelim_ref指向的是btrfs_leaf, 但下面有没法保证btrfs_leaf. 把extent_buffer中的第一个btrfs_key放到__prelim_ref->btrfs_key中.
+   - 设置读锁
+   > btrfs_tree_read_lock(extent_buffer)
+   - 不一定是btrfs_leaf??
+   > btrfs_header_level(extent_buffer)
+   - 如果是btrfs_leaf, level==0, 获取第一个btrfs_item的btrfs_key
+   > btrfs_header_key_to_cpu(extent_buffer, ...)
+   - 如果是内部节点, level>0, 获取第一个指针
+   > btrfs_node_key_to_cpu(extent_buffer, ...)
+   - 释放锁
+   > btrfs_tree_read_unlock(extent_buffer)
+
+** __merge_refs(list_head, mode)
+   - list_head队列是__prelim_ref,每个都包含extent_inode_elem链表.双重遍历这个队列,合并相同的2个__prelim_ref的extent_inode_elem链表.
+   - 如果mode=1, 比较复杂一些
+   > ref_for_same_block(__prelim_ref, __prelim_ref)
+   - 否则仅比较__prelim_ref->parent.
+   - 合并__prelim_ref->inode_list,这是extent_inode_elem链表.
+
+** __add_delayed_refs(btrfs_delayed_ref_head, seq, list_head)
+   - 遍历btrfs_delayed_ref_head管理的btrfs_delayed_ref_node,创建对应的__prelim_ref, 放到参数list_head中
+   - 使用btrfs_delayed_ref_node->rb_node遍历, 如果btrfs_delayed_ref_node->bytenr不是参数btrfs_delayed_ref_head指向的extent,停止遍历
+   - btrfs_delayed_ref_node->seq > seq不会处理. 
+   - 只处理btrfs_delayed_ref_node->action是BTRFS_ADD_DELAYED_REF/BTRFS_DROP_DELAYED_REF的情况,如果BTRFS_ADD_DELAYED_REF,增加计数;如果BTRFS_DROP_DELAYED_REF, 减小计数. 它决定了__prelim_ref->count
+   - 检查btrfs_delayed_ref_node->type
+   - 对于BTRFS_TREE_BLOCK_REF_KEY,获取btrfs_delayed_tree_ref
+   > btrfs_delayed_node_to_tree_ref(btrfs_delayed_ref_node)
+   - 设定了btrfs_key,level是上一层,parent无效,wanted_disk_byte是自己的位置,count是要修改的索引数. 后续查找时会处理它,查找level+1层的btree节点
+   > __add_prelim_ref(list_head, root_objectid, btrfs_key, btrfs_delayed_tree_ref->level+1, 0, btrfs_delayed_ref_node->bytenr, btrfs_delayed_ref_node->ref_mod * (1 / -1))
+   - 对于BTRFS_SHARED_BLOCK_REF_KEY, parent不是0, 同样处理btrfs_delayed_tree_ref
+   - 设置btrfs_key为NULL,可以通过bytenr去找.设置了parent,不会去查找反向索引
+   > __add_prelim_ref(list_head, root_objectid, NULL, btrfs_delayed_tree_ref->level+1, btrfs_delayed_tree_ref->parent, bytenr, ref_mod)
+   - 对于BTRFS_EXTENT_DATA_REF_KEY, btrfs_delayed_ref_node是btrfs_delayed_data_ref
+   - 构造btrfs_key(btrfs_delayed_data_ref->objectid, BTRFS_EXTENT_DATA_KEY, offset), level为0,parent为0,后续查找时会查找索引它的btrfs_leaf
+   > __add_prelim_ref(list_head, btrfs_delayed_data_ref->root, btrfs_key, 0, 0, bytenr, ref_mod)
+   - 对于BTRFS_SHARED_DATA_REF_KEY, 参数同样构造btrfs_key,level为0,而且设定了parent,不会再去反向查找
+   > __add_prelim_ref(list_head, btrfs_delayed_data_ref->root, btrfs_key, 0, parent, bytenr, btrfs_delayed_ref_node->ref_mod)
+
+** __add_inline_refs(btrfs_fs_info, btrfs_path, bytenr, info_level, list_head)
+   - btrfs_path里面是btrfs_extent_item, 遍历btrfs_extent_inline_ref. 可能是tree block, 可能是extent data.
+   - 如果是extent是tree block, 获取对应的btrfs_key/level
+   - 和上面类似, 获取backref需要的数据,组装__prelim_ref队列.
+   - 对于BTRFS_SHARED_BLOCK_REF_KEY, 都没有指定root_objectid?没有btrfs_key, offset应该是parent. 这里不用反向查找,不用root.
+   > __add_prelim_ref(list_head, 0, NULL, level+1, offset, bytenr, 1)
+   - 对于BTRFS_SHARED_DATA_REF_KEY, 没有root_objectid,btrfs_key, level是0, 有parent
+   > __add_prelim_ref(list_head, 0, NULL, 0, offset, bytenr, count)
+   - 对于BTRFS_TREE_BLOCK_REF_KEY, 更少, offset应该是root_objectid, 没有btrfs_key, 没有parent. 只有level,为何不都会来btrfs_key?
+   > __add_prelim_ref(list_head, offset, NULL, level+1, 0, bytenr, 1)
+   - 对于BTRFS_EXTENT_DATA_REF_KEY,需要构造btrfs_key(inode_objectid, BTRFS_EXTENT_DATA_KEY, offset), 这是btrfs_file_extent_item, 它是btrfs_extent_data_ref->objectid/offset. 还需要root. 没有parent, level是0. 需要去反向查找btrfs_leaf
+   > __add_prelim_ref(list_head, root, btrfs_key, 0, 0, bytenr, count)
+
+** __add_keyed_refs(btrfs_fs_info, btrfs_path, bytenr, info_level, list_head)
+   - 从参数里面传进来level,应该从btrfs_extent_item中获取
+   - 处理非inline backref, 也就是独立的btrfs_item, 使用btrfs_path遍历btree
+   > btrfs_next_item(extent_root, btrfs_path)
+   - 仅仅处理(BTRFS_TREE_BLOCK_REF_KEY ~ BTRFS_SHARED_DATA_REF_KEY)的btrfs_item
+   - 对于BTRFS_SHARED_DATA_REF_KEY,btrfs_item指向btrfs_shared_data_ref,它只有count, btrfs_key->offset是parent. 它也只需要parent
+   > __add_prelim_ref(__prelim_ref, 0, NULL, 0, btrfs_key->offset, bytenr, count)
+   - 对于BTRFS_SHARED_BLOCK_REF_KEY, parent在btrfs_key->offset, 它只需要level, 根据参数获取, 索引竟然是1
+   > __add_prelim_ref(__prelim_ref, 0, NULL, info_level + 1, btrfs_key->offset, bytenr, 1)
+   - 对于BTRFS_TREE_BLOCK_REF_KEY, btrfs_key->offset是root_objectid, 它需要btrfs_key,但在后面去读取
+   > __add_prelim_ref(__prelim_ref, btrfs_key->offset, NULL, info_level+1, 0, bytenr, 1)
+   - 对于BTRFS_EXTENT_DATA_REF_KEY, 它只缺少parent. 这里count怎么会有多个?!唯一的文件使用唯一的偏移索引多个extent?
+   > __add_prelim_ref(__prelim_ref, root, btrfs_key, 0, 0, bytenr, count)
+
+** find_parent_nodes(btrfs_trans_handle, btrfs_fs_info, bytenr, time_seq, ulist refs, ulist roots, extent_item_pos)
+   - 处理bytenr对应extent的所有backref? 包括inline, 非inline, delayed.
+   - 构造btrfs_key(bytenr, BTRFS_EXTENT_ITEM_KEY, -1),先去查找btrfs_extent_item
+   > btrfs_search_slot(btrfs_trans_handle, extent_root, btrfs_key, btrfs_path, 0, 0)
+   - 先处理delayed ref, 去btrfs_trans_handle->delayed_refs中找btrfs_delayed_ref_head, 搜集对应的__prelim_ref信息.
+   > btrfs_find_delayed_ref_head(btrfs_trans_handle, bytenr)
+   > __add_delayed_refs(head, time_seq, btrfs_delayed_ref_head)
+   - 然后是inline, 而且它要返回level
+   > __add_inline_refs(btrfs_fs_info, btrfs_path, bytenr, info_level, list_head)
+   - 非inline的
+   > __add_keyed_refs(...)
+   - 对于btrfs_key无效的,从btree中读取,只会处理BTRFS_TREE_BLOCK_REF_KEY的情况. 其他要不有parent,要不有btrfs_key
+   > __add_missing_keys(btrfs_fs_info, list_head)
+   - 针对同样的索引信息合并,count也加起来.这是__prelim_ref->inode_list还是空的
+   > __merge_refs(list_head, 1)
+   - 针对parent无效的找反向索引,也就是BTRFS_EXTENT_DATA_REF_KEY和BTRFS_TREE_BLOCK_REF_KEY.对于BTRFS_EXTENT_DATA_REF_KEY,可能会多出来__prelim_ref
+   > __resolve_indirect_refs(btrfs_fs_info, search_commit_root, time_seq, list_head, extent_item_pos)
+   - 2模式合并,针对parent一样的. 这样就知道了parent索引了多少对应的extent
+   > __merge_refs(list_head, 2)
+   - 遍历list_head, 开始处理__prelim_ref
+   - 对于__prelim_ref->count > 0 && __prelim_ref->root_id && __prelim_ref->parent=0, 这就是树的根节点.放到结果ulist中. 对于shared tree block/shared extent data索引就无效
+   - 对于__prelim_ref->parent > 0 && __prelim_ref->count>0, 所以有效的情况
+   - 如果参数extent_item_pos有效,而__prelim_ref->inode_list无效, 这里处理extent data
+   - 找到了parent,却没有找到btrfs_file_extent_item,读取parent对应的btrfs_leaf,遍历它的btrfs_file_extent_item
+   > read_tree_block(extent_root, parent, blocksize/leafsize, 0)
+   - 检查btrfs_file_extent_item, 构造extent_inode_elem链表
+   > find_extent_in_eb(extent_buffer, bytenr, extent_item_pos, extent_inode_elem)
+   - 最后把这个(parent,extent_elem_inode)放到结果refs中.如果碰到相同的,就合并
+   > ulist_add_merge(list_head, __prelim_ref->parent, __prelim_ref->inode_list, extent_inode_elem, GFP_NOFS)
+   - 这里返回2个ulist,一个是为根节点准备的,一个是普通节点准备.根节点索引0,普通节点可能索引extent_inode_elem链表
+
+** free_leaf_list(ulist)
+   - 释放ulist, 双重循环, 还有extent_inode_elem单链表.
+
+** btrfs_find_all_leafs(btrfs_trans_handle, btrfs_fs_info, bytenr, time_seq, ulist, extent_item_pos)
+   - 找到指向bytenr/extent_item_pos的所有btrfs_leaf,以及对应的使用信息
+   > ulist_alloc(GFP_NOFS)
+   > find_parent_nodes(btrfs_trans_handle, btrfs_fs_info, bytenr, time_seq, ...)
+   > ulist_free(...)
+   - 这里ulist是辅助信息,保存btrfs_leaf和extent_inode_elem链表.
+
+** btrfs_find_all_roots(btrfs_trans_handle, btrfs_fs_info, bytenr, time_seq, ulist roots)
+   - 找到索引extent(bytenr)的根节点.根据backref找到索引它的父节点,然后处理父节点.对于没有父节点的就是根节点.一直遍历直到没有节点可以处理.
+   > ulist_alloc(GFP_NOFS)
+   - 找到索引bytenr的btrfs_node, 放到ulist中. 这里ulist中只有key,没有value.根节点会保存到roots中
+   > find_parent_nodes(btrfs_trans_handle, btrfs_fs_info, bytenr, time_seq, ulist tmp, ulist roots, NULL)
+   - 然后从ulist中取出一个ulist_node,处理ulist_node->val,也就是新的bytenr
+   - 继续循环,直到tmp空了
+
+** __inode_info(inum, ioff, key_type, btrfs_root, btrfs_path, btrfs_key)
+   - 构造btrfs_key(inum, key_bypte, ioff), 就是去btree中搜索,找到的是什么btrfs_item?
+
+** inode_item_info(inum, ioff, btrfs_root, btrfs_path)
+   > __inode_info(inum, ioff, BTRFS_INODE_ITEM_KEY, btrfs_root, btrfs_path, btrfs_key)
+   - 这里获取btrfs_key, 但没有使用，只是检查btrfs_item是否存在
+
+** inode_ref_info(inum, ioff, btrfs_root, btrfs_path, btrfs_key)
+   > __inode_info(inum, ioff, BTRFS_INODE_REF_KEY, btrfs_root, btrfs_path, btrfs_key)
+   - 返回找到的btrfs_key. btrfs_key的offset什么意思?
+
+** btrfs_find_one_extref(btrfs_root, inode_objectid, start_off, btrfs_path, btrfs_inode_extref, found_off)
+   - 构造btrfs_key(inode_objectid, BTRFS_INODE_EXTREF_KEY, start_off)
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 在btree中查找,找BTRFS_INODE_EXTREF_KEY对应的,btrfs_inode_extref, 还要把找到的btrfs_key->offset给参数found_off. start_off / found_off, 表示什么?
+
+** btrfs_ref_to_path(btrfs_root, btrfs_path, name_len, name_off, extent_buffer, parent, dest, size)
+   - 根据btrfs_key找到完成的路径?
+   > inode_ref_info(parent inode_objectid, 0, btrfs_root, btrfs_path, btrfs_key)
+   - 根据inode objectid/0, 找到btrfs_key, 还有btrfs_path, 指向btrfs_inode_ref,  btrfs_key->offset传入的是0, 传出的是parent inode objectid,  如果和参数parent一样,那就指向自己, 是'.'吗? 退出循环.
+   - 获取btrfs_inode_ref里面的name, 放到dest指针中, 循环处理btrfs_key->offset, 也就是父目录.
+   > btrfs_set_lock_blocking_rw(extent_buffer, BTRFS_READ_LOCK)
+   > btrfs_tree_read_lock(extent_buffer)
+   - 在读的过程中锁住extent_buffer
+
+** btrfs_iref_to_path(btrfs_root, btrfs_path, btrfs_inode_ref, extent_buffer, parent, dest, size)
+   - 参数中extent_buffer / btrfs_inode_ref已经指向btrfs_inode_ref, 下面的函数先把数据放到dest中,然后开始遍历parent
+   > btrfs_ref_to_path(btrfs_root, btrfs_path, name_len, name_offset, extent_buffer, parent, dest, size)
+
+** extent_from_logical(btrfs_fs_info, logical, btrfs_path, btrfs_key, flags_ret)
+   - 根据logical查找对应的btrfs_extent_item
+   - 构造btrfs_key(logical, BTRFS_EXTENT_ITEM_KEY, -1), 去btree中查找
+   > btrfs_search_slot(NULL, btrfs_fs_info->extent_root, btrfs_key, btrfs_path, 0, 0)
+   > btrfs_previous_item(extent_root, btrfs_path, 0, BTRFS_EXTENT_ITEM_KEY)
+   - 找到的btrfs_extent_item必须覆盖logical, btrfs_key->objectid不一定是logical
+   - 检查btrfs_extent_item->flags的BTRFS_EXTENT_FLAG_TREE_BLOCK, 或者 BTRFS_EXTENT_FLAG_DATA,设置参数flags_ret
+
+** __get_extent_inline_ref(ptr, extent_buffer, btrfs_extent_item, item_size, btrfs_extent_inline_ref out_eiref, out_type)
+   - extent_buffer和btrfs_extent_item指向一个extent, 处理它里面的btrfs_extent_inline_ref
+   - 这个函数是辅助函数,为遍历btrfs_extent_inline_ref数组
+   - 如果ptr是0,需要先从btrfs_extent_item中获取信息. 确定tree block或者extent data, 获取btrfs_extent_item->flags, 如果是tree block, 还要跳过btrfs_tree_block_info.
+   - 如果ptr不是0, 直接跳下一个btrfs_extent_inline_ref, 获取offset, type, ptr更新指向下一个btrfs_extent_inline_ref
+
+** tree_backref_for_extent(ptr, extent_buffer, btrfs_extent_item, item_size, out_root, out_level)
+   - 获取tree block的btrfs_tree_block_info信息,使用参数返回
+   - extent_buffer / btrfs_extent_item指向extent, 从里面获取btrfs_extent_inline_ref信息. 
+   - 循环处理btrfs_extent_inline_ref数组
+   > __get_extent_inline_ref(ptr, extent_buffer, btrfs_extent_item, ...)
+   - 碰到BTRFS_TREE_BLOCK_REF_KEY / BTRFS_SHARED_BLOCK_REF_KEY停止循环,确认它的存在
+   - btrfs_tree_block_info中获取level, root在btrfs_extent_inline_ref->offset中.那这是一个BTRFS_TREE_BLOCK_REF_KEY, 对于另一个应该是parent
+
+** iterate_leaf_refs(extent_inode_elem, root, extent_item_objectid, iterate_extent_inodes_t, void ctx)
+   - 遍历extent_inode_elem单链表,使用iterate函数处理他们.
+   > iterate_extent_inodes_t(inum, offset, root, ctx)
+
+** iterate_extent_inodes(btrfs_fs_info, extent_item_objectid, extent_item_pos, search_commit_root, iterate_extent_inodes_t, ctx)
+   - 找到所有索引extent_item_objectid/extent_item_pos的inode的btrfs_file_extent_item,使用iterate_extent_inodes_t处理它.
+   - BTRFS_BACKREF_SEARCH_COMMIT_ROOT是什么btrfs_trans_handle
+   - 找一个btrfs_trans_handle, 如果search_commit_root有效,就是用上面的0, 否则创建一个
+   > btrfs_join_transaction(extent_root)
+   > btrfs_get_tree_mod_seq(btrfs_fs_info, seq_list)
+   - 首先找出所有的btrfs_leaf
+   > btrfs_find_all_leafs(btrfs_trans_handle, btrfs_fs_info, extent_item_objectid, tree_mod_seq_elem.seq, ulist, extent_item_pos)
+   - 双循环,遍历extent_inode_elem单链表, 使用参数iterate_extent_inodes_t函数.
+   > btrfs_end_transaction(btrfs_trans_handle, extent_root)
+
+** iterate_inodes_from_logical(logical, btrfs_fs_info, btrfs_path, iterate_extent_inodes_t, ctx)
+   - 获取logical对应的btrfs_path, btrfs_key, flags
+   > extent_from_logical(btrfs_fs_info, logical, btrfs_path, btrfs_key, flags)
+   - 检查flags,必须是BTRFS_EXTENT_FALG_EXTENT_DATA,否则直接返回.
+   - extent_item_pos就是logical - btrfs_key->objectid, 这是extent内部offset
+   > iterate_extent_inodes_t(btrfs_fs_info, btrfs_key->objectid, extent_item_pos, search_commit_root, iterate, ctx)
+
+** iterate_inode_refs(inum, btrfs_root, btrfs_path, iterate_irefs_t, ctx)
+   - iterate_irefs_t是用来遍历inode, 看下面就看出
+   > iterate_irefs_t(parent, name_len, name_off, extent_buffer, ctx)
+   - 遍历inum使用的所有btrfs_inode_ref节点, 找到所有parent, name. parent+1,是用来向前遍历.
+   > inode_ref_info(inum, parent+1, btrfs_root, btrfs_path, btrfs_key)
+   - 同时要锁住extent_buffer
+   > iterate_irefs_t(parent, name_len, name, extent_buffer, ctx)
+   - 这里name还是一个extent_buffer内部的偏移
+
+** iterate_inode_extrefs(inum, btrfs_root, btrfs_path, iterate_irefs_t, ctx)
+   - 对于BTRFS_INODE_EXTREF_KEY, offset使用hash, 考虑hash碰撞问题, btrfs_item里面是btrfs_inode_extref数组
+   > btrfs_find_one_extref(btrfs_root, inum, offset, btrfs_path, btrfs_inode_extref, offset)
+   - 这里把找到的offset返回, 下次遍历直接+1
+   - 从每个btrfs_inode_extref里面获取name, name_len
+   > iterate_irefs_t(parent, name_len, name, extent_buffer, ctx)
+
+** iterate_irefs(inum, btrfs_root, btrfs_path, iterate_irefs_t, ctx)
+   > iterate_inode_refs(inum, btrfs_root, btrfs_path, iterate, ctx)
+   > iterate_inode_exterfs(...)
+
+** inode_fs_paths 
+   #+begin_src 
+	struct btrfs_path		*btrfs_path;
+	struct btrfs_root		*fs_root;
+	struct btrfs_data_container	*fspath;
+   #+end_src
+
+** btrfs_data_container
+   #+begin_src 
+	__u32	bytes_left;	/* out -- bytes not needed to deliver output */
+	__u32	bytes_missing;	/* out -- additional bytes needed for result */
+	__u32	elem_cnt;	/* out */
+	__u32	elem_missed;	/* out */
+	__u64	val[0];		/* out */
+   #+end_src
+
+** inode_to_path(inum, name_len, name_off, extent_buffer, ctx)
+   - btrfs_data_container指的内存用来存放path. 参数中extent_buffer / name_offset是准备好的.
+   > btrfs_ref_to_path(btrfs_root, btrfs_path, name_len, ...)
+   - 所以这是一个iterate_inode_refs
+
+** path_from_inode(inum, inode_fs_paths)
+   > iterate_irefs(inum, btrfs_root, btrfs_path, inode_to_path, ipath)
+   - 获取文件系统所有指向这个inode的路径
+
+** btrfs_data_container init_data_container(total_bytes)
+   - 分配内存,btrfs_data_container, 使用vmalloc??
+   > vmalloc(size)
+   
+** inode_fs_paths init_ipath(total_bytes, btrfs_root, btrfs_path)
+   - 构造inode_fs_paths
+
+** 总结
+   - 2部分,一个是辅助处理extent的backref,另一个是inode backref. inode backref是根据ino,获取这个文件的所有路径
+   - extent的backref比较负责,它找到索引extent的所有btrfs_root.这里只看到所有extent data,还需要如何索引的信息.
+   - 最终的结果是一个btrfs_root中的btrfs_inode的extent数据,对特定磁盘extent的索引.只有在snapshot和cow交叉的过程中出现.snapshot了一个文件,但文件io在snapshot前面,所以必须保证snapshot的数据是正确的.使用这里的功能找到被代替的文件信息,替换对应的btrfs_file_extent_item
+

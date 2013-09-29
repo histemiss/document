@@ -1,0 +1,976 @@
+File Locking over XNFS
+
+1. Introduction
+    Because NFS is a stateless service, it cannot provide inherently stateful services such as file locking and access control synchronisation. Instead these services are provided by two cooperating processes: the Network Lock Manager (NLM) and the Network Status Monitor (NSM). The NLM and NSM are RPC-based servers which normally execute as autonomous "daemon" servers on XNFS client and server systems. They work together to provide stateful file locking and access control capability over XNFS. This chapter describes the RPC protocols which the NLM and NSM implement, and defines how they interact. Full specifications of the NLM and NSM protocols are in Network Lock Manager Protocol and Network Status Monitor Protocol .
+
+1.1. NLM Protocol
+    The NLM is a service that provides advisory X/Open CAE file and record locking, and DOS compatible file sharing and locking in an XNFS environment. Its use is strongly encouraged but not mandatory. XNFS clients must be prepared to interoperate with servers which do not support this service. It is also recommended, but not required, that locks created by DOS processes are honoured by processes running on an X/Open host and vice versa.
+    The NLM provides two types of locks, monitored and non-monitored.
+    1.1.1. Monitored Locks
+    Monitored locks are reliable. A client process which establishes monitored locks can be assured that if the server host, on which the locks are established, crashes and recovers, the locks will be reinstated without any action on the client process' part. Likewise, locks that are held by a client process will be discarded by the NLM on the server host if the client host crashes before the locks are released.
+Monitored locks require both the client and server hosts to implement the NSM protocol.
+Monitored locks are preferred over the non-monitored locks.
+    1.1.2. Non-monitored Locks
+    Non-monitored locks are provided to support single-tasking personal computers that cannot run an NSM due to memory or speed constraints. A client that is able to run an NSM should use monitored locks.
+    Non-monitored locks provide the same functionality as monitored locks except if the server host, on which the locks are established, crashes and recovers, the locks will not be re-established. The personal computer client is responsible for detecting a server host failure and re-establishing the locks. Additionally, the personal computer client must inform the server NLM when it has been rebooted so it can discard all locks and file shares held for the client.
+
+1.2. NSM Protocol
+    The NSM is a service that provides applications with information on the status of network hosts. It is included in this document as it is heavily used by the NLM to track hosts that have established locks and the hosts that are holding those locks. Although the NSM is a general service, this document will only describe the NSM as it is used by the NLM.
+    Each NSM keeps track of its own "state" and notifies any interested party of a change in this state. The state is merely a number which increases monotonically each time the condition of the host changes: an even number indicates the host is down, while an odd number indicates the host is up.
+    The NSM does not actively "probe" hosts it has been asked to monitor; instead it waits for the monitored host to notify it that the monitored host's status has changed (that is, crashed and rebooted).
+    When it receives an SM_MON request an NSM adds the information in the SM_MON parameter to a notify list. If the host has a status change (crashes and recovers), the NSM will notify each host on the notify list via the SM_NOTIFY call. If the NSM receives notification of a status change from another host it will search the notify list for that host and call the RPC supplied in the SM_MON call.
+    For obvious reasons, the NSM maintains copies of its current state and of the notify list on stable storage.
+    For correct operation of the NLM, the client and server hosts are required to monitor each other. When a lock request is issued by a process running on the client host, the NLM on the client host requests the NSM on the client host to monitor the server host. The client NLM then transmits the lock request to the NLM on the server. On reception of the lock request the NLM on the server host will request the NSM on the server host to monitor the client host. In this way each host is monitored by the NSM on the other host.
+2. Interaction
+    It is assumed that the user process requests locks and file shares via a user-level API or system call such as the XSI fcntl(). The NLM protocol provides both synchronous and asynchronous procedures. An implementor may choose to use either the synchronous or asynchronous procedures to implement client functionality, but must be able to accept and process both types of requests.
+    This section will describe the interaction between the NLM and the NSM for the synchronous procedures. For simplicity it is assumed that all network lock requests are passed to the client NLM for handling. This is an implementation dependency; the protocol does not require this.
+
+2.1. Monitored Locks
+    Monitored locks require both the client and server hosts to support the NSM protocol.
+
+2.1.1. Locking
+    NLM_LOCK requests may be blocking or non-blocking. When the server NLM receives the NLM_LOCK request, it must make a call to the SM_MON procedure on its local NSM to monitor the calling host. The SM_MON call includes the name of the host to be monitored and an RPC to be called if the NSM is notified of a state change for the monitored host. The RPC information includes a transport end-point, program number, program version, procedure number and an opaque argument. The RPC information is of significance only to an NLM implementation, and is not defined by this specification.
+    If the lock can be granted immediately, or the call was non-blocking, the RPC returns immediately with the appropriate status (granted or denied).
+    If the lock cannot be granted immediately (it conflicts with an existing lock) and the call was a blocking call, the RPC will return with a blocked status, thus allowing the client NLM to continue processing. At this point the client NLM can choose to cancel the outstanding lock request by calling the NLM_CANCEL procedure. Upon reception of an NLM_CANCEL request, the server NLM will then delete the outstanding lock request and may request its local NSM to stop monitoring the calling host by calling the SM_UNMON procedure.
+    When the blocked lock request can be processed, the server NLM makes an NLM_GRANTED call-back to the client NLM indicating success or failure.
+    Once the lock has been granted, the client NLM instructs the local NSM to monitor the server via the SM_MON RPC, as described above; once again, the RPC used for notification is not defined by this specification. At this point the NSMs on both the client and server hosts are monitoring each other.
+
+2.1.2. Crash Recovery
+    When the server host crashes and is restarted, its NSM will go through the notify list and will call the SM_NOTIFY procedure for each of these hosts to inform them of the state change. Each local NSM that receives this SM_NOTIFY call will search their notify list and make the corresponding RPC supplied in the previous SM_MON call, to the interested parties. One of the interested parties will be the client NLM protocol implementation which will have supplied an RPC which can go through the steps necessary to re-establish the lost locks during the server NLM server's grace period.
+    The grace period is an implementation-dependent time during which the NLM implementation will only accept requests to re-establish locks or shares that were in effect at the time of the crash. During this period any other lock or share requests will be returned with a status indicating that the NLM is in the grace period and is not accepting new requests.
+    If the client host crashes, upon reboot, the NSM will go through the same process notifying the NSMs on hosts in the notify list via the SM_NOTIFY procedure call that there was a change in state. The server NSM will receive this notification call and in turn notify the server NLM, via the provided RPC, that the client host had crashed. The server NLM can then dispose of all locks and shares held by the crashed host.
+
+2.1.3. Unlocking
+    A monitored lock is unlocked by making a call to the NLM_UNLOCK procedure. The server NLM will process the request and release the lock and return status. The server NLM can then ask its local NSM to stop monitoring the calling host via the SM_UNMON procedure call. At this point the server NLM will check existing blocked lock requests and service them if possible.
+
+2.2. Non-Monitored Locks
+    Non-monitored locks do not require the client or server host to support the NSM protocol. All non-monitored locks calls are synchronous.
+
+2.2.1. Locking
+    A client host establishes a non-monitored lock by calling the NLM_NM_LOCK procedure on the server NLM. The server NLM will process the lock and return status to the client host indicating whether the lock was granted or denied. The NLM_NM_LOCK procedure call cannot block and so cannot result in a call-back.
+
+2.2.2. Crash Recovery
+    If the client host crashes while it has established locks or file shares, it must generate an NLM_FREE_ALL RPC upon reboot. When it receives an NLM_FREE_ALL request the server NLM must free all locks and files shares held by the requesting host. The client host has no way of determining whether the server host crashes, and therefore no way to re-establish the locks during the server NLM grace period. The client must be prepared to handle errors when a previously requested lock is lost.
+
+2.2.3. Unlocking
+    The unlock operation is the same as for monitored locks. The NLM_UNLOCK procedure is called. The server NLM will process the request and release the lock as requested, and return a status.
+
+3. Transport Issues
+    NLM and NSM implementations are required to support both UDP and TCP transports. Personal computer NFS clients will always use UDP when issuing locking and sharing requests to an NLM. Most implementations of the NSM use TCP when interacting with the local NLM and any remote NSMs, but both NLM and NSM must accept any request over either transport.
+4. Examples of Locking
+    This section outlines the behaviour of the NLM and NSM daemons during an X/Open-compliant system boot, crash and reboot. It describes the following two cases:
+    a client locks a file, and the server crashes and is restarted while the file is locked
+    a client locks a file, then crashes and is restarted without releasing the lock.
+
+4.1. Server Crash Example
+
+4.1.1. Server NSM Initialisation
+    The server NSM is started. (Note that NSM and NLM initialisation proceed in parallel.) The server NSM retrieves a copy of the last server state from stable storage, increments it to the next odd value, and saves it on stable storage. It then processes the notify list on stable storage, which is initially empty.
+
+4.1.2. Server NLM Initialisation
+    The server NLM is started. It issues an SM_UNMON_ALL to the server NSM, from which it obtains a copy of the server state. It then enters grace period recovery state, waits for the grace period, and then enters normal service state.
+
+4.1.3. Client NSM Initialisation
+    The client NSM is started. (Note that NSM and NLM initialisation proceed in parallel.) The client NSM retrieves a copy of the last client state from stable storage, increments it to the next odd value, and saves it on stable storage. It then processes the notify list, which is initially empty.
+
+4.1.4. Client NLM Initialisation
+    The client NLM is started. It issues an SM_UNMON_ALL to the client NSM, from which it obtains a copy of the client state. It then enters grace period recovery state, waits for the grace period, and then enters normal service state.
+
+4.1.5. Client Lock Request
+    A process on the client system requests a byte range lock on a file stored on the server. The client NFS passes this request, including the file handle, to the local NLM using a private protocol.
+    The client NLM issues an NLM_LOCK RPC to the server NLM. This request includes a copy of the client state.
+    The server NLM determines that the lock can be granted. It verifies that this is the first lock held for the client, and issues an SM_MON call to the server NSM instructing it to monitor the client.
+    The server NSM saves the client name and RPC information in the notify list, committing the client name to stable storage, and reports success to the server NLM.
+    The server NLM records the fact that it is holding a lock for the named client which is in client state. It then sends a success response to the client NLM.
+    The client NLM verifies that this is the first lock which it is holding on the server system, and issues an SM_MON call to the client NSM instructing it to monitor the server.
+    The client NSM saves the server name and RPC information in the notify list, committing the server name to stable storage, and reports success to the client NLM.
+    The client NLM records the fact that the server NLM is holding a lock for it, and returns to the local application.
+
+4.1.6. Server Failure and Restart
+    The server system fails and is restarted.
+
+4.1.7. Server NSM Restart
+    The server NSM is restarted. (Note that NSM and NLM initialisation proceed in parallel.) The server NSM retrieves a copy of the last server state from stable storage, increments it to the next odd value, and saves it on stable storage. It then processes the notify list on stable storage, adding each name to a recovery list.
+    For each name in the recovery list, the server NSM issues an SM_NOTIFY RPC to the NSM on the named host. In this example it will issue an SM_NOTIFY to the client NSM, including the server name and the new server state.
+    The client NSM receives the SM_NOTIFY RPC and compares the hostname against each entry in the notify list. When it encounters a match, it calls back the client NLM using the RPC information provided with the original SM_MON RPC.
+    The callback procedure in the client NLM notes that the server state has changed and schedules lock recovery (see below). It then acknowledges the RPC callback from the client NSM.
+    After comparing the name against all entries in the notify list, the client NSM acknowledges the SM_NOTIFY RPC from the server NSM.
+    After processing all entries in the recovery list, the server NSM enters normal service state with an empty notify list.
+4.1.8. Server NLM Restart
+    The server NLM is started. It issues an SM_UNMON_ALL to the server NSM, from which it obtains a copy of the new server state. It then enters grace period recovery state.
+Client Lock Recovery
+    The client NLM now attempts to recover all locks which it was holding on the server. For each lock, it issues an NLM_LOCK request with reclaim set to true. This NLM_LOCK is processed as described above; the server NLM and NSM register the lock and (re)initiate monitoring of the client, and the client NLM confirms the lock and arranges for the client NSM to monitor the server.
+4.1.9. Server NLM Restart Completion
+    At the conclusion of the grace period, the server NLM enters normal service mode.
+Client Unlock Request
+    Eventually the client application releases the lock on the file. The client NLM issues an NLM_UNLOCK RPC to the server NLM.
+    The server NLM releases the lock, and notices that this is the last lock which was being held on behalf of the client. It issues an SM_UNMON RPC to the server NSM.
+    The server NSM removes the client from the notify list, and returns to the server NLM, which completes the NLM_UNLOCK request.
+    The client NLM deletes the lock record, and notices that this is the last lock which it was holding on the server. It issues an SM_UNMON RPC to the client NSM.
+    The client NSM removes the server from the notify list, and returns to the client NLM, which completes the application's unlock request.
+
+4.2. Client Crash Example
+
+4.2.1. Initialisation
+    The server and client NSM and NLM are initialised as described in the previous example.
+4.2.2. Client Lock Request
+    The client lock request is processed as described in the previous example.
+4.2.3. Client Failure and Restart
+    The client system fails and is restarted.
+4.2.4. Client NSM Restart
+    The client NSM is restarted. (Note that NSM and NLM initialisation proceed in parallel.) The client NSM retrieves a copy of the last client state from stable storage, increments it to the next odd value, and saves itstable storage. It then processes the notify list on stable storage, adding each name to a recovery list.
+    For each name in the recovery list, the client NSM issues an SM_NOTIFY RPC to the NSM on the named host. In this example it will issue an SM_NOTIFY to the server NSM, including the client name and the new client state.
+    The server NSM receives the SM_NOTIFY RPC and compares the hostname against each entry in the notify list. When it encounters a match, it calls back the server NLM using the RPC information provided with the original SM_MON RPC.
+    The callback procedure in the server NLM notes that the client state has changed and releases all locks held on behalf of the client. It then acknowledges the RPC callback from the server NSM.
+    After comparing the name against all entries in the notify list, the server NSM acknowledges the SM_NOTIFY RPC from the client NSM.
+    After processing all entries in the recovery list, the client NSM enters normal service state with an empty notify list.
+4.2.5. Client NLM Restart
+    The client NLM is now restarted as normal. 
+
+Network Lock Manager Protocol
+1. Introduction
+    The Network Lock Manager (NLM) is a service that provides advisory X/Open CAE file and record locking, and DOS compatible file sharing and locking in an XNFS environment. Here, DOS refers to MS-DOS or PC DOS, and DOS file sharing and record locking is as defined in Disk Operating System Technical Reference, IBM part no. 6138536.
+
+1.1. Versions
+    There are multiple versions of the NLM. This document describes version 3 which is backward compatible with versions 1 and 2.
+
+1.2. Synchronization of NLMs
+    Due to the stateless nature of XNFS servers it is difficult to incorporate a stateful service. The NLM relies on the server holding the locks as the keeper of the state and on the NSM for information on host status (monitored locks only). When an XNFS server crashes and is rebooted, locks which it had granted may be recreated by the lock holders (clients) during a grace period. During this grace period no new locks are accepted although NFS requests are accepted. The duration of this grace period is implementation-dependent; 45 seconds is common.
+
+1.3. DOS-Compatible File-Sharing Support
+    Version 3 of the protocol supports DOS compatible file locking and sharing. File sharing is a mechanism which allows a DOS process to open or create a file and to restrict the way in which subsequent processes may access the file. For example, a DOS client may request that a file is opened for reading and writing, and that subsequent users may only open it for reading. To use a DOS sharing mode an NLM_SHARE request is issued when a file is opened, and a corresponding NLM_UNSHARE is performed when it is closed. These procedures rely on the nlm_share structure, defined below. Because the sharing requests were intended to be used by a single-tasking client host, they are non-monitored.
+
+2. RPC Information
+
+2.1. Authentication
+    The NLM service uses AUTH_UNIX style authentication only.
+
+2.2. Transport Protocols
+    The NLM Protocol supports both UDP/IP and TCP/IP transports. However, a client implementation may choose to only generate requests over the UDP/IP protocol.
+
+2.3. Port Number
+    Consult the server's port mapper, described in Port Mapper Protocol , to find the port number on which the NLM service is registered.
+
+2.4. Sizes of XDR Structures
+    These are the sizes, given in decimal bytes, of various XDR structures used in the protocol.
+    /* The maximum length of the string identifying the caller. */ 
+    const LM_MAXSTRLEN = 1024;  
+    /* The maximum number of bytes in the nlm_notify name argument. */ 
+    const LM_MAXNAMELEN = LM_MAXSTRLEN+1; 
+    const MAXNETOBJ_SZ = 1024; 
+
+2.5. Basic Data Types for Locking
+    The following XDR definitions are the basic structures and types used in the parameters passed to, and returned from, the NLM.
+
+2.5.1. netobj
+    opaque netobj<MAXNETOBJ_SZ> 
+
+    Netobj is used to identify an object, generally a transaction, owner or file. The contents and form of the netobj are defined by the client.
+2.5.2 nlm_stats
+
+    enum nlm_stats { 
+        LCK_GRANTED = 0, 
+        LCK_DENIED = 1, 
+        LCK_DENIED_NOLOCKS = 2, 
+        LCK_BLOCKED = 3, 
+        LCK_DENIED_GRACE_PERIOD = 4 
+    }; 
+
+    Nlm_stats are returned whenever the NLM is called upon to create or test a lock on a file.
+
+LCK_GRANTED
+    Indicates that the procedure call completed successfully.
+
+LCK_DENIED
+    Indicates that the request failed.
+
+LCK_DENIED_NOLOCKS
+    Indicates that the procedure call failed because the server NLM could not allocate the resources needed to process the request.
+
+LCK_BLOCKED
+    Indicates the blocking request cannot be granted immediately. The server NLM will make a call-back to the client with an NLM_GRANTED procedure call when the lock can be granted.
+
+LCK_DENIED_GRACE_PERIOD
+    Indicates that the procedure call failed because the server has recently been rebooted and the server NLM is re-establishing existing locks, and is not yet ready to accept normal service requests.
+
+    Note that some versions of NFS source may use mixed or lower-case names for the enumeration constants in "nlm_stats".
+
+2.5.3. nlm_stat
+
+    struct nlm_stat { 
+        nlm_stats stat; 
+    }; 
+
+    This structure returns lock status. It is used in many of the other data structures.
+
+2.5.4. nlm_res
+
+    struct nlm_res { 
+        netobj cookie; 
+        nlm_stat stat; 
+    }; 
+
+    The nlm_res structure is returned by all of the main lock routines except for NLM_TEST which has a separate return structure defined below. Note that clients must not rely upon the "cookie" being the same as that passed in the corresponding request.
+
+2.5.5. nlm_holder
+
+    struct nlm_holder { 
+        bool exclusive; 
+        int uppid; 
+        netobj oh; 
+        unsigned l_offset; 
+        unsigned l_len; 
+    }; 
+
+    The nlm_holder structure identifies the holder of a particular lock. It is used as part of the return value from the NLM_TEST procedure. The boolean "exclusive" indicates whether the lock is exclusively held by the current holder. The integer "uppid" provides a unique per-process identifier for lock differentiation. The values "l_offset" and "l_len" define the region of the file locked by this holder. The "oh" field is an opaque object that identifies the host, or a process on the host, that is holding the lock.
+
+2.5.6. nlm_testrply
+    union nlm_testrply switch (nlm_stats stat) { 
+        case LCK_DENIED: 
+            struct nlm_holder holder; /* holder of the lock */ 
+        default: void; 
+    }; 
+
+    The nlm_testrply is used as part of the return value from the NLM_TEST procedure. If the lock specified in the NLM_TEST procedure call would conflict with a previously granted lock, information on the holder of the lock is returned in "holder", otherwise just the status is returned.
+
+2.5.7. nlm_testres
+
+    struct nlm_testres { 
+        netobj cookie; 
+        nlm_testrply test_stat; 
+    }; 
+
+    This structure is the return value from the NLM_TEST procedure. The other main lock routines return the nlm_res structure.
+
+2.5.8. nlm_lock
+
+    struct nlm_lock { 
+        string caller_name<LM_MAXSTRLEN>; 
+        netobj fh; /* identify a file */ 
+        netobj oh; /* identify owner of a lock */ 
+        int uppid; /* Unique process identifier */ 
+        unsigned l_offset; /* File offset (for record locking) */ 
+        unsigned l_len; /* Length (size of record) */ 
+    }; 
+
+    The nlm_lock structure defines the information needed to uniquely specify a lock. The "caller_name" uniquely identifies the host making the call. The "fh" field identifies the file to lock. The "oh" field is an opaque object that identifies the host, or a process on the host, that is making the request. "uppid" uniquely describes the process owning the file on the calling host. The "uppid" may be generated in any system-dependent fashion. On an X/Open-compliant system it is generally the process ID. On a DOS system it may be generated from the program segment prefix (PSP). The "l_offset" and "l_len" determine which bytes of the file are locked.
+
+2.5.9. nlm_lockargs
+
+    struct nlm_lockargs { 
+        netobj cookie; 
+        bool block; /* Flag to indicate blocking behaviour. */ 
+        bool exclusive; /* If exclusive access is desired. */ 
+        struct nlm_lock alock; /* The actual lock data (see above) */ 
+        bool reclaim; /* used for recovering locks */ 
+        int state; /* specify local NSM state */ 
+    }; 
+
+    The nlm_lockargs structure defines the information needed to request a lock on a server. The "block" field must be set to true if the client wishes the procedure call to block until the lock can be granted (see NLM_LOCK). A false value will cause the procedure call to return immediately if the lock cannot be granted. The "reclaim" field must only be set to true if the client is attempting to reclaim a lock held by an NLM which has been restarted (due to a server crash, and so on). The "state" field is used with the monitored lock procedure call (NLM_LOCK). It is the state value supplied by the local NSM, see Network Status Monitor Protocol .
+
+2.5.10. nlm_cancargs
+
+    struct nlm_cancargs { 
+        netobj cookie; 
+        bool block; 
+        bool exclusive; 
+        struct nlm_lock alock; 
+    }; 
+
+    The nlm_cancargs structure defines the information needed to cancel an outstanding lock request. The data in the nlm_cancargs structure must exactly match the corresponding information in the nlm_lockargs structure of the outstanding lock request to be cancelled.
+2.5.11. nlm_testargs
+
+    struct nlm_testargs { 
+        netobj cookie; 
+        bool exclusive; 
+        struct nlm_lock alock; 
+    }; 
+
+    The nlm_testargs structure defines the information needed to test a lock. The information in this structure is the same as the corresponding fields in the nlm_lockargs structure.
+
+2.5.12. nlm_unlockargs
+
+    struct nlm_unlockargs { 
+        netobj cookie; 
+        struct nlm_lock alock; 
+    }; 
+
+    The nlm_unlockargs structure defines the information needed to remove a previously established lock.
+
+2.6. DOS File-Sharing Data Types
+    The following data types are used in version 3 of the NLM to support DOS 3.1 and above compatible file-sharing control. All file-sharing procedure calls are non-monitored.
+2.6.1. fsh_mode
+
+    enum fsh_mode { 
+        fsm_DN = 0, /* deny none */ 
+        fsm_DR = 1, /* deny read */ 
+        fsm_DW = 2, /* deny write */ 
+        fsm_DRW = 3 /* deny read/write */ 
+    }; 
+
+    fsh_mode defines the legal sharing modes.
+2.6.2. fsh_access
+
+    enum fsh_access { 
+        fsa_NONE = 0, /* for completeness */ 
+        fsa_R = 1, /* read-only */ 
+        fsa_W = 2, /* write-only */ 
+        fsa_RW = 3 /* read/write */ 
+    }; 
+
+    fsh_access defines the legal file access modes.
+2.6.3. nlm_share
+
+    struct nlm_share { string caller_name<LM_MAXSTRLEN>; netobj fh; netobj oh; fsh_mode mode; fsh_access access; }; 
+
+    The nlm_share structure defines the information needed to uniquely specify a share operation. The netobj's define the file. "fh" and owner "oh", "caller_name" uniquely identifies the host. "mode" and "access" define the file-sharing and the access modes.
+
+2.6.4. nlm_shareargs
+
+    struct nlm_shareargs { 
+        netobj cookie; 
+        nlm_share share; /* actual share data */ 
+        bool reclaim; /* used for recovering shares */ 
+    }; 
+
+    This structure encodes the arguments for an NLM_SHARE or NLM_UNSHARE procedure call. The boolean "reclaim" must be true if the client is attempting to reclaim a previously-granted sharing request, and false otherwise.
+2.6.5. nlm_shareres
+
+    struct nlm_shareres { 
+        netobj cookie; 
+        nlm_stats stat; 
+        int sequence; 
+    }; 
+
+    This structure encodes the results of an NLM_SHARE or NLM_UNSHARE procedure call. The "cookie" and "sequence" fields should be ignored; they are required only for compatibility reasons. The result of the request is given by "stat".
+2.6.6. nlm_notify
+
+    struct nlm_notify { 
+        string name<LM_MAXNAMELEN>; 
+        long state; 
+    }; 
+
+    This structure encodes the arguments for releasing all locks and shares a client holds.
+
+3. NLM Procedures
+
+    The following reference pages define the protocol used by the NLM using RPC Language. Version 3 of the protocol is the same as version 1 and 2 with the addition of the non-monitored locking procedures and the DOS compatible sharing procedures.
+
+    /* 
+     * NLM procedures 
+     */ 
+    program NLM_PROG { 
+        version NLM_VERSX { 
+            /* 
+             * synchronous procedures 
+             */ 
+            void NLM_NULL(void) = 0; 
+            nlm_testres NLM_TEST(struct nlm_testargs) = 1; 
+            nlm_res NLM_LOCK(struct nlm_lockargs) = 2; 
+            nlm_res NLM_CANCEL(struct nlm_cancargs) = 3; 
+            nlm_res NLM_UNLOCK(struct nlm_unlockargs) = 4; 
+            /* 
+             * server NLM call-back procedure to grant lock 
+             */ 
+            nlm_res NLM_GRANTED(struct nlm_testargs) = 5; 
+            /* 
+             * asynchronous requests and responses 
+             */ 
+            void NLM_TEST_MSG(struct nlm_testargs) = 6; 
+            void NLM_LOCK_MSG(struct nlm_lockargs) = 7; 
+            void NLM_CANCEL_MSG(struct nlm_cancargs) =8; 
+            void NLM_UNLOCK_MSG(struct nlm_unlockargs) = 9; 
+            void NLM_GRANTED_MSG(struct nlm_testargs) = 10; 
+            void NLM_TEST_RES(nlm_testres) = 11; 
+            void NLM_LOCK_RES(nlm_res) = 12; 
+            void NLM_CANCEL_RES(nlm_res) = 13; 
+            void NLM_UNLOCK_RES(nlm_res) = 14; 
+            void NLM_GRANTED_RES(nlm_res) = 15; 
+            /* 
+             * synchronous non-monitored lock and DOS file-sharing 
+             * procedures (not defined for version 1 and 2) 
+             */ 
+            nlm_shareres NLM_SHARE(nlm_shareargs) = 20; 
+            nlm_shareres NLM_UNSHARE(nlm_shareargs) = 21; 
+            nlm_res NLM_NM_LOCK(nlm_lockargs) = 22; 
+            void NLM_FREE_ALL(nlm_notify) = 23; 
+        } = 3; 
+    } = 100021; 
+
+    The NLM provides synchronous and asynchronous procedures which provide the same functionality. The client portion of an NLM may choose to implement locking and file-sharing functionality by using either set of procedure calls.
+    The server portion of an NLM implementation must support both the synchronous and asynchronous procedures.
+    The asynchronous procedures implement a message passing scheme to facilitate asynchronous handling of locking and unlocking. Each of the functions Test, Lock, Unlock and Grant is broken up into a message patt, and a result part. An NLM will send a message to another NLM to perform some action. The receiving NLM will queue the request, and when it is dequeued and completed, will send the appropriate result via the result procedure. For example an NLM may send an NLM_LOCK_MSG and will expect an NLM_LOCK_RES in return. These functions have the same functionality and parameters as the synchronous procedures.
+    Note that most NLM implementations do not send RPC-layer replies to asynchronous procedures. When a client sends an NLM_LOCK_MSG call, for example, it should not expect an RPC reply with the corresponding xid. Instead, it must expect an NLM_LOCK_RES call from the server. The server should not expect an RPC reply to the NLM_LOCK_RES call. 
+
+4. NLM_CANCEL 
+
+Name
+    NLM_CANCEL - Cancel Lock 
+
+Call Arguments
+        struct nlm_cancargs { 
+            netobj cookie; 
+            bool block; 
+            bool exclusive; 
+            struct nlm_lock alock; 
+        }; 
+
+Return Arguments
+        struct nlm_res { 
+            netobj cookie; 
+            nlm_stat stat; 
+        }; 
+
+RPC Procedure Description
+
+        nlm_res NLM_CANCEL(nlm_cancargs) = 3; 
+
+
+Description
+    This procedure cancels an outstanding blocked lock request.
+    If the client made an NLM_LOCK procedure with "nlm_lockargs.block" set to true, and the procedure was blocked by the server (that is, the procedure returned a status of "LCK_BLOCKED"), the client can choose to cancel this outstanding lock request by using this procedure.
+    The "block", "exclusive" and "alock" arguments must exactly match the corresponding arguments to the NLM_LOCK procedure. 
+
+Return Codes
+    When the procedure returns, "stat" will be set to one of the following values:
+    LCK_GRANTED
+        Indicates that the procedure completed successfully. The NLM may also return this code even if the "alock.oh" of the NLM_CANCEL procedure call does not match that of the outstanding lock request, or if there is no matching outstanding lock request.
+    LCK_DENIED
+        Indicates that the procedure failed possibly because there was no lock to cancel.
+    LCK_DENIED_GRACE_PERIOD
+        Indicates that the procedure failed because the server host has recently been rebooted and the server NLM is re-establishing existing locks, and is not yet ready to accept normal service requests. 
+
+5. NLM_CANCEL_MSG 
+Name
+    NLM_CANCEL_MSG - Cancel a Lock 
+
+Call Arguments
+        struct nlm_cancargs { 
+            netobj cookie; 
+            bool block; 
+            bool exclusive; 
+            struct nlm_lock alock; 
+        }; 
+
+Return Arguments
+    None. 
+
+RPC Procedure Description
+        void NLM_CANCEL_MSG(nlm_cancargs) = 8; 
+
+Description
+    This procedure is one of the asynchronous RPCs. It performs the same function as the NLM_CANCEL procedure.
+    If the client makes an NLM_LOCK_MSG procedure with "nlm_lockargs.block" set to true, and the procedure is blocked by the server (that is, the procedure returned a status of "LCK_BLOCKED"), the client can choose to cancel this outstanding lock request by calling this procedure.
+    The "block", "exclusive" and "alock" arguments must exactly match the corresponding arguments to the NLM_LOCK_MSG procedure. 
+
+6. NLM_CANCEL_RES 
+Name
+    NLM_CANCEL_RES - Cancel Lock Result 
+
+Call Arguments
+        struct nlm_res { 
+            netobj cookie; 
+            nlm_stat stat; 
+        }; 
+
+Return Arguments
+    None. 
+
+RPC Procedure Description
+        void NLM_CANCEL_RES(nlm_res) = 13; 
+
+Description
+    This procedure is one of the asynchronous RPCs. The server calls this procedure to return results of the NLM_CANCEL_MSG procedure to the client (the host issuing the NLM_CANCEL_MSG call).
+    "stat" will be set to one of the following values:
+    LCK_GRANTED
+        Indicates that the procedure completed successfully.
+    LCK_DENIED
+        Indicates that the procedure failed possibly because there was no lock to cancel.
+    LCK_DENIED_GRACE_PERIOD
+        Indicates that the procedure failed because the server host has recently been rebooted and its NLM is re-establishing existing locks, and is not yet ready to accept normal service requests. 
+
+7. NLM_FREE_ALL 
+Name
+
+    NLM_FREE_ALL - Free All 
+
+Call Arguments
+
+        struct nlm_notify { 
+            string name<MAXNAMELEN>; 
+            unsigned int state; 
+        }; 
+
+Return Arguments
+
+        void 
+
+RPC Procedure Description
+
+        void NLM_FREE_ALL(nlm_notify) = 23; 
+
+Description
+    This procedure informs the server that the client "name" has been rebooted. The server will discard all file-sharing reservations and file locks currently being held on behalf of the client. The "state" field is unused and should be set to 0.
+    This procedure is primarily called by clients that do not implement the NSM protocol and therefore use the non-monitored lock procedure, NLM_NM_LOCK, or the non-monitored file-sharing procedure, NLM_SHARE. 
+
+Return Codes
+    None. 
+
+8. NLM_GRANTED 
+Name
+
+    NLM_GRANTED - Lock Granted 
+
+Call Arguments
+        struct nlm_testargs { 
+            netobj cookie; 
+            bool exclusive; 
+            struct nlm_lock alock; 
+        }; 
+
+Return Arguments
+        struct nlm_res { 
+            netobj cookie; 
+            nlm_stat stat; 
+        }; 
+
+RPC Procedure Description
+        nlm_res NLM_GRANTED(nlm_testargs) = 5; 
+
+Description
+    This procedure is a call-back procedure from the server NLM running on the host where the file resides to the client.
+    Note:
+        With this procedure the server is the caller and the client the recipient. 
+    This procedure call is made by the NLM server on the host where the file resides and the procedure is executed, and the return value generated on the client that issued the lock request.
+    A client issuing an NLM_LOCK procedure that blocks will be returned a status of "LCK_BLOCKED". At a later point, when the lock is granted, the server will issue an NLM_GRANTED procedure call to the client to indicate the lock has been granted. "exclusive" and "alock" will be the values in the original NLM_LOCK procedure. The client must not depend on "cookie" being the same in the NLM_LOCK and NLM_GRANTED procedures. 
+
+Return Codes
+    When the server makes the NLM_GRANTED procedure the lock requested by the client has been granted. The client must now give a return code to the NLM_GRANTED procedure. The client must return the nlm_res structure to the server with "stat" set to one of the following values:
+    LCK_GRANTED
+        Indicates that the procedure completed successfully.
+    LCK_DENIED
+        Indicates that the procedure failed, possibly due to internal resource constraints.
+    LCK_DENIED_GRACE_PERIOD
+        Indicates that the procedure failed because the client host (the host making the lock request) has recently been rebooted and its NLM is re-establishing existing locks, and is not yet ready to accept normal service requests. 
+
+9. NLM_LOCK
+
+Name
+    NLM_LOCK - Establish a Lock 
+
+Call Arguments
+        struct nlm_lockargs { 
+            netobj cookie; 
+            bool block; 
+            bool exclusive; 
+            struct nlm_lock alock; 
+            bool reclaim; 
+            int state; 
+        }; 
+
+Return Arguments
+        struct nlm_res { 
+            netobj cookie; 
+            nlm_stat stat; 
+        }; 
+
+RPC Procedure Description
+        nlm_res NLM_LOCK(nlm_lockargs) = 2; 
+
+Description
+
+    This procedure attempts to establish a monitored lock described in "alock".
+    If "block" is true, then if the lock request cannot be granted immediately the server will return a status of "LCK_BLOCKED" for this procedure call. When the request can be granted, the server will make a call-back to the client with the NLM_GRANTED procedure call. If "block" is set to false, and the lock cannot be granted immediately, the procedure will return with a status of LCK_DENIED, and no NLM_GRANTED call-back will be made.
+    If "reclaim" is true, then the server will assume this is a request to re-establish a previous lock (for example, after the server has crashed and rebooted). During the grace period the server will only accept locks with "reclaim" set to true.
+    "state" contains the state of the client's NSM. This information is kept by the server implementation, so if the client crashes, the server can determine which locks to discard by checking this state against the state in the crash notification (SM_NOTIFY) sent by the NSM. See File Locking over XNFS . 
+
+Return Codes
+    When the procedure returns, "stat" will be set to one of the following values:
+    LCK_GRANTED
+        Indicates that the procedure completed successfully, the lock was granted.
+    LCK_DENIED
+        Indicates that the procedure failed because the request conflicted with existing lock reservations for the file.
+    LCK_DENIED_NOLOCKS
+        Indicates that the procedure failed because the server NLM could not allocate the resources needed to process the request.
+    LCK_BLOCKED
+        Indicates the blocking request cannot be granted immediately. The server NLM will make a call-back to the client with an NLM_GRANTED procedure when the lock can be granted.
+    LCK_DENIED_GRACE_PERIOD
+        Indicates that the procedure failed because the server host has recently been rebooted and the server NLM is re-establishing existing locks, and is not yet ready to accept normal service requests. 
+
+10. NLM_LOCK_MSG 
+Name
+    NLM_LOCK_MSG - Lock Message 
+
+Call Arguments
+        struct nlm_lockargs { 
+            netobj cookie; 
+            bool block; /* Flag to indicate blocking behaviour. */ 
+            bool exclusive; /* If exclusive access is required. */ 
+            struct nlm_lock alock; /* Actual lock data */ 
+            bool reclaim; /* used for recovering locks */ 
+            int state; /* specify local NSM state */ 
+        }; 
+
+Return Arguments
+    None. Results are returned asynchronously via the NLM_LOCK_RES procedure. 
+
+RPC Procedure Description
+        void NLM_LOCK_MSG(nlm_lockargs) = 7; 
+
+Description
+
+    This procedure is one of the asynchronous RPCs. It performs the same function as the NLM_LOCK procedure.
+    This procedure attempts to establish a monitored lock described in "alock".
+    If "block" is true, and the lock request cannot be granted immediately, the server will return an NLM_LOCK_RES procedure with a status of "LCK_BLOCKED". When the request can be granted the server will make a call-back to the client with an NLM_GRANTED_MSG procedure. If "block" is set to false, and the lock cannot be granted immediately, the server will return an NLM_LOCK_RES procedure with a status of "LCK_DENIED", and no NLM_GRANTED_MSG call-back will be made.
+
+    If "reclaim" is true, then the server will assume this is a request to re-establish a previous lock (for example, after the server has crashed and rebooted). During the grace period, the server will only accept locks with "reclaim" set to true.
+
+    "state" contains the state of the client's NSM. This information is kept by the server implementation, so if the client crashes, the server can determine which locks to discard by checking this state against the state in the crash notification (SM_NOTIFY) sent by the NSM. See File Locking over XNFS .
+
+    The following sequence occurs if the lock request is blocked:
+
+        Client                  Server 
+        NLM_LOCK_MSG --->   
+                        <--- NLM_LOCK_RES (stat is set to LCK_BLOCKED) 
+                        when the lock can be granted 
+                        <--- NLM_GRANTED_MSG 
+        NLM_GRANTED_RES ---> 
+
+11. NLM_TEST
+Name
+    NLM_TEST - Test Lock 
+
+Call Arguments
+        struct nlm_testargs { 
+            netobj cookie; 
+            bool exclusive; 
+            struct nlm_lock alock; 
+        }; 
+
+Return Arguments
+        struct nlm_testres { 
+            netobj cookie; 
+            nlm_testrply test_stat; 
+        }; 
+
+RPC Procedure Description
+        nlm_testres NLM_TEST(nlm_testargs) = 1; 
+
+Description
+    This procedure tests to see whether the monitored lock specified by "alock" is available to this client. 
+
+Return Codes
+    When the procedure returns, "test_stat.stat" will be set to one of the following values:
+    LCK_GRANTED
+        Indicates that the procedure call completed successfully. The server would be able to grant the lock in question.
+    LCK_DENIED
+        Indicates that the test failed as it conflicted with existing lock reservations for the file. "test_stat.holder" describes the current holder of the lock as follows. The boolean "exclusive" indicates whether the lock is exclusively held by the current holder or whether other locks are permitted. The integer "uppid" provides a unique per-process identifier for lock differentiation. The unsigned values "l_offset" and "l_len" define the region of the file locked by this holder.
+    LCK_DENIED_NOLOCKS
+        Indicates that the procedure call failed because the server NLM could not allocate the resources needed to process the request.
+    LCK_DENIED_GRACE_PERIOD
+        Indicates that the procedure call failed because the server host has recently been rebooted and the server NLM is re-establishing existing locks, and is not yet ready to accept normal service requests. 
+
+
+
+Network Status Monitor Protocol
+1. Introduction
+    This chapter describes the Network Status Monitor (NSM) protocol which is related to, but separate from, the Network Lock Manager (NLM) protocol. The NSM protocol is not specified as a part of the NLM protocol to allow the implementor flexibility and to facilitate the development of new mechanisms without requiring the revision of related protocols.
+    The NLM uses the NSM protocol to enable it to recover from crashes of either the client or server host. To provide this functionality the NSM and NLM protocols on both the client and server hosts must cooperate.
+    The NSM is a service that provides applications with information on the status of network hosts. Each NSM keeps track of its own "state" and notifies any interested party of a change in this state to any other NSM upon request. The state is merely a number which increases monotonically each time the state of the host changes; an even number indicates the host is down, while an odd number indicates the host is up.
+    Applications register the network hosts they are interested in with the local NSM. If one of these hosts crashes, the NSM on the crashed host, after a reboot, will notify the NSM on the local host that the state changed. The local NSM can then, in turn, notify the interested application of this state change.
+    The NSM is used heavily by the Network Lock Manager (NLM). The local NLM registers with the local NSM all server hosts on which the NLM has currently active locks. In parallel, the NLM on the remote (server) host registers all of its client hosts with its local NSM. If the server host crashes and reboots, the server NSM will inform the NSM on the client hosts of this event. The local NLM can then take steps to re-establish the locks when the server is rebooted. Low-end systems that do not run an NSM, due to memory or speed constraints, are restricted to using non-monitored locks. See File Locking over XNFS and Network Lock Manager Protocol .
+
+2. RPC Information
+2.1. Authentication
+    The NSM service uses AUTH_UNIX style of authentication.
+2.2. Transport Protocols
+    The NSM Protocol is required to support the UDP/IP transport protocol to allow the NLM to operate. However, implementors may also choose to support the TCP/IP transport protocol.
+Port Number
+    Consult the server's port mapper, described in Port Mapper Protocol , to find the port number on which the NSM service is registered.
+2.3. Sizes of XDR Structures
+    These are the sizes, given in decimal bytes, of various XDR structures used in the protocol.
+
+    /* 
+     * This defines the maximum length of the string 
+     * identifying the caller. 
+     */ 
+    const SM_MAXSTRLEN = 1024 
+
+2.4. Basic Data Types
+    This section presents the data types used by the NSM.
+
+2.4.1. sm_name
+    struct sm_name { 
+        string mon_name<SM_MAXSTRLEN>; 
+    }; 
+
+    sm_name is the name of the host to be monitored by the NSM. It is the parameter to the SM_STAT call.
+    Implementations and applications must be able to handle host names as 8-bit transparent data (allowing use of arbitrary character set encodings). For maximum portability and interworking, it is recommended that applications and users define host names containing only the characters of the Portable Filename Character Set defined in ISO/IEC 9945-1:1990. (This also applies to the "my_id.my_name" fields in the call arguments of the SM_MON, SM_UNMON and SM_UNMON_ALL procedures.)
+2.4.2. res
+    res { 
+        STAT_SUCC = 0, /* NSM agrees to monitor. */ 
+        STAT_FAIL = 1 /* NSM cannot monitor. */ 
+    }; 
+
+    res is returned when the NSM is asked whether it can monitor the given host or if it has been successful in monitoring the given host.
+2.4.3. sm_stat_res
+    struct sm_stat_res { 
+        res res_stat; 
+        int state; 
+    }; 
+
+    sm_stat_res is the return value from SM_STAT and SM_MON procedures. It includes the return status of the call and the state number of the local host.
+2.4.4. sm_stat
+    struct sm_stat { 
+        int state; /* state number of NSM */ 
+    }; 
+
+    The state number of the NSM monotonically increases each time state of the host changes; an even number indicates that the host is down, while an odd number indicates that it is up.
+2.4.5. my_id
+
+    struct my_id { 
+        string my_name<SM_MAXSTRLEN>; /* hostname */ 
+        int my_prog; /* RPC program number */ 
+        int my_vers; /* program version number */ 
+        int my_proc; /* procedure number */ 
+    }; 
+    my_id contains the RPC call-back information. See SM_NOTIFY for more information.
+
+2.4.6. mon_id
+
+    struct mon_id { 
+        string mon_name<SM_MAXSTRLEN>; /* name of the host to be monitored */ 
+        struct my_id my_id; 
+    }; 
+
+    Contains the name of the host to be monitored and RPC call-back information. See SM_NOTIFY for more information.
+2.4.7. mon
+
+    struct mon { 
+        struct mon_id mon_id; 
+        opaque priv[16]; /* private information */ 
+    }; 
+
+    Parameter to SM_MON call. "priv" is information provided by the client that is returned on notification of a server state change (crash and reboot).
+
+2.4.8. stat_chge
+
+    struct stat_chge { 
+        string mon_name; 
+        int state; 
+    }; 
+
+    This is the parameter to the SM_NOTIFY call. It contains the name of the host that had a state change (that is, crashed and recovered) and its new state number.
+
+3. NSM Procedures
+    The following reference pages define the RPC procedures supplied by an NSM server.
+
+    /* 
+     * Protocol description for the NSM program. 
+     */ 
+    program SM_PROG { 
+        version SM_VERS { 
+            void SM_NULL(void) = 0; 
+            struct sm_stat_res SM_STAT(struct sm_name) = 1; 
+            struct sm_stat_res SM_MON(struct mon) = 2; 
+            struct sm_stat SM_UNMON(struct mon_id) = 3; 
+            struct sm_stat SM_UNMON_ALL(struct my_id) = 4; 
+            void SM_SIMU_CRASH(void) = 5; 
+            void SM_NOTIFY(struct stat_chg) = 6; 
+        } = 1; 
+    } = 100024; 
+
+4. SM_MON
+Name
+    SM_MON - Monitor Host 
+
+RPC Data Descriptions
+
+Call Arguments
+        struct my_id { 
+            string my_name<SM_MAXSTRLEN>; /* hostname */ 
+            int my_prog; /* RPC program number */ 
+            int my_vers; /* program version number */ 
+            int my_proc; /* procedure number */ 
+        }; 
+    
+        struct mon_id { 
+            string mon_name<SM_MAXSTRLEN>; 
+            struct my_id my_id; 
+        }; 
+        struct mon { 
+            struct mon_id mon_id; 
+            opaque priv[16]; 
+        }; 
+
+Return Arguments
+        struct sm_stat_res { 
+            res res_stat; 
+            int state; 
+        }; 
+
+RPC Procedure Description
+        sm_stat_res SM_MON(struct mon) = 2; 
+
+
+Description
+    This procedure initiates the monitoring of the given host. This call enables the NSM to respond to notification of change of state calls (SM_NOTIFY) for the host specified in "mon_id.mon_name", and to notify that host, via the SM_NOTIFY call, when its state (that is, crash and reboot) changes.
+    "mon_id.mon_name" specifies the host to be monitored. "mon_id.my_id" specifies the hostname, RPC program number, version and procedure number in the local application, for example, the NLM, to be called when the NSM receives notification via the SM_NOTIFY call, that the state of host "mon_id.mon_name" has changed. "priv" may contain any private information required by the SM_MON call. This information will be supplied in the SM_NOTIFY call. See SM_NOTIFY for more details.
+    When an NSM receives an SM_MON call it must save the name of the host, "mon_id.mon_name" in a notify list on stable storage. If the host running the NSM crashes, on reboot it must send out an SM_NOTIFY call to each host in the notify list.
+    When an NSM receives an SM_NOTIFY call from remote NSM, it must search the notify list for the host specified in the SM_NOTIFY call, if it is found the RPC specified in "mon_id.my_id" is made. 
+
+Return Codes
+
+    When the procedure returns, "res_stat" will be set to one of the following values:
+
+    STAT_SUCC
+        Indicates the procedure completed successfully. The server will be able to monitor the host requested. "state" will be contain the state of the remote NSM.
+
+    STAT_FAIL
+        Indicates the procedure failed. 
+
+5. SM_NOTIFY
+Name
+    SM_NOTIFY - Notify 
+
+RPC Data Descriptions
+
+Call Arguments
+        struct stat_chge { 
+            string mon_name; 
+            int state; 
+        }; 
+
+
+Return Arguments
+
+    None. 
+
+RPC Procedure Description
+        void SM_NOTIFY(struct stat_chge) = 6; 
+
+
+Description
+    If a host has a state change, either a crash and reboot or the NSM has processed an SM_SIMU_CRASH call, the local NSM must notify each host on its notify list (see SM_MON) of the change in state.
+    "mon_name" is the name of the host that had the state change. "state" is the new state for the host.
+    When an NSM receives the SM_NOTIFY call it must search its notify list for "mon_name". The host "mon_name" will be found in the notify list if an SM_MON call was made to the NSM to register the host. The NSM must call the RPC program, version, procedure number on the hostname supplied in the "my_id" field of the SM_MON parameter. This RPC will be called with the following parameter:
+        struct status { 
+            string mon_name<SM_MAXSTRLEN>; 
+            int state; 
+            opaque priv[16]; /* for private information */ 
+        }; 
+    Where "mon_name" and "state" are copied from the SM_NOTIFY parameters. "priv" is the information supplied in the corresponding field of the SM_MON call that registered the host "mon_name". 
+
+Return Codes
+    None. 
+
+6. SM_SIMU_CRASH
+Name
+    SM_SIMU_CRASH - Simulate a Crash 
+
+RPC Data Descriptions
+
+Call Arguments
+    None. 
+
+Return Arguments
+    None. 
+
+RPC Procedure Description
+        void SM_SIMU_CRASH(void) = 5; 
+
+
+Description
+    This procedure simulates a crash. The NSM releases all its current state information and reinitialises itself, incrementing its state variable. It reads through its notify list (see SM_MON) and informs the NSM on all hosts on the list that the state of this host has changed, via the SM_NOTIFY procedure. 
+
+Return Codes
+
+    None. 
+
+7. SM_STAT
+Name
+    SM_STAT - Check Status 
+
+RPC Data Descriptions
+
+Call Arguments
+        struct sm_name { 
+            string mon_name<SM_MAXSTRLEN>; 
+        }; 
+
+
+Return Arguments
+        struct sm_stat_res { 
+            res res_stat; 
+            int state; 
+        }; 
+
+RPC Procedure Description
+        sm_stat_res SM_STAT(struct sm_name) = 1; 
+
+Description
+    This procedure tests to see whether the NSM agrees to monitor the given host.
+    Implementations should not rely on this procedure being operative. In many current implementations of the NSM it will always return a "STAT_FAIL" status. 
+
+Return Codes
+    When the procedure returns, "sm_stat_res.sm_stat" will be set to one of the following values:
+    STAT_SUCC
+        The NSM will monitor the given host. "sm_stat_res.state" contains the state of the NSM.
+    STAT_FAIL
+        The NSM is not be able to monitor the host. 
+
+8. SM_UNMON
+Name
+    SM_UNMON - Unmonitor Host 
+
+RPC Data Descriptions
+
+Call Arguments
+        struct mon_id { 
+            string mon_name<SM_MAXSTRLEN>; 
+            struct my_id my_id; 
+        }; 
+
+Return Arguments
+        struct sm_stat { 
+            int state; 
+        }; 
+
+RPC Procedure Description
+        sm_stat SM_UNMON(struct mon_id) = 3; 
+
+Description
+    This procedure stops monitoring the host "mon_name". The information in "my_id" must exactly match the information given in the corresponding SM_MON call. 
+
+Return Codes
+    When the procedure returns, "state" . "state" is set to the state of the local NSM. 
+
+9. SM_UNMON_ALL
+Name
+    SM_UNMON_ALL - Unmonitor All Hosts 
+
+RPC Data Descriptions
+
+Call Arguments
+        struct my_id { 
+            string my_name<SM_MAXSTRLEN>; 
+            int my_prog; 
+            int my_vers; 
+            int my_proc; 
+        }; 
+
+Return Arguments
+        struct sm_stat { 
+            int state; 
+        }; 
+
+RPC Procedure Description
+        sm_stat SM_UNMON_ALL(struct my_id) = 4; 
+
+Description
+    This procedure stops monitoring all hosts for which monitoring was requested. 
+
+Return Codes
+    When the procedure returns, "state" will be the state of the local NSM. 
+
+

@@ -1,0 +1,294 @@
+* xfs_dinode.h
+
+** di_flags
+   #+begin_src 
+#define XFS_DIFLAG_REALTIME_BIT  0	/* file's blocks come from rt area */
+#define XFS_DIFLAG_PREALLOC_BIT  1	/* file space has been preallocated */
+#define XFS_DIFLAG_NEWRTBM_BIT   2	/* for rtbitmap inode, new format */
+#define XFS_DIFLAG_IMMUTABLE_BIT 3	/* inode is immutable */
+#define XFS_DIFLAG_APPEND_BIT    4	/* inode is append-only */
+#define XFS_DIFLAG_SYNC_BIT      5	/* inode is written synchronously */
+#define XFS_DIFLAG_NOATIME_BIT   6	/* do not update atime */
+#define XFS_DIFLAG_NODUMP_BIT    7	/* do not dump */
+#define XFS_DIFLAG_RTINHERIT_BIT 8	/* create with realtime bit set */
+#define XFS_DIFLAG_PROJINHERIT_BIT   9	/* create with parents projid */
+#define XFS_DIFLAG_NOSYMLINKS_BIT   10	/* disallow symlink creation */
+#define XFS_DIFLAG_EXTSIZE_BIT      11	/* inode extent size allocator hint */
+#define XFS_DIFLAG_EXTSZINHERIT_BIT 12	/* inherit inode extent size */
+#define XFS_DIFLAG_NODEFRAG_BIT     13	/* do not reorganize/defragment */
+#define XFS_DIFLAG_FILESTREAM_BIT   14  /* use filestream allocator */
+   
+   #+end_src
+
+** xfs_dinode
+   #+begin_src 
+	__be16		di_magic;	/* inode magic # = XFS_DINODE_MAGIC */
+	__be16		di_mode;	/* mode and type of file */
+	__u8		di_version;	/* inode version */
+	__u8		di_format;	/* format of di_c data */
+	__be16		di_onlink;	/* old number of links to file */
+	__be32		di_uid;		/* owner's user id */
+	__be32		di_gid;		/* owner's group id */
+	__be32		di_nlink;	/* number of links to file */
+	__be16		di_projid_lo;	/* lower part of owner's project id */
+	__be16		di_projid_hi;	/* higher part owner's project id */
+	__u8		di_pad[6];	/* unused, zeroed space */
+	__be16		di_flushiter;	/* incremented on flush */
+	xfs_timestamp_t	di_atime;	/* time last accessed */
+	xfs_timestamp_t	di_mtime;	/* time last modified */
+	xfs_timestamp_t	di_ctime;	/* time created/inode modified */
+	__be64		di_size;	/* number of bytes in file */
+	__be64		di_nblocks;	/* # of direct & btree blocks used */
+	__be32		di_extsize;	/* basic/minimum extent size for file */
+	__be32		di_nextents;	/* number of extents in data fork */
+	__be16		di_anextents;	/* number of extents in attribute fork*/
+	__u8		di_forkoff;	/* attr fork offs, <<3 for 64b align */
+	__s8		di_aformat;	/* format of attr fork's data */
+	__be32		di_dmevmask;	/* DMIG event mask */
+	__be16		di_dmstate;	/* DMIG state info */
+	__be16		di_flags;	/* random flags, XFS_DIFLAG_... */
+	__be32		di_gen;		/* generation number */
+
+	/* di_next_unlinked is the only non-core field in the old dinode */
+	__be32		di_next_unlinked;/* agi unlinked list ptr */
+
+	/* start of the extended dinode, writable fields */
+	__le32		di_crc;		/* CRC of the inode */
+	__be64		di_changecount;	/* number of attribute changes */
+	__be64		di_lsn;		/* flush sequence */
+	__be64		di_flags2;	/* more random flags */
+	__u8		di_pad2[16];	/* more padding for future expansion */
+
+	/* fields only written to during inode creation */
+	xfs_timestamp_t	di_crtime;	/* time created */
+	__be64		di_ino;		/* inode number */
+	uuid_t		di_uuid;	/* UUID of the filesystem */
+
+	/* structure must be padded to 64 bit alignment */
+   #+end_src
+   -在磁盘中,inode后面还有2块数据di_u, di_a, 他们的内容根据di_format/di_aformat而定.
+
+** xfs_icdinode
+   #+begin_src 
+	__uint16_t	di_magic;	/* inode magic # = XFS_DINODE_MAGIC */
+	__uint16_t	di_mode;	/* mode and type of file */
+	__int8_t	di_version;	/* inode version */
+	__int8_t	di_format;	/* format of di_c data */
+	__uint16_t	di_onlink;	/* old number of links to file */
+	__uint32_t	di_uid;		/* owner's user id */
+	__uint32_t	di_gid;		/* owner's group id */
+	__uint32_t	di_nlink;	/* number of links to file */
+	__uint16_t	di_projid_lo;	/* lower part of owner's project id */
+	__uint16_t	di_projid_hi;	/* higher part of owner's project id */
+	__uint8_t	di_pad[6];	/* unused, zeroed space */
+	__uint16_t	di_flushiter;	/* incremented on flush */
+	xfs_ictimestamp_t di_atime;	/* time last accessed */
+	xfs_ictimestamp_t di_mtime;	/* time last modified */
+	xfs_ictimestamp_t di_ctime;	/* time created/inode modified */
+	xfs_fsize_t	di_size;	/* number of bytes in file */
+	xfs_drfsbno_t	di_nblocks;	/* # of direct & btree blocks used */
+	xfs_extlen_t	di_extsize;	/* basic/minimum extent size for file */
+	xfs_extnum_t	di_nextents;	/* number of extents in data fork */
+	xfs_aextnum_t	di_anextents;	/* number of extents in attribute fork*/
+	__uint8_t	di_forkoff;	/* attr fork offs, <<3 for 64b align */
+	__int8_t	di_aformat;	/* format of attr fork's data */
+	__uint32_t	di_dmevmask;	/* DMIG event mask */
+	__uint16_t	di_dmstate;	/* DMIG state info */
+	__uint16_t	di_flags;	/* random flags, XFS_DIFLAG_... */
+	__uint32_t	di_gen;		/* generation number */
+
+	/* di_next_unlinked is the only non-core field in the old dinode */
+	xfs_agino_t	di_next_unlinked;/* agi unlinked list ptr */
+
+	/* start of the extended dinode, writable fields */
+	__uint32_t	di_crc;		/* CRC of the inode */
+	__uint64_t	di_changecount;	/* number of attribute changes */
+	xfs_lsn_t	di_lsn;		/* flush sequence */
+	__uint64_t	di_flags2;	/* more random flags */
+	__uint8_t	di_pad2[16];	/* more padding for future expansion */
+
+	/* fields only written to during inode creation */
+	xfs_ictimestamp_t di_crtime;	/* time created */
+	xfs_ino_t	di_ino;		/* inode number */
+	uuid_t		di_uuid;	/* UUID of the filesystem */
+
+	/* structure must be padded to 64 bit alignment */
+   
+   #+end_src
+
+** xfs_inode 
+   #+begin_src 
+	/* Inode linking and identification information. */
+	struct xfs_mount	*i_mount;	/* fs mount struct ptr */
+	struct xfs_dquot	*i_udquot;	/* user dquot */
+	struct xfs_dquot	*i_gdquot;	/* group dquot */
+
+	/* Inode location stuff */
+	xfs_ino_t		i_ino;		/* inode number (agno/agino)*/
+	struct xfs_imap		i_imap;		/* location for xfs_imap() */
+
+	/* Extent information. */
+	xfs_ifork_t		*i_afp;		/* attribute fork pointer */
+	xfs_ifork_t		i_df;		/* data fork */
+
+	/* Transaction and locking information. */
+	struct xfs_inode_log_item *i_itemp;	/* logging information */
+	mrlock_t		i_lock;		/* inode lock */
+	mrlock_t		i_iolock;	/* inode IO lock */
+	atomic_t		i_pincount;	/* inode pin count */
+	spinlock_t		i_flags_lock;	/* inode i_flags lock */
+	/* Miscellaneous state. */
+	unsigned long		i_flags;	/* see defined flags below */
+	unsigned int		i_delayed_blks;	/* count of delay alloc blks */
+
+	xfs_icdinode_t		i_d;		/* most of ondisk inode */
+
+	/* VFS inode */
+	struct inode		i_vnode;	/* embedded VFS inode */
+   #+end_src
+
+   - xfs_inode包装inode/xfs_icdinode, 其他的结构和文件系统其他功能关联. mount/dquot/extent/log等.
+
+** xfs_imap
+   #+begin_src 
+	xfs_daddr_t	im_blkno;	/* starting BB of inode chunk */
+	ushort		im_len;		/* length in BBs of inode chunk */
+	ushort		im_boffset;	/* inode offset in block in bytes */
+   #+end_src
+   - 保存inode的磁盘位置信息.
+
+** xfs_ifork 
+   #+begin_src 
+	int			if_bytes;	/* bytes in if_u1 */
+	int			if_real_bytes;	/* bytes allocated in if_u1 */
+	struct xfs_btree_block	*if_broot;	/* file's incore btree root */
+	short			if_broot_bytes;	/* bytes allocated for root */
+	unsigned char		if_flags;	/* per-fork flags */
+	union {
+		xfs_bmbt_rec_host_t *if_extents;/* linear map file exts */
+		xfs_ext_irec_t	*if_ext_irec;	/* irec map file exts */
+		char		*if_data;	/* inline file data */
+	} if_u1;
+	union {
+		xfs_bmbt_rec_host_t if_inline_ext[XFS_INLINE_EXTS];
+						/* very small file extents */
+		char		if_inline_data[XFS_INLINE_DATA];
+						/* very small file data */
+		xfs_dev_t	if_rdev;	/* dev number if special */
+		uuid_t		if_uuid;	/* mount point value */
+	} if_u2;
+        //if_u1和if_u2的用途不同, if_u2给if_u1提供空间. 如果需要的空间很小, if_u1可直接使用if_u2的.
+   #+end_src
+
+** xfs_dinode_fmt
+   #+begin_src 
+typedef enum xfs_dinode_fmt {
+	XFS_DINODE_FMT_DEV,		/* xfs_dev_t */
+	XFS_DINODE_FMT_LOCAL,		/* bulk data */
+	XFS_DINODE_FMT_EXTENTS,		/* struct xfs_bmbt_rec */ 
+	XFS_DINODE_FMT_BTREE,		/* struct xfs_bmdr_block */
+	XFS_DINODE_FMT_UUID		/* uuid_t */
+} xfs_dinode_fmt_t;
+   #+end_src
+   - 对于regular
+   - XFS_DINODE_FMT_EXTENTS: extents队列在di_a中
+   - XFS_DINODE_FMT_BTREE: extents使用btree保存,root在di_a中
+   - 对于directory 
+   - XFS_DINODE_LOCAL: di_a中是xfs_dir2_sf
+   - XFS_DINODE_EXTENTS: directory item在extent中保存,extent队列在di_a中.
+   - XFS_DINODE_BTREE: directory item在btree的叶子中保存,root在di_a中.
+
+** xfs_bmdr_block
+   #+begin_src 
+	__be16		bb_level;	/* 0 is a leaf */
+	__be16		bb_numrecs;	/* current # of data records */
+   #+end_src
+
+** xfs_btree_block
+   #+begin_src 
+	__be32		bb_magic;	/* magic number for block type */
+	__be16		bb_level;	/* 0 is a leaf */
+	__be16		bb_numrecs;	/* current # of data records */
+	union {
+		struct {
+			__be32		bb_leftsib;
+			__be32		bb_rightsib;
+
+			__be64		bb_blkno;
+			__be64		bb_lsn;
+			uuid_t		bb_uuid;
+			__be32		bb_owner;
+			__le32		bb_crc;
+		} s;			/* short form pointers */
+		struct	{
+			__be64		bb_leftsib;
+			__be64		bb_rightsib;
+
+			__be64		bb_blkno;
+			__be64		bb_lsn;
+			uuid_t		bb_uuid;
+			__be64		bb_owner;
+			__le32		bb_crc;
+			__be32		bb_pad; /* padding for alignment */
+		} l;			/* long form pointers */
+	} bb_u;				/* rest */
+   #+end_src
+
+** xfs_exntst_t 
+   #+begin_src 
+	XFS_EXT_NORM, XFS_EXT_UNWRITTEN,
+	XFS_EXT_DMAPI_OFFLINE, XFS_EXT_INVALID
+	// extent state??
+   #+end_src
+   
+** xfs_bmbt_irec
+   #+begin_src 
+	xfs_fileoff_t	br_startoff;	/* starting file offset */
+	xfs_fsblock_t	br_startblock;	/* starting block number */
+	xfs_filblks_t	br_blockcount;	/* number of blocks */
+	xfs_exntst_t	br_state;	/* extent state */
+	//文件的extent数据
+   #+end_src
+
+** xfs_exntfmt 
+   #+begin_src 
+	XFS_EXTFMT_NOSTATE = 0,
+	XFS_EXTFMT_HASSTATE
+   #+end_src
+
+**
+
+** 总结
+   - 读取inode的metadata数据,很2部分, 一个是普通元数据,比如目录项或extents,还有一种是extent attr.
+   - 对于XFS_DATA_FORK, 也就是普通metadaa, xfs_inode->xfs_ifork,把数据保存到xfs_inode->i_df (xfs_ifork)
+   - XFS_DINODE_FMT_LOCAL,  把数据直接放到xfs_ifork->if_u1->if_data中
+   - XFS_DINODE_FMT_EXTENTS, 数据是xfs_bmbt_rec数组,长度是xfs_dinode->nextents. 把数据放到xfs_ifork->if_u1->if_extents中.
+   - XFS_DINODE_FMT_BTREE, 数据是xfs_bmdr_block, 大小根据它计算. 把数据给xfs_ifork->if_broot, 这是xfs_btree_block
+   - 对于XFS_XATTR_FORK, 把数据给xfs_inode->i_afp. 具体的也很3种情况,和上面一样.
+   - 打开inode时的顺序是,根据ino找到xfs_imap, 得到具体的FSB地址和内部偏移, 然后读回对应的数据到xfs_buf, 验证xfs_dinode数据, 然后读回inode的数据给xfs_icdinode; 然后是xfs_ifork.
+   - 在分配inode时,先创建xfs_dinode, 然后使用vfs结构创建inode,然后把参数设置xfs_inode
+
+* inode.c
+  - 这里管理xfs_ifork的数据. 
+
+* xfs_trans_inode.c
+
+** xfs_trans_ijoin(xfs_trans, xfs_inode, lock_flags)
+   - 把xfs_inode加到xfs_trans中.
+   - 如果xfs_inode->i_itemp无效,创建新的xfs_inode_log_item
+   > xfs_inode_item_init(xfs_inode, xfs_mount)
+   - 把xfs_inode_log_item放到xfs_trans中
+   > xfs_trans_add_item(xfs_trans, xfs_inode_log_item->xfs_log_item)
+
+** xfs_trans_ichgtime(xfs_trans, xfs_inode, flags)
+   - 更新inode的时间?  和xfs_trans没关系??
+   - 如果flags包含XFS_ICHGTIME_MOD, 更新mtime
+   - xfs_inode->xfs_icdinode->di_mtime
+   - 如果flags包含XFS_ICHGTIME_CHG, 更新ctime
+   - xfs_inode->xfs_icdinode->di_ctime
+
+** xfs_trans_log_inode(xfs_trans, xfs_inode, flags)
+   - 设置xfs_trans->t_flags的XFS_TRANS_DIRTY, xfs_inode->xfs_inode_log_item->xfs_log_item->xfs_log_item_desc->lid_flags的XFS_LID_DIRTY
+   - 把flags存储到xfs_inode->xfs_inode_log_item->ili_fields中. 包括xfs_inode->xfs_inode_log_item->ili_last_fields
+
+

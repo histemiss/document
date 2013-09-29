@@ -1,0 +1,1290 @@
+* extent_io.c
+  - extent_buffer 表示磁盘上的一块buffer,好像用于存储树节点. 这段磁盘空间映射到内存中. extent树的作用是处理逻辑磁盘位置向物理磁盘位置的映射
+  - 这里的函数管理extent, 一部分是ctree服务,还有是file extent?? 还有和disk-io交互..
+
+** extent_buffer
+    #+begin_src 
+ 	u64 start;      #前面2个是文件偏移,因为extent_io_tree使用start索引extent_buffer.. 它属于某个文件..
+	unsigned long len;
+	unsigned long map_start;  
+	unsigned long map_len;
+	unsigned long bflags;
+	struct extent_io_tree *tree;  //这是btrfs_inode->extent_io_tree
+	spinlock_t refs_lock;
+	atomic_t refs;  //使用计数..
+	atomic_t io_pages;  //io中的page数量, 在read/write开始设置,结束bio时减小..
+	int read_mirror;    //在读失败时记录mirror
+	struct list_head leak_list;  //这个是全局states队列
+	struct rcu_head rcu_head;
+	pid_t lock_owner;
+
+	/* count of read lock holders on the extent buffer */
+	atomic_t write_locks;  #对这个extent使用读写锁保护, 使用了复杂的锁..
+	atomic_t read_locks;
+	atomic_t blocking_writers;
+	atomic_t blocking_readers;
+	atomic_t spinning_readers;
+	atomic_t spinning_writers;
+	int lock_nested;
+	/* protects write locks */
+	rwlock_t lock;
+
+	/* readers use lock_wq while they wait for the write
+	 * lock holders to unlock
+	 */
+	wait_queue_head_t write_lock_wq;
+
+	/* writers use read_lock_wq while they wait for readers
+	 * to unlock
+	 */
+	wait_queue_head_t read_lock_wq;
+	wait_queue_head_t lock_wq;
+
+	struct page *inline_pages[INLINE_EXTENT_BUFFER_PAGES];
+	struct page **pages;   //管理数据的缓存, page一般从address_space中获取.
+};
+    //extent_io_tree 这个应该是管理extent_buffer和extent_state,使用下面的radix_tree_root
+    #+end_src
+
+** extent_io_tree 
+   #+begin_src 
+	struct rb_root state;  //管理extent_state
+	struct radix_tree_root buffer;  //管理extent_buffer
+	struct address_space *mapping;  // 这个mapping应该管理btrfs_super_block下面的某个inode,因为通过它找btrfs_fs_info,  extent_io_tree=>address_space=>inode=>super_block=>btrfs_fs_info..
+        //ctree中的extent肯定使用表示整个磁盘的inode, 普通文件呢??
+	u64 dirty_bytes;   //统计带有EXTENT_DIRTY标志的extent_state的空间
+	int track_uptodate;  
+	spinlock_t lock;
+	spinlock_t buffer_lock;
+	struct extent_io_ops *ops;
+    //这个数据结构同样和extent_io_tree相关，它表示什么信息？ 好像是一段磁盘数据的状态? 这个rb_tree存储这些东西.
+   #+end_src
+
+** extent_state 
+   #+begin_src 
+	u64 start;
+	u64 end; /* inclusive */
+	struct rb_node rb_node;
+
+	/* ADD NEW ELEMENTS AFTER THIS */
+	struct extent_io_tree *tree;
+	wait_queue_head_t wq;   //等待标志??
+	atomic_t refs;
+	unsigned long state;  //这时主要的数据,如果为0,就删除extent_state
+
+	/* for use by the FS */
+	u64 private;
+
+	struct list_head leak_list;  #这个队列和state_buffer->leak_list一样,也是全局队列
+#define EXTENT_DIRTY 1
+#define EXTENT_WRITEBACK (1 << 1)
+#define EXTENT_UPTODATE (1 << 2)
+#define EXTENT_LOCKED (1 << 3)
+#define EXTENT_NEW (1 << 4)
+#define EXTENT_DELALLOC (1 << 5)
+#define EXTENT_DEFRAG (1 << 6)
+#define EXTENT_DEFRAG_DONE (1 << 7)
+#define EXTENT_BUFFER_FILLED (1 << 8)
+#define EXTENT_BOUNDARY (1 << 9)
+#define EXTENT_NODATASUM (1 << 10)
+#define EXTENT_DO_ACCOUNTING (1 << 11)
+#define EXTENT_FIRST_DELALLOC (1 << 12)
+#define EXTENT_NEED_WAIT (1 << 13)
+#define EXTENT_DAMAGED (1 << 14)
+#define EXTENT_IOBITS (EXTENT_LOCKED | EXTENT_WRITEBACK)
+#define EXTENT_CTLBITS (EXTENT_DO_ACCOUNTING | EXTENT_FIRST_DELALLOC)
+   #+end_src
+
+   - 使用extent_state_cache管理extent_state变量, extent_buffer_cache管理extent_buffer  kmem_cache
+
+** extent_map
+   #+begin_src 
+	struct rb_node rb_node;
+
+	/* all of these are in bytes */
+	u64 start;
+	u64 len;
+	u64 mod_start;
+	u64 mod_len;
+	u64 orig_start;
+	u64 orig_block_len;
+	u64 block_start;
+	u64 block_len;
+	u64 generation;
+	unsigned long flags;
+	struct block_device *bdev;
+	atomic_t refs;
+	unsigned int in_tree;
+	unsigned int compress_type;
+	struct list_head list;
+   #+end_src
+
+** alloc_extent_state(gfp_t)  / free_extent_state(extent_state）
+   - 使用kmem_cache管理extent_state
+
+** tree_entry  
+   #+begin_src 
+      u64 start, end
+      rb_node
+      // 这个数据结构和extent_state的开始是一样的,使用它帮助rb_tree操作..
+   #+end_src
+
+** tree_insert(root, offset, node)
+   - 把node插入到offset中,rbtree的key是一段范围,应该不会覆盖. 如果找到节点冲突,就返回找到的节点..
+ 
+** __etree_search(extent_io_tree, offset, prev_ret, next_ret)
+   - 在extent_io_tree->state中找offset对应的树节点..如果找不到设置prev_ret/next_ret.  prev_ret表示offset在prev_ret前面, next_ret表示offset在next_ret的后面..
+
+** tree_search(extent_io_tree, offset)
+   - 包装上面,如果没有找到合适的节点,返回后一个节点, 结果extent_state->end > offset
+
+** merge_cb(extent_io_tree, extent_state new, extent_state other)
+   > extent_io_tree->extent_io_ops->merge_extent_hook(extent_io_tree->address_space->inode, new, other)
+
+** merge_state(extent_io_tree, extent_state)
+   - extent_state在extent_io_tree->state中,检查是否可以和其他的合并. 仅仅检查extent_state->start/end
+   > merge_cb(extent_io_tree, state, other)
+   > free_extent_state(other)
+
+** set_state_cb(extent_io_tree, extent_state, bits)
+   > extent_io_tree->extent_io_ops->set_bit_hook(inode, extent_state, bits)
+
+** clear_state_cb(extent_io_tree, extent_state, bits)
+   > extent_io_tree->extent_io_ops->clear_bit_hook(...)
+   - 这里操作为何使用inode?? 
+
+** insert_state(extent_io_tree, extent_state, start, end, bits)
+   - 设置参数extent_state的start/end/bits
+   > tree_insert(extent_io_tree->state, end,extent_state->rb_node)
+   > merge_state(extent_io_tree, extent_state)
+
+** split_cb(extent_io_tree, extent_state, split)
+   > extent_io_tree->extent_io_ops->split_extent_hook(extent_io_tree->address_space_mapping->inode, extent_state, split)
+
+** split_state(extent_io_tree, extent_state, extent_state prealloc, split)
+   - 把extent_state在split地方分开.. 直接修改start/end, 然后前部分就是prealloc,把它查到tree中
+   > tree_insert(extent_io_tree->state, ...)
+
+** next_state(extent_state)
+   > rb_next(extent_state->rb_node)
+
+** clear_state_bit(extent_io_tree, extent_state, bits, wake)
+   - extent_state的主用作用是追踪一段地址的使用情况?? extent_state->state,  EXTENT_DIRTY/WRITEBACK/LOCKED/NEW/DELALLOC..等..  如果这里是清除EXTENT_DIRTY,修改extent_io_tree->dirty_bytes计数..  唤醒等待某些标志的任务..
+   > wake_up(extent_state->wq)
+   - 如果extent_state->state是0,它也就没什么用,释放它, 否则尝试合并...
+   > free_extent_state(extent_state)
+   > merge_state(extent_io_tree, extent_state)
+
+** clear_extent_bit(extent_io_tree, start, end, bits, wake, delete, extent_state cached_state, mask)
+   - (start,end)范围会覆盖或交叉某些extent_state, 如果交叉就分裂相关extent_state
+   > tree_search(extent_io_tree, start)
+   > split_state(extent_io_tree, extent_state, ...)
+   > clear_state_bit(extent_io_tree, extent_state, bits, wake)
+   > free_extent_state(..)
+   - 这里有个参数时wake, 在清除时会唤醒extent_state->wq...
+
+** wait_extent_bit(extent_io_tree, start, end, bits) 
+   - 查找(start, end)范围内的extent_state, 检查extent_state->state和bits.. 也需要遍历rb tree..
+
+** set_state_bits(extent_io_tree, extent_state, bits)
+   - 直接修改extent_state->state, 注意修改extent_io_tree->dirty_bytes
+   > set_state_cb(extent_io_tree, extent_state, bits)
+  
+** cache_state(extent_state *, extent_state **) / uncache_state(extent_state **)  
+   - 把extent_state缓冲给双重指针,只有带EXTENT_IOBITS或EXTENT_BOUNDARY才可以.  BOUNDARY|LOCK|WRITEBACK..
+   - 有cache_state, 就有uncache_state, 减小refs计数..
+
+** __set_extent_bit(extent_io_tree, start, end, bits, exclusive_bits, falied_start, extent_state, mask) 
+   - 设置extent_io_tree中一段空间的标志,同时检查排斥标志.. 和上面清除标志的一样麻烦..  (start,end)会覆盖交叉某些extent_state, 如果缺失某些extent_state,就插入extent_state, 相当于没有排斥..
+   > tree_search(extent_io_tree, start)
+   > insert_state(..)
+   > set_state_bits(extent_io_tree, extent_state, bits)
+   > split_state(...)
+   > merge_state(..)
+   - 找到覆盖的extent_state, 检查排斥标志..
+
+** convert_extent_bit(extent_io_tree, start, .. bit, clear_bits, ...)
+   - 设置一段空间内的extent_state的标志，如果有漏洞缺少extent_state,创建新的.  第一种情况是没有对应的
+   > alloc_extent_state_atomic(..)
+   > insert_state(extent_io_tree, extent_state, start, end, bits)  
+   - 如果找到覆盖的,而且没有缺漏
+   > set_state_bits(extent_io_tree, extent_state, bits)
+   > clear_state_bit(extent_iO_tree, extent_state, clear_bits, 0) 
+   - 如果找到交叉的,分裂,在设置后半段..
+   > split_state(extent_io_tree, extent_state, ..)
+   - 这个函数和上面的去别是，上面碰到互斥的会失败，这里不会失败!!
+
+** set_extent_dirty / set_extent_bits(...)
+   - 一些列的bit操作函数..
+
+** clear_extent_bits(extent_io_tree, start, end, bits, mask)
+   - 清除标志, 不会唤醒..
+
+** set_extent_delalloc(extent_io_tree, start, end ...)
+   - 设置EXTENT_DELALLOC | EXTENT_UPTODATE标志..  为何delalloc的就是uptodate?
+
+** set_extent_defrag(extent_io_tree, ...)
+   - 设置EXTENT_DELALLOC | EXTENT_UPTODATE | EXTENT_DEFRAG 标志..
+
+** clear_extent_dirty(extent_io_tree, start, end, mask)
+   - 清除标志: EXTENT_DIRTY | EXTENT_DELALLOC | EXTENT_DO_ACCOUNTING..
+
+** set_extent_new(extent_io_tree, ...)  / set_extent_uptodate(...)
+   - 设置EXTENT_NEW ..  / EXTENT_UPTODATE..
+
+** lock_extent_bits(extent_io_tree, start, end, bits, cached_state)
+   > __set_extent_bit(extent_io_tree, start, end, EXTENT_LOCKED|bits, EXTENT_LOCKED, 
+   > wait_extent_bit(extent_io_tree, failed_start, end, EXTENT_LOCKED)
+   - 设置extent_state的标志,但使用EXTENT_LOCKED锁住,防止并行？ 如果返回EEXIST说明在创建新extent_state时有冲突,等待EXTENT_LOCKED,当然等待之前先看这个标志是否设置. 在添加标志EXTENT_LOCKED时,先检查EXTENT_LOCKED是否存在..
+
+** lock_extent(extent_io_tree, start, end)
+   - 包装上面的函数,但没有cached_state..
+
+** try_lock_extent(extent_io_tree, start, end)
+   > __set_extent_bit(extent_io_tree, start, end, EXTENT_LOCKED, EXTENT_LOCKED, &failed_start, NULL, GFP_NOFS)
+   - 如果上面失败, 不会等待，重新设置,而是退出..
+   > clear_extent_bit(extent_io_tree, start, failed_start-1, EXTENT_LOCKED, ...)
+
+** unlock_extent(extent_io_tree, start, end)
+   > clear_extent_bit(extent_io_tree, start, end, EXTENT_LOCKED, 1, ...)
+   - 会唤醒的..
+
+** unlock_extent(extent_io_tree, start, end)
+   - 包装上面的函数..
+
+** extent_range_clear_dirty_for_io(inode, start, end)
+   - 清除(start,end)范围内的page的PG_DIRTY标志..  查找address_space的page
+   > find_get_page(inode->address_space, index)
+   > clear_page_dirty_for_io(page)
+
+** extent_range_redirty_for_io(inode, start, end)
+   - 处理inode的(start, end)范围内的page, 设置PG_DIRTY标志?!  
+   > find_get_page(inode->address_space, index)
+   > accounting_page_redirty(page)
+   - 更新计数, 减小dirty的计数,等设置PG_DIRTY时加上??
+   > __set_page_dirty_nobuffers(page)
+   - 这个函数设置的标志包括PG_DIRTY, address_space radix_tree的PAGECACHE_TAG_DIRTY, 还有设置inode的I_DIRTY_PAGES..  pagecache就是address_space.. 有道理!
+
+** set_range_writeback(extent_io_tree, start, end)
+   - start是虚拟地址,同样用于extent_state->address_space, 这个函数设置(start,end)覆盖的page的PG_WRITEBACK, 还有address space的PAGECACHE_TAG_WRITEBACK, 还涉及到PAGECACHE_TAG_TOWRITE, 忘记了如何使用这2个... TOWRITE是和DIRTY对应的..
+   > find_get_page(...)
+   > set_page_writeback(page)
+
+** find_first_exent_bit_state(extent_io_tree, start, bits)
+   > tree_search(tree, start) 
+   > rb_next(extent_node)
+   - 找一个extent_state,它带有标志bits, 返回的是extent_state..
+
+** find_first_extent_bit(extent_io_tree, start, start_ret, end_ret, bits, cached_state)
+   - 和上面的函数类似,这个的结果是start,end
+   > 先检查cached_state, 查找它附近的
+   > find_first_extent_bit_state(..) 
+   - 把它的start, end返回, 直接返回extent_state不行??
+
+** find_dealloc_range(extent_io_tree, start, end, max_bytes, cache_state) 
+   - 在extent_io_tree中遍历一段空间,找带有标志DEALLOC的extent_state的一个extent_state, 碰到没有带这个标志的停止查找
+   > tree_search(extent_io_tree, start)
+   - 它会查找extent_state, extent_state->end > start.. 如果找不到,说明没有整个空间没有那么大?文件或磁盘大小?! 直接退出!  代码很奇怪..
+   - 顺序遍历rb tree节点, 碰到不连续的extent_state(start, end) 或者 带有EXTENT_BOUNDARY的停止, 碰到不带EXTENT_DELALLOC的也停止..
+   - 其他情况就是地址连续,而且都带有EXTENT_DELALLOC, 当然state肯定不相同..累计extent_state的数量,还有长度
+   - 当长度超过max_bytes时也退出.. 
+
+** __unlock_for_dealloc(inode, page, start, end)
+   - 在inode的address_space中找出在start,end之间的page, 释放page的锁.. 参数还有一个page??
+   > unlock_page(page)
+
+** lock_dealloc_pages(inode, page*, dealloc_start, dealloc_end)
+   - 锁住start,end之间的page,但前提是page是PageDirty,而且page->address_space=inode->address_space
+   > find_get_pages_contig(inode->address_space, index, ...)
+   > lock_page(page)
+   > PageDirty(page)
+   - 必须保证page带有PG_DIRTY标志...
+   > __unlock_for_dealloc(inode, ..) 如果查找中有page条件不满足,返回EAGAIN,而且释放已经使用的锁
+
+** find_lock_delalloc_range(inode, extent_io_tree, page, start, end, max_bytes)
+   - 这个函数在writeextent中使用, delalloc是延迟分配extent, 那里应该是提交io的地方??
+   > find_dealloc_range(extent_io_tree, start, end, max_bytes, extent_state)
+   > lock_dealloc_pages(inode, ...)
+   > lock_extent_bits(extent_io_tree, start, end, 0, extent_state) 
+   > test_range_bit(extent_io_tree, start, end, EXTENT_DEALLOC, 1, extent_state)
+   - 先找到EXTENT_DEALLOC的一段extent_state, 然后在对应的page上加锁,然后在extent_state上加锁.. 返回(start,end)..  这个函数在往上就是pagewrite调用,调用栈不是很复杂..
+   - 如果找不到的时候也有返回,caller怎么使用??
+   - 在查找失败时会缩小max_bytes,也就是找到的可能会不满PAGE_SIZE..
+   - writepage中调用这些,应该只操作一个page, 但穿进来的max_bytes却是128M.. 为何管那些page?
+
+** extent_clear_unlock_dealloc(inode, extent_io_tree, start, end, page, op)
+   - op使用宏表示动作,要去除extent_state和page上的标志, 应该和行上面的函数正好相反..
+   - 首先处理extent_state的标志,清除的标志可能包括EXTENT_LOCKED|EXTENT_DIRTY|EXTENT_DELALLOC.
+   > clear_extent_bit(extent_io_tree, start, end, bits, ...)
+   - op中还有其他的操作??  都是针对的extent覆盖的page的..
+   > find_get_pages_contig(inode->address_space, ...) 
+   - EXTENT_SET_PRIVATE2操作..
+   > SetPagePrivate2(page)
+   - EXTENT_CLEAR_DIRTY操作..
+   > clear_page_dirty_for_io(page)
+   > set_page_writeback(page)
+   - EXTENT_SET_WRITEBACK操作..
+   > end_page_writeback(page)
+   - EXTENT_CLEAR_UNLOCK_PAGE操作..
+   > unlock_page(page) 
+   - 注意这里的参数也有一个page, 所有这个操作要回避page..
+   - 没看清楚谁调用这个函数..应该在bio完成时吧?..
+
+** count_range_bits(extent_io_tree, start, end, max_bytes, bits, congit) 
+   - 统计带bits标志的extent_state覆盖的空间大小. congit和max_bytes表示搜索的条件,是否要求连续和最大搜索空间, 用处不多, 糟蹋了这么复杂的实现..
+
+** set_state_private(extent_io_tree, start, private)
+   > tree_search(extent_io_tree, start)
+   - 设置extent_io_tree中某个extent_state的private, 必须保证extent_state->start == start
+
+** get_state_private(extent_io_tree, start, private)
+   - 获取extent_state->private
+
+** test_range_bit(extent_io_extent, start, end, bits, filled, cached_extent)
+   - 检查start,end之间的extent_state,检查是否有bits的一部分标志, filled表示满足条件是(1)所有extent_state, 范围必须连续,还是(0)带一部分extent_state, 范围不必连续..
+   - 即使bits有多个标志,也只处理extent_state->state & bits
+
+** check_page_uptodate(extent_io_tree, page)
+   - 检查page覆盖的extent_state是否有EXTENT_UPTODATE, 设置PageUptodate.. 下面filled是1,所以条件很严!
+   > test_range_bit(extent_io_tree, start, end, EXTENT_UPTODATE, 1, NULL)
+   > SetPageUptodate(page)
+
+** check_page_locked(extent_io_tree, page)
+   - 检查page使用的extent是否带有EXTENT_LOCKED, 如果没有,需要释放PG_locked..
+   > test_range_bit(extent_io_tree, start, end, EXTENT_LOCKED, 0, NULL)
+
+** check_page_writeback(extent_io_tree, page)
+   > end_page_writeback(page)  
+   - 这里为何没有extent_state的标志??
+
+   - 下面是一些io错误的处理函数,一个block的io失败后，尝试它的mirror的block.如果其他的成功，把原来的block修复.
+
+** free_io_failure(inode, io_failure_record, did_repair)
+   - 修改io错误后的处理.. btrfs_inode->io_failure_tree用于处理错误情况??
+   > clear_extent_bits(failure_tree, start, end, EXTENT_LOCKED|EXTENT_DIRTY, GFP_NOFS)
+   > clear_extent_bits(btrfs_inode->extent_io_tree, start, end, EXTENT_DAMAGED, ..)
+   - 修改2个extent_io_tree..
+     
+** repair_io_failure(btrfs_fs_info, start, length, logical, page, mirror_num)
+   - 应该是io出错时的处理,提交新的bio, 但提交的是WRITE, 可以看看这里一个bio的处理过程. 参数里面page对应数据的内存位置,logical是数据的磁盘位置..
+   > bio_alloc(GFP_NOFS) 
+   - 尝试第mirror_num个mirror??  创建一个新的btrfs_bio.  btrfs_bio返回磁盘设备名字和block的物理磁盘位置..
+   > btrfs_map_block(btrfs_fs_info, WRITE, logical, length, btrfs_bio, miror_num) 
+   > bio_add_page(bio, page, length, off) 
+   - 这是bio的函数,把page加到bio队列中,会有合并相关的动作, 然后提交bio..
+   > btrfs_submit_bio(WRITE_SYNC, bio) 
+   - 等待的是io_failure_record->complete, 在bio完成的回调函数中会唤醒这里.
+   > wait_for_completion(complete) 
+   - 最后检查bio的BIO_UPTODATE ....
+
+** repair_eb_io_failure(btrfs_root, extent_buffer, mirror_num)
+   - 修复extent_buffer的数据,使用mirror_num镜像, 修复是以page为单位..
+   > extent_buffer_page(extent_buffer, i)
+   > repair_io_failure(...)  
+
+** clean_io_failure(start, page)
+   - page对应的inode有io_failure_tree, 这个就是extent_io_tree. 每次完成io后,在里面查找是否有失败的. start数据的文件位置..
+   > count_range_bits(btrfs_inode->io_failure_tree, private, -1, , EXTENT_DIRTY, 0)
+   - 如果有失败,这个private_failure就是io_failure_record,里面就是失败的信息
+   > get_state_private(extent_io_tree, start, private_failure) 
+   > find_first_extent_bit_state(btrfs_inode->extent_io_tree, failrec->start, EXTENT_LOCKED) 
+   - 查找锁住的extent_state,出错了就锁住?!  检查数据是否有多个备份,把好的数据写回去..
+   > btrfs_num_copies(btrfs_inode->btrfs_root->btrfs_fs_info, ...) 
+   > repair_io_failure(btrfs_fs_info, start, len, ...) 
+   > free_io_failure(inode, io_failure_tree, did_repair)
+   - 这个函数在readpage中调用..
+
+** io_failure_record
+   #+begin_src 
+	struct page *page;   //可以锁引导文件..
+	u64 start;      //文件位置信息,可能不是page对齐..
+	u64 len;
+	u64 logical;    //磁盘位置..
+	unsigned long bio_flags;
+	int this_mirror;
+	int failed_mirror;
+	int in_validation;
+   #+end_src
+
+** bio_readpage_error(bio, page, start, end, failed_mirror, extent_state)
+   - 这是readpage中的错误处理
+   - 看一下参数, (start,end)是文件偏移,根据page index计算..
+   - 先去找是否已经准备了failrec, 如果没有找到,根据信息构造failrec
+   > get_state_private(failure_extent_io_tree, start, private) 
+   - 构造io_failure_record, 需要的数据位置信息, 文件位置,逻辑磁盘位置..
+   > lookup_extent_mapping(extent_map_tree, start, len) 
+   - 使用extent_map获取数据的磁盘位置, 这里的extent_map是btrfs_inode->extent_map_tree中的,也可能是文件,也可能是整个磁盘..
+   - 最后把准备好的io_failure_record给extent_state, 这个extent_state是btrfs_inode->failure_tree管理的.. 锁住failure_tree中的数据.
+   > set_extent_bits(btrfs_inode->failure_tree, start, end, EXTENT_LOCKED|EXTENT_DIRTY, GFP_NOFS)
+   - 设置原来的tree中的extent_state的EXTENT_DAMAGED标志..
+   > set_extent_bits(btrfs_inode->tree, start, end, EXTENT_DAMAGED, GFP_NOFS)
+   - 检查数据有多少备份,如果没有冗余的,就返回EIO,同时释放io_failure_record.
+   > btrfs_num_copies(btrfs_fs_info, logic, len)
+   - 根据failrec->in_validation=1? 判断什么? 
+   - 判断failed_bio->bi_vcnt, 如果>1, 就设置in_validate=1, this_mirror=failed_mirror, 说明是原始的bio失败??
+   - 如果是1,同样设置failed_mirror, 但this_mirror递增，这个是修改的bio也出现错误..
+   - 创建bio, 回调函数是failed_bio->bi_end_io..
+   > bio_alloc(GFP_NOFS, 1)
+   > bio_add_page(...)
+   > extent_io_tree->ops->submit_bio_hook(inode, read_mode, bio, failrec->this_mirror, ...)
+   - 最后提交bio, 但是failed_bio没有处理.. 新创建的bio和failed_bio使用同样的回调函数...
+   - 这个函数是在一个bio的回调函数中的错误处理.
+
+** end_extent_writepage(page, err, start, end) 
+   - 根据err更新bio结果
+   > extent_io_tree->ops->writepage_end_io_hook(page, start, end, NULL, uptodate)
+   - 如果error有错误,就清除PG_UPTODATE, 设置PG_ERROR..
+   > ClearPageUptodate()
+
+** end_bio_extent_writepage(bio, err)
+   - 这个肯定是bio的回调函数..主要工作是检查错误,而且去掉PG_WRITEBACK标志, 回调函数只有普通inode使用,就是提交ordered data工作..
+   - 遍历bio->bi_io_vec队列, 处理bio_vec中的page
+   > end_extent_writepage(page, err, start, end) 
+   > end_page_writeback(page ..)  
+   - 更新page的的标志,这是page cache的工作
+ 
+** end_bio_extent_readpage(bio, err)
+   - 遍历bio->bi_io_vec队列, 检查bio_vec.. 主要工作设置uptodate的标志,还有解锁..
+   - 先找到extent_state, 带有EXTENT_LOCKED
+   > find_first_extent_bit_state(extent_io_tree, start, EXTENT_LOCKED)
+   - 这里主要是做read之后的数据检查,设置EXTENT_UPTODATE.. 这个函数有2个版本,btree和inode..
+   > extent_io_tree->ops->readpage_end_io_hook/ readpage_end_io_failed_hook
+   - 如果没有回调函数,直接调用错误处理
+   > bio_readpage_error(bio, page, start, end, mirror, NULL)
+   - 这里重复了..
+   > set_extent_uptodate(extent_io_tree, start, end, cache, GFP_ATOMIC)
+   - 如果bio_vec管理整个page, 设置PG_UPTODATE/PG_ERROR..
+   > SetPageUptodate(page) 
+   > ClearPageUptodate() / SetPageError()  
+   > unlock_page(page)
+   - 如果没有修改整个page..
+   > check_page_uptodate(extent_io_tree, page)
+   > check_page_locked(extent_io_tree, page)
+   - 去extent_io_tree中检查page范围内的标志, 如果都是UPTODATE/LOCKED, 就更新page.. 好主意...
+
+** btrfs_bio_alloc(block_device, first_sector, nr_vecs, gfp_t)
+   - 构造bio,给它block_device.. 把参数给他..
+
+** submit_one_bio(rw, bio, mirror_num, bio_flag)
+   - 提交bio, 有两种方法
+   - page是从bio->bi_io_vec中取得, start是数据的文件offset..
+   > extent_io_tree->ops->submit_bio_hook(page->address_space->inode, rw, bio, mirror_num, bio_flags, start)  
+   > btrfsic_submit_bio(rw, bio) 
+  
+** merge_bio(extent_io_tree, page, offset, size, bio, bio_flags)
+   > extent_io_tree->ops->merge_bio_hook(page, offset, size, bio, bio_flags)
+
+** submit_extent_page(rw, extent_io_tree, page, sector_t, size, offset, block_device, bio_ret, max_pages, end_io_func, mirror_num , prev_bio_flags, bio_flags)  
+   - 这里的工作就是创建bio, 根据参数填充数据信息,然后发射bio.. 但是bio尽量合并连续的请求,所以使用(bio_ret,prev_bio_flags)等处理连续的请求..
+   - 参数实际上信息挺多的, extent_io_tree表示操作的对象,普通文件或btree inode..(btree inode就是把整个文件系统空间作为一个文件的数据).. sector_t表示数据磁盘位置.. offset表示page偏移, page表示内存位置,也可计算文件偏移, block_device表示数据所在的设备, 最后最重要的是bio回调函数..
+   - 就是提交一个page的bio?? bio_ret是承接作用,如果它有效,就先尝试合并,合并成功就返回,不成功,把它提交,然后创造一个新的,给bio_ret. 如果为空,就直接创建一个新的,提交..
+   - bio_ret是一个bio,建议把page合并到里面. 当要要判断是否能合并,就是位置是否挨着, bio->bi_sector+size==sector_t; prev_bio_flags和bio_flags是否一样,下面extent_state是否能合并??
+   > merge_bio(extent_io_tree, page, offset, page_size, bio, bio_flags)
+   > bio_add_page(bio, page, page_size, offset) 
+   - 最后不能合并就提交bio_ret  
+   > btrfs_bio_alloc(block_device, sector_t, nr, GFP_NOFS|...)
+   > submit_one_bio(rw, bio, mirror_num, prev_bio_flags)
+   - 上面如果不能合并就什么都不做退出. 当不需要合并时, 创建一个新的bio,  bi_end_io回调函数使用参数end_io_func...
+
+** attach_extent_buffer_page(extent_buffer, page) / set_page_extent_mapped(..)
+   - 关联就是把extent_buffer给page->private, 但第二个函数给EXTENT_PAGE_PRIVATE..
+   > PagePrivate(page)
+   > SetPagePrivate(page)
+   > page_cache_get(page)
+   > set_page_private(page, extent_buffer/EXTENT_PAGE_PRIVATE)
+
+** __extent_read_full_page(extent_io_tree, page, get_extent_t, bio, mirror_num, bio_flags)
+   - 实现readpage? 对extent_state加锁,在io完成时释放锁,构造一个bio.  先设置page标志
+   > set_page_extent_mapped(page)
+   - 使用extent_state锁住地址空间..
+   > lock_extent(extent_io_tree, start, end)
+   - 首先处理btrfs_ordered_extent?? ordered_extent到处影响.. 检查这里操作的数据是否影响ordered_extent, 如果有要等待它完成..
+   > btrfs_lookup_ordered_extent(inode, start)  
+   > btrfs_start_ordered_extent(inode, btrfs_ordered_extent, 1)
+   > btrfs_put_ordered_extent(btrfs_ordered_extent)
+   - 如果page是inode的最后一页,而且文件大小不对齐,清空page..
+   - 开始读取操作
+   - 应该是在循环最后,检查文件的操作位置是否超过文件大小, 对应的page应该清空.
+   > kmap_atomic / kunmap_atomic / set_extent_uptodate(extent_io_tree, start, end, extent_state cached, GFP_NOFS)
+   - 这里set_extent_uptodate设置的是一段范围的state
+   > unlock_extent_cached(...)  
+   - 先获取数据的磁盘地址信息..
+   > get_extent(inode, page, pg_offset, cur, len, 0)
+   - 根据extent_map设置bio_flags, compress相关的标志; iosize不能超过extent_map->len; 磁盘位置就是extent_map->block_start, 但还是还要根据文件偏移计算extent内部偏移; 还有对应的磁盘设备..
+   - 检查extent_map->block_start, 如果是EXTENT_MAP_HOLE,或者EXTENT_FLAG_PREALLOC, 就不在读取,直接把page清空..
+   > kmap_atomic(page) / memset(...) / kunmap_atomic(userspace)
+   > set_extent_uptodate(extent_io_tree, ...)
+   > unlock_extent_cached(extent_io_tree, ...)
+   - 这时哪里锁住的extent? 这里使用cached,可能会快一些,实际上这里可能会有很多块的split/merge操作
+   - 如果不是hole,需要io操作,检查extent_state的EXTENT_UPTODATE, 如果是EXTENT_UPTODATE,就不用更新.. 设置PG_UPTODATE
+   > test_range_bit(extent_io_tree, cur, cur_end, EXTENT_UPTODATE, 1, NULL)
+   > check_page_uptodate(extent_io_tree, page) 
+   > unlock_extent(extent_io_tree, cur, ...)
+   - 如果是EXTENT_MAP_INLINE, 就是错误? 为什么? btree extent不能有不是uptodate的??
+   > SetPageError(page)
+   - 提交bio, page是参数, sector/disk_io_size/bdev根据extent_map获取, pg_offset是页内偏移,pnr是最大的io页数,没有使用,回调函数是end_bio_extent_readpage..
+   > submit_extent_page(READ, extent_io_tree, page, sector, disk_io_size, pg_offset, bdev, bio, pnr, end_bio_extent_readpage 
+   - 这里的功能就是为page获取数据的磁盘位置，然后检查是否是update, 如果不是就提交bio获取数据..
+
+** extent_read_full_page(extent_io_tree, page, get_extent_t, mirror_num)
+   - 这里会提交bio, get_extent_t函数相当于其他文件系统的get_blkmap之类的.. 这里的参数少多了..
+   > __extent_read_full_page(...)
+   - 如果上面bio合并返回一个为发射的,这里发送请求..
+   > submit_one_bio(READ, bio, mirror_num, bio_flags)
+
+** update_nr_written(page, writeback_control, nr_written)
+   - 根据writeback_control的参数更新page->address_space->writeback_index...统计数?  这个参数在周期写回数据时会使用,每次都接着上次写的位置.. 
+   - 减小writeback_control->nr_to_write, 表示完成的io任务..
+
+** extent_page_data 
+   #+begin_src 
+      bio bio
+      extent_io_tree tree
+      get_extent_t  get_extent
+      long bio_flags 
+      extent_locked # 
+      sync_io       # WRITE_SYNC
+      // 这个数据结构是哪里设定的..
+   #+end_src
+
+** __extent_writepage(page, writeback_control, data) 
+   - writepage的实现,很庞大的实现.. data就是extent_page_data. 所需要的信息根据page应该能获取,主要是inode, epd里面可能主要是get_extent,bio_flags等..
+   - page是否在inode大小范围内,如果不在可以退出,同时使page无效.. 这里会无效page...
+   > page->address_space->a_ops->invalidatepage(page, 0)
+   - 如果page跨文件边界,清空超过文件大小的部分..
+   > kmap_atomic(page) / memset(...) / kunmap_atomic(userpage)
+   - 准备操作page, 设置一个标志..EXTENT_PAGE_PRIVATE
+   > set_page_extent_mapped(page) 
+   - 下面先处理delalloc?? delay allocation. 但extent没有锁住. extent_page_data->extent_locked=0..
+   - 首先找delalloc的extent, 下面会同时锁住page/extent..
+   > find_lock_delalloc_range(inode, extent_io_tree, page, delalloc_start, delalloc_start, delalloc_end, 128*1024*1024) 
+   - 这个128M是什么东西? 只为了一个page,为何要找这么大范围的一段. 这里一次处理delalloc的单位最大是128M??  但它实际锁住的范围可能远超过一个page..
+   > extent_io_tree->ops->fill_delalloc(inode, page, delalloc_start, delalloc_end, page_started, nr_written)
+   - page_started返回的是什么? 它决定了delalloc的结果.. fill_delalloc完成后,一般就不会有writepage..
+   - 开始写回:
+   > extent_io_tree->ops->writepage_start_hook(page, start, page_end)
+   > update_nr_written(page, writeback_control, nr_written)
+   - 开始进入写回循环,里面看似一个page分成多个bio, 但应该不是这样..
+   - 如果页的范围在文件大小之外,停止io, 这就是循环停止的条件.
+   > extent_io_tree->ops->writepage_end_io_hook(page, start, ...) 
+   - 先找到数据的磁盘位置信息, 和readpage一样, sector/iosize/block_device
+   > extent_page_data->get_extent(inode, page, ...) 
+   - 获取extent_buffer, 如果是compressed数据,或者hole, inline数据,这里不处理. hole为何还不写回?? 只有读完成的操作??
+   > extent_io_tree->ops->writepage_end_io_hook(page, ...)
+   - writepage竟然有3个回调..
+   > extent_io_tree->ops->writepage_io_hook(page, cur, ...) 
+   > set_range_writeback(extent_io_tree, cur, cur+iosize-1)
+   - 设置PG_WRITEBACK的标志, 提交bio.. 为何没有extent的writeback操作..
+   > submit_extent_page(write_flags, extent_io_tree, page, sector, iosize, pg_offset, block_device, extent_page_data->bio, max_nr, end_bio_extent_writepage, 0, 0, 0) 
+   - 看来extent_data_page->bio还要传承bio... 
+   - EXTENT_WRITEBACK没怎么使用阿!!
+
+** wait_on_extent_buffer_writeback(extent_buffer)
+   - 等待extent_buffer->bflags的EXTENT_BUFFER_WRITEBACK..
+   - 这里怎么开始操作extent_buffer?
+
+** lock_extent_buffer_for_io(extent_buffer, btrfs_fs_info, extent_page_data)
+   - extent_buffer使用读写锁保护, extent_page_data会放到page->private中.
+   - 先尝试锁住extent_buffer, 如果锁不住,就提交extent_page_data->bio??然后再锁..  那个不就是当前page或者extent??
+   > btrfs_try_tree_write_lock(extent_buffer) 
+   > flush_write_bio(extent_page_map)
+   > btrfs_tree_lock(extent_buffer)
+   - 上面会等待锁. 难道写操作使用这里的锁同步?!
+   - extent_buffer->bflags如果包含EXTENT_BUFFER_WRITEBACK, 应该是正在写回, 先处理它.. 释放write lock
+   - btrfs_tree_unloK(extent_buffer)
+   - 如果不是sync io,返回不管  extent_page_data->sync_io表示同步..
+   - 如果是同步,先提交bio.. 上面也提交了,设置变量阻止这里提交..
+   > flush_write_bio(extent_page_data)
+   - 等待extent_buffer上面的EXTENT_BUFFER_WRITEBACK标志. 被唤醒后再次检查.. 这里会循环等待..
+   > wait_on_extent_buffer_write(extent_page_data) 
+   - 继续处理,检查并清空EXTENT_BUFFER_DIRTY,如果原来是脏的,设置EXTENT_BUFFER_WRITEBACK. 有使用和page并行的标志.. 如果没有EXTENT_BUFFER_DIRTY, 就直接退出.. 和extent_state有什么区别??
+   - BTRFS_HEADER_FLAG_WRITTEN什么意思?  和reloc对应??
+   - extent_buffer是磁盘中的一个extent, 下面这个函数是ctree的操作,获取extent_buffer指向的page,数据映射成btrfs_header, 修改flags.  这个extent_buffer是metadata, 修改btrfs_fs_info->dirty_metadata_bytes统计数.
+   - 处理extent_buffer管理的page, 要写回数据,所以要锁住page?? 写也要锁住..
+   > extent_buffer_page(extent_buffer, i) 
+   > trylock_page(page)
+   - 如果锁不住,可能其他io在操作它,可能就是extent_page_data, 提交bio..当然不能和上面重复.
+   > flush_write_bio(extent_page_data)
+   > lock_page(page) 
+   - 等待写完之后的唤醒.
+
+** end_extent_buffer_writeback(extent_buffer)
+   - 清除extent_buffer的EXTENT_BUFFER_WRITEBACK, 并唤醒等待标志的任务
+
+** end_bio_extent_buffer_writepage(bio, err)
+   - 这是bio write回调,现在处理的extent_buffer和extent_state不是一回事. 从bio->bi_vec获取page, page->private是extent_buffer..如果err有错误,还要清空uptodate? 设置extent_buffer->bflags的EXTENT_BUFFER_IOERR.. 和上面的写操作是一块的吗?
+   > end_page_wirteback(page)  
+   - 减小extent_buffer->io_pages, 如果减到0,说明extent_buffer完成,唤醒等待写回的任务..
+   > end_extent_buffer_writeback(extent_buffer)  
+   - 一个bio可以包含多个extent_buffer?!  无所谓,反正使用page索引extent_buffer..
+
+** write_one_eb(extent_buffer, btrfs_fs_info, writeback_control, extent_page_data)
+   - 写回extent_buffer, 数据在extent_buffer->pages. 首先清除EXTENT_BUFFER_IOERR, 以及page中的dirty, 设置writeback
+   - 根据extent_buffer->start, len 设置extent_buffer->io_pages, 这是地址连续的数据,内存地址连续,逻辑磁盘地址也连续..
+   - extent_buffer里面是btree树节点..
+   - 遍历extent_buffer中的page, 挨个提交page的io..
+   > extent_buffer_page(extent_buffer, i) 
+   - 清除PG_DIRTY标志,设置PG_WRITEBACK..
+   > clear_page_dirty_for_io(page)
+   > set_page_writeback(page)
+   > submit_extent_page(rw, extent_buffer->extent_io_tree, page, offset>>9, PAGE_CACHE_SIZE, 0, bdev, extent_page_data->bio, -1, end_bio_extent_buffer_writepage, 0, extent_page_data->bio_flags, bio_flags) 
+   - 看一下参数: offset是extent_buffer->start, 就是逻辑磁盘位置?! 所以它作为sector_t传进去的. bio回调函数是上面用来解锁extent..
+   - 把page给bio  上面操作可能会失败?!  不确定提交多少个bio, 这里使用extent_page_data->bio合并请求..
+   - 如果在提交bio时有错误,就释放extent/page的锁..
+   > end_extent_buffer_writeback(extent_buffer)
+   - 每次提交完成,更新writeback_control, 而且释放page锁..
+   > update_nr_written(page, writeback_control, 1)
+   > unlock_page(page) 
+
+** btree_write_cache_pages(address_space, writeback_control)
+   - 这是pagecache的回收内存时写回page的操作. 写回的数据在writeback_control中.  WB_SYNC_ALL是同步写回..
+   - 先确认写回的范围 range_cyclic表示循环写回,使用(address_space->writeback_index, -1), 否则使用(writeback_control->range_start, writeback_control->range_end) . 这里会构造一个extent_page_data, 指向extent_io_tree.. sync_io根据writeback_control->sync_mode, 如果是WB_SYNC_ALL, 就是同步操作.
+   - 如果是WB_SYNC_ALL, 把address_space的PAGECACHE_TAG_DIRTY变为PAGECACHE_TAG_TOWRITE, 也就是写回所有脏的..
+   > tag_pages_for_writeback(address_space, index, end)
+   - 开始处理pagecache(address_space)的page..
+   > pagevec_lookup_tag(pagevec, address_space, index, tag, PAGEVEC_SIZE ..)
+   - 遍历这些page, page->private是extent_buffer. 这里有了extent_buffer和extent_io_tree..
+   - 循环中每次是针对page, 但实际上针对extent_buffer, 如果当前page->extent_buffer和上次循环碰到的一样, 就不再处理, 所以下面提交write操作,是对一个extent提交的.
+   > lock_extent_buffer_for_io(extent_buffer, btrfs_fs_info, extent_page_data) 
+   - 锁住extent_buffer的write blocking lock,  如果同步写回,要等待extent_buffer的EXTENT_BUFFER_WRITEBACK标志. 但还要检查EXTENT_BUFFER_DIRTY, 如果有脏数据,需要设置EXTENT_BUFFER_WRITEBACK标志,并锁住page..
+   > free_extent_buffer(extent_buffer) 
+   - 如果上面不需要在写，就不再操作这个eb. 这里会比较相邻page的extent_buffer,如果使用同一个,不再继续处理. 下面处理extent_buffer不会重复..
+   > write_one_eb(extent_buffer, btrfs_fs_info, writeback_control, extent_page_data) 
+   - 上面的参数缓存了extent_page_data->bio, 提交bio是会根据是否同步,提交这个bio..
+   > pagevec_release(pagevec)
+   > flush_write_bio(extent_page_data)
+   - 最后会提交一遍extent_page_data->bio
+
+** extent_write_cache_pages(extent_io_tree, address_space, writeback_control, writepage_t, void *data, flush_fn)
+   - writepage_t是用来操作一个page, 这应该是辅助writepages实现, 和上面的函数很像，从address_space中取出要写回的page, 先锁住page, 如果是同步,刷新写操作,等待writeback. 然后使用回调函数写回page..
+   - data是extent_page_data, 里面包含extent的write的状态.. flush_fn是提交extent_page_data里面的bio, 这个bio占据某个page, 影响了别人,需要提交它，完成io，释放page.. 当然这个bio只能提交一次，提交之后这个函数就没有意义..
+   - 上面的函数看,在提交bio的过程中会锁住page, 在提交完成后释放,但这里仅仅刷新extent_page_data->bio? 就能释放page lock?? 还有其他地方锁住page??
+   - 根据writeback_control获取一个操作范围,pagecache的哪些page. 如果WB_SYNC_ALL, 就根据writeback_control->writeback_index, 否则根据writeback_control->range_start/range_end.. 还有哪类的page(PAGECACHE_TAG_TOWRITE/DIRTY)
+   > tag_pages_for_writeback(address_space, index, end)
+   - 循环处理address_space, 每次获取几个page,放到pagevec
+   > pagevec_lookup_tag(pagevec, address_space, index, tag, end, pagevec_size)
+   - 对于每个page的处理.. 先锁住page, 如果锁不住,就有别人在操作着, 需要使用回调函数刷新page状态..
+   > trylock_page(page)
+   > flush_fn(data)
+   - 提交bio, 赶紧让他释放page
+   > lock_page(page)
+   - 等待flush操作完成..
+   - 检查PG_WRITEBACK, 如果正在写回,而且不是同步操作,不再处理. 
+   > PageWriteback(page) 
+   - 否则需要等待写操作完成
+   > flush_fn(data)
+   > wait_on_page_writeback(page) 
+   - 等待别人写回..  如果还是需要写回,检查dirty标志,再次检查是否需要写回.
+   > clear_page_dirty_for_io(page)
+   - 如果不脏,就不用写回, 不需处理.
+   - 写回一个page..这个函数就是上面的__extent_writepage
+   > writepage(page, writeback_control, data)
+   - delayed inode??
+   > btrfs_add_delayed_iput(inode)
+
+** flush_epd_write_bio(extent_page_data)
+   - 提交extent_page_data->bio
+   > submit_one_bio(WRITE/WRITE_SYNC, extent_page_data->bio, 0, extent_page_data->bio_flags)
+
+** flush_write_bio(data)
+   - 看来上面的flush_fn就是这个函数,data就是extent_page_data
+   > flush_epd_write_bio(extent_page_data)
+
+** extent_write_full_page(extent_io_tree, page, get_extent_t, writeback_control)
+   - 构造extent_page_data, 写回page. 这里需要同步操作,因为extent_page_data是栈变量. 不过它也不会变成page/bio的回调变量..
+   > __extent_writepage(page, writeback_control, extent_page_data)
+   > flush_epd_write_bio(extent_page_data)
+
+** extent_write_locked_range(extent_io_tree, inode, start, end, get_extent_t, mode)
+   - 同时构造extent_page_data和writeback_control, mode很重要,他就是writeback_control->sync_mode..WB_SYNC_ALL/WB_SYNC_NONE..  这里填充writeback_control比上面复杂..上面没有构造writeback_control..
+   - 虽然构造了writeback_control，但具体的处理就是(start, end)之间的page..
+   > find_get_page(address_space, start)
+   - 检查page的dirty
+   > clear_page_dirty_for_io(page)
+   > __extent_writepage(page, writeback_control, extent_page_data)
+   - 如果不是dirty, 就不写了.. 不写就仅仅调用end_io_hook??
+   > extent_io_tree->ops->writepage_end_io_hook(page, start, end, NULL, 1)
+   > flush_epd_write_bio(extent_page_data)
+
+** extent_writepages(extent_io_tree, address_space, get_extent_t, writeback_control)
+   - 和上面的extent_write_full_page很像..构造extent_page_data, 提交请求..
+   > extent_write_cache_pages(extent_io_tree, address_space, writeback_control, __extent_writepage, extent_page_data, flush_write_bio)
+   - 注意这里的写回操作使用了__extent_writepage, 刷新函数的确是操作:extent_page_data的  (多亏我看了memery cache, 这些还算理解...)  __extent_writepage果然是上面那个变态长的函数..上面某些写回extent_buffer的函数同样被开始的一些函数调用,一会回去捋顺一下...
+   - 上面这些函数大部分都是使用extent_write_cache_pages, 不同是操作不同的范围,和方式, 构造不同的epd/writeback_control..
+
+** extent_readpages(extent_io_tree, address_space, list_head, nr_pages, get_extent_t)
+   - 遍历list_head中的page,读取page. 先把page添加到address_space的idr管理中,还有file cache的lru队列.
+   > add_to_page_cache_lru(page, address_space, index, GFP_NOFS)
+   > page_cache_release(page)
+   > __extent_read_full_page(extent_io_tree, page, get_extent_t, bio, 0, bio_flags) 
+   - 把page队列添加到bio中,它使用参数合并page到一个bio,  不能合并自己提交..
+   > submit_one_bio(READ, bio, 0, bio_flags)
+   - 这里应该好好看一下...
+
+** extent_invalidatepage(extent_io_tree, page, offset)
+   - 下面的操作和invlidate没关系, 在disk-io.c中调用..释放page时使用, 使用extent_state把page保护起来.. 没有任何page的操作??
+   > lock_extent_bits(extent_io_tree, start, end, 0, extent_state) 
+   - 锁住extent_state的EXTENT_LOCKED
+   > wait_on_page_writeback(page) 
+   - 等待写回. 这里却等待extent_buffer
+   > clear_extent_bit(extent_io_tree, start, end, EXTENT_LOCKED|EXTENT_DIRTY|EXTENT_DELALLOC|EXTENT_DO_ACCOUNTING， 1，1， ...) 
+   - 清除标志.. 写完之后就没有DIRTY/LOCKED/DELALLOC?! 这里都不用EXTENT_WRITEBACK
+
+** try_relaese_extent_state(extent_map_tree, extent_io_tree, page, gfp_t)
+   - EXTENT_IOBITS就是EXTENT_LOCK/EXTENT_WRITEBACK... 如果page在io过程中,它不能释放?? io过程使用EXTENT_LOCKED?? 释放EXTENT_LOCKED和io之外的所有标志..
+   > test_range_bit(extent_io_tree, start, end, EXTENT_IOBITS, 0, NULL)
+   - 如果有这些标志不能释放.
+   > clear_extent_bit(extent_io_tree, start, end, ~(EXTENT_LOCKED|EXTENT_NODATASUM), 0,0, NULL, mask)
+   - 把其他标志都删除,对应的也会删除那些extent_state..
+
+** try_release_extent_mapping(extent_map_tree, extent_io_tree, page, mask)
+   - 这里把extent_state和extent_map关联起来..先检查extent_state,如果没有锁住的, 就把extent_buffer释放..只有文件大小超过16M时,才释放extent_map?? 先找到extent_map
+   - 找到extent_map, 但这个范围很小, 不过只要extent_map的范围和(start,len)交叉就可, 所以这里不是严格的释放一个page.. 
+   > lookup_extent_mapping(exent_map_tree, start, len) 
+   - 如果extent_map->flags带有EXTENT_FLAG_PINNED标志,不会释放它.
+   > try_range_bit(extent_io_tree, start, extent_map_end(extent_map(extent_map)-1, EXTENT_LOCKED|EXTENT_WRITEBACK, 0,NULL)
+   - 检查是否有对应的extent_state被锁住,如果没有就可以释放掉extent_map
+   > remove_extent_mapping(extent_map_tree, extent_map)
+   > free_extent_map(extent_map)
+   - 最后清除extent_state中的状态,没有了任何状态自然就删除了extent_state
+   > try_release_extent_state(extent_map_tree, extent_io_tree, page, mask)
+   - 这里看来extent_state和extent_map没有关系..即使extent_state释放了,extent_map也可以存在.但释放extent_map时,必须检查extent_state..
+
+** get_extent_skip_holes(inode, offset, last, get_extent_t)
+   - 查找(offset, last)范围内的extent_map. 找一个不是hole的extent_map
+   > get_extent(inode, NULL, 0, offset, len, 0)
+   - len是blocksize对齐的,
+   - holde的判断条件有2个: extent_map->flags包含EXTENT_FLAG_VACANCY; extent_map->start == EXTENT_MAP_HOLE..
+   > free_extent_map(extent_map)
+
+** fiemap_extent
+   #+begin_src 
+      fe_logical, fe_physical
+      fe_length, fe_reserved
+      fe_flags, fe_reserved
+   #+end_src
+
+** fiemap_extent_info
+   #+begin_src 
+     fi_flags, fi_extents_mapped  数量
+     fi_extens_max # 数组大小
+     fiemap_extent fi_extents_start
+   #+end_src
+
+** extent_fiemap(inode, fiemap_extent_info, start, len, get_extent_t)
+   - 这是给userspace使用的辅助函数,提供数据的磁盘位置信息..
+   - 首先去btree中查找文件的位置最大的btrfs_file_extent_item, 确定文件大小. 这里不用inode->i_size,是因为preallocation..
+   > btrfs_lookup_file_extent(NULL, btrfs_root, btrfs_path, btrfs_inode, -1,0)
+   - 这个函数返回的信息给btrfs_path, 在btree中找文件的数据extent, 使用的key是-1..注释说不使用文件大小,而是使用磁盘中数据.
+   > btrfs_item_ptr(btrfs_path->nodes[0], btrfs_path->slots[0], btrfs_file_extent_item) 
+   - 奇怪的地方, btrfs_path肯定会返回下一个key, 应该没有-1对应的btrfs_key, 然后btrfs_path->slots[0]--, 为何没有检查slots[0]是0..
+   - 根据path获取btrfs_file_extent_item, 检查btrfs_key的objectid/type,如果不是inode/BTRFS_EXTENT_DATA_KEY,说明磁盘中没有相关数据,这个文件现在的属于delalloc的数据..使用inode->i_size.
+   > btrfs_item_key_to_cpu(path->nodes[0], found_key, path->slots[0]) 
+   > lock_extent_bits(extent_io_tree, start, len, 0, extent_state)
+   - 锁住extent_state, 开始查找extent信息.. 首先跳过hole extent, 但就这一个吗?
+   > get_extent_skip_holes(inode, start, last_for_get_extent, get_extent_t) 
+   - 找到一个extent_map, 获取extent_map的start, 这是文件偏移,确认磁盘位置偏移... extent_map->block_start 是磁盘位置,处理它的特殊值, EXTENT_MAP_LAST_BYTE表示最后一个extent, EXTENT_MAP_INLINE, EXTENT_MAP_DELALLOC..
+   > fiemap_fill_next_extent(fiemap_extent_info, em_start, disko, em_len, flags)
+   - 把上面的信息给fiemap_extent, 继续查找.
+   > free_extent_map(extent_map)
+   > unlock_extent_cached(...)
+   - 这些信息使用extent_state获取不了,看看fiemap_extent->fe_flags.. 如果extent_map->block_start = EXTENT_MAP_LAST_BYTE,对应FIEMAP_EXTENT_LAST, EXTENT_MAP_INLINE对应FIEMAP_EXTENT_DATA_INLINE|FIEMAP_EXTENT_NOT_ALIGNED, EXTENT_MAP_DELALLOC对应FIEMAP_EXTENT_DELALLOC|FIEMAP_EXTENT_UNKNOWN, 这些不正常的都获取不到磁盘位置...
+  
+** __free_extent_buffer(extent_buffer)
+   - 释放extent_buffer->pages,如果不使用内部的数组...使用kmem_cache...
+  
+** __alloc_extent_buffer(extent_io_tree, start, len, mask)
+   - extent_buffer的内存使用extent_buffer_cache, 它关联extent_io_tree
+
+** btrfs_clone_extent_buffer(extent_buffer)
+   - 深度复制extent_buffer, 创建extent_buffer,同时分配内存page, 复制数据到新的page上..
+   > __alloc_extent_buffer(...)
+   > alloc_page(GFP_ATOMIC)
+   > attach_extent_buffer_page(extent_buffer, page)
+   > SetPageUptodate(page)
+   > copy_extent_buffer(extent_buffer, extent_buffer, ....)
+   - 设置EXTENT_BUFFER_UPTODATE / EXTENT_BUFFER_DUMMY
+
+** alloc_dummy_extent_buffer(start, len)
+   - dummy什么意义? 没有关联extent_io_tree.  这是被用的btree中的节点extent
+   > __alloc_extent_buffer(NULL, start, len, GFP_ATOMIC)
+   - 创建extent_buffer, 分配page, 设置EXTENT_BUFFER_DUMMY, 设置EXTENT_BUFFER_UPTODATE, 还有PageUptodate..
+   > set_extent_buffer_uptodate(extent_buffer)
+   - 没有初始化btrfs_header, 仅仅设置节点的item个数..
+   > btrfs_set_header_nritmes(extent_buffer, 0)
+  
+** extent_buffer_under_io(extent_buffer)
+   - 检查extent_buffer是否在io过程中??  extent_buffer->io_pages > 0, EXTENT_BUFFER_WRITEBACK/EXTENT_BUFFER_DIRTY.  DIRTY也在io过程中?? 哪里设置的DIRTY标志.
+
+** btrfs_release_extent_buffer_page(extent_buffer, long start_idx)
+   - 如果extent_buffer->bflags带有EXTENT_BUFFER_DUMMY, 它是一个没有和btree 磁盘映射的..也就是它的page不是btree inode.. 正常的page从pagecache中来..
+   - 释放extent_buffer的page, 从第start_idx开始释放,处理是必须保证page在extent_buffer中
+   > extent_buffer_page(extent_buffer, index)
+   - page->private_data=> exent_buffer 是当前处理的extent_buffer, 而且保证当前page不能有PageDirty/PageWriteback, 不能在io过程中.. 这里只有page操作...
+   > set_page_private(page, 0)
+   > page_cache_release(page)
+  
+** btrfs_release_extent_buffer(extent_buffer)
+   - 释放page, 再释放本身. 
+   > btrfs_release_extent_buffer_page(extent_buffer, 0)
+   > __free_extent_buffer(extent_buffer)
+
+** check_buffer_tree_ref(extent_buffer)
+   - 处理extent_buffer的EXTENT_BUFFER_TREE_REF, 设置这个标志设置, 如果原来没有增加refs. 在extent_buffer被访问,或设置EXTENT_BUFFER_DIRTY标志时会设置. 
+   > test_and_set_bit(EXTENT_BUFFER_TREE_REF, extent_buffer->bflags)
+   - 这里先返回原来的值(value!=0),之前还以为(value==0), 理解都错了!!
+
+** makr_extent_buffer_accessed(extent_buffer)
+   - 当extent_buffer被访问时,设置对应的page的标志,会影响他们在lru队列中的位置. 这个函数在查找函数中使用到..
+   > check_buffer_tree_ref(extent_buffer) 
+   > num_extent_pages(extent_map, i)
+   > mark_page_accessed(page)  
+   - 修改page的标志...
+
+** alloc_extent_buffer(extent_io_tree, start, len)
+   - extent_io_tree中使用radix tree管理extent_buffer, 根据extent_buffer的起始位置索引. 
+   > radix_tree_lookup(extent_io_tree->buffer, start>>PAGE_CACHE_SIZE) 
+   - 如果找到一个extent_buffer就是返回这个
+   > __alloc_extent_buffer(extent_io_tree, start, len, GFP_NOFS)
+   > find_or_create_mapping(address_space, index, GFP_NOFS)
+   - 在pagecache中创建对应的page. 检查extent_buffer->refs, 如果有别人使用,这个extent_buffer分配失败. 在分配page是,可能找到page被别的extent_buffer使用, 增加extent_buffer的计数. 怎么会有extent的交叉? 返回碰到的这个extent_buffer..当然如果那个extent_buffer->refs为0,就仍然使用这个page
+   > ClearPagePrivate(page)
+   > attach_extent_buffer_page(extent_buffer, page)
+   > mark_page_accessed(page)
+   > radix_tree_insert(...)
+   > unlock_page(page)
+
+** find_extent_buffer(extent_io_tree, start, len)
+   - 从radix tree中查找extent_buffer.. len没有用到, extent_buffer管理很死,它需要固定的管理pages, 不像extent_state..
+   > mark_extent_buffer_accessed(extent_buffer)
+
+** release_extent_buffer(extent_buffer, gfp_t)
+   - 这里包装btrfs_release_extent_buffer, 因为要处理EXTENT_BUFFER_DUMMY, 它表示extent_buffer是否在extent_io_tree管理中..
+   > radix_tree_delete(extent_io_tree->buffer, ...)
+   > btrfs_release_extent_page(extent_buffer, 0)
+   - 异步释放extent_buffer
+
+** free_extent_buffer(extent_buffer)
+   - 根据extent_buffer->refs释放extent_buffer, 得先减小extent_buffer->refs..使用原子操作修改计数..
+   > atomic_cmpxchg(extent_buffer->refs, refs, refs-1)
+   - 然后检查extent_buffer的EXTENT_BUFFER_DUMMY|EXTENT_BUFFER_STALE|EXTENT_BUFFER_TREE_REF标志..
+   > release_extent_buffer(extent_buffer, GFP_ATOMIC)
+
+** free_extent_buffer_stale(extent_buffer)
+   - 设置EXTENT_BUFFER_STALE, 释放..
+   > release_extent_buffer(extent_buffer, GFP_NOFS)
+   - 为何这么多free???
+
+** clear_extent_buffer_dirty(extent_buffer)
+   - 首先检查PG_DIRTY,再清除address_space中对应的标志PAGECACHE_TAG_DIRTY. 
+   > clear_page_dirty_for_io(page)
+   - 一般在writeback时使用它, 而且它不修改PAGECACHE_TAG_DIRTY, 因为io任务会根据它写回数据..但这里明显不是为io准备的..??
+   > radix_tree_tag_clear(page->address_space->page_tree, ..)
+   > unlock_page(..)
+   - 修改它需要锁住page..
+
+** set_extent_buffer_dirty(extent_buffer)
+   - 设置extent_buffer的EXTENT_BUFFER_DIRTY, 然后是每个page的
+   > extent_buffer_page(extent_buffer, i)
+   > set_page_dirty(page)
+   - 这个函数信息量很大,设置pagecache, inode..甚至buffer
+
+** range_straddles_page(start, len)
+   - 开始位置和终止位置是否页对齐.. 如果有不对齐的返回1
+
+** clear_extent_buffer_uptodate(extent_buffer)
+   - 清除extent_buffer->bflags的EXTENT_BUFFER_UPTODATE
+   > ClearPageUptodate(page)
+
+** set_extent_buffer_uptodate(extent_buffer)
+   - 设置EXTENT_BUFFER_UPTODATE
+   > SetPageUptodate(page)
+   - 为何这里的操作反而简单,没有和extent_state任何关系..
+
+** extent_range_uptodate(extent_io_tree, start, len)
+   - 检查extent是否uptodate,如果地址没有页对齐,使用extent_state,否则使用page..但是extent_state检查不出来,也会使用page.. 因为extent_state没有相关信息?!
+   > range_straddles_pages(..)
+   > test_range_bit(extent_io_tree, start, end, EXTENT_UPTODATE, 1, NULL)
+   - 从pagecache中获取page
+   > find_get_page(address_space, index)
+   - 如果找不到page, 说明uptodate,因为extent还在磁盘中..
+
+** extent_buffer_uptodate(extent_buffer)
+   - 检查extent_buffer->bflags的EXTENT_BUFFER_UPTODATE
+   - page/extent_state/extent_buffer这三个数据怎么一致??
+
+** read_extent_buffer_pages(extent_io_tree, extent_buffer, start, wait, get_extent_t, mirror_num)
+   - 读回extent_buffer的数据,根据start表示读取的范围. start/extent_buffer->start是文件偏移,根据它获取要读取的page
+   - 首先检查EXTENT_BUFFER_UPTODATE,如果没有,锁住读取的page,检查PG_UPTODATE,如果没有读取page,最后等待结果使用PG_locked.
+   - wait可能是WAIT_NONE/WAIT_COMPLETE/WAIT_PAGE_LOCK
+   - WAIT_NONE表示开始锁page时,如果不成功就返回
+   - WAIT_COMPLETE表示提交io后,等待PG_locked,等待完成
+   - WAIT_PAGE_LOCK表示提交io后,不等待结果
+   - 检查EXTENT_BUFFER_UPTODATE
+   > test_bit(EXTENT_BUFFER_UPTODATE, extent_buffer->bflags)
+   - 遍历对应的page, 锁住page,可能等待PG_locked
+   - 检查PG_uptodate. 如果extent_buffer的所有page都有PG_uptodate,设置extent_buffer->bflags的EXTENT_BUFFER_UPTODATE
+   - 如果没有,清除EXTENT_BUFFER_UPTODATE
+   > clear_bit(EXTENT_BUFFER_UPTODATE, extent_buffer->bflags)
+   - 帧读没有PG_uptodate的page,提交io..
+   > __extent_read_full_page(extent_io_tree, page, get_extent_t, bio, mirror_num...)  
+   > submit_one_bio(READ, bio, mirror_num, bio_flags)
+   - 如果不需要等待就返回,否则等待
+   > wait_on_page_locked(page)
+
+** read_extent_buffer(extent_buffer, void, start, len) 
+   - 把extent_buffer的数据读到void内存中. extent_buffer中的数据都是准备好的.. 读的时候需要映射page, 注意start, 计算页内偏移.
+
+** map_private_extent_buffer(extent_buffer, start, min_len, mmap, map_start, map_len)
+   - 把extent_buffer的页映射到指针..
+
+** write_extent_buffer(extent_buffer, void, start, len) / memset_extent_buffer
+   - 把数据从void内存搬到extent_buffer中..
+   > copy_extent_buffer()
+
+** copy_pages(page, page, offset, ...)
+   - memmove(...) 和 memcpy(...)不一样..
+
+** try_release_extent_buffer(page, mask)
+   - 检查PagePrivate, 如果没有设置没什么可做..获取extent_buffer, 如果extent_buffer->refs=1, 释放它, 否则不处理??!!
+   - 这里就使用到了EXTENT_BUFFER_TREE_REF, 如果没有这个标志, 是不会处理..
+   > release_extent_buffer(extent_buffer, mask)
+
+** 总结
+   - 这里的函数不是一般的乱, 基本无法整理!! 可以看这个文件导出的函数,也就是非static的函数..
+   - 但挑出来非static的函数,可以清楚一下. 这个文件主要分为3个部分,最上面是extent_state的管理, 中间是io的管理,最后是extent_buffer的使用,为btree提供服务,访问btree的数据.
+   - pagecache的读: readpages, 读还是比较简单,错误处理复杂一些. 这里使用的接口是extent_io_tree->ops->readpage_end_io_hook, 检查读回来的数据..
+   #+begin_src 
+     //这个函数是address_space_operations->readpages
+     btrfs_readpages(file, address_space, list_head, nr_pages)
+         //获取inode使用的extent_io_tree, 还有get_extent函数是inode独有的..
+	 //遍历链表上的page, 对每个page提交bio..
+         extent_readpages(extent_io_tree, address_space, pages, nr_pages, btrfs_get_extent)
+	     //get_extent往下传, 这里的参数只有page. 过程是根据extent_map获取磁盘信息,如果是hole/prealloc, 就不再读取; 而且通过exteent_state的EXTENT_UPTODATE同步数据, 提交bio.  这里要锁住extent_state.  
+	     //倒数第2个参数是mirror_num, 这里是0..
+	     __extent_read_full_page(extent_io_tree, page, get_extent, bio, 0, bio_flags)
+		 get_extent(inode, page, pg_offset, cur, len, 0)
+	         // 参数虽然多,但没什么可解释的..
+		 //创建bio, 把page加到bio中,提交bio..
+	         submit_extent_page(READ, extent_io_tree, page, sector, disk_io_size, pg_offset, block_device, pnr, end_bio_extent_readpage, mirror_num, bio_flags, this_bio_flags)
+		     btrfs_bio_alloc(block_device, sector, nr, GFP_NOFS)
+		     bio_add_page(bio, page, page_size, offset)
+		     //使用extent_io_tree->ops->submit_bio_hook, 当然如果没有,就直接使用submit_bio. 有2套,一个是btree, 一个是普通inode..
+		     submit_one_bio(rw, bio, mirror_num, prev_bio_flags)
+	//继续看bio回调函数, 这里还没看到那里释放extent_state的锁..
+	//bio已经完成,这里的工作是检查结果,处理错误,修改数据管理状态, extent/page的lock/uptodate
+	//参数是bio, 但是处理bio->bi_vec.. 比较复杂..
+	end_bio_extent_readpage(bio, error)
+	    //首先找到锁住的extent..
+	    find_first_extent_bit_state(extent_io_tree, start, EXTENT_LOCKED)
+	    // 如果没有错误, bio->bi_flags包含BIO_UPTODATE, 回调..检查读回来的数据..
+	    extent_io_tree->ops->readpage_end_io_hook(page, start, end, state, mirror)
+	    clean_io_failure(start, page)
+	        //从extent_state中获取io_failure_record, 然后提交一个write bio..
+	        repair_io_failure(extent_fs_info, start, len, ...)
+	    // 如果有错误,检查回调extent_io_tree->ops->readapge_io_failed_hook, 只有btree read提供这个接口..
+	    extent_io_tree->ops->readpage_end_io_failed_hook
+	    // 使用默认的错误处理函数...
+	    bio_readpage_error(bio, page, start, end, mirror, NULL)
+	        //这种处理还挺多的, 记录错误在btrfs_inode的2个extent_io_tree中,然后再提交bio, 在其他mirror读取数据..
+	    // 没有错误的话,检查extent/page的状态.
+	    set_extent_uptodate(extent_io_tree, start, end, ...)
+	    unlock_extent_cached(extent_io_tree, start, end, ...)
+	    // 下面姑且都使用extent_state同步page的状态..
+	    check_page_uptodate(extent_io_tree, page)
+	    check_page_locked(extent_io_tree, page)
+   #+end_src
+
+   - pagecache的读: readpage  btrfs_readpage  普通inode使用的..
+     #+begin_src 
+         btrfs_readpage(file, page)
+	     //下面的函数调用了上面的一部分.
+	     extent_read_full_page(extent_io_tree, page, btrfs_get_extent, 0)
+	         __extent_read_full_page(extent_io_tree, get_extent, bio, mirror_num, bio_flags)
+     #+end_src
+		 
+   - pagecache的读: readpage btree_readpage, 这是btree的读..
+     #+begin_src 
+         //和上面的区别是使用不同的get_extent??
+         btree_readpage
+	     extent_read_full_page(extent_io_tree, page, btree_get_extent, 0)
+     #+end_src
+
+   - pagecache的write: writepages, 这是普通inode使用的,这里使用3个回调函数接口.
+     #+begin_src 
+     // 这个函数是address_space_operations->writepages, 在inode中使用.. 
+     // 奇怪参数和readpage不一样..
+     btrfs_writepages(address_space, writeback_control)
+         //构造extent_page_data, 里面有extent_io_tree, get_extent等信息..而且提供2个回调函数,还一个参数..
+         extent_writepages(extent_io_tree, address_space, get_extent_t, writeback_control)
+	     //数据操作范围在writeback_control中
+	     extent_write_cache_pages(extent_io_tree, address_space, writeback_control, __extent_writepage, extent_page_data, flush_write_bio)
+	     //需要锁住page?? 奇怪, 如果有互斥,需要刷新回调函数
+	     trylock_page(page)
+	     flush_fn(data)
+	         //这里刷新extent_page_data, 提交extent_page_data->bio
+		 flush_write_bio(extent_page_data)
+	     //等待PG_WRITEBACK
+	     wait_on_page_writeback(page)
+	     // 单独处理一个page的函数.
+	     __extent_writepage(page, writeback_control, extent_page_data)
+	         //首先处理delalloc
+		 extent_io_tree->ops->fill_delalloc(inode, page, ...)
+		 extent_io_tree->ops->writepage_start_hook(page, start, page_end)
+		 extent_page_data->get_extent(inode, page, pg_offset, cur, len, 1)
+		 extent_io_tree->ops->writepage_io_hook(page, cure, len)
+		 submit_extent_page(write_flags, extent_io_tree, page, sector, iosize, pg_offset, block_device, bio, max_nr, end_bio_extent_writepage, 0, 0, 0)
+		 // 这里会释放page lock
+		 unlock_page(page)
+
+	//写的回调函数
+	end_bio_extent_writepage
+	    end_extent_writepage(page, err, start, end)
+	        extent_io_tree->ops->writepage_end_io_hook(page, start, end, NULL, uptodate)
+	    //释放page的writeback锁..
+	    check_page_writeback(extent_io_tree, page)
+     #+end_src
+
+   - pagecache的写: writepage:  btrfs_writepage, 普通inode使用
+     #+begin_src 
+        btrfs_writepage(page, writeback_control)
+	   //处理PF_MEMALLOC??  分配内存就不写回了??
+	   //构造extent_page_data, 不会像上面一样有那么多的flash操作.. bio的刷新工作和上面不一样.
+	   extent_write_full_page(extent_io_tree, page, btrfs_get_extent, writeback_control)
+	       __extent_writepage(page, writeback_control, extent_page_data)
+	       flush_epd_write_bio(extent_page_data)
+     #+end_src
+	       
+   - pagecache的写, writepages: btree_writepages, btree使用的.
+     #+begin_src 
+     //如果不是sync操作(WB_SYNC_NONE),就不一定必须写回数据..检查btrfs_fs_info->dirty_metadata_bytes, 是否超过32M  
+     btree_writepages(address_space, writeback_control)
+         //这个函数和extent_writepages/btrfs_writepages有些类似, 但它处理bio更直接.
+         btree_write_cache_pages(address_space, writeback_control)
+	     //检查writeback_control, 获取数据范围..
+	     pagevec_lookup_tag(pagevec, address_space, index, tag)
+	     //这个锁是上面没有的,它要锁住extent_buffer, blocking write锁,EXTENT_BUFFER_WRITEBACK, 还有page的锁..
+	     lock_extent_buffer_for_io(extent_buffer, btrfs_fs_info, extent_page_data)
+	     //提交整个extent的bio..下面只会有PG_WRITEBACK的标志操作,提交io后,释放PG_locked
+	     write_one_eb(extent_buffer, btrfs_fs_info, writeback_control, extent_page_data)
+	         submit_extent_page(rw, extent_buffer->extent_io_tree, page, sector, PAGE_CACHE_SIZE, 0, block_device, bio, -1, end_bio_extent_buffer_writepage, 0, bio_falgs, ...)
+		 
+	//回调函数, 检查extent_buffer->io_pages, 唤醒PG_WRITEBACK..
+	end_bio_extent_buffer_writepage
+	    end_page_writeback(page)
+	    end_extent_buffer_writeback(extent_buffer)
+	
+     #+end_src
+
+   - 对于剩下的是extent_buffer的操作,在btree的操作中会用得到..
+
+* extent_map.c
+   extent_map表示磁盘块block和某种单一空间的映射. 它和extent_buffer很像, 这里还有block_device
+   (start,len) <=> (block_start, block_len)
+
+** extent_map
+   #+begin_src 
+      rb_node rb_node
+      u64 start, len           //文件偏移
+      mod_start, mod_len  
+      orig_start, orig_block_len, 
+      block_start, block_len   //磁盘偏移
+      u64 generation
+      block_device bdev
+      atomic_t refs
+      int in_tree, compress_type
+      list_head list  #对应extent_map_tree->modified_extents
+   #+end_src
+
+** extent_map_tree  
+   #+begin_src 
+      rb_troo map    #管理extent_map->rb_node, 根据(start,len)
+      list_head modified_extents
+      rwlock_t lock
+   #+end_src
+
+   - 树中key是根据extent_map->start决定的,(start, start+len), extent_map是不能覆盖的,如果要查找offset的rbnode, 
+      - offset < start     -> left node
+      - offset > start+len -> right node
+
+   - 这里就是一个rbtree的管理，标准的rbtree应该有相应的实现?!
+   - extent_map使用extent_map_cache / kmem_cache管理.
+
+** tree_insert(rb_root, offset, rb_node)
+   - 这些实现和extent-io.c中很象,为何不公用?? 其实还有好多别的实现..  根据offset插入节点rb_root
+
+** __tree_search(rb_root, offset, rb_node, rb_node)
+   - 查找节点,如果找不到,就找出2个临近的..  offset < extent_map->end, 和 offset>extent_map->start
+
+** mergable_maps(extent_map, extent_map next)
+   - 首先比较extent_map->flags, 然后看块地址是否连续.. 
+   - EXTENT_FLAG_PINNED   还没写到磁盘中
+   - EXTENT_FLAG_COMPRESSED
+   - EXTENT_FLAG_VACANCY   # 空白??没有对应的file extent
+   - EXTENT_FLAG_PREALLOC  # pre-alloc, 读这种extent_map, 不能读回数据..
+   - EXTENT_FLAG_LOGGING   # log
+   - EXTENT_FLAG_FILLING   # filling??
+   - 块地址还有特殊值: 
+   - EXTENT_MAP_LAST_BYTE
+   - EXTENT_MAP_HOLE      #两个extent_map都是下面的地址也可合并
+   - EXTENT_MAP_INLINE 
+   - EXTENT_MAP_DELALLOC
+
+** try_merge_map(extent_map_tree, extent_map)
+   - 尝试合并挨着的extent_map, 修改start,block_start, orig_start, mod_start等等.. 把被合并的删除,合并的加到modified_extents中
+   > rb_erase(..)
+   > free_extent_map(extent_map)
+
+** unpin_extent_cache(extent_map_tree, start, len, gen)
+   - 在extent写到磁盘后使用, gen用于fsync中使用.. 下面的函数在下面实现..找一个extent_map, 设置generation, 把(start,len)放到(mod_start, mod_len)..  还有flags的设置,如果有EXTENT_FLAG_FILLING改为prealloc..  清除EXTENT_FLAG_PINNED标志.
+   > lookup_extent_mapping(extent_map_tree, start, len)
+   > try_merge_map(extent_map_tree, extent_map)
+   > free_extent_map(extent_map)
+
+** clear_em_logging(extent_map_tree, extent_map)
+   - 清除EXTENT_FALG_LOGGING
+   > try_merge_map(extent_map_tree, extent_map)
+
+** add_extent_mapping(extent_map_tree, extent_map)
+   - 把extent_map插到extent_map_tree中,先查找一下
+   > lookup_extent_mapping(extent_map_tree, start, len)
+   > tree_insert(...)
+   > try_merge_map(extent_io_tree, extent_map)
+
+** __lookup_extent_mapping(extent_map_tree, start, len, strict)
+   - 找一个extent_map, 而且增加它的计数, 如果strict不为1, 使用临近的..
+
+** lookup_extent_mapping(extent_map_tree, start, len)
+   - 找一个extent_map,  和(start,len)一致..
+
+** search_extent_mapping(extent_map_tree, start, len)
+   > __lookup_extent_mapping(extent_map_tree, start, len, 0)
+
+** remove_extent_mapping(extent_map_tree, extent_map)
+   - 删除extent_map.  释放rb_tree和list的关系..
+
+   - 上面主要是三个结构extent_state, extent_buffer, extent_map, 这三个应该主要处理文件数据, extent_state管理extent的状态,用于同步,锁等, extent_map用于数据磁盘信息的管理,这里应该是逻辑空间.extent_buffer是和page同步,管理io过程中的extent状态...
+
+* locking.c
+  - 介绍extent_buffer的锁..
+
+** extent_buffer
+   #+begin_src 
+	u64 start;
+	unsigned long len;
+	unsigned long map_start;
+	unsigned long map_len;
+	unsigned long bflags;
+	struct extent_io_tree *tree;   //它和extent_state为什么分开? 因为page无法extent_state中管理,还有别的??  
+	spinlock_t refs_lock;
+	atomic_t refs;
+	atomic_t io_pages;  //它主要用于io?
+	int read_mirror;
+	struct list_head leak_list;
+	struct rcu_head rcu_head;
+	pid_t lock_owner;
+
+	/* count of read lock holders on the extent buffer */
+	atomic_t write_locks;
+	atomic_t read_locks;
+	atomic_t blocking_writers;  //这个能保证不超过1,多余的锁在read队列上等
+	atomic_t blocking_readers;  //和上面一样
+	atomic_t spinning_readers;  
+	atomic_t spinning_writers;  //这里怎么能保证不冲突??
+	int lock_nested;  //和lock_owner对应..
+
+	/* protects write locks */
+	rwlock_t lock;    //保护这个数据结构..
+
+	/* readers use lock_wq while they wait for the write
+	 * lock holders to unlock
+	 */
+	wait_queue_head_t write_lock_wq;
+
+	/* writers use read_lock_wq while they wait for readers
+	 * to unlock
+	 */
+	wait_queue_head_t read_lock_wq;
+	wait_queue_head_t lock_wq;  //哪里使用??
+	struct page *pages[INLINE_EXTENT_BUFFER_PAGES];
+   #+end_src
+
+** btrfs_set_lock_blocking_rw(extent_buffer, rw)
+   - rw这里为BTRFS_WRITE_LOCK/BTRFS_READ_LOCK, 还有2种是BTRFS_WRITE_LOCK_BLOCKING/BTRFS_READ_LOCK_BLOCKING..
+   - 检查extent_buffer->lock_nested, 如果有效,说明有人什么?? 检查extent_buffer->lock_owner, 如果是current, 就不再锁..
+   - 对于BTRFS_WRITE_LOCK, 如果extent_buffer->blocking_writers为0,才能加锁?
+   - 减小extent_buffer->spinning_writers, 增加extent_buffer->block_writers
+   - 对于BTRFS_READ_LOCK, 只增加extent_buffer->blocking_readers, 减小extent_buffer->spinning_readers..
+
+** btrfs_clear_lock_blocking_rw(extent_buffer, rw)
+   - 和上面类似,rw是BTRFS_WRITE_LOCK_BLOCKING/BTRFS_READ_LOCK_BLOCKING..
+   - 检查extent_buffer->lock_nested, 如果current是extent_buffer->lock_owner, 没有操作..
+   - 对于BTRFS_WRITE_LOCK_BLOCKING, 增加extent_buffer->spinning_writers, 减小extent_buffer->blocking_writers, 如果减到0, 就唤醒extent_buffer->write_lock_wq队列..
+   - 对于BTRFS_READ_LOCK_BLOCKING, 增加extent_buffer->spinning_readers,减小extent_buffer->blocking_readers, 如果减到0,唤醒extent_buffer->read_lock_wq队列..
+
+** btrfs_tree_read_lock(extent_buffer)
+   - 函数名字还是锁的tree?? 应该锁extent..   获取spinning read lock?
+   - 如果有write锁, extent_buffer->blocking_writers有效,检查是不是自己锁的,如果是就设置extent_buffer->lock_nested标志,然会退出..
+   - 如果不是自己锁的,在extent_buffer->write_lock_wq队列上等待..
+   - 如果没有write锁,增加extent_buffer->read_locks / extent_buffer->spinning_readers
+
+** btrfs_try_tree_read_lock(extent_buffer)
+   - 尝试加锁,先检查extent_buffer->blocking_writers, 如果不为0, 返回失败, 因为有读锁..
+   - 增加extent_buffer->read_locks, spinning_readers..
+   - 难道锁还有2步??
+
+** btrfs_try_tree_write_lock(extent_buffer)
+   - 尝试加写锁.. 和上面类似,不过要检查的条件是extent_buffer->blocking_writers和blocking_readers..
+   - 增加extent_buffer->write_locks和extent_buffer->spinning_writers
+   - 设置extent_buffer->lock_owner为current..
+
+** btrfs_tree_read_unlock(extent_buffer)
+   - 首先检查lock_nested, 反正只能嵌套1次,如果有嵌套就把lock_nested设为0, 直接退出.. 
+   - 没有检查?? 直接减小extent_buffer->read_locks / spinning_readers
+   - 这里是spin lock.
+
+** btrfs_tree_read_unlock_blocking(extent_buffer)
+   - 操作block lock..
+   - 先检查extent_buffer->lock_nested...
+   - 减小extent_buffer->blocking_readers, 如果减到0, 唤醒extent_buffer->read_lock_wq,  减小extent_buffer->read_locks..
+
+** btrfs_tree_lock(extent_buffer)
+   - 添加spin write lock, 它要等待blocking readers和blocking writers..检查extent_buffer->blocking_readers或者extent_buffer->blocking_writers
+   > wait_event(extent_buffer->read_lock_rq, extent_buffer->blocking_readers=1)
+   > wait_event(extent_buffer->write_lock_rq, extent_buffer->blocking_writers=1)
+   - 增加extent_buffer->spinning_writers, 和extent_buffer->write_locks, 设置extent_buffer->lock_owner
+
+** btrfs_tree_unlock(extent_buffer)
+   - 释放一个spinning或者blocking write lock..
+   - 减小extent_buffer->write_locks.. 
+   - 如果extent_buffer->blocking_writers有效,就要释放blocking write lock..减小extent_buffer->blocking_writers, 唤醒extent_buffer->write_lock_wq..
+   - 否则就减小extent_buffer->spinning_writers
+
+** btrfs_tree_unlock_rw(extent_buffer, rw)
+   - 对于writer, spinning/blocking使用一个函数..
+   > btrfs_tree_unlock(extent_buffer)
+   - 对于spinning read
+   > btrfs_tree_read_unlock(extent_buffer)
+   - 对于blocking read 
+   > btrfs_tree_read_unlock_blocking(extent_buffer)
+
+** btrfs_set_lock_blocking(extent_buffer)
+   - 这是把spinning锁变为blocking锁
+   > btrfs_set_lock_blocking_rw(extent_buffer, BTRFS_WRITE_LOCK)
+
+** btrfs_clear_lock_blocking(extent_buffer)
+   - 这里把blocking锁变为spinning锁..
+   > btrfs_clear_lock_blocking_rw, extent_buffer, BTRFS_WRITE_LOCK_BLOCKING)
+
+   - 这里的锁都是操作btree的节点extent..
+
+   - 这里锁分成2步,先添加spinning lock, 然后升级为blocking lock..在spinning lock时仅仅判断blocking lock?? 这里还有什么意义? 应该还有其他检查..
+
+
+
+
+* 总结
+  - extent_map的过程
+
+  - extent_state的过程 
+  - extent_buffer的过程

@@ -1,0 +1,826 @@
+* lowcomms.c
+  - low-level comms
+  - 使用tcp/stcp发送信息
+
+** cbuf
+   #+begin_src 
+	unsigned int base;
+	unsigned int len;
+	unsigned int mask;   
+   #+end_src
+
+** connection
+   #+begin_src 
+	struct socket *sock;	/* NULL if not connected */
+	uint32_t nodeid;	/* So we know who we are in the list */
+	struct mutex sock_mutex;
+	unsigned long flags;
+#define CF_READ_PENDING 1
+#define CF_WRITE_PENDING 2
+#define CF_CONNECT_PENDING 3
+#define CF_INIT_PENDING 4
+#define CF_IS_OTHERCON 5
+#define CF_CLOSE 6
+#define CF_APP_LIMITED 7
+	struct list_head writequeue;  /* List of outgoing writequeue_entries */
+	spinlock_t writequeue_lock;
+	int (*rx_action) (struct connection *);	/* What to do when active */
+	void (*connect_action) (struct connection *);	/* What to do to connect */
+	struct page *rx_page;
+	struct cbuf cb;
+	int retries;
+#define MAX_CONNECT_RETRIES 3
+	int sctp_assoc;
+	struct hlist_node list;
+	struct connection *othercon;
+	struct work_struct rwork; /* Receive workqueue */
+	struct work_struct swork; /* Send workqueue */
+	bool try_new_addr;   
+   #+end_src
+
+** waitqueue_entry
+   #+begin_src 
+	struct list_head list;
+	struct page *page;
+	int offset;
+	int len;
+	int end;
+	int users;
+	struct connection *con;   
+   #+end_src
+
+** dlm_node_addr
+   #+begin_src 
+	struct list_head list;
+	int nodeid;
+	int addr_count;
+	int curr_addr_index;
+	struct sockaddr_storage *addr[DLM_MAX_ADDR_COUNT];   
+   #+end_src
+
+** __find_con(nodeid)
+   - 使用hash表管理所有的connection
+   - 根据nodeid计算hash值
+   > nodeid_hash(nodeid)
+   - 遍历对应的hash链表, 比较connection->nodeid == nodeid
+
+** __nodeid2con(nodeid, alloc)
+   - alloc表示没有对应的connection时,是否创建
+   - 先在hash表中查找
+   > __find_con(nodeid)
+   - 如果找不到,而且alloc ==1, 创建一个新的
+   - 把它放到hash表中
+   - nodeid=0对应什么connection, 把它的connection->connect_action/rx_action复制过来
+
+** foreach_conn(conn_func)
+   - 遍历hash表中的所有connection, 调回回调函数
+   > conn_func(connection)
+
+** nodeid2con(nodeid, allocation)
+   - 根据nodeid查找connection
+
+** assoc2con(assoc_id)
+   - 遍历所有的connection, 比较connection->sctp_assoc == assoc_id
+
+** find_node_addr(nodeid)
+   - dlm_node_addrs队列里面是dlm_node_addr, 查找dlm_node_addr->nodeid == nodeid
+
+** addr_compare(sockaddr_storage x, y)
+   - 比较ip地址和port端口
+
+** nodeid_to_addr(nodeid, sockaddr_storage sas_out, sockaddr sa_out, try_new_addr)
+   - 根据nodeid找到dlm_node_addr, 获取它的地址信息
+   > find_node_addr(nodeid)
+   - dlm_node_addr->addr数组保存多个地址,个数是addr_count, 当前使用的是curr_addr_index
+   - 这里要把当前指向的sockaddr_storage拷给sas_out, 把ip地址给sa_out
+   - 如果try_new_addr ==1, 先增加connection->curr_addr_index
+
+** addr_to_nodeid(sockaddr_storage, nodeid)
+   - 这里根据sockaddr找到对应的nodeid
+   - 遍历dlm_node_addr, 然后遍历每个dlm_node_addr的sockaddr_storage
+   > addr_compare(sockaddr_sotrage, sockaddr_storage)
+
+** dlm_lowcomms_addr(nodeid, sockaddr_storage, len)
+   - 根据nodeid创建一个dlm_node_addr, 把sockaddr_storage给它
+   - 需要查找,是否已经存在
+   > find_node_addr(nodeid)
+   - 如果找不到,就把新的放到dlm_node_addrs链表中
+   - 如果找到了,就把sockaddr_storage放到dlm_node_addr->addr数组中
+
+** lowcomms_data_ready(sock, count_unused)
+   - sock->sk_user_data指向connection
+   - 把connection->rwork放到recv_workqueue中执行
+
+** lowcomms_write_space(sock)
+   - 这是发送数据?
+   - 清除connection->flags的CF_APP_LIMITED标志
+   - 这个谁设置的?? 同时去掉 connection->socket->flags的CF_WRITE_PENDING
+   - 设置connection->flags的CF_WRITE_PENDING标志, 并且把connection->swork放到send_workqueue中
+
+** lowcomms_connect_sock(connection)
+   - 这是什么函数?
+   - 如果connection->flags & CF_CLOSE !=0, 立即返回. connection已经关闭
+   - 设置connection->flags的CF_CONNECT_PENDING, 并把它放到workqueue中
+   > queue_work(send_workqueue, connection->swork)
+
+** lowcomms_state_change(sock)
+   - 如果sock->sk_state == TCP_ESTABLISHED, 说明建立socket
+   - 在内核中socket这么用??
+   > lowcomms_write_space(sock)
+
+** dlm_lowcomms_connect_node(nodeid)
+   - dlm_config->ci_protocol !=0, 返回0??  dlm_config都出来了?!
+   - nodeid是本机自己,返回
+   > dlm_out_nodeid()
+   - 创建connection
+   > nodeid2con(nodeid, GFP_NOFS)
+   - 创建connect? 具体执行函数还没看到
+   > lowcomms_connect_sock(connection)
+
+** add_sock(socket, connection)
+   - 设置connection使用的sock的回调函数
+   - 设置connection->socket , 还有socket->sock的回调函数
+   - sk_data_ready = lowcomms_data_ready
+   - sk_write_ready = lowcomms_write_space
+   - sk_state_change = lowcomms_state_change
+
+** make_sockaddr(sockaddr_storage, port, addr_len)
+   - 把port放到sockaddr_storage中
+
+** close_connection(connection, and_other)
+   - 关闭connection->socket
+   > sock_relese(connection->sock)
+   - 还有connection->othercon, 调用自己!
+   > close_connection(connection->othercon, false)
+   - 释放page
+   > __free_page(connection->rx_page)
+
+** sctp_send_shutdown(sctp_assoc_t)
+   - 发送sctp数据??
+   - 发送的是msghdr, 里面包含cmsghdr
+   - 找到connection, nodeid=0表示什么?
+   > nodeid2con(0, 0)
+   - cmsghdr里面是sctp_sndrcvinfo, 设置sctp_sndrcvinfo->sinfo_assoc_id = 参数
+   - 发送数据
+   > kernel_sendmsg(connection->socket, msghdr, NULL, 0, 0)
+
+** sctp_init_failed_foreach(connection)
+   - sctp失败??
+   - 重新执行connection->swork
+
+** sctp_init_failed()
+   - sctp失败了,不知道那个失败了?!
+   - 遍历所有的connection
+   > foreach_conn(sctp_init_failed_foreach
+
+** sctp_send_failed
+   #+begin_src 
+	__u16 ssf_type;
+	__u16 ssf_flags;
+	__u32 ssf_length;
+	__u32 ssf_error;
+	struct sctp_sndrcvinfo ssf_info;
+	sctp_assoc_t ssf_assoc_id;
+	__u8 ssf_data[0];   
+   #+end_src
+
+** sctp_sndrcvinfo
+   #+begin_src 
+	__u16 sinfo_stream;
+	__u16 sinfo_ssn;
+	__u16 sinfo_flags;
+	__u32 sinfo_ppid;
+	__u32 sinfo_context;
+	__u32 sinfo_timetolive;
+	__u32 sinfo_tsn;
+	__u32 sinfo_cumtsn;
+	sctp_assoc_t sinfo_assoc_id;   
+   #+end_src
+
+** dlm_mhandle
+   #+begin_src 
+   
+   #+end_src
+
+** retry_failed_sctp_send(connection, sctp_send_failed, buf)
+   - 上面发送的地方包装sctp_sndrcvinfo
+   - sctp_sndrcvinfo->sinfo_ppid是nodeid, 获取connection
+   > nodeid2con(nodeid, 0)
+   - dlm_mhandle没找到?
+   > dlm_lowcomms_get_buffer(nodeid, len, GFP_NOFS, retry_buf)
+   - buf中是什么格式的数据? 前面是sctp_send_failed, 后面是??
+   - 把数据给dlm_mhandle, dlm_mhandle应该关联connection
+   - 发送connection
+   > dlm_lowcomms_commit_buffer(dlm_mhandle)
+   - 检查connection->sctp_assoc, 它表示什么?
+   - 如果connection->sctp_assoc !=0, 设置connection->flags的CF_WRITE_PENDING标志
+   > queue_work(send_workqueue, connection->swork)
+   - 如果没有,就通知每个connection的失败
+   > sctp_init_failed_foreach(connection)
+
+** sctp_notification
+   #+begin_src 
+	struct {
+		__u16 sn_type;             /* Notification type. */
+		__u16 sn_flags;
+		__u32 sn_length;
+	} sn_header;
+	struct sctp_assoc_change sn_assoc_change;
+	struct sctp_paddr_change sn_paddr_change;
+	struct sctp_remote_error sn_remote_error;
+	struct sctp_send_failed sn_send_failed;
+	struct sctp_shutdown_event sn_shutdown_event;
+	struct sctp_adaptation_event sn_adaptation_event;
+	struct sctp_pdapi_event sn_pdapi_event;
+	struct sctp_authkey_event sn_authkey_event;
+	struct sctp_sender_dry_event sn_sender_dry_event;
+   #+end_src
+
+** process_sctp_notification(connection, msghdr, buf)
+   - buf中是sctp_notification, sctp_notification->sn_header->sn_type表示具体的通知
+   - SCTP_SEND_FAILED, 重新发送数据?? 
+   > retry_failed_sctp_send(connection, sctp_notification->sn_send_failed, buf)
+   - 如果是SCTP_ASSOC_CHANGE, 处理sctp_assoc_change, 其他不处理.
+   - 检查sctp_assoc_change->sac_state
+   - 如果是SCTP_COMM_UP / SCTP_RESTART
+   - 使用sctp_prim获取对方地址信息??
+   > kernel_getsockopt(socket, IPPROTO_SCTP, SCTP_PRIMARY_ADDR, sctp_prim, prim_len)
+   - 使用sctp_prim->ssp_addr查找nodeid
+   > addr_to_nodeid(sctp_prim->ssp_addr, nodeid)
+   - 找到对应的connection, 如果没有会创建新的
+   > nodeid2con(nodeid, GFP_NOFS)
+   - peel off??
+   > sctp_lock_sock(connection->socket->sock)
+   > sctp_do_peeloff(sock, sctp_assoc_change->sac_assoc_id, socket)
+   - 建立socket关系
+   > add_sock(connection->socket, connection)
+   - 设置connection->sctp_assoc, 设置标志CF_INIT_PENDING / CF_READ_PENDING, 放到workqueue中
+   > queue_work(send_workqueue, connection->swork)
+   > queue_work(recv_workqueue, connection->rwork)
+   - 如果sctp_assoc_change->sac_state是SCTP_COMM_LOST, SCTP_SHUTDOWN_COMP, 关闭connection->sctp_assoc
+   - 使用sctp_assoc_change->sac_assoc_id找到connection
+   > assoc2con(sctp_assoc_change->sac_assoc_id)
+  
+** receive_from_sock(connection)
+   - 接受数据
+   - 把数据放到connection->rx_page上面?  如果它为NULL, 分配page
+   - 做一些初始化cbuf, 它是page里面的数据指针. page作为环形队列使用
+   > cbuf_init(connection->cb, PAGE_CACHE_SIZE)
+   - 使用msghdr和sctp_sndrcvinfo接受数据的属性信息??
+   - 使用kvec数组接受数据, 数组长度是2, 跨越数组边界时,就会有2段空间
+   - 接受数据
+   > kernel_recvmsg(connection->socket, msghdr, kvec, nvec, len, MSG_DONTWAIT|MSG_NOSIGNAL)
+   - 检查msghdr->msg_flags & MSG_NOTIFICATION, 这是通知数据??
+   > process_sctp_notification(connection, msghdr, page_address(page + base))
+   - 否则就是普通数据??
+   - 增长队列指针
+   > cbuf_add(cbuf, ret)
+   - 处理数据
+   > dlm_process_incoming_buffer(nodeid, page_address(page), base, len, PAGE_CACHE_SIZE)
+   
+** tcp_accept_from_sock(connection)
+   - accept收到connect请求??
+   - 根据自己的ip地址创建socket??
+   > sock_create_kern(dlm_local_addr[0]->ss_family, SOCK_STREAM, IPPROTO_TCP, socket)
+   - 处理accept
+   > connection->socket->sock->accept(socket, new_socket, O_NONBLOCK)
+   - 对去对方sockaddr
+   > newsocket->ops->getname(socket, sockaddr, len, 2)
+   - 根据地址,获取nodeid
+   > make_sockaddr(sockaddr, nodeid)
+   > addr_to_nodeid(sockaddr, nodeid)
+   - 获取对应的connection
+   > nodeid2con(nodeid, GFP_NOFS)
+   - 如果connection->socket有效, 它本来已经建立connect. 准备它的connection->othercon. 如果为NULL, 创建一个新的connection
+   - 把新创建的socket给othercon
+   > add_sock(newsock, othercon)
+   - 如果找到的connection->socket无效, 把新的socket和它建立联系
+   - 最后设置connection->flags的CF_READ_PENDING, 并放到work_queue中
+   > queue_work(recv_workqueue, connection->rwork)
+
+** writequeue_entry
+   #+begin_src 
+	struct list_head list;
+	struct page *page;
+	int offset;
+	int len;
+	int end;
+	int users;
+	struct connection *con;   
+   #+end_src
+
+** writequeue_entry_complete(writequeue_entry, completed)
+   - 完成writequeue_entry的一部分数据, 增加offset,减小len.
+   - 如果len==0, user==0, 释放writequeue_entry,主要是释放page
+   > free_entry(writequeue_entry)
+
+** sctp_init_assoc(connection)
+   - 初始化sctp?
+   - 使用connection->flags的CF_INIT_PENDING表示已经初始化
+   - 获取connection的sockaddr
+   > nodeid_to_addr(connection->nodeid, NULL, sockaddr, connection->try_new_addr)
+   - 参数connection表示远程的nodeid, 必须使用一个本地的?
+   > nodeidcon(0, 0)
+   - 填加sockaddr的port, 使用dlm_config.ci_tcp_port
+   > make_sockaddr(sockaddr_sotrage, dlm_config->ci_tcp_port, addrlen)
+   - 初始化msghdr
+   - msghdr在什么时候使用,里面是ip地址和链接的属性
+   - 对于不同的链接,msghdr->msg_control. 一般都是cmsghdr包装的数据包,这里包装sctp_sndrcvinfo
+   - 处理connection->writequeue,链表中是writequeue_entry, 里面是在内存中要发送的数据
+   - 设置cmsghdr = (IPPROTO_SCTP, SCTP_SNDRCV)
+   - 设置sctp_sndrcvinfo->sinfo_ppid = nodeid
+   - 发送的数据是writequeue_entry中的, 包装为kiovec
+   > kernel_sendmsg(base_con->socket, msghdr, kiovec, 1, len)
+   - 这应该是同步发送
+   - 更新writequeue_entry
+   > writequeue_entry_complete(writequeue_entry, ret)
+
+** tcp_connect_to_sock(connection)
+   - 创建conection->socket, 它是connect返回的?
+   - 创建本地的socket
+   - sock_create_kern(dlm_local_addr[0]->ss_family, SOCK_STREAM, IPPROTO_TCP, socket)
+   - 获取nodeid对应的sockaddr
+   > nodeid_to_addr(connection->nodeid, sockaddr, NULL, false)
+   - 设置回调函数?
+   - connection->rx_action = receive_from_sock, connection_action = tcp_connect_to_sock
+   - 设置socket->sock->sk_user_data = connection, 建立2者关联
+   - 设置sock的回调函数
+   > add_sock(socket, connection)
+   - bind动作,地址是本地地址dlm_local_addr[0]
+   > socket->ops->bind(socket, sockaddr, addr_len)
+   - 构造目标地址,也就是上面获取的ip地址,使用dlm_config->ci_tcp_port
+   > make_sockaddr(sockaddr, dlm_config->ci_tcp_port, addr_len)
+   - 设置什么?
+   > kernel_setsockopt(socket, SOL_TCP, TCP_NODELAY, one, sizeof(one))
+   - connect动作
+   > socket->ops->connect(socket, sockaddr, addr_len, O_NONBLOCK)
+   
+** tcp_create_listen_sock(connection, sockaddr_storage)
+   - 首先创建socket
+   > sock_create_kern(dlm_local_addr[0]->ss_family, SOCK_STREAM, IPPORTO_TCP, socket)
+   - 关闭nagle算法??
+   > kernel_setsockopt(socket, SOL_TCP, TCP_NODELAY, one, sizeof(one))
+   > kernel_setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, one, sizeof(one))
+   - 设置回调函数
+   - rx_action = tcp_accept_from_sock, connect_action = tcp_connect_to_sock
+   - 获取自己的地址
+   > make_sockaddr(saddr, dlm_config->ci_tcp_port, addr_len)
+   - bind动作
+   > socket->ops->bind(socket, sockaddr, addr_len)
+   - 设置keepalive
+   - kernel_setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE)
+
+** init_local(void)
+   - 初始化本地的地址, 从config中取出sockaddr_storage, 保存到dlm_local_addr数组. 使用专用的dlm_comm local_comm
+   > dlm_our_addr(sockaddr_storage, i)
+
+** add_sctp_bind_addr(connection, sockaddr_storage, addr_len, num)
+   - num ==1时,创建bind动作
+   > kernel_bind(connection->socket, addr, addr_len)
+   - 否则设置option??
+   > kernel_setsockopt(connection->socket, SOL_SCTP, SCTP_SOCKOPT_BINDX_ADD, addr, addr_len)
+   
+** sctp_listen_for_all(void)
+   - 创建socket 
+   > sock_create_kern(dlm_local_addr[0]->ss_family, SOCK_SEQPACKAGE, IPPROTO_SCTP, socket)
+   - 设置sctp_event_subscribe, sctp_data_io_event, sctp_association_event, sctp_send_failure_event, sctp_shutdown_event, sctp_partial_delivery_event
+   - NEEDED_RMEM是什么??
+   - kernel_setsockopt(socket, SOL_SOCKET, SO_RCVBUFFORCE, NEEDED_RMEM, sizeof(NEEDED_RMEM))
+   - 设置sctp_event_subscribe
+   > kernel_setsockopt(socket, SOL_SCTP, SCTP_EVENTS, sctp_event_subscribe, sizeof(sctp_event_subscribe))
+   - 然后是SCTP_NODELAY
+   > kernel_setsockopt(socket, SOL_SCTP, SCTP_NODELAY, one, sizeof(one))
+   - 创建完毕,建立关联
+   > socket->sock->sk_user_data = connection
+   - 设置rx_action, connection_action, 为sctp版本的
+   - 还有多地址bind?
+   > 遍历dlm_local_addr, 都bind到创建的socket
+   > addr_sctp_bind_addr(connection, localaddr, addr_len, num)
+   - listen动作
+   - socket->sock->listen(socket, 5)
+
+** tcp_listen_for_all(void)
+   - tcp的listen就简单了
+   - dlm_local_count必须是1,不支持多地址
+   - tcp_create_listen_sock(connection, dlm_local_addr[0]
+
+** new_writequeue_entry(connection, allocation)
+   - 创建writequeue_entry, 还有它使用的page
+
+** dlm_lowcomms_get_buffer(nodeid, len, allocation, ppc)
+   - 需要向nodeid发送一些数据, 获取它的writequeue_entry的内存指针
+   - 首先找到对应的connection
+   > nodeid2con(nodeid, allocation)
+   - 获取connection->writequeue队列上最后一个writequeue_entry
+   - 如果队列为空,或writequeue_entry空间不够, PAGE_CACHE_SIZE - writequeue_entry->end < len
+   - 去创建新的writequeue_entry
+   > new_writequeue_entry(connection, allocation)
+   - 最后把它的page的指针,经过writepage_dentry->offset, 返回给ppc
+   - 同时修改writequeue_entry->end指针, writequeue_entry->users ++
+   
+
+** dlm_lowcomms_commit_buffer(mh)
+   - 参数是writequeue_entry
+   - -- writequeue_entry->users, 如果减为0, 发送它的数据. 使用work_queue
+   - 设置connection->flags的CF_WRITE_PENDING
+   - queue_work(send_workqueue, connection->swork)
+
+** send_to_sock(connection)
+   - 发送数据
+   - 循环处理connection->writequeue队列的writequeue_entry
+   - 发送的数据是writequeue_entry->page, 范围是(offset,len)
+   - kernel_sendpage(connection->socket, writequeue_entry->page, offset, len)
+   - 如果返回EAGAIN或0, 说明被阻塞
+   - 设置socket->sock->flags的SOCK_NOSPACE,  sock->sk_write_pending ++
+   - 否则根据返回结果,更新writepage_entry
+   > writequeue_entry_complete(writequeue_entry, ret)
+   - 它回自动释放发送完的writequeue_entry
+
+** clean_one_writequeue(connection)
+   - 释放connection->writequeue队列上的writequeue_entry
+
+** dlm_lowcomms_close(nodeid)
+   - recovery时使用?
+   - 关闭nodeid对应的connection
+   - 找到对应的connection
+   > nodeid2con(nodeid, 0)
+   - 清除connection->flags的CF_CONNECT_PENDING, CF_WRITE_PENDING, 设置CF_CLOSE
+   - 取消connection->swork, connection->rwork
+   > cancel_work_sync(connection->swork)
+   - 清除writequeue_entry
+   > clean_one_writequeue(connection)
+   - 关闭socket, 释放page资源
+   > close_connection(connection, true)
+   - 找到对应的dlm_node_addr
+   > find_node_addr(nodeid)
+   - 直接删除它, 还有它的sockaddr数组
+
+** process_recv_sockets(work_struct)
+   - 接受数据
+   - 清除connection->flags的CF_READ_PENDING
+   - 循环接受..
+   > connection->rx_action
+
+** process_send_sockets(work_struct)
+   - 发送数据
+   - 这里也有connect动作??
+   - 如果conection->flags有CF_CONNECT_PENDING, 需要connect动作
+   > connection->connect_action(connection)
+   - 设置CF_WRITE_PENDING标志
+   - 如果有CF_WRITE_PENDING标志,发送数据
+   > send_to_sock(connection)
+
+** clean_writequeues(void)
+   - 释放所有的conection
+   > foreach_conn(clean_one_writequeue)
+
+** work_stop(void)
+   - 关闭work_queue
+   > destroy_workqueue(recv_workqueue)
+
+** work_start(void)
+   - 创建work_queue
+
+** stop_conn(connection)
+   - 设置connection->flags的0x0F??
+
+** free_conn(connection)
+   - 关闭connection 
+   > close_connection(connection, true)
+   - 释放othercon, connection
+
+** dlm_lowcomms_stop(void)
+   - 首先关闭所有的connection
+   > foreach_conn(stop_conn)
+   - 关闭work_queue
+   > work_stop()
+   - 清除所有的writequeue_entry
+   > clean_writequeues()
+   - 释放connection
+   > foreach_conn(free_conn)
+   - 释放kmem?
+
+** dlm_lowcomms_start()
+   - 出时候low-level comms
+   - hash表  connection_hash
+   - 本地的地址
+   > init_local()
+   - kmem_cache
+   - 开始work_queue
+   > work_start()
+   - 建立listen
+   - 如果dlm_config->ci_protocol ==0, 就是tcp
+   > tcp_listen_for_all()
+   - 否则是sctp
+   > sctp_listen_for_all()
+
+** dlm_lowcomms_exit()
+   - 释放dlm_node_addr..
+   
+* midcomms.c
+  - middle level comms layer
+
+** copy_from_cb(dst, base, offset, len, limit)
+   - 搬运数据,从base(offset,len)到dst
+   - base是循环列表中的指针,如果碰到边界,会从数据开头搬运
+
+** dlm_header
+   #+begin_src 
+	uint32_t		h_version;
+	uint32_t		h_lockspace;
+	uint32_t		h_nodeid;	/* nodeid of sender */
+	uint16_t		h_length;
+	uint8_t			h_cmd;		/* DLM_MSG, DLM_RCOM */
+	uint8_t			h_pad;   
+   #+end_src
+
+** dlm_rcom
+   #+begin_src 
+	struct dlm_header	rc_header;
+	uint32_t		rc_type;	/* DLM_RCOM_ */
+	int			rc_result;	/* multi-purpose */
+	uint64_t		rc_id;		/* match reply with request */
+	uint64_t		rc_seq;		/* sender's ls_recover_seq */
+	uint64_t		rc_seq_reply;	/* remote ls_recover_seq */
+	char			rc_buf[0];   
+   #+end_src
+
+** dlm_message
+   #+begin_src 
+	struct dlm_header	m_header;
+	uint32_t		m_type;		/* DLM_MSG_ */
+	uint32_t		m_nodeid;
+	uint32_t		m_pid;
+	uint32_t		m_lkid;		/* lkid on sender */
+	uint32_t		m_remid;	/* lkid on receiver */
+	uint32_t		m_parent_lkid;
+	uint32_t		m_parent_remid;
+	uint32_t		m_exflags;
+	uint32_t		m_sbflags;
+	uint32_t		m_flags;
+	uint32_t		m_lvbseq;
+	uint32_t		m_hash;
+	int			m_status;
+	int			m_grmode;
+	int			m_rqmode;
+	int			m_bastmode;
+	int			m_asts;
+	int			m_result;	/* 0 or -EXXX */
+	char			m_extra[0];	/* name or lvb */   
+   #+end_src
+
+** dlm_packet
+   #+begin_src 
+   	struct dlm_header	header;		/* common to other two */
+	struct dlm_message	message;
+	struct dlm_rcom		rcom;
+	//它表示2类数据包,都是以header开头
+   #+end_src
+
+** dlm_process_incoming_buffer(nodeid, base, offset, len, limit)
+   - lowcomms调用这个函数,处理收到的数据. 循环的从base中获取数据包,调用上层应用
+   - 先读取dlm_header, 检查它的参数
+   > copy_from_cb(p, base, offset, sizeof(dlm_header), limit)
+   - 检查dlm_header->h_length, 这是dlm_packet的长度
+   - 如果dlm_header->h_cmd == DLM_MSG, 长度必能小于sizeof(dlm_message), 否则不能小于sizeof(dlm_rcom)  DLM_RCOM
+   - 然后重新读取
+   > copy_from_cb(p, base, offset, msglen, limit)
+   - 调用上层处理函数
+   > dlm_receive_buffer(p, nodeid)
+   
+* rcom.c
+
+** dlm_rcom
+   #+begin_src 
+	struct dlm_header	rc_header;
+	uint32_t		rc_type;	/* DLM_RCOM_ */
+	int			rc_result;	/* multi-purpose */
+	uint64_t		rc_id;		/* match reply with request */
+	uint64_t		rc_seq;		/* sender's ls_recover_seq */
+	uint64_t		rc_seq_reply;	/* remote ls_recover_seq */
+	char			rc_buf[0];   
+   #+end_src
+
+** rcom_response(dlm_ls)
+   - 检查dlm_ls->ls_flags的LSFL_RCOM_READY标志
+
+** create_rcom(dlm_ls, to_nodeid, type, len, dlm_rcom, dlm_mhandle)
+   - dlm_mhandle/dlm_rcom是发送消息使用, 去申请writequeue_entry的空间
+   - 下面buf获取指向dlm_rcom的内存指针,返回返回值是writequeue_entry, 给dlm_mhandle
+   > dlm_lowcomms_get_buffer(to_nodeid, mb_len, GFS_NOFS, buf)
+   - 初始化dlm_rcom->dlm_header, h_cmd= DLM_RCOM
+   - 使用参数返回dlm_rcom/dlm_mhandle
+
+** send_rcom(dlm_ls, dlm_mhandle, dlm_rcom)
+   - 发送dlm_mhandle指向的数据
+   - 包装数据,处理大小端, 使用小端格式
+   > dlm_rcom_out(dlm_rcom)
+   - dlm_mhandle是writequeue_entry, 释放它,可能会触发它的发送动作
+   > dlm_lowcomms_commit_buffer(dlm_mhandle)
+   - 这里尽量积累同时操作的数据,一块发送
+
+** rcom_status 
+   #+begin_src 
+	__le32			rs_flags;
+	__le32			rs_unused1;
+	__le64			rs_unused2;
+   #+end_src
+
+** set_rcom_status(dlm_ls, rcom_status, flags)
+   - 设置rcom_status->rs_flags = flags
+
+** rcom_config
+   #+begin_src 
+	__le32			rf_lvblen;
+	__le32			rf_lsflags;
+
+	/* DLM_HEADER_SLOTS adds: */
+	__le32			rf_flags;
+	__le16			rf_our_slot;
+	__le16			rf_num_slots;
+	__le32			rf_generation;
+	__le32			rf_unused1;
+	__le64			rf_unused2;   
+   #+end_src
+
+** set_rcom_config(dlm_ls, rcom_config, num_slots)
+   - 根据dlm_ls, 设置rcom_config. 发送本地dlm_ls的配置信息
+
+** check_rcom_config(dlm_ls, dlm_rcom, nodeid)
+   - 检查dlm_rcom是否和dlm_ls的参数相同 dlm_ls->ls_lvblen == dlm_rcom->rf_lvblen, dlm_ls->ls_exflags == dlm_rcom->lsflags
+
+** allow_sync_reply(dlm_ls, new_seq)
+   - 分配new_seq = ++ dlm_ls->ls_rcom_seq
+   - 设置dlm_ls->ls_flags的LSFL_RCOM_FLAGS
+
+** disallow_sync_reply(dlm_ls)
+   - 不同意??
+   - 清除dlm_ls->ls_flags的LSFL_RCOM_WAIT|LSFL_RCOM_READY
+
+** dlm_rcom_sttus(dlm_ls, nodeid, status_flags)
+   - 构造dlm_rcom
+   > create_rcom(dlm_ls, nodeid, DLM_RCOM_STATUS, sizeof(rcom_status), dlm_rcom, dlm_mhandle)
+   - dlm_rcom数据区最后面是rcom_status. 设置rcom_status->rs_flags = status_flags
+   > set_rcom_status(dlm_ls, dlm_rcom->rcom_status, status_flags)
+   - 设置dlm_rcom->rc_id
+   > allow_sync_reply(dlm_ls, dlm_rcom->rc_id)
+   - 清空dlm_ls->ls_recovery_buf
+   > memset(dlm_ls->ls_recovery_buf, 0, dlm_config->ci_buffer_size)
+   - 发送dlm_rcom
+   > send_rcom(dlm_ls, dlm_mhandle, dlm_rcom)
+   - 等待返回,条件是通过dlm_response判定, dlm_ls->ls_flags包含LSFL_RCOM_READY
+   > dlm_wait_function(dlm_ls, dlm_response)
+   - 关闭sync??
+   > disallow_sync_reply(dlm_ls)
+   - 检查dlm_ls->ls_recover_buf, 也就是返回的dlm_rcom
+   > check_rcom_config(dlm_ls, rc, nodeid)
+
+** dlm_slot
+   #+begin_src 
+	int nodeid; /* 1 to MAX_INT */
+	int slot;   /* 1 to MAX_INT */   
+   #+end_src
+
+** receive_rcom_status(dlm_ls, dlm_rcom)
+   - 处理dlm_rcom请求??
+   - 检查dlm_header->h_version
+   > dlm_slots_version(dlm_rcom->rc_header)
+   - 创建一个dlm_rcom?? 参数是干什么的??
+   - 取出dlm_ls->ls_recover_status, 给下面的dlm_rcom->rc_result
+   > dlm_recover_status(dlm_ls)
+   - 如果dlm_rcom->rs_flags & DLM_RSF_NEED_SLOTS !=0, 在dlm_rcom中还要包括rcom_slot
+   - 构造dlm_rcom, dlm_mhandle
+   > create_rcom(dlm_ls, nodeid, DLM_RCOM_STATUS_REPLY, len, dlm_rcom, dlm_mhandle)
+   - 设置dlm_rcom, rc_id, rc_seq_reply, rc_result
+   - 设置rcom_config, 包括dlm_ls的参数,还有rcom_config->rf_num_slots = num_slots
+   > set_rcom_config(dlm_ls, dlm_rcom->rc_buf, num_slots)
+   - 复制slot信息, 就是dlm_ls->dlm_slot, 包含nodeid,slot
+   > dlm_slots_copy_out(dlm_ls, dlm_rcom)
+   - 发送dlm_rcom 
+   > send_rcom(dlm_ls, dlm_mhandle, dlm_rcom)
+
+** receive_sync_reply(dlm_ls, dlm_rcom)
+   - 接收到数据??
+   - 把dlm_rcom的数据复制到dlm_ls->ls_recover_buf中
+   > memcpy(dlm_ls->ls_recover_buf, dlm_rcom, dlm_rcom->dlm_header->h_length)
+   - 设置dlm_ls->ls_flags的LSFL_RCOM_READY, 清除LSFL_RCOM_WAIT
+   - 唤醒dlm_ls->ls_wait_general等待队列
+
+** dlm_rcom_names(dlm_ls, nodeid, last_name, last_len)
+   - 构造dlm_rcom, 发送name信息
+   > create_rcom(dlm_ls, nodeid, DLM_RCOM_NAMES, last_len, dlm_rcom, dlm_mhandle)
+   - last_name是什么??
+   > memcpy(dlm_rcom->rc_buf, last_name, last_len)
+   - 启动dlm_ls的sync
+   > allow_sync_reply(dlm_ls, dlm_rcom->rc_id)
+   - 发送数据
+   > send_rcom(dlm_ls, dlm_mhandle, dlm_rcom)
+   - 等待结果
+   > dlm_wait_function(dlm_ls, rcom_response)
+   - 结束同步
+   > disallow_sync_reply(dlm_ls)
+
+** receive_rcom_names(dlm_ls, dlm_rcom)
+   - 接受到怎么也发送??
+   - 从dlm_rcom中获取dlm_header->h_nodeid
+   - 构造dlm_rcom 
+   > create_rcom(dlm_ls, nodeid, DLM_RCOM_NAMES_REPLY, outlen, dlm_rcom, dlm_mhandle)
+   - 复制dlm_rcom->rc_id/rc_seq
+   - 把本地的一些dlm_rsb->res_name添到dlm_rcom中,发送出去. 他们的hash值对应nodeid, 而且他们的master是localhost
+   > dlm_copy_master_names(dlm_ls, dlm_rcom->rc_buf, inlen, dlm_rcom->rc_buf, outlen, nodeid)
+   - 发送数据
+   > send_rcom(dlm_ls, dlm_mhandle, dlm_rcom)
+
+** dlm_send_rcom_lookup(dlm_rsb, dlm_nodeid)
+   - 查找一个dlm_rsb??
+   - 构造dlm_rcom, 类型是DLM_RCOM_LOOKUP
+   > create_rcom(dlm_ls, dir_nodeid, DLM_RCOM_LOOKUP, dlm_rcom->res_length, dlm_rcom, dlm_mhandle)
+   - 把dlm_rsb->res_name放到里面, 还有dlm_rsb->rc_id
+   - 发送dlm_rcom
+   > send_rcom(dlm_ls, dlm_mhandle, dlm_rcom)
+
+** dlm_send_rcom_lookup_dump(dlm_rsb, tonodeid)
+   - dump??
+   - 构造dlm_rcom
+   > create_rcom(dlm_ls, to_nodeid, DLM_RCOM_LOOKUP, dlm_rsb->res_length, dlm_rcom, dlm_mhandle)
+   - 设置dlm_rcom->rc_buf为dlm_rsb->res_name, dlm_rcom->rc_id = -1 ??
+   - 发送消息
+   > send_rcom(dlm_ls, dlm_mhandle, dlm_rcom)
+
+** receive_rcom_lookup(dlm_ls, dlm_rcom)
+   - 处理lookup消息,很简单,直接构造一个消息返回结果!!
+   > create_rcom(dlm_ls, nodeid, DLM_RCOM_LOOKUP_REPLY, 0, dlm_rcom, dlm_mhandle)
+   - 如果dlm_rcom->rc_id == -1, 去hash表中查找 rb_root
+   > dlm_dump_rsb_name(dlm_ls, name, len)
+   - 否则查找本地master的dlm_rsb??
+   > dlm_master_lookup(dlm_ls, nodeid, dlm_rcom->rc_buf, len, DLM_LU_RECOVER_MASTER, ret_nodeid, NULL)
+   - 最后包装dlm_rcom, rc_result / rc_id
+   - 发送dlm_rcom 
+   > send_rcom(dlm_ls, dlm_mhandle, dlm_rcom)
+
+** receive_rcom_lookup_reply(dlm_ls, dlm_rcom)
+   > dlm_recover_master_reply(dlm_ls, dlm_rcom)
+
+** rcom_lock 
+   #+begin_src 
+	__le32			rl_ownpid;
+	__le32			rl_lkid;
+	__le32			rl_remid;
+	__le32			rl_parent_lkid;
+	__le32			rl_parent_remid;
+	__le32			rl_exflags;
+	__le32			rl_flags;
+	__le32			rl_lvbseq;
+	__le32			rl_result;
+	int8_t			rl_rqmode;
+	int8_t			rl_grmode;
+	int8_t			rl_status;
+	int8_t			rl_asts;
+	__le16			rl_wait_type;
+	__le16			rl_namelen;
+	char			rl_name[DLM_RESNAME_MAXLEN];
+	char			rl_lvb[0];
+   #+end_src
+
+** pack_rcom_lock(dlm_rsb, dlm_lkb, rcom_lock)
+   - 把dlm_lkb的信息包装到rcom_lock中
+   - 如果dlm_lkb->lkb_bastfn有效,设置rcom_lock->rl_asts的DLM_CB_BAST, dlm_lkb->lkb_astfn对应DLM_CB_CAST
+   - 还有dlm_lkb->lkb_lvbptr, 放到rcom_lock->rl_lvb中
+
+** dlm_send_rcom_lock(dlm_rsb, dlm_lkb)
+   - 构造dlm_rcom
+   > create_rcom(dlm_ls, dlm_rsb->res_nodeid, DLM_RCOM_LOCK, len, dlm_rcom, dlm_mhandle)
+   - dlm_rcom->rc_buf就是rcom_lock
+   > pack_rcom_lock(dlm_rsb, dlm_lkb, rcom_lock)
+   - 设置dlm_rcom->rc_id = dlm_rsb指针??
+   - 发送数据
+   > send_rcom(dlm_ls, dlm_mhandle, dlm_rcom)
+
+** receive_rcom_lock(dlm_ls, dlm_rcom)
+   - 恢复lock请求??
+   - 先处理请求?? 把结构写到dlm_com中  rl_remid/rl_result
+   > dlm_recover_master_copy(dlm_ls, dlm_rcom)
+   - 然后构造一个dlm_rcom
+   > create_rcom(dlm_ls, nodeid, DLM_RCOM_LOCK_REPLY, sizeof(rcom_lock), dlm_rcom, dlm_mhandle)
+   - 这里没看出来什么处理, 把dlm_rcom->rcom_lock原样发回去
+   > memcpy(dlm_rcom->rc_buf, dlm_rcom->rc_buf, sizeof(rcom_lock))
+   - 设置dlm_rcom->rc_id / rc_seq_reply
+   - 发送数据
+   > send_rcom(dlm_rcom, dlm_mhandle)
+
+** dlm_send_ls_not_ready(nodeid, dlm_rcom)
+   - 如果当前dlm_ls还没有准备好, 发起一个请求 rcom_config
+   - 准备dlm_rcom
+   > dlm_lowcomms_get_buffer(nodeid, mb_len, GFP_NOFS, dlm_mhandle)
+   - 设置dlm_rcom->dlm_header, dlm_rcom->rc_type = DLM_RCOM_STATUS_REPLY,
+   - 对于rcom_config, 仅仅设置rc_lvblen = -1 ??
+   > dlm_rcom_out(dlm_rcom)
+   - 发送数据
+   > dlm_lowcomms_commit_buffer(dlm_mhandle)
+
+** dlm_receive_rcom(dlm_ls, dlm_rcom, nodeid)
+   - 结构dlm_rcom数据,根据dlm_rcom->rc_type, 分别调用上面的函数
+   - 首先分成4中,name, lookup, lock, 还有config?
+   - 不同类型的dlm_rcom, 必须和dlm_ls->ls_recover_status对应
+
+

@@ -1,0 +1,310 @@
+* buffer.c 
+
+
+buffer_head, 作用于page, filesystem, bio之间,为block的地址映射服务,追踪page中的数据块的状态
+
+数据结构
+    * b_state, 好多状态
+    * buffer_head *b_this_page, 单链表,一个page中的所有buffer_head
+    * page * b_page
+    * b_blocknr . 块号,相对哪里的? page?
+    * b_size 块大小
+    * char * b_data 应该是内存指针, 那前提需要page建立映射
+    * block_device b_bdev
+    * bh_end_io_t b_end_io,  bio中的回调函数
+    * b_private  b_end_io的参数?  
+    * list_head a_assoc_buffers,  associated with another mapping..
+    * address_space b_assoc_map 
+    * b_count  ?? 计数
+
+bh_state_bits block状态, 非常丰富:
+    BH_Uptodate
+    BH_Dirty
+    BH_Lock
+    BH_Req    在bio的请求队列中
+    BH_Uptodate_Lock 
+    BH_Mapped  disk mapping
+    BH_New  
+    BH_Async_Read, BH_Async_Write  异步读写?  为何这里还有异步?
+    BH_Delay 没有分配到disk block
+    BH_Boundary : block在边界上
+    BH_Write_EIO  eio错误
+    BH_Quiet   有错误不要说出来?
+    BH_PrivateStart  ..标志位置
+
+
+1. __lock_buffer / unlock_buffer 在buffer_head->b_state的BH_Lock上等待
+    __wait_on_buffers(buffer_head)
+
+2. __clear_page_buffers(page) page->private好像是buffer_head, 这个函数情况page->private, 还有PG_Private.
+
+3. __end_buffer_read_notouch(buffer_head, uptodate) 根据uptodate更新buffer_head的状态
+    > set_buffer_uptodate(buffer_head)
+    > clear_buffer_uptodate(buffer_head)
+    > unlock_buffer(buffer_head) 唤醒等待函数
+
+    end_buffer_read_sync(buffer_head, uptodate) 包装上面的函数
+    > __end_buffer_read_notouch(buffer_head, uptodate)
+    > put_bh(buffer_head)
+对于读操作,就是设置一个uptodate标志,对于写操作,还有错误处理
+    
+4. end_buffer_write_sync(buffer_head, uptodate)
+    > 根据uptodate 设置buffer_head标志. 如果uptodate=0,设置BH_Error ?
+    > set_buffer_write_io_error(buffer_head) / clear_buffer_uptodate
+    > uplock_buffer / put_bh  唤醒等待的任务,并释放这个东西
+
+5. __find_get_block_slow(block_device, sector_t) 根据sector_t从block_device上获取buffer_head, block_device应该是磁盘设备,也可能是md/lvm设备...
+    > block_device -> bd_inode -> i_mapping, 所以buffer_head所在的page是在设备inode的pagecache中的page,而不是其他的pagecache, 那这部分pagecache应该只有这里使用,而且其他应用用不到.
+    > find_get_page(address_space, index) 根据sector切换page号
+    > page_has_buffer(page) 是否有page->private数据,获取buffer_head列表头
+    > 遍历buffer_head->b_this_page, 比较buffer_head->b_blocknr和参数sector_t,如果相通则就是需要找的buffer_head, 这里的参数sector_t是在块设备中的位置..
+
+6. free_money_momory() 在分配block_buffer失败是唤醒内存回收工作?
+    > wakeup_flusher_threads(1024, WB_REASON_FREE_MORE_MEM)
+    > try_to_free_pages(zonelist, order, gfp_t, 0) 也是释放内存...
+
+7. end_buffer_async_read(buffer_head, uptodate) 这是异步读回数据,修改当前buffer_head状态,还要修改所在page的状态.
+    > set_buffer_uptodate / clear_buffer_uptodate, clear_buffer_async_read 清空一些设置
+    > unlock_buffer(buffer_head) 唤醒等待的任务
+    > 遍历page所有的buffer_head, 使用first buffer_head->b_state锁住整个page的buffer_head.
+    > 如果有的buffer_head还带有BH_async_read标志,则无需继续处理这个page
+    > 如果所有的buffer_head都是uptodate,才能设置PG_uptodate, 如果所有buffer_head完成async_read, 则唤醒等待page的任务 unlock_page(page)
+
+8. end_buffer_async_write(buffer_head, uptodate) 为何无论读写都使用uptodate? 这个函数和上面类似,但它不会直接修改PG_uptodate
+    > set_buffer_uptodate / set_buffer_write_io_error /  clear_buffer_uptodate / clear_buffer_async_write 写着吧，虽然很乱
+    > 遍历page的所有buffer_head
+    > end_page_writeback(page)
+
+是在不明白何为底层还需要异步?
+    mark_buffer_async_read / mark_buffer_async_write(buffer_head) 填充buffer_head->b_end_io, 设置buffer_head->b_state的标志BH_Async_read/ BH_Async_write
+
+9. __remove_assoc_queue(buffer_head) 这是怎么说? 处理buffer_head->b_assoc_buffers
+
+10. osync_buffers_list(lock, list_head) 据说这是同步等待buffer_head操作完成,遍历list_head上的buffer_head, 如果被锁,等待buffer_head
+    > buffer_locked / wait_on_buffer 
+    > buffer_uptodate(buffer_head) 如果不是最新的,说明有EIO..
+    > get_bh / brelse(buffer_head)
+
+    sync_mapping_buffers(address_space) 这里可是address_space, 而不是page.., 包装上面的实现, list_head是address_space->private_list. 这一串buffer_head是从哪里来的?
+
+11. write_boundary_block(block_device, bblock, blocksize) 这个函数的作用就是提交一个buffer_head
+    > __find_get_block(block_device, bblock+1, blocksize) 为何+1??
+    > buffer_dirty(buffer_head) 如果buffer_head是脏的?
+    > ll_rw_block(WRITE, 1, &bh) 
+    
+12. mark_buffer_dirty_inode(buffer_head, inode) 设置buffer_head的脏标志
+    > mark_buffer_dirty(buffer_head)
+    > 把buffer_head->assoc_mapping添加到address_space->private_list. 这里有两个address_space,  buffer_head->page->address_space 和 inode->address_space, 需要设置第一个address_space->assoc_mapping,为第二个..
+
+13. __set_page_dirty(page, address_space, warn) 设置page在address_space->page_tree中对应的标志. 没有设置PG_dirty
+    > radix_tree_tag_set(radix_tree_root, page_index, PAGECACHE_TAG_DIRTY) 
+    > __mark_inode_dirty(inode, I_DIRTY_PAGES)
+
+14. __set_page_dirty_buffers(page) 先把page关联的buffer_head设置dirty,然后设置page的dirty
+    > page_has_buffers(page) / page_buffers(page) 遍历所有buffer_head,设置dirty, set_buffer_dirty(buffer_head)
+    > __set_page_dirty(page, address_space, 1) 
+
+15. fsync_buffers_list(lock, list_head) list_head是一串buffer_head, 但这里要写回buffer_head, 写的时候要把它从address_space->private_list中取出来,但写完后如果发现还是dirty,需要再放到队列中
+    > __remove_assoc_queue(buffer_head) 
+    > buffer_dirty(buffer_head) / buffer_locked(buffer_head) 这两个条件满足时才处理
+    > write_dirty_buffer(buffer_head, WRITE_SYNC) 这里是同步写回,当然要检查BH_dirty > submit_bh
+    > get_bh(buffer_head) / brelse(buffer_head)
+    > 再遍历一边这些buffer_size, 如果buffer_dirty(buffer_head),添加到address_space->private_list
+    > wait_on_buffer(buffer_head) / brelse(buffer_head) 反正就这些操作，翻来覆去的..
+    > osync_buffers_list(lock, list)
+
+16. invalidate_inode_buffers(inode)  要删除文件,删除inode->address_space->private_list上的buffer_head
+ > __remove_assoc_queue(buffer_head)
+
+ remove_inode_buffers(inode) 和上面一样..
+
+17. alloc_page_buffers(page, size, retry) 这里size可能不是PAGE_SIZE的分数?
+ > alloc_buffer_head(GFP_NOFS), 然后简单的初始化,和page关联,地址使用page的地址.
+
+18. link_dev_buffers(page, buffer_head) 把buffer_head的单链表变成环?!
+ > attach_page_buffers(page, head) 把buffer_head给page, 添加PG_private标志.
+
+19. init_page_buffers(page, block_device, sector_t, size) 初始化page关联的一串buffer_head, 根据PG_uptodate设置BH_uptodate. 还有block/block_dev等.
+
+20. grow_dev_page(block_device, sector_t, pgoff_t, size, sizebits) 这个函数也是填充page关联的buffer_head, index表示page的位置.
+ > find_or_create_page(inode->address_space, index, GFP_t) 这个inode是block_device关联的inode上面的page,而不是某个文件, 奇怪吧..
+ > page_has_buffers(page) 如果已经有buffer_head, 比较buffer_head->b_size和size, 如果一样
+ > init_page_buffers(page, block_dev, index<<sizebits/block, size)
+ > 如果不一样  try_to_free_buffers(page) 释放,应该也写回.
+ > alloc_page_buffers(page, size, 0) 这个
+ > link_dev_buffers(page, buffer_head)
+
+ grow_buffers(block_device, sector_t, size) 包装上面的函数
+
+21. __getblk_slow(block_device, sector_t, size) 这是获取一个buffer_head.
+ > bdev_logical_block_size(block_device) 检查block_device的大小
+ > __find_get_block(block_device, block, size) 先找, 如果找到就返回
+ > grow_buffers(block_device, block, size) 如果分配失败应该会继续..
+
+22. mark_buffer_dirty(buffer_head) 当一个buffer_head脏时,对应的page肯定是脏的,还需要设置radix_tree中的脏标志,把inode添加到对应的bdi_writeback链表中,这个inode应该不是block_device的文件? 但在buffer_head初始化的时候已经设置page是block_device文件的inode的..
+ > buffer_dirty(buffer_head)  已经是脏的,不需要做任何事情
+ > test_set_buffer_dirty
+ > TestSetPageDirty(page) 这个page应该属于哪个inode?? 如果page已经是dirty,不需要修改page的标志
+ > __set_page_dirty(page, address_space, 0) 修改radix_tree, inode..
+
+23. __brelse(buffer_head)   这是干啥?  这里只是减小buffer_head->b_count, 不会释放buffer_head. 好像在page释放时才释放它..
+ > put_bh(buffer_head) 
+    
+24. __bforget(buffer_head) 丢掉它的数据, 好像buffer_head->b_assoc_buffers没有了就是没有数据了..
+ > clear_buffer_dirty(buffer_head)
+ > 释放buffer_head->b_assoc_buffers)关系, buffer_head->b_assoc_map..
+
+25. __bread_slow(buffer_head) 应该是读回数据,根据BH_uptodate
+ > buffer_uptodate(buffer_head) 如果已经是有效的返回
+ > 设置buffer_head->b_end_io = end_buffer_read_sync, 设置同步读回..
+ > submit_bh(READ, buffer_head)
+ > wait_on_buffer(buffer_head) 最后判断BH_uptodate...
+
+26. bh_lru_install(buffer_head)  这里有一个静态数组的lru,把buffer_head放到对头,他可能已经在对中。。。
+ lookup_bh_lru(block_device, sector_t, size) 根据block_device/block在lru队列中找,如果找到把它放到对头..
+ invalidate_bh_lru(arg)  释放lru队列中的page...
+
+27. __find_get_block(block_device, sector_t, size)
+ > lookup_bh_lru(block_device, block, size) 这叫快找?
+ > __find_get_block_slow(block_device, block)
+ > bh_lru_install(buffer_head) 放到lru队列中
+ > touch_buffer(buffer_head) > mark_page_accessed(buffer_head_page) 这个函数可麻烦了, 设置PG_active / PG_referrenced
+
+28. __getblk(block_device, block, size)
+ > __find_get_block(block_device, block, size) 先找,如果找不到再分配..
+ > __getblk_slow(block_device, block, size)
+
+29. __breadahead(block_device, block, size) 这个实际上也是找buffer_head, 找到了可能它没有数据,或者数据不是有效的
+ > __getblk(block_device, block, size)
+ > ll_rw_block(READA, 1, &buffer_head) 这个函数实际上是读多个buffer_head..
+ > brelse(buffer_head)
+
+30. __bread(block_device, sector_t, size) 这个实际上是包装__bread_slow(buffer_head)
+ > __getblk(block_device, block, size) 
+ > __bread_slow(buffer_head)
+
+31. discard_buffer(buffer_head) 清空buffer_head的所有标志...
+
+32. block_invalidatepage(page, offset) offset是页内偏移, page被裁剪了，把offset以后的buffer设为无效
+ > discard_buffer
+ > try_to_release_page(page, 0) 如果offset=0,则整页都无效..
+
+33. create_empty_buffers(page, blocksize, b_state) 为page构造一串buffer, 设置上b_state, 还有PG_uptodate/PG_dirty标志...
+ > attach_page_buffers(page, buffer_head) 关联起来..
+
+34. unmap_underlying_metadata(block_device, block) 释放映射关系?就是释放这个buffer_head?
+ > __find_get_block_slow(block_device, block)
+ > clear_buffer_dirty(buffer_head) 去掉脏标志,可能无法写回去..
+ > wait_on_buffer(buffer_head)  等待写回完成
+ > clear_buffer_req(buffer_head) 清除BH_Req标志
+ > __brelse(buffer_head)  释放buffer_head ...
+
+35. BH_Mapped和BH_Uptodate的关系, 如果都是No, block状态位置, 如果是No/Yes, 则是空洞文件? 块设备也有空洞?  如果是Yes/No, 则它在块设备上分配了,但数据没有读回来,如果是Yes/Yes, 则可以使用...
+  __block_write_full_page(inode, page, get_block_t, writeback_control, bh_end_io_t) 这个函数有些复杂? inode/page是哪里的? 这个应该是一个写回操作..
+ > page_has_buffers(page) 
+ > create_empty_buffers(page, blocksize, BH_Dirty|BH_Uptodate)
+ > 这里需要检查inode的大小,查看page的buffer队列上的buffer_head的block? 如果超过界限，把buffer_head设为!BH_Dirty, BH_Uptodate
+ > 如果buffer_head没有BH_Mapped,或者BH_Delay,而且BH_Dirty? 需要分配buffer_head..
+ > get_block_inode, block, buffer_head, 1) 这个函数是参数,希望不是只有ext定义它..
+ > clear_buffer_delay(buffer_head) 不再等待磁盘块
+ > clear_new(buffer_head) / unmap_underlying_metadata(buffer_head->b_bdev, block_head->b_blocknr) 这是啥意思? 它在其他设备上也有镜像?
+ > 如果writeback_control->sync_mode不是WB_SYNC_NONE, 需要同步,等待写回完成 > lock_buffer(block_head)
+ > 否则如果buffer_head被锁住  > redirty_page_for_writepage(writeback_control, page)
+ > 需要写回这个block,检查BH_Dirty  > mark_buffer_async_write_endio(buffer_head, handler) 回调函数是handler,而且设置BH_Async_write..
+ > set_page_writeback(page) 开始写回page, 所以这里处理page cache中..
+ > submit_bh(write_op, buffer_head) 提交buffer_head...
+应该看看这些函数怎么使用， 这里就是走马观花...
+
+36. page_zero_new_buffers(page, from, to) 处理page的buffer_head链表中的new的buffer, from/to都是page内部偏移
+ > buffer_new(buffer_head) 只处理BH_new, 而且需要在(from,to)范围内..
+ > clear_buffer_new(buffer_head) / mark_buffer_dirty(buffer_head) ... 好像是把page的一部分置为0，而且修改其中的buffer的状态..
+
+37. __block_write_begin(page, pos, len, get_block)  这个函数的意思是在写数据的时候,如果写不满一页,需要读回一部分，然后写回去..
+ > create_empty_buffers(page, blocksize, 0) 先创建buffer_head
+ > 如果buffer_head在(from,to)范围内,不需要操作，只要设置BH_Uptodate
+ > 否则,需要把page读上来..  > get_block(inode, block, buffer_head, 1)
+ > unmap_underlying_metadata(block_device, blocknr) 这是什么意思?
+ > 如果page是PG_uptodate, 则读上来的不用变? 
+ > 否则需要把page置为0
+ > 如果发现buffer_head不是最新的,BH_Uptodate, 需要把它读回来  ll_rw_block(READ, 1, &buffer_head)
+ > wait_on_buffer(buffer_head) 这是什么意思?
+
+38. __block_commit_write(inode, page, from, to) 写过成把数据搬到了page,设置相应的buffer_head标志
+ > buffer_uptodate(buffer_head)
+ > mark_buffer_dirty(buffer_head) / set_buffer_uptodate(buffer_head)
+
+  block_write_begin(address_space, pos, len, flags, page, get_block) / block_write_end(...) 包装上面两个函数, 不明白有些标志是谁设置的, BH_Uptodate等..
+
+39. generic_write_end(file, address_space, pos, len, copied, page, fsdata) 在文件写完或的操作,
+ > block_write_end(file, address_space, pos, len, copied, page, fsdata)返回写的数据,检查文件大小是否改变  pos+copied > inode->i_size, 如果改变需要更新inode
+ > mark_inode_dirty(inode)
+
+40. block_is_partially_uptodate(page, read_descriptor_t, from) 只是检查page的buffer_head链表上的buffer都是BH_Uptodate, 而且要检查的buffer在from/desc规定的范围之外. desc中有数据量..
+
+41. block_read_full_page(page, get_block_t) 读回page中的buffer, 需要遍历两遍,第一遍检查BH_Uptodate. 如果全部有效,则page也是有效的,不用读回来. 检查buffer_mapped, 如果没有映射需要使用 > get_block_t .  如果无法映射,说明磁盘空洞? 把block写为0..
+ >  遍历,提交任务  > mark_buffer_async_read(buffer_head) , submit_bh(READ, buffer_head)
+
+42. generic_cont_expand_simple(inode, size) truncate操作..
+ > pagecache_write_begin(...
+ > pagecache_write_end(...
+
+43. cont_expand_zero 这个函数中使用address_space_operations->write_begin/write_end. 在这两个函数中间,把数据清空..
+
+43. cont_write_begin(file, address_space, pos, len, flags ...) 先扩展文件，修改大小,填充上0
+ > cont_expand_zero(file, address_space, pos, bytes)
+ > block_write_begin(address_space, ...)
+
+    block_commit_write(page, from, to) 包装上面的 __block_commit_write(inode, ..)
+
+44. __block_page_mkwrite / block_page_mkwrite 这是在地址中断使用的,应该是写mapped的地址,顺便修改文件大小..
+
+45. end_buffer_read_nobh(buffer_head, uptodate)  简单的更新BH_Uptodate,解锁buffer_head
+ > __end_buffer_read_notouch(buffer_head, uptodate)
+ 
+46. attach_nobh_buffers(page, buffer_head)  把buffer_head和page关联起来
+
+47. nobh_write_begin(address_space, pos, len, flags, page ..., get_block) 这里还是分配buffer_head, 读取数据，和上面类似,只有ext2使用..
+
+ nobh_write_end(...) 这里好像没有发起io_request操作..
+
+一系列的写函数
+
+48.  end_bio_bh_io_sync(bio, err) 取出bio->bi_private(buffer_head),和bio->bi_flags 更新buffer_head状态..
+ > buffer_head->b_endio(buffer_head, BH_Uptodate)
+ > bio_put(bio)
+
+49. submit_bh(rw, buffer_head) 提交buffer_head,不限读写.. 使用buffer_head(1个)构造一个bio
+ > bio_alloc(GFP_NOIO, 1) 初始化一些参数, bi_sector(位置), bi_bdev = buffer_head->b_bdev, bi_io_vec[0], 就是buffer_head所在的page,  bi_size/bi_idx/bi_vcnt=1,这里只有位置sector是需要和底层有关系,iovec不一定多大..
+ > bio->bi_end_io = end_bio_bh_io_sync, 这个函数没有多余的操作,只是传递一下回调
+ > submit_bio(rw, bio)
+ > bio_get / bio_put
+
+50. ll_rw_block(rw, nr, buffer_head ) 这个函数处理一串buffer_head,但这里和上面的函数类似,只是给buffer_head设置回调函数
+ > 如果rw=WRITE, 设置  end_buffer_write_sync
+ > 如果READ, 设置 end_buffer_read_sync
+ > submit_bh(rw, buffer_head)
+
+51. write_dirty_buffer(buffer_head, rw) 设置buffer_head->b_end_io为end_buffer_write_sync, 提交任务..
+
+52. __sync_dirty_buffer(buffer_head, rw) 这个和上面类似，但多做了一步,在提交后等待,而且buffer_head状态不正确,返回EIO
+ > buffer_head->b_end_io = end_buffer_write_sync
+ > submit_bh
+ > wait_on_buffer(buffer_head)
+
+ sync_dirty_buffer(buffer_head)  包装上面的函数  
+ > __sync_dirty_buffer(buffer, WRITE_SYNC)
+
+53. drop_buffers(page, buffer_head) 释放buffer_head和page的关系,并把buffer_head返回给传入参数, 还要释放buffer_head和address_space的关系
+ > __remove_assoc_queue(buffer_head)
+ > __clear_page_buffers(page)
+
+54. try_to_free_buffers(page) 这里是来释放buffer_head, 先把buffer_head链表和page关系释放开,然后释放buffer_head的内存..
+ > drop_buffers(page, buffer_head **)
+ > free_buffer_head(buffer_head)
+
+55. bh_submit_read(buffer_head) 读回数据, 同步实现的..
+ > buffer_head->b_end_io = end_buffer_read_sync 只有唤醒操作....
+ > submit_bh(READ, buffer_head)
+ > wait_on_buffer(buffer_head)
+
+阿，这个好漫长的而无意义的东西, fuck!!!

@@ -1,0 +1,1188 @@
+* xprt.c
+
+** xprt_class
+   #+begin_src 
+        list_head
+        ident //XPRT_TRANSPORT identifier
+        rpc_xprt (setup) (xprt_class)
+        module owner
+        name 
+   #+end_src
+
+** xprt_create
+   #+begin_src 
+	int			ident;		/* XPRT_TRANSPORT identifier */
+	struct net *		net;
+	struct sockaddr *	srcaddr;	/* optional local address */
+	struct sockaddr *	dstaddr;	/* remote peer address */
+	size_t			addrlen;
+	const char		*servername;
+	struct svc_xprt		*bc_xprt;	/* NFSv4.1 backchannel */
+	unsigned int		flags;
+   #+end_src
+
+** rpc_xprt
+   #+begin_src 
+	atomic_t		count;		/* Reference count */
+	struct rpc_xprt_ops *	ops;		/* transport methods */
+
+	const struct rpc_timeout *timeout;	/* timeout parms */
+	struct sockaddr_storage	addr;		/* server address */
+	size_t			addrlen;	/* size of server address */
+	int			prot;		/* IP protocol */
+
+	unsigned long		cong;		/* current congestion */
+	unsigned long		cwnd;		/* congestion window */
+
+	size_t			max_payload;	/* largest RPC payload size,
+						   in bytes */
+	unsigned int		tsh_size;	/* size of transport specific
+						   header */
+
+	struct rpc_wait_queue	binding;	/* requests waiting on rpcbind */
+	struct rpc_wait_queue	sending;	/* requests waiting to send */
+	struct rpc_wait_queue	pending;	/* requests in flight */
+
+	struct rpc_wait_queue	backlog;	/* waiting for slot */
+	struct list_head	free;		/* free slots */
+
+	unsigned int		max_reqs;	/* max number of slots */
+	unsigned int		min_reqs;	/* min number of slots */
+	atomic_t		num_reqs;	/* total slots */
+	unsigned long		state;		/* transport state */
+	unsigned char		resvport   : 1; /* use a reserved port */
+	unsigned int		swapper;	/* we're swapping over this
+						   transport */
+	unsigned int		bind_index;	/* bind function index */
+
+	/*
+	 * Connection of transports
+	 */
+	unsigned long		bind_timeout,
+				reestablish_timeout;
+	unsigned int		connect_cookie;	/* A cookie that gets bumped
+						   every time the transport
+						   is reconnected */
+
+	/*
+	 * Disconnection of idle transports
+	 */
+	struct work_struct	task_cleanup;
+	struct timer_list	timer;
+	unsigned long		last_used,
+				idle_timeout;
+
+	/*
+	 * Send stuff
+	 */
+	spinlock_t		transport_lock;	/* lock transport info */
+	spinlock_t		reserve_lock;	/* lock slot table */
+	u32			xid;		/* Next XID value to use */
+	struct rpc_task *	snd_task;	/* Task blocked in send */
+	struct svc_xprt		*bc_xprt;	/* NFSv4.1 backchannel */
+#if defined(CONFIG_SUNRPC_BACKCHANNEL)
+	struct svc_serv		*bc_serv;       /* The RPC service which will */
+						/* process the callback */
+	unsigned int		bc_alloc_count;	/* Total number of preallocs */
+	spinlock_t		bc_pa_lock;	/* Protects the preallocated
+						 * items */
+	struct list_head	bc_pa_list;	/* List of preallocated
+						 * backchannel rpc_rqst's */
+#endif /* CONFIG_SUNRPC_BACKCHANNEL */
+	struct list_head	recv;
+
+	struct {
+		unsigned long		bind_count,	/* total number of binds */
+					connect_count,	/* total number of connects */
+					connect_start,	/* connect start timestamp */
+					connect_time,	/* jiffies waiting for connect */
+					sends,		/* how many complete requests */
+					recvs,		/* how many complete requests */
+					bad_xids,	/* lookup_rqst didn't find XID */
+					max_slots;	/* max rpc_slots used */
+
+		unsigned long long	req_u,		/* average requests on the wire */
+					bklog_u,	/* backlog queue utilization */
+					sending_u,	/* send q utilization */
+					pending_u;	/* pend q utilization */
+	} stat;
+
+	struct net		*xprt_net;
+	const char		*servername;
+	const char		*address_strings[RPC_DISPLAY_MAX];
+   #+end_src
+
+** rpc_rqst
+   #+begin_src 
+	/*
+	 * This is the user-visible part
+	 */
+	struct rpc_xprt *	rq_xprt;		/* RPC client */
+	struct xdr_buf		rq_snd_buf;		/* send buffer */
+	struct xdr_buf		rq_rcv_buf;		/* recv buffer */
+
+	/*
+	 * This is the private part
+	 */
+	struct rpc_task *	rq_task;	/* RPC task data */
+	struct rpc_cred *	rq_cred;	/* Bound cred */
+	__be32			rq_xid;		/* request XID */
+	int			rq_cong;	/* has incremented xprt->cong */
+	u32			rq_seqno;	/* gss seq no. used on req. */
+	int			rq_enc_pages_num;
+	struct page		**rq_enc_pages;	/* scratch pages for use by
+						   gss privacy code */
+	void (*rq_release_snd_buf)(struct rpc_rqst *); /* release rq_enc_pages */
+	struct list_head	rq_list;
+
+	__u32 *			rq_buffer;	/* XDR encode buffer */
+	size_t			rq_callsize,
+				rq_rcvsize;
+	size_t			rq_xmit_bytes_sent;	/* total bytes sent */
+	size_t			rq_reply_bytes_recvd;	/* total reply bytes */
+							/* received */
+
+	struct xdr_buf		rq_private_buf;		/* The receive buffer
+							 * used in the softirq.
+							 */
+	unsigned long		rq_majortimeo;	/* major timeout alarm */
+	unsigned long		rq_timeout;	/* Current timeout value */
+	ktime_t			rq_rtt;		/* round-trip time */
+	unsigned int		rq_retries;	/* # of retries */
+	unsigned int		rq_connect_cookie;
+						/* A cookie used to track the
+						   state of the transport
+						   connection */
+	
+	/*
+	 * Partial send handling
+	 */
+	u32			rq_bytes_sent;	/* Bytes we have sent */
+
+	ktime_t			rq_xtime;	/* transmit time stamp */
+	int			rq_ntrans;
+
+#if defined(CONFIG_SUNRPC_BACKCHANNEL)
+	struct list_head	rq_bc_list;	/* Callback service list */
+	unsigned long		rq_bc_pa_state;	/* Backchannel prealloc state */
+	struct list_head	rq_bc_pa_list;	/* Backchannel prealloc list */
+#endif /* CONFIG_SUNRPC_BACKCHANEL */
+   #+end_src
+
+** rpc_xprt_ops
+   #+begin_src 
+	void		(*set_buffer_size)(struct rpc_xprt *xprt, size_t sndsize, size_t rcvsize);
+	int		(*reserve_xprt)(struct rpc_xprt *xprt, struct rpc_task *task);
+	void		(*release_xprt)(struct rpc_xprt *xprt, struct rpc_task *task);
+	void		(*alloc_slot)(struct rpc_xprt *xprt, struct rpc_task *task);
+	void		(*rpcbind)(struct rpc_task *task);
+	void		(*set_port)(struct rpc_xprt *xprt, unsigned short port);
+	void		(*connect)(struct rpc_xprt *xprt, struct rpc_task *task);
+	void *		(*buf_alloc)(struct rpc_task *task, size_t size);
+	void		(*buf_free)(void *buffer);
+	int		(*send_request)(struct rpc_task *task);
+	void		(*set_retrans_timeout)(struct rpc_task *task);
+	void		(*timer)(struct rpc_xprt *xprt, struct rpc_task *task);
+	void		(*release_request)(struct rpc_task *task);
+	void		(*close)(struct rpc_xprt *xprt);
+	void		(*destroy)(struct rpc_xprt *xprt);
+	void		(*print_stats)(struct rpc_xprt *xprt, struct seq_file *seq);
+   #+end_src
+
+** xdr_buf
+   #+begin_src 
+	struct kvec	head[1],	/* RPC header + non-page data */
+			tail[1];	/* Appended after page data */
+
+	struct page **	pages;		/* Array of pages */
+	unsigned int	page_base,	/* Start of page data */
+			page_len,	/* Length of page data */
+			flags;		/* Flags for data disposition */
+#define XDRBUF_READ		0x01		/* target of file read */
+#define XDRBUF_WRITE		0x02		/* source of file write */
+
+	unsigned int	buflen,		/* Total length of storage buffer */
+			len;		/* Length of XDR encoded message */   
+   #+end_src
+
+** xprt_register_transport(xprt_class)
+   - 目前有tcp/udp/local/rdma类型的xprt. 所有的xprt_class都在xprt_list队列中,根据xprt_class->ident区分. 
+   - 遍历xprt_list队列, 如果没有相通ident的，把它放到队列中.
+   > xprt_unregister_transport(xprt_class)
+   - 遍历xprt_list,找到对应ident的xprt_class,然后释放队列关系. xprt_class和rpc_xprt并没有管理关系，这里只有简单链表操作.
+
+** xprt_load_transport(transport_name)
+   - 遍历xprt_list，查找xprt_class->name与transport_name相通的xprt_class, 如果没有，请求模块
+   > request_module("xprt" + transport_name)
+
+** xprt_reserve_xprt(rpc_xprt, rpc_task)
+   - rpc_task使用rpc_xprt发送数据必须是串行，一个rpc_task使用完成之后，另一个再使用.
+   - 接受好像没有这样的约束,因为接受使用的sock的回调函数，还不知道它在哪里执行. 
+   - rpc_xprt->rpc_task(snd_task)表示当前在发送数据的rpc_task. 
+   > test_and_set_bit(XPRT_LOCKED, rpc_xprt->state)
+   - 如果已经设置，说明正在使用。
+   - 如果参数rpc_task == rpc_xprt->snd_task, 直接返回
+   - 否则别人正在使用, 去rpc_xprt->sending队列上等待, 这里是没有超时设定的. 计算它的优先级
+     - 如果rpc_task->rpc_rqst无效,说明第一次传输数据，使用RPC_PRIORITY_LOW
+     - 如果rpc_task->rq_ntrans = 0 说明还没有重传过,使用RPC_PRIORITY_NORMAL
+     - 其他，多次重传，设置高优先级 RPC_PRIORITY_HIGH
+   > rpc_sleep_on_priority(rpc_xprt->sending, rpc_task, priority)
+   - 如果以前还没有XPRT_LOCKED，说明没有人使用，设置上参数rpc_task. 如果rpc_task->rpc_rqst有效，说明重传,以及发送数据重置. rpc_rqst->rq_bytes_send = 0; rpc_rqst->rq_ntrans++
+
+** xprt_clear_locked(rpc_xprt)
+   - 这个函数在后面经常使用. 设置rpc_xprt->snd_task = NULL.
+   - 如果 rpc_xprt->state & XPRT_CLOSE_WAIT !=0, 正在等待关闭
+   - 使用工作队列rpc_xprt->task_cleanup释放rpc_xprt
+   > queue_work(rpciod_workqueue, rpc_xprt->task_cleanup
+   - 否则就去掉rpc_xprt->state的XPRT_LOCKED
+
+** xprt_reserve_xprt_cong(rpc_xprt, rpc_task)
+   - 和上面的rpc_reserve_xprt一样,不过这里添加阻塞控制. 
+   - 如果rpc_xprt被锁住,XPRT_LOCKED, 而且是参数rpc_task, 直接返回. 否则参数rpc_task去等待
+   - 如果rpc_xprt没有被锁住
+   - 如果rpc_xprt没有关联rpc_task, 可以直接使用, 直接返回
+   - 否则,需要检查rpc_task会不会阻塞系统
+   > __xprt_get_cong() 
+   - 如果会阻塞,也会等待, 而且去掉rpc_xprt->state的XPRT_LOCKED, 下次不会被锁住
+   > xprt_clear_locked(rpc_xprt)
+    
+** xprt_lock_write(rpc_xprt, rpc_task)
+   - 这里是锁定rpc_xprt, 就是上面的xprt_reserve_xprt
+   - 在分配rpc_rqst时使用, 在xprt_connect时也会使用
+   - 对应的还有rpc_task释放rpc_xprt, 在对应的FSM阶段也会使用
+   > rpc_xprt->ops->reserve_xprt(rpc_xprt, rpc_task) 
+
+** __xprt_lock_write_func(rpc_task, data)
+   - 在rpc_wait_queue唤醒rpc_task中使用,把rpc_xprt分配给rpc_task
+
+** _xprt_lock_write_next(rpc_xprt)
+   - 如果rpc_xprt没有被rpc_task锁定，唤醒在rpc_xprt->sending队列上的第一个rpc_task, 让它获取rpc_xprt
+   > test_and_set_bit(XPRT_LOCKED, rpc_xprt->state)
+   - 唤醒之前给他rpc_xprt
+   > rpc_wake_up_first(rpc_xprt->sending, __xprt_lock_write_func, xprt)
+   - 这里使用的是sending队列
+
+** __xprt_lock_write_cong_func(rpc_task, data)
+   - 这里和上面一套类似,让rpc_task获取rpc_xprt时，判断rpc_rqst是否重传,而且会不会导致rpc_xprt阻塞
+   > __xprt_get_cong(rpc_xprt, rpc_task) 
+   - 如果阻塞检测没通过，返回false.就不会唤醒rpc_task
+
+** __xprt_lock_write_next_cong(rpc_xprt)
+   - 如果rpc_xprt是阻塞的 RPC_XPRT_CONGESTED, 则不再唤醒
+   > rpc_wait_up_first(rpc_xprt->sending, __xprt_lock_write_cong_func, xprt)
+   > xprt_clear_locked(rpc_xprt) 
+   - 如果已经阻塞，清除XPRT_LOCKED,也就是rpc_xprt不能分配出去
+
+** xprt_release_xprt(rpc_xprt, rpc_task)
+   - 如果rpc_task正在使用rpc_xprt, 释放rpc_task与rpc_xprt的关系,并唤醒下一个rpc_task
+   > xprt_clear_locked(rpc_xprt)
+   > __xprt_lock_write_next(rpc_xprt)
+
+** xprt_release_xprt_cong(rpc_xprt, rpc_task)
+   - 和上面一样，不过调用阻塞处理版的
+   -> __xprt_lock_write_next_cong(rpc_xprt)
+
+** xprt_release_write(rpc_xprt, rpc_task)
+   - 使用xprt_release_xprt,所以这是对上面的封装.
+   > rpc_xprt->ops->release_xprt(rpc_xprt, rpc_task) 
+
+** __xprt_get_cong(rpc_xprt, rpc_task)
+   - 检查rpc_task能否通过cong检查, rpc_rqst->cong = 1表示他被接受
+   - 检查rpc_xprt是否阻塞  rpc_xprt->cong > rpc_xprt->cwnd
+   > RPCXPRT_CONGESTED(rpc_xprt)
+   - 如果阻塞,返回0, 表示rpc_task不能接受?
+   - 否则,设置rpc_rqst->rq_cong = 1, rpc_xprt->cong += RPC_CWDSCALE.
+    
+** __xprt_put_cong(rpc_xprt, rpc_rqst)
+   - 这里是rpc_xprt释放rpc_task, 减小阻塞窗口的大小. 
+   - 如果rpc_rqst->rq_cong == 0, 表示它没有影响cong, 直接返回
+   - 设置rpc_xprt->cong -= RPC_CWNDSCALE, 唤醒等待sending队列上的rpc_task
+   > __xprt_lock_write_next_cong(rpc_xprt)
+
+** xprt_release_rqst_cong(rpc_task)
+   > __xprt_put_cong(rpc_task->rpc_xprt, rpc_task->rpc_rqst) 这个被udp作为rpc_xprt_ops->release_request
+
+** xprt_adjuest_cwnd(rpc_task, result)
+   - 当rpc_task完成后，根据result修改rpc_xprt->cwnd大小.  这个在两个地方调用timeout和xs_udp_data_ready.
+   - result >= 0 增大rpc_task->rpc_xprt->cwnd, 同时唤醒下一个任务 -> __xprt_lock_write_next_cong(rpc_xprt)
+   - result = ETIMEOUT rpc_xprt->cwnd /= 2, 同时保证 > RPC_CWNDSCALE
+   - 其他 -> __xprt_put_cong(rpc_xprt, rpc_rqst) 这里会重复唤醒,没事，唤醒之前检查rpc_xprt是否被锁定. 使用阻塞控制的都是udp使用的功能函数.
+
+** 总结
+   - tcp  / local
+     - reserve_xprt = xprt_reserve_xprt: 获取rpc_xprt, 如果失败,去sending队列等待
+     - release_xprt = xprt_release_xprt: 释放XPRT_LOCKED, 而且唤醒sending队列的下一个rpc_task
+   - udp 使用阻塞控制
+     - reserve_xprt = xprt_reserve_xprt_cong
+     - release_xprt = xprt_release_xprt_cong
+     - release_request = xprt_releast_rqst_cong
+   - xprt_lock_write  => rpc_xprt_ops->reserve_xprt 
+   - xprt_release_write => rpc_xprt->ops->release_xprt   在结束时会唤醒sending队列中的下一个rpc_task.
+   - 对于rpc_xprt和rpc_task的关系, FSM中的reserve,bind,connect,transmit状态和它有关系,几乎每个状态都需要绑定
+   - 根据包装, 主要使用这对函数  xprt_lock_write / xprt_release_write(xprt_release)
+   - 在reserve,connect,transmit都会使用这些函数
+   - 对于xprt_release, 他不确定那个FSM调用它,所以他需要根据rpc_rqst的状态,做一些操作.
+
+** xprt_wake_pending_tasks(rpc_xprt, status)
+   - 唤醒rpc_xprt->pending上所有的rpc_task
+   - 如果status < 0, 改变rpc_task的状态
+   > rpc_wake_up_status(rpc_xprt->pending, status)
+   - 否则不需要
+   > rpc_wake_up_status(rpc_xprt->pending)
+
+** xprt_wait_for_buffer_space(rpc_task, rpc_actione)
+   - 等待sock有足够的发送内存, 使用rpc_xprt->pending队列.
+   - 如果使用soft, 在这个队列上等待使用timeout, 时间为rpc_rqst->rq_timeout
+   - 在xs_nospace上调用,如果检测rpc_xprt=>sock_xprt->socket带有标志SOCK_ASYNC_NOSPACE,把这个task放到等待队列. 
+   - 此函数在发送数据的函数中间接调用过来,实现等待. 
+   - rpc_sleep_on设置rpc_task->tk_callback，而没有设置rpc_task->tk_action. tk_action保证FSM继续运行, tk_callback是恢复等待前状态?
+   > rpc_sleep_on(rpc_xprt->pending, rpc_task, action)
+
+** xprt_write_space(rpc_xprt)
+   - 这个函数可能在softirq中调用, tcp/ip的回调函数
+   - 唤醒当前锁定rpc_xprt的rpc_task. 这里可看出必须有个rpc_task锁定rpc_xprt
+   - 这里为何能保证rpc_xprt->snd_task在pending队列中,而不是sending队列中??
+   > rpc_wake_up_queued_task(rpc_xprt->pending, rpc_xprt->snd_task)
+   - 在数据发送时，检查socket,如果没有空间，把rpc_task放到pending队列,然后会有人唤醒rpc_xprt, 唤醒操作使用了sock->sk_write_space回调函数.
+
+** 总结
+   - 上面是pending队列的操作, 这是在call_transmit状态中使用
+   - 等待动作是在发送阻塞时处罚,唤醒动作实在sock的回调中处罚. 
+   - 但pending队列还包括等待结果的rpc_task.
+   - 如果发生网络阻塞的情况,rpc_xprt->snd_task一直锁定rpc_xprt, 而且在唤醒时也是唤醒特定的rpc_xprt->snd_task
+
+** xprt_set_retrans_timeout_def(rpc_task)
+   - 设置请求的超时时间,这里使用rpc_rqst的时间.
+   - rpc_task->tk_timeout = rpc_task->rpc_rqst->rq_timeout
+
+** xprt_set_retrans_timeout_rtt(rpc_task)
+   - 这么复杂的东西,nfsv4已经不再使用!!
+   - 使用RTT estimator设置rpc_task的超时时间
+   > rpc_calc_rto(rpc_rtt, time)
+    
+** xprt_reset_majortimeo(rpc_rqst)
+   - 根据rpc_rqst->rpc_task->rpc_clnt->rpc_timeout计算rpc_rqst->rq_majortimeor.
+   - rpc_timeout->to_increment * to_retires + rpc_rqst->rq_timeout/rpc_timeout->to_initial
+   - 最后rq_majortimeo += jiffies
+    
+** xprt_adjuest_timeout(rpc_rqst)
+   - 这里调整rpc_rqst->rq_timeout, 并返回status, 表示是否真正的超时
+   - rpc_timeout->rq_retries表示允许rpc_task可以失败几次,也就是这些不算timeout, 以后在后面严重的情况下,才算超时
+   - rpc_rqst->rq_timeout是递增或翻倍的. 而且超过majortime之后,重新设置.
+   - 把rpc_rqst->rq_timeout给rpc_task->tk_timeout才使用rpc_wait_queue的计时器. 在connect失败和socket空间不足时使用
+   - 在call_timeout中调用它,bind/connect等失败使用. 但它们失败只会影响rpc_rqst->rq_timeout, 间接影响rpc_task的上面2中超时等待.
+   - rpc_delay操作, 可能会影响rpc_rqst->rq_timeout的重置或导致TIMEOUT错误, 那的确耽误了时间;
+
+** xprt_update_rtt(rpc_task)
+   > rpc_update_rtt()
+   > rpc_set_timeo(...)
+        
+** xprt_autoclose(work_struct)
+   - rpc_xprt->task_cleanup / work_struct 使用的回调函数，关闭rpc_xprt
+   - 异步方式关闭connect
+   > rpc_xprt->ops->close(rpc_xprt)
+   - 去掉rpc_xprt->state的XPRT_CLOSE_WAIT, 解除rpc_xprt的锁定, XPRT_LOCKED
+   > xprt_release_write(rpc_xprt, NULL)
+   - 对于tcp来说，会释放sock_xprt使用的socket, 调用下面的函数，唤醒所有rpc_task.
+
+** xprt_disconnect_done(rpc_xprt)
+   - rpc_xprt已经断开链接，去掉rpc_xprt->state XPRT_CONNECTED, 唤醒所有等待发送完成的任务，让他们重新发送. 这里表示rpc_xprt底层的socket链接断开
+   > rpc_wake_pending_tasks(rpc_xprt, EAGAIN)
+
+** xprt_force_disconnect(rpc_xprt)
+   - 这里是错误处理,底层的链接断开
+   - 需要关闭socket, 使所有pending上面的rpc_task重新启动.
+   - 设置rpc_xprt->state的XPRT_CLOSE_WAIT
+   - 设置XPRT_LOCKED, 禁止别人使用这个rpc_xprt.
+   - 如果已经被锁定, 那个rpc_task会释放socket等
+   - 否则提交一个work_struct, 去释放socket
+   > queue_work(rpciod_workqueue, rpc_xprt->task_cleanup)
+   - 唤醒所有等待接受数据的rpc_task, 网络已经断开,接不到数据
+   > xprt_wake_pending_tasks(rpc_xprt, EAGAIN)
+
+** xprt_conditional_disconnect(rpc_xprt, cookie)
+   - 注意这里的锁都使用bh版，因为这个锁可能在softirq中有使用
+   - 和上面类似, 不过这里要判断cookie和rpc_xprt->connect_cookie. 
+   - 这也避免多次disconnect操作
+   > test_and_set_bit(XPRT_LOCKED, rpc_xprt->state)
+   > queue_work(rpciod_workqueue, rpc_xprt->task_cleanup)
+   > xprt_wake_pending_tasks(rpc_xprt, EAGAIN)
+
+** xprt_init_autodisconnect(data)
+   - 这个回调函数被rpc_xprt->timer使用,它在FSM中最后使用
+   - 当一个rpc_task处理完成,而且发现rpc_xprt->recv空, rpc_xprt->idle_timeout > 0, 就会设置计时器, 自动断开socket
+   - 如果rpc_xprt->recv不为空,说明有rpc_task等待结束数据，不能disconnect
+   - 设置rpc_xprt->state的XPRT_LOCKED, 禁止别人使用 
+   - 如果已经设置,说明别人在使用,也不能disconnect.
+   - 断开connect使用rpc_xprt->task_cleanup, 通过workqueue实现
+   - idle_timeout初始化设置后不会改变.
+
+** xprt_connect(rpc_task)
+   - 这里实现创建socket,connect的动作. 这个操作是在call_connect使用的.
+   - rpc_xprt->state & XPRT_BOUND, 没有bind返回EGAIN
+   - 让rpc_task锁定rpc_xprt.
+   > xprt_lock_write(rpc_xprt, rpc_task) 
+   - rpc_xprt->state & XPRT_CLOSE_WAIT, 需要重新connect
+   > rpc_xprt->ops->close
+   - 如果已经有connect, 可以结束rpc_xprt的锁定. rpc_xprt->state & XPRT_CONNECTED
+   > xprt_release_write(rpc_xprt, rpc_task)
+   - 否则去建立链接
+   - 先把rpc_task放到等待队列中 rpc_task->tk_timeout = rpc_task->rpc_rqst->rq_timeout,使用超时等待
+   > rpc_sleep_on(rpc_xprt->pending, rpc_task, xprt_connect_status)
+   - XPRT_CLOSING 直接退出
+   - 添加标志XPRT_CONNECTING, 如果已经有，返回, 不要重复发起connect操作
+   - rpc_xprt->ops->connect(rpc_task)
+   - 设置rpc_xprt->stat->connect_start = jiffies
+
+** rpc_connect_status(rpc_task)
+   - 如果没有错误, 修改统计数
+   - rpc_xprt->stat->connect_count++, connect_time += (jiffies - connect_start)
+   - 如果是EAGAIN/ETIMEOUT，返回结果；
+   - 其他的需要释放对rpc_xprt的锁定, 错误是-EIO
+   > xprt_release_write(rpc_xprt, rpc_task)
+   - 原来connect操作也是串行的, 而且使用pending队列
+
+** xprt_lookup_rqst(rpc_xprt, xid)
+   - 在rpc_xprt->recv队列中找rpc_xprt,它对应的rq_xid与参数一样. rpc数据包头部的xid是根据这里确定的
+
+** xprt_complete_rqst(rpc_task, copied)
+   - rpc 收到数据后的操作
+   - 把rpc_task从rpc_xprt->recv队列中释放
+   - 设置rpc_rqst->rq_private_buf.len = rpc_rqst->rq_reply_bytes_recvd = copied
+   > xprt_update_rtt(rpc_task)
+   > rpc_wake_up_queued_task(rpc_xprt->pending, rpc_task)
+   - 刚才看了下主要在接受数据操作中调用这些. 应该是收取一个rpc数据包，把它对应的rpc_task从pending 队列上唤醒，让它继续执行. 
+   - 在准备接受时，已经把rpc_rqst->rq_rcv_buf给rq_private_buf，所有数据放到rq_rcv_buf指向的内存. 
+   - 此函数在xs_tcp_read_reply中调用，那是接受数据的操作.
+
+** xprt_timer(rpc_task)
+   - 只有rpc_task->status是ETIMEOUT才调用这个函数, 这是rpc_sleep_on(rpc_xprt->pending, rpc_task, rpc_call)使用的rpc_task->tk_callback回调函数
+   > rpc_xprt->ops->timer(rpc_task)
+
+** xprt_has_timer(rpc_xprt)
+   - rpc_xprt->idle_timeout != 0
+   - rpc_xprt有一个计时器，如果长时间没有任务使用这个rpc_xprt,他会自动断开链接. 
+   - 计时器使用的回调函数是xprt_init_autodisconnect. 这个在xprt_release使用,而这个函数是FSM中一部分.
+
+** xprt_prepare_transmit(rpc_task)
+   - 检查他是否已经完成????
+   - rpc_rqst->rq_reply_bytes_received > 0 && rpc_rqst->rq_bytes_send ==0
+   - 在call_transmit中调用. 锁定rpc_xprt
+   > rpc_xprt->ops->reserve_xprt(rpc_xprt, rpc_task)
+
+** xprt_end_transmit(rpc_task)
+   - 解锁rpc_xprt. 是整个发送数据过程中都要锁住rpc_xprt, 在call_transmit_status中使用.
+   > xprt_release_write(rpc_task->rpc_rqst->rpc_xprt, rpc_task)
+    
+** xpr_transmit(rpc_task)
+   - 数据的发送应该是一次完成的，而数据的接受可以分多次. 
+   - 如果还没有开始接受数据, rpc_rqst->rq_reply_bytes_recvd ==0, 为接受准备
+   - 如果需要接受数据, encode有效
+   > rpc_reply_excepted(rpc_task)
+   - 把rpc_rqst->rq_list放到rpc_xprt->recv队列中
+   - 把rpc_rqst->rq_rcv_buf给rpc_rqst->rq_private_buf, 接受数据时,直接放到rq_rcv_buf中
+   - 重设timeout
+   > xprt_reset_majortimeo(rpc_rqst)
+   - 关闭timer, 不需要rpc_xprt关闭socket
+   > del_singleshot_timer_sync(rpc_xprt->timer)
+   - 如果rpc_rqst->rq_byte_sent != 0,并且rq_reply_bytes_recvd != 0, 表示数据已经发送,而且在接受?? 直接退出
+   - 然后是发送操作, 设置rpc_rqst->rq_connect_cookie = rpc_xprt->connect_cookie
+   - rpc_rqst->rq_xtime = ktime_get()
+   > rpc_xprt->ops->send_rqst(rpc_task)
+   - 如果结果不是0, 直接返回,有错误, 或者进入了queue
+   - 否则发送完成, 更新统计数
+   - 给rpc_task->tk_flags添加RPC_TASK_SEND标志
+   > rpc_xprt->ops->set_retrans_timeout(rpc_task)
+   - 最后检查状态 , 如果没有connect, 返回-ENOTCONN
+   > xprt_connected(rpc_xprt)
+   - 如果正常, 而且rpc_rqst->rq_reply_bytes_recvd == 0, 表示还没有数据, 去pending队列上等待. 但tcp不使用timer
+   > rpc_sleep_in(rpc_xprt->pending, rpc_task, xprt_timer)
+
+** xprt_add_backlog(rpc_xprt, rpc_task)
+   - 设置rpc_xprt->state的XPRT_CONGESTED
+   - 等待backlog队列
+   > rpc_sleep_on(rpc_xprt->backlog, rpc_task, NULL)
+
+** xprt_wake_up_backlong(rpc_xprt)
+   > rpc_wake_up_next(rpc_xprt->backlog)
+   - 如果没有可唤醒的,去掉XPRT_CONGESTED
+
+** xprt_throttle_congested(rpc_xprt, rpc_task)
+   - 首先检查XPRT_CONGESTED, 如果有就锁住rpc_xprt->reserve_lock, 再检查
+
+** xprt_dynamic_alloc_slot(rpc_xprt, gfp_t)
+   - 检查rpc_xprt->num_reqs是否超过rpc_xprt->max_reqs，如果没超过使用kmalloc分配一个rpc_rqst; 否则不让分配.
+
+** xprt_dynamic_free_slot(rpc_xprt, rpc_rqst)
+   - 如果rpc_xprt->num_reqs是否大于rpc_xprt->min_rqst, 如果大于，使用kfree释放rpc_rqst；否则不让释放.
+        
+** xprt_alloc_slot(rpc_task)
+   - 这个函数要为rpc_task分配rpc_rqst
+   - 首先从rpc_task->rpc_xprt->free队列上取一个，如果没有，则动态分配一个
+   - 如果返回EAGAIN, 超过限制, 去backlog中等待
+   > xprt_add_backlog(rpc_xprt, rpc_task)
+   - 否则就返回ENOMEM, 上传错误
+   - 如果分配成功, 关联rpc_task
+   > xprt_request_init(rpc_task, rpc_rqst)
+
+** xprt_lock_and_alloc_slot(rpc_xprt, rpc_task)
+   - 分配都要先把rpc_xprt锁起来
+   > xprt_lock_write(rpc_xprt, rpc_task)
+   > xprt_alloc_slot(rpc_xprt, rpc_task)
+   - 释放锁定
+   > xprt_release_write(rpc_xprt, rpc_task)
+   - 这样在connect,transmit过程中,不会接受新的rpc_task的请求
+
+** xprt_free_slot(rpc_xprt, rpc_rqst)
+   - 释放rpc_rqst, 或者把它放到rpc_xprt->free队列中,并唤醒rpc_xprt->backlog队列
+   > xprt_dynamic_free_slot(rpc_xprt, rpc_rqst)
+   > xprt_wake_up_backlog(rpc_xprt)
+
+** xprt_free_all_slots(rpc_xprt)
+   - 释放rpc_xprt->free上的所有rpc_rqst,简单的kfree
+
+** xprt_alloc(net, size, num_prealloc, max_alloc)
+   - 这里返回的是rpc_xprt，应该是为它分配内存.而且这里预分配num_prealloc个rpc_rqst
+   - 根据num_prealloc设置rpc_xprt->min_reqs, rpc_xprt->max_reqs.
+   > xprt_init(rpc_xprt, net)
+    
+** xprt_free(rpc_xprt)
+   - 释放所有的rpc_rqst，然后它自己,也比较简单.
+   > put_net(rpc_xprt->net)
+   > rpc_free_all_slots(rpc_xprt)
+
+** xprt_reserve(rpc_xprt)
+   - 为rpc_task分配一个rpc_rqst
+   - 如果rpc_task->rpc_rqst != NULL, 直接返回, 他已经有了!
+   - 检查是否分配过多
+   > xprt_throttle_congested(rpc_xprt, rpc_task)
+   > rpc_xprt->ops->alloc_slot(rpc_xprt, rpc_task)
+
+** xprt_retry_reserve(rpc_task)
+   - 重新分配, 不再检查CONGESTED
+   > rpc_xprt->ops->alloc_slot(rpc_xprt, rpc_task)
+
+** xprt_alloc_xid(rpc_xprt)
+   - 递增rpc_xprt->xid
+
+** xprt_init_xid(rpc_xprt)
+   - xpr_xprt->xid选一个随机值
+
+** xprt_request_init(rpc_task, rpc_xprt)
+   - 初始化一个rpc_task->rpc_rqst
+   - 关联rpc_xprt,分配xid,初始化timeout相关参数.
+   > xprt_alloc_xid(rpc_xprt)
+   > xprt_reset_majortimeo(rpc_rqst)
+
+** xprt_release(rpc_task)
+   - 在释放rpc_task使用, 释放rpc_task->rpc_rqst
+   - 如果rpc_task->rpc_rqst == NULL, 没什么可释放, 检查他是否锁定rpc_xprt, 解除rpc_xprt的锁定
+   > xprt_release_write(rpc_xprt, rpc_task)
+   - 否则, 这个rpc_task就是一个完成的
+   - 先更新统计数
+   > rpc_task->tk_ops->rpc_count_stats(rpc_task, rpc_task->tk_calldata)
+   > rpc_count_iostats(rpc_task, rpc_task->rpc_clnt->cl_metrics)
+   - 释放socket层的资源,而且唤醒下一个
+   > rpc_xprt->ops->release_xprt(rpc_xprt, rpc_task)
+   - 释放rpc_rqst->rq_list队列
+   - 更新rpc_xprt->timer
+   - 释放enc/dec使用的内存
+   > rpc_xprt->ops->buf_free(rpc_rqst->rq_buffer)
+   - 释放rpc_rqst->rpc_cred
+   > rpc_rqst->rq_release_snd_buf(rpc_rqst)
+   - 最后释放rpc_rqst
+   > rpc_free_slot(rpc_xprt, rpc_rqst)
+
+** xprt_init(rpc_xprt, net)
+   - 初始化rpc_xprt,觉得他们的初始化都跟他们的数据结构的规模不成比例.
+   - 这里的初始化只有lock，free,recv,cwnd,last_used, 四个等待队列pending,binding,backlog,sending,还有xid,net
+
+** xprt_create_transport(xprt_create)
+   - 首先找一个rpc_xprt_class
+   > rpc_xprt_class->setup(xprt_create)
+   - 初始化work_struct,使用回调函数xprt_autoclose,用来自动关闭socket
+
+** xprt_destroy(rpc_xprt)
+   - 销毁rpc_xprt->timer, rpc_xprt->shutdown =1，说明这个rpc_xprt不能用了，销毁4个等待队列.
+   > rpc_xprt->ops->destroy(rpc_xprt) 在底层实现中上调了rpc的释放函数 xprt_free
+
+** xprt_put(rpc_xprt) / xprt_get(rpc_xprt)
+   - 减小rpc_xprt->count,如果减到0， 
+   >xprt_destroy(rpc_xprt)
+
+** 总结
+   - rpc_xprt->state中标志
+   - XPRT_LOCKED     某个rpc_task正在使用rpc_xprt, 目前就receive/bind不使用.其他都使用
+   - XPRT_CONNECTED  底层建立链接之后才有的标志
+   - XPRT_CONNECTING 正在执行connect操作
+   - XPRT_CLOSE_WAIT 正在等待关闭
+   - XPRT_BOUND      rpcbind
+   - XPRT_BINDING    
+   - XPRT_CLOSING    在关闭，为何还有等待关闭?
+   - XPRT_CONNECTION_ABORT   网络端口
+   - XPRT_COUNECTION_CLOSE   网络关闭
+
+
+* xprtsock.c
+
+** sock_xprt
+   #+begin_src 
+	struct rpc_xprt		xprt;
+
+	/*
+	 * Network layer
+	 */
+	struct socket *		sock;
+	struct sock *		inet;
+
+	/*
+	 * State of TCP reply receive
+	 */
+	__be32			tcp_fraghdr,
+				tcp_xid,
+				tcp_calldir;
+
+	u32			tcp_offset,
+				tcp_reclen;
+
+	unsigned long		tcp_copied,
+				tcp_flags;
+
+	/*
+	 * Connection of transports
+	 */
+	struct delayed_work	connect_worker;
+	struct sockaddr_storage	srcaddr;
+	unsigned short		srcport;
+
+	/*
+	 * UDP socket buffer size parameters
+	 */
+	size_t			rcvsize,
+				sndsize;
+
+	/*
+	 * Saved socket callback addresses
+	 */
+	void			(*old_data_ready)(struct sock *, int);
+	void			(*old_state_change)(struct sock *);
+	void			(*old_write_space)(struct sock *);   
+   #+end_src
+
+** xs_send_kvec(socket, sockaddr, addrlen, kvec, base, more)
+   - 向server发送数据一块内存,不是多块内存.
+   - 对于base偏移,设置kvec->iov_base += base
+   - 先构造一个msghdr,封装sockaddr/addrlen/more
+   > kernel_sendmsg(socket, msghdr, kvec, len)
+   - socket已经创建,为何还要指定目标地址?
+
+** xs_send_pagedata(socket, xdr_buf, base, more)
+   - 发送xdr_buf->pages上的数据,xdr_buf->page_base表示第一个page的内粗偏移, base表示待发送数据在xdr_buf->pages中的偏移
+   - xdr_buf->page_len表示有效数据的长度,要发送数据长度xdr_buf->page_len-base.
+   - 总的pages偏移是xdr_buf->page_base + base
+   - 遍历xdr_buf->pages数组
+   > socket->ops->sendpage(socket, page, base,len,flags)
+
+** xs_sendpages(socket, sockaddr, addrlen, xdr_buf, base)
+   - 这是tcp和udp共用的函数, sockaddr/addrlen就是给udp使用的
+   - 要发送的数据量是xdr_buf->len - base
+   - 分别发送xdr_buf->head[0], pages, tail[0]
+   - 每次发送时，考虑base是否在kvec->iov_len范围内,同时计算发送数据量iov_len-base.发送下一个数据段时，base减为0或者上个数据段长度.
+   > xs_send_kvec(socket, addr/addrlen, kvec, base, more)
+   > xs_send_pagedata(socket, xdr_buf, base, more)
+
+** xs_nospace_callback(rpc_task)
+   - 这是一个rpc_task->tk_callback使用的回调函数, nospace而在rpc_xprt->pending队列上等待, 被唤醒时执行
+   - rpc_task->rpc_rqst=>sock_xprt->sock->sk_write_pending--, 清除socket的SOCK_ASYNC_NOSPACE.
+
+** xs_nospace(rpc_task)
+   - 在发送数据返回EAGAIN, 表示网络阻塞
+   - 底层socket没有发送空间使用,把它放到等待队列中
+   - 如果rpc_xprt->flags & XPRT_CONNECTED !=0, 而且socket->flags & SOCK_ASYNC_NOSPACE !=0,把它放到rpc_xprt->pending队列中,设置socket->flags的SOCK_NOSPACE
+   > xprt_wait_for_buffer_space(rpc_task, xs_nospace_callback)
+   - 否则,rpc_xprt是断开链接,清除sock_xprt->socket->flags的SOCK_ASYNC_NOSPACE, 返回-ENOTCONN
+
+** xs_encode_stream_record_marker(xdr_buf)
+   - 开始填充xdr_buf->head[0], 第一个32位是整个数据包的长度
+   - xdr_buf->len - sizeof(rpc_fraghdr)
+   - rpc_fraghdr表示rpc包的格式, 但仅仅封装一个长度
+
+** xs_tcp_shutdown(rpc_xprt)
+   - 关闭rpc_xprt=>sock_xprt->socket,这是rpc_xprt的操作, 在xs_tcp_close调用,这个是rpc_xprt_ops->close. 在rpc_tcp_send_request中出错也会调用
+   > kernel_sock_shutdown(socket, SHUT_WR)
+
+** xs_tcp_send_request(rpc_task)
+   - 这个是rpc_xprt_ops->send_request，在xprt_transmit中使用
+   - 发送之前设置rpc_fraghdr, 这时encode已经完成,确定了数据包的长度
+   > xs_encode_stream_record_marker(rpc_rqst->rq_snd_buf)
+   - tcp一次可能发送不完，但可以继续发送，这里循环发送，直到返回错误
+   - 每次循环更新rpc_rqst->rq_bytes_send
+   > xs_sendpages(socket, NULL, 0, rpc_rqst->rq_snd_buf, rpc_rqst->rq_bytes_send) 
+   - 返回>0 更新rpc_rqst->rq_bytes_send/rpc_rqst->rq_xmit_bytes_send
+   - 如果rpc_rqst->rq_bytes_send > rqc_rqst->rq_snd_buf.len, 发送完成返回.并设置rpc_rqst->rq_bytes_send = 0
+   - 如果返回0, 当作-EAGAIN错误处理
+   - 返回EAGAIN, 去pending队列上等待
+   > xs_nospace(rpc_task)
+   - ECONNRESET, 关闭socket
+   > xs_tcp_shutdown()
+   - 其他情况上传错误
+
+** xs_tcp_release_xprt(rpc_xprt, rpc_task)
+   - 这是rpc_xprt_ops->release_xprt, 他包装rpc_task对rpc_xprt的锁定. 使用非常频繁
+   - 如果rpc_xprt->snd_task != rpc_task, 直接退出. 
+   - 如果rpc_rqst有效,而且数据发送完毕 rpc_rqst->rq_bytes_send == rpc_rqst->rq_snd_buf->len, 不会设置XPRT_CLOST_WAIT??
+   - 释放rpc_xprt, 唤醒下一个rpc_task
+   > xprt_release_xprt(rpc_xprt, rpc_task) 
+
+** xs_save_old_callbacks(sock_xprt, sock)
+   - 保存sock->sk_data_ready / sk_state_change / sk_write_space / sk_error_report, 在xs_tcp_finish_connectiong使用.
+
+** xs_restore_old_callbacks(sock_xprt, sock)
+   - 在xs_reset_transport中使用, 恢复sock的callbacks
+
+** xs_reset_transport(sock_xprt)
+   - 释放sock_xprt的srcport,socket,sock. 恢复sock的callbacks, 在xs_close中调用它
+   > xs_restore_old_callbacks(sock_xprt, sock)
+   > sock_release(socket)
+
+** xs_close(rpc_xprt)
+   - 这是rpc_xprt_ops->xs_close操作. 当所有数据包都发送完毕后,关闭socket相关资源
+   > xs_reset_transport(sock_xprt) 
+   - 清除rpc_xprt的reestablish_timeout / XPRT_CONNECTION_ABORT / XPRT_CLOSE_WAIT / XPRT_CLOSING
+   - 唤醒等待接受数据的rpc_task, 让他们重新执行
+   > xprt_disconnect_done(rpc_xprt)
+
+** xs_tcp_close(rpc_xprt)
+   - 如果rpc_xprt & XPRT_CONNECTION_CLOSE !=0 
+   > xs_close(rpc_xprt)
+   - 否则 xprt资源已经释放,仅仅关闭socket
+   > xs_tcp_shutdown 
+   - 这是rpc_xprt_ops->close, 他在2个地方地用
+   - 一个是rpc_connect中, 如果设置XPRT_CLOSE_WAIT, 关闭它
+   - 另一个xprt_autoclose, 使用rpc_xprt->task_cleanup.
+   - 对于第2种,也有3种情况
+   - 一种是长时间没有使用rpc_xprt, 计时器触发它, xprt_init_autodisconnect
+   - 另一种是强制disconnect, 在tcp错误处理中xs_tcp_force_close
+   - 还有一种是XPRT_CLOSE_WAIT, 仅仅在数据发送一半时,rpc_task释放rpc_xprt时设置.
+   - 在这个函数里面XPRT_CONNECTION_CLOSE控制关闭哪些资源
+   - 如果设置, 释放sock/socket,几乎所有的资源. 也只有在计时器中设置它
+   - 如果没有设置,仅仅断开socket, 但没有释放,也没有让rpc_task重新执行
+
+** xs_local_destroy(rpc_xprt)
+   - 释放rpc_xprt
+   > xs_close(rpc_xprt)
+   > xs_free_peer_address(rpc_xprt)
+   > xprt_free(rpc_xprt)
+
+** xs_destroy(rpc_xprt)
+   - 这个是rpc_xprt_ops中的回调函数,在注销rpc_xprt时使用.
+   - 取消connect的任务
+   > cancel_delayed_work_sync(rpc_xprt=>sock_xprt->connect_worker)  
+   > xs_local_destroy(rpc_xprt)
+
+** xprt_from_sock(sock)
+   - sock->sk_user_data是rpc_xprt
+
+** xs_tcp_force_close(rpc_xprt)
+   - 设置rpc_xprt->state的XPRT_CONNECTION_CLOSE, 问题很严重,需要重置rpc_xprt
+   > xprt_force_disconnect(rpc_xprt)
+
+** xdr_skb_reader
+   #+BEGIN_SRC 
+	struct sk_buff	*skb;
+	unsigned int	offset;
+	size_t		count;
+	__wsum		csum;   
+   #+END_SRC
+
+** xs_tcp_read_fraghdr(rpc_xprt, xdr_skb_reader)
+   - 接受rpc_fraghdr,但包头只有一个长度的32bit数
+   - 数据给sock_xprt->tcp_fraghdr, sock_xprt->tcp_offset是已经读到的tcp数据长度. 即使是32bit,也要这么复制!!
+   > xdr_sbk_read_bits(xdr_skb_reader, p, sizeof(sock_xprt->tcp_fraghdr) - tcp_offset)
+   - 如果没有接受完,直接返回
+   - 读到后把sock_xprt->tcp_fraghdr改变字节序给sock_xprt->tcp_reclen
+   - 设置sock_xprt->tcp_flags的TCP_RCV_LAST_FRAG, 去掉TCP_RCV_COPY_FRAGHDR, 已经fraghdr已经处理完
+   - 如果sockxpr->tcp_reclen<8,如果数据太少,关闭链接
+   > xs_tcp_force_close(rpc_xprt)
+
+** xs_tcp_check_fraghdr(sock_xprt)
+   - 检查是否全部受到rpc数据包,tcp_offset == tcp_reclen. 
+   - 如果全部受到添加TCP_RCV_COPY_FRAGHDR, tcp_offset=0, 表示重新接受数据. 
+   - 如果是TCP_RCV_LAST_FRAG，去掉TCP_RCV_COPY_DATA,添加TCP_RCV_COPY_XID标志
+
+** xs_tcp_read_xid(sock_xprt, xdr_skb_reader)
+   - 读取xid,给sock_xprt->tcp_xid. 
+   - 如果完全读取,去掉TCP_RCV_COPY_XID,添加TCP_RCV_READ_CALLDIR,表示该读取calldir数据. 
+   - 最后设置sock_xprt->tcp_copied=4.
+   > xdr_skb_read_bits(xdr_skb_reader, p, len)
+   > xs_tcp_check_fraghdr(sock_xprt)
+
+** xs_tcp_read_calldir(sock_xprt, xdr_skb_reader)
+   - 读取calldir给sock_xprt->tcp_calldir, 完全读取后去掉TCP_RCV_READ_CALLDIR,然后设置TCP_RCV_COPY_CALLDIR, TCP_RCV_COPY_DATA. 下面需要读取数据. 
+   > xdr_skb_read_bits(xdr_skb_reader, p, len) 
+   - 如果calldir必须是RPC_REPLY, RPC_CALL, 否则关闭rpc_xprt
+   > xprt_force_disconnect(rpc_xprt) 
+   > xs_tcp_check_fraghdr(sock_xprt)
+
+** xs_tcp_read_common(rpc_xprt, xdr_sbk_reader, rpc_rqst)
+   - sk_buff的数据给rpc_rqst->rq_private_buf
+   - 首先处理sock_xprt->tcp_calldir. 如果sock_xprt->tcp_flags & TCP_RCV_COPY_CALLDIR !=0, 把他放到xdr_buf中,去掉这个标志
+   - 然后处理数据. xdr_skb_reader包装skb_buf, 以及数据位置
+   > xdr_partial_copy_from_skb(rpc_rqst->rq_private_buf, sock_xprt->tcp_copied,xdr_skb_reader, xdr_skb_read_bits
+   - 搬数据, 设置sock_xprt->tcp_copied += r, sock_xprt->tcp_offset += r. 
+   - 这里有tcp_reclen和tcp_offset,tcp_copied, rq_private_buf.buflen. 可能分多次发送/接受文件,每次都有一个fraghdr.多次拷贝构成一个rpc的数据包
+   - tcp_reclen和tcp_offset是每次拷贝使用的
+   - tcp_copied表示整个数据包大小, 如果tcp_copied=rpc_rqst->rq_private_buf.buflen,表示数据拷贝完成,去掉TCP_RCV_COPY_DATA
+   - 或者tcp_offset=tcp_reclen，而且最后一个数据包,去掉TCP_RCV_COPY_DATA. buflen是xdr_buf的总容量
+
+** xs_tcp_read_reply(rpc_xprt, xdr_skb_reader)
+   - 在接受到rpc包头后,如果是正常的reply, 接受数据
+   - sock_xprt已经获取xid,找出rpc_rqst,然后把其他数据拷贝给他
+   > xprt_lookup_rqst(rpc_xprt, sockxprt->tcp_xid)
+   - 直接把skb_buf的数据放到里面
+   > xs_tcp_read_common(rpc_xprt, xdr_skb_reader, rpc_rqst)
+   - 如果tcp_flags & TCP_RCV_COPY_DATA ==0, 表示数据接受完成, 唤醒rpc_task继续执行
+   > xprt_complete_rqst(rpc_task, copied)
+
+** xs_tcp_read_callback(rpc_xprt, xdr_skb_reader)
+   - 如果支持backchannel, 他接受的rpc包可能是请求,RPC_CALL, 而不是RPC_REPLY
+   - 从rpc_rqst->bc_pa_list中分配一个rpc_rqst
+   > xprt_alloc_bc_request(rpc_xprt)
+   - 如果分配失败,也需要重新设置socket??
+   > xprt_force_disconnect(rpc_xprt)
+   - 设置rpc_rqst->rq_xid = sock_xprt->tcp_xid, 接受数据
+   > xs_tcp_read_common(rpc_xprt, xdr_skb_reader)
+   - 如果数据接受完成  sock_xprt->tcp_flags & TCP_RCV_COPY_DATA ==0, 把它放到rpc_xprt->svc_serv->sv_cb_list队列中
+   - 唤醒svc_serv->sv_cb_waitq队列
+
+** _xs_tcp_read_data(rpc_xprt, xdr_sbk_reader)
+   - 检查sock_xprt->tcp_flags的TCP_RPC_REPLY, 如果是reply
+   > xs_tcp_read_reply(rpc_xprt, xdr_sbk_reader)
+   - 否则是rpc_call 
+   > xs_tcp_read_callback(rpc_xprt, xdr_skb_reader)
+
+** xs_tcp_read_data(rpc_xprt, xdr_sbk_reader)
+   > _xs_tcp_read_data(rpc_xprt, xdr_sbk_reader)
+   > xs_tcp_check_fraghdr(sock_xprt)  
+
+** xs_tcp_read_discard(sock_xprt, xdr_skb_reader)
+   - 丢掉一个rpc数据包, 但不是把skb_buf都丢掉
+   - xdr_skb_reader->offset += sock_xprt->tcp_reclen - sock_xprt->tcp_offset)
+   - 重新读取一个新的数据包, sock_xprt->tcp_offset=0,添加TCP_RCV_COPY_FRAGHDR.
+   > xs_tcp_check_fraghdr(sock_xprt) 
+
+** xs_tcp_data_recv(read_descriptor_t, sk_buff, offset, len)
+   - 这是READ操作使用的数据，把数据提取给用户. read_descriptor_t->arg.data就是一个rpc_xprt
+   - 这个函数集成上面的功能. 综合一个rpc数据包在tcp上接受的过程.
+   - 构造read_descriptor，
+   - TCP_RCV_COPY_FRAGHDR
+   - xs_tcp_read_fraghdr 
+   - TCP_RCV_COPY_XID 
+   > xs_tcp_read_xid
+   - TCP_RCV_READ_CALLDIR
+   > xs_tcp_read_calldir
+   - TCP_RCV_COPY_DATA 
+   > xs_tcp_read_data
+   - 其他 xs_tcp_read_discard
+    
+** 总结
+   - 接受rpc包分成4部分:fraghdr, xid, calldir, data, 需要tcp_offset/tcp_reclen支持.
+   - fraghdr把数据给tcp_fraghdr/tcp_reclen,xid给tcp_xid, calldir给tcp_calldir
+   - data给rpc_rqst->rq_private_buf, 这应该是rpc_rqst->rq_snd_buf
+   - 但还没有看到这些参数的初始化，读不同的rpc包之间没有初始化，因为tcp是串行的，所以保证数据流的正确,而rpc包是有格式的，完全使用tcp_*参数控制rpc包的划分,不需要不同的tcp包处理不同的rpc包.
+   - 一个rpc包分成若干个frag包,每个frag包有包头，有标志说明它是否是最后一个rpc包.frag可能会收多次,xid/calldir应该受一次,data收多次. 
+   - TCP_RCV_COPY_FRAGHDR => 接受fraghdr, 去掉TCP_RCV_COPY_FRAGHDR, 设置reclen => 1
+   - TCP_RCV_COPY_XID => 接受xid, 去掉TCP_RCV_COPY_XID,添加TCP_RCV_READ_CALLDIR, 修改tcp_offset, tcp_copied=4 => 5
+   - TCP_RCV_READ_CALLDIR => 接受calldir, 去掉TCP_RCV_READ_CALLDIR, 添加TCP_RCV_COPY_CALLDIR/TCP_RCV_COPY_DATA, 修改tcp_offset, tcp_copied=8 => 5
+   - TCP_RCV_COPY_DATA => 搬数据,去掉TCP_RCV_COPY_CALLDIR/TCP_RCV_COPY_DATA,修改tcp_offset, tcp_copied => 6
+   - tcp_reclen = tcp_offset, 添加TCP_RCV_COPY_FRAGHDR; 如果rpc读取完整，添加TCP_REV_COPY_XID,去掉TCP_RCV_COPY_DATA. => 1
+   - rpc_rqst->rq_private_buf.len = rpc_rqst->rq_reply_bytes_recvd = tcp_copied. 这是一个rpc数据包的大小 => 1
+   - 对2/3/4/5如果读取不完，继续本次循环, 去第1步是比较tcp_flags. 1~4是if/elseif的关系.
+
+** xs_tcp_data_ready(sock, bytes)
+   - 这个函数是收到tcp数据后通过sock->sk_data_ready调用的,把他们给rpc_xprt上对应的rpc_rqst
+   - 获取rpc_xprt
+   > xprt_from_sock(sock)
+   - 构造read_descriptor, 接受数据
+   > tcp_read_sock(sock, read_descriptor_t, xs_tcp_data_recv)
+   - 没看到rpc_xprt的线程监听socket, 而是在这个回调函数中接受数据??
+
+** xs_tcp_schedule_linger_timeout(rpc_xprt, timeout)
+   - 设置rpc_xprt->state的XPRT_CONNECTING, 如果已经有XPRT_CONNECTING,直接退出. 别人已经触发connect操作
+   - 设置XPRT_CONNECTION_ABORT
+   - 把sock_xprt->connect_worker添加到rpciod_workqueue队列上
+   - 回调函数是xs_tcp_setup_socket,这个函数是建立sock_xprt使用的socket
+   - 这里的作用是网络断开或还没有链接时，发起链接操作,而且操作使用delayed work_struct.
+   > queue_delayed_work(rpciod_workqueue, rpc_xprt->connect_worker, timeout)
+
+** xs_tcp_cancel_linger_timeout(rpc_xprt)
+   - 结束XPRT_CONNECTING的过程,把sock_xprt->connect_worker从workqueue中取出来
+   - XPRT_CONNECTION_ABORT标志有效时,才有必要操作工作队列.
+   > cancel_delayed_work(sock_xprt->connect_worker)
+   - 去掉XPRT_CONNECTING和XPRT_CONNECTION_ABORT位
+   > xprt_clear_connecting(rpc_xprt)
+   - 这个函数在xs_tcp_state_change中调用，表示sock关闭,它是sock->sk_state_change.
+
+** xs_sock_reset_connection_flags(rpc_xprt)
+   - 去掉rpc_xprt->state的标志 XPRT_CONNECTION_ABORT, XPRT_CONNECTION_CLOSE, XPRT_CLOSE_WAIT, XPRT_CLOSING
+
+** xs_sock_mark_closed(rpc_xprt)
+   - 表示socket已经关闭
+   > xs_sock_reset_connection_flags(rpc_xprt)
+   - 清除rpc_xprt标志，唤醒队列上的任务
+   > xprt_disconnect_done(rpc_xprt)
+
+** xs_tcp_state_change(sock)
+   - 典型的sock回调函数,这也是tcp的. 获取rpc_xprt
+   - 如果sock->sk_state == TCP_ESTABLISHED, 建立connect, 设置XPRT_CONNECTED
+   - 如果rpc_xprt->state原来没有XPRT_CONNECTED,修改sock_xprt的tcp相关参数
+   - sock_xprt->tcp_offset / tcp_reclen / tcp_copied / tcp_flags
+   - 唤醒rpc_xprt->pending的rpc_task 
+   > xprt_wake_pending_tasks(rpc_xprt, EAGAIN)
+   - 如果是 TCP_FIN_WAIT1, cient(本地)发起close操作, 过一段时间重新发起connect操作
+   - 设置XPRT_CLOSING，清除XPRT_CLOSE_WAIT,XPRT_CONNECTING
+   > xs_tcp_schedule_linger_timeout(rpc_xprt, xs_tcp_fin_timeout)
+   - 如果是 TCP_CLOSE_WAIT, server要断开网络
+   - 去掉XPRT_CONNECTED标志
+   > xprt_force_disconnect(rpc_xprt)
+   - 如果是 TCP_CLOSING,  server 关闭了网络
+   - 设置rpc_xprt->reestablish_timeout = XS_TCP_INIT_REEST_TO
+   - 如果是 TCP_LAST_ACK ??  让sock_xprt重新链接
+   > xs_tcp_schedule_linger_timeout(rpc_xprt, xs_tcp_fin_timeout)，同时去掉XPRT_CONNECTED
+   - TCP_CLOSE 表示已经关闭socket, 取消reconnect
+   > xs_tcp_cancel_linger_timeout(rpc_xprt)
+   > xs_sock_mark_closed(rpc_xprt)
+
+** xs_write_space(sock)
+   - 这是sock->sk_write_space调用的, sock=>socket=>rpc_xprt
+   - socke有发送空间后的回调函数,清除socket->flags的SOCK_NOSPACE和SOCK_ASYNC_NOSPACE
+   - 从rpc_xprt->pending队列中唤醒rpc_xprt->snd_task任务.这是rpc_xprt还是锁定的.
+   > xprt_write_space(rpc_xprt)
+
+** xs_tcp_write_space(sock)
+   - 检查sock的空间, 空间足够,就发送数据
+   > sk_stream_wspace(sock) >= sk_stream_min_wspace(sock)
+   - 唤醒任务发送数据
+   > xs_write_space(sock)
+
+** xs_get_random_port()
+   - 产生一个随机的port，它在范围(xprt_max_resvport  xprt_min_resvport)之间
+
+** xs_set_port(rpc_xprt, port)
+   > rpc_set_port(rpc_xprt->addr, port)
+   > xs_update_peer_port(rpc_xprt)
+
+** xs_get_srcport(sock_xprt)
+   - 获取rpc_xprt->srcport, 如果这个无效,而且不用secure port,则随机分配一个
+   > xs_get_random_port
+
+** xs_next_srcport(sock_xprt, port)
+   - 这是要遍历port作为src port?
+
+** xs_bind(sock_xprt, socket)
+   > rpc_set_port(sock_xprt->srcaddr, port)
+   - 这里需要循环直到找到合适port.
+   > kernel_bind(socket, sockaddr, addrlen) 
+   > xs_next_srcport(sock_xprt, port)
+
+** xs_create_sock(rpc_xprt, sock_xprt, family, type, protocol)
+   - 创建一个socket, bind, 这是在xs_tcp_setup_socket使用，下面的这些函数都为了建立connect服务.
+   > __sock_create(rpc_xprt->net, family, type, protocol, socket, 1)
+   > xs_reclassify_socket
+   > xs_bind(sock_xprt, socket)
+   - 如果bind失败,释放socket
+   > sock_release(socket)
+
+** xs_abort_connection(sock_xprt)
+   - 断开tcp链接,使用AF_UNSPEC断开网络
+   > kernel_connect(socket, sockaddr ...)
+   - 修改rpc_xprt->state
+   > xs_sock_mark_closed(sock_xprt->rpc_xprt) 
+
+** xs_tcp_reuse_connection(sock_xprt)
+   - 关闭tcp connect, 检查socket是否能重用,不能的话关闭它
+   - sock->sk_state == TCP_CLOSE, 而且socket->state == SS_UNCONNECTED, sock->sk_shutdown ==0, 可以重用??
+   - 如果sock没有关闭,也可以重用?? 
+   - 1 << state & TCPF_ESTABLISHED | TCPF_SYNC_SEND), 而且sock->sk_shutdown ==0, 也可以重用
+   - 如果不能重用,使用socket函数关闭
+   > xs_abort_connection(sock_xprt)
+
+** xs_tcp_finish_connecting(rpc_xprt, socket)
+   - 执行connect操作, 已经创建本地的socket/sock
+   - 设置sock的回调函数,关联rpc_xprt和socket/sock
+   - 检查rpc_xprt->flags&XPRT_BOUND, 他应该表示rpcbind, 如果还没有XPRT_BOUND, 直接退出
+   - 发起connect 
+   > kernel_connect(socket, xs_addr(rpc_xprt), rpc_xprt->addrlen, O_NONBLOCK)
+
+** xs_tcp_setup_socket(work_struct)
+   - 这个work_struct是sock_xprt->connect_worker->work_struct, 用来建立connect
+   - 如果sock_xprt->socket无效,创建一个
+   > xs_create_sock(rpc_xprt, sock_xprt, sockaddr, ...)
+   - 否则检查重用或关闭
+   > xs_tcp_reuse_connection(sock_xprt)
+   - 还要检查rpc_xprt->state的XPRT_CONNECTION_ABORT !=0, 返回-EAGAIN
+   - 这里建立connect，根据返回结构处理不同
+   > xs_tcp_finish_connecting(rpc_xprt, socket) 
+   - 如果返回EADDRNOTAVAI
+   > xprt_force_disconnect(rpc_xprt)
+   - 如果返回EINVAL / ECONNREFUSED/ECONNRESET/ENETUNREACH, 唤醒rpc_task
+   > xprt_clear_connecting(rpc_xprt) 
+   > xprt_wake_pending_tasks(rpc_xprt, status) 
+   - 如果返回0/EINPROGRESS/EALREADY, connect成功
+   > xprt_clean_connecting(rpc_xprt)
+
+** xs_connect(rpc_task)
+   - 把sock_xprt->connect_worker放到workqueue中,让它建立其connect
+   - 如果已经有socket,而且是hard connect, 使用延时的work_struct
+   - 而且rpc_xprt->reestablish_timeout <<= 1
+   > queue_delayed_work(rpciod_workqueue, sock_xprt->connect_worker, rpc_xprt->reestablish_timeout)
+   - 否则延时为0
+
+** 总结
+   - 下面介绍tcp使用的rpc_xprt_ops, xprt_class
+   - rpc_xprt_ops xs_tcp_ops
+     #+BEGIN_SRC 
+        * reserve_xprt       = xprt_reserve_xprt,
+        * release_xprt       = xs_tcp_release_xprt,
+        * rpcbind        = rpcb_getport_async,
+        * set_port       = xs_set_port,
+        * connect        = xs_connect,
+        * buf_alloc      = rpc_malloc,
+        * buf_free       = rpc_free,
+        * send_request       = xs_tcp_send_request,
+        * set_retrans_timeout    = xprt_set_retrans_timeout_def,
+        * close          = xs_tcp_close,
+        * destroy        = xs_destroy,
+        * print_stats        = xs_tcp_print_stats,
+     #+END_SRC
+
+** xs_setup_xprt(xprt_create, slot_table_size, max_slot_table_size)
+   - slot代表rpc_rqst.
+   - 首先它分配sock_xprt使用的内存, 并初始化rpc_xprt
+   > xprt_alloc(xprt_create->net, slot_table_size, max_slot_table_size)
+   - 设置自己的ip地址 sock_xprt->srcaddr
+   > xs_init_anyaddr(xprt_create->dstaddr->sa_family, sock_xprt->srcaddr)
+
+** xs_setup_tcp(xprt_create)
+   - 创建使用tcp的rpc_xprt, 最大的slot是65536,已经非常大了!!
+   - 创建rpc_xprt仅仅设置了rpc_xprt->addr / addrlen
+   > xs_setup_xprt(xprt_create, xprt_tcp_slot_table_entries, max_slot_table_size)
+   - 设置sock_xprt使用的参数
+   - 初始化sock_xprt->connect_worker, 实现connect
+
+** 总结
+   - rpc_xprt数据结构的成员变量的作用, 而sock_xprt使用的成员变量在操作中赋值.
+     - addr / addrlen server sockaddr. 如果port!=0, 设置XPRT_BOUND, 不用rpcbind服务
+     - prot = IPPROTO_TCP
+     - tsh_size = 1 rpc数据包前4字节是长度的包头,数据处理时跳过它
+     - max_payload = 1<<31  最大包长
+     - bind_timeout = XS_BIND_TO 给rpc_task->tk_timeout,在call_bind中使用
+     - reestablish_timeout 在rpc_xprt->connect_worker在workqueue中工作有关, 这个值只能倍数增长，或改为0(XS_TCP_INIT_RESET_TO).
+     - idle_timeout 给rpc_xprt->timer使用, 当最后一个rpc_rqst用完rpc_xprt后开始计时，时长为idle_timeout,超时断开链接.
+     - rpc_xprt_ops
+     - rpc_timeout timeout 使用xs_tcp_default_timeout
+
+   - FSM的状态中rpc_xprt的操作,但是函数参数还是rpc_task
+     - reserve -> xprt_reserve  分配rpc_rqst, 如果无法分配在去backlog队列中等待. 这个过程锁定rpc_xprt. 可能的错误是没有内存,返回错误,不用等待，否则返回EAGAIN, 对这个错误应该单独处理一下. 哪里初始化rpc_rqst?
+     - allocate -> 分配rpc_rqst->rq_buffer, 空间大小根据procedure->rq_callsize/rq_rcvsize. 在rpc_xdr_encode中,把rpc_rqst->rq_buffer分给rpc_rqst->rq_snd_buf和rq_rcv_buf.
+     - bind -> rpc_xprt_ops->rpcbind 查找rpc服务的端口号
+     - connect -> xprt_connect   锁住rpc_xprt,清楚XPRT_CLOSE_WAIT,关闭时有数据没发送完, 让任务在pending队列上等待.不会释放rpc_xprt, 直到被唤醒或超时
+     - transmit -> xprt_transmit  把rpc_rqst->rq_rcv_buf给rpc_rqst->rq_private_buf, 设置超时, 调用rpc_xprt_ops->send_request. 如果没发送完成,把它放到pending队列.
+     - call_status  这个状态是从上面的transmit转变过来的, 估计它从pending队列脱离就到这里.
+     - timeout 
+     - decode 
+       - 把rpc_rqst->rq_private_buf给rpc_rcv_buf. 做一些gss的验证. 退出FSM.  
+    
+   - 数据流和内存管理
+     - 在call_allocate分配rpc_rqst->rq_buf, 根据rpc_procinfo计算空间
+     - rpc_xdr_encode初始化rpc_rqst->rq_snd_buf/rq_rcv_buf
+     - 在call_transmit->rpcauth_wrap_req_encode中,调用rpc_procinfo->encode.
+     - 例如nfs4_xdr_enc_read, 把发送数据都放到xdr_buf->head[0]中, 同时初始化rpc_rqst->rq_rcv_buf,  然后把接受数据的page使用nfs_readargs->pages. 而且初始化rq_rcv_buf->head/tail
+     - 在xprt_transmit开始发送rpc_rqst时,把rpc_rqst->rq_rcv_buf给rpc_rqst->rq_private_buf, 在tcp的回调函数中把数据放到这里面
+     - xs_tcp_read_common(rpc_xprt, xdr_skb_reader, rpc_rqst) 把sk_buff的数据给rq_private_buf.
+     - xprt_complete_rqst(rpc_task, copied) 修改rq_private_buf.len，收到rpc包的长度
+     - call_decode 设置rq_private_buf->len = rq_rcv_buf->len, 不用搬运数据
+     - 在rpccath_unwrap_req_decode中调用decode
+     - nfs4_xdr_dec_read, 把xdr_buf的数据解析出来给nfs_readres, 而且xdr_buf->head[0]的长度是估算,所以pages中应该有数据移动.
+     - 对于write, nfs4_xdr_enc_write把pages给rpc_rqst->rq_snd_buf
+
+   - socket的建立
+     - call_connect  建立connect, 使用XPRT_CONNECTED表示已经完成
+     - xprt_connect, 如果有XPRT_CLOSE_WAIT, 关闭xprt xs_tcp_close. 否则锁定rpc_xprt, 执行tcp操作
+     - rpc_xprt_ops->connect = xs_tcp_connect, 提交sock_xprt->connect_worker, 可能会延时提交, sock_xprt->reestablish_timeout
+     - xs_tcp_setup_socket, 创建或重用socket
+     - xs_tcp_finish_connecting(rpc_xprt, socket) , 设置sock_xprt->sock, 回调函数, 执行kernel_conect. 这个work_struct的工作完成
+     - xs_tcp_state_change 这时sock的回调函数,它负责connect的结果处理, 如果是TCP_ESTABLISHED, 设置XPRT_CONNECTED, 唤醒pending队列
+   
+   - socket的关闭
+     - xprt_init_autodisconnect  rpc_xprt->timer使用的回调函数, 在释放rpc_task时,检查rpc_xprt->recv队列, 如果为空, 启动计时器
+     - xprt_autoclose 使用rpc_xprt->task_cleanup使用的回调函数. 长时间不使用网络,关闭socket. rpc_xprt->idle_timeout = 5m
+     - rpc_xprt_ops->close = xs_tcp_close 关闭socket, 如果没有有XPRT_CONNECTION_CLOSE, 仅仅关闭socket, 否则关闭rpc_xprt的资源. 看到下面,就知道server出问题! 所以释放所有资源
+     - xs_close(rpc_xprt) 释放socket(上面只是关闭它), 释放sock_xprt的sock/socket, 
+     - xprt_disconnect_done  connect断开后唤醒rpc_task
+
+     - xs_tcp_force_close(rpc_xprt) 在server断开,或发生严重错误时使用, 设置XPRT_CONNECTION_CLOSE
+     - xprt_force_disconnect 强制断开connect, 设置XPRT_CLOSE_WAIT, 使用rpc_xprt->task_cleanup清理socket. XPRT_CLOSE_WAIT会使xprt_connect调用 xs_tcp_close, 禁止锁定
+
+     - xprt_conditional_disconnect 和上面类似，添加一个判断. 
+      
+     - xprt_destroy ===> xs_close / xprt_free  释放rpc_xprt
+
+** bc_sendto(rpc_rqst)
+   - 发送rpc_rqst->rq_snd_buf的数据.
+   - 这个rpc_rqst应该是收到的RPC_CALLBACK数据包,它已经有rpc_xprt.
+   > xs_encode_stream_record_marker(xdr_buf)
+   - 使用rpc_xprt->socket发送xdr_buf数据
+   > svc_send_common(socket, xdr_buf, head, headoff, tail, tailoff)
+  
+** bc_send_request(rpc_task)
+   - 使用rpc_xprt->bc_xprt / svc_xprt发送数据
+   - 如果有互斥访问,在svc_xprt->xpt_bc_pending队列上等待
+   > rpc_sleep_on(svc_xprt->xpt_bc_pending, rpc_task, NULL)
+   - 被唤醒后自己离开队列?? 
+   > rpc_wake_up_queued_task(svc_xprt->xpt_bc_pending, rpc_task)
+   - 使用svc_xprt发送数据
+   > bc_sendto(rpc_rqst)
+
+** bc_close(rpc_xprt)
+   - 什么都没有
+
+** xs_setup_bc_tcp(xprt_create)
+   - 构造backchannel使用的rpc_xprt, 他应该是给svc_serv使用
+   - 首先检查是否已经存在  xprt_create->svc_xprt->xpt_bc_xprt !=0, 直接返回
+   - 和普通sock_xprt不一样的地方
+   - 设置XPRT_BOUND, 直接使用svc_serv->svc_xprt的sock/socket
+   > xprt_set_connected(rpc_xprt)
+
+* backchannel_rqst.c 
+  
+** xprt_need_to_requeue(rpc_xprt)
+   - 返回 rpc_xprt->bc_alloc_count > 0
+
+** xprt_inc_alloc_count(rpc_xprt, n) / xprt_dec_alloc_count(rpc_xprt, n)
+   - 修改rpc_xprt->bc_alloc_count
+
+** xprt_free_allocation(rpc_rqst)
+   - 释放rpc_rqst->rq_private_buf / rq_snd_buf使用的内存,都是page
+
+** xprt_setup_backchannel(rpc_xprt, min_reqs)
+   - 为rpc_xprt创建min_reqs个rpc_rqst, 放到rpc_xprt->bc_pa_list中
+   - 为这些rpc_rqst->rq_snd_buf / rq_rcv_buf 分配内存,每个使用一个page
+
+** xprt_destroy_backchannel(rpc_xprt, max_reqs)
+   - 释放rpc_xprt->ba_pa_list上的rpc_rqst
+   > xprt_free_allocation(rpc_rqst)
+
+** xprt_alloc_bc_request(rpc_xprt)
+   - 从rpc_xprt->bc_pa_list队列上获取一个rpc_rqst
+   - 设置rpc_rqst->rq_bc_pa_state的RPC_BC_PA_IN_USE
+   - 初始化rpc_rqst->rq_privete_buf / rq_reply_bytes_recvd / rq_bytes_sent
+
+** xprt_free_bc_requests(rpc_rqst)
+   - 释放rpc_rqst
+
+* bc_svc.c
+
+** bc_send(rpc_rqst)
+   - 对于bc,有和svc类似的实现 bc_svc_process 调度这种rpc_rqst, 他接受额数据在svc_serv->sv_cb_list中
+   > rpc_run_bc_task(rpc_rqst, nfs41_callback_ops)

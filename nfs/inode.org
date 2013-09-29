@@ -1,0 +1,362 @@
+* nfs4file.c 
+
+** nfs4_open_context
+   #+BEGIN_SRC 
+	struct nfs_lock_context lock_context;
+	struct dentry *dentry;
+	struct rpc_cred *cred;
+	struct nfs4_state *state;
+	fmode_t mode;
+
+	unsigned long flags;
+#define NFS_CONTEXT_ERROR_WRITE		(0)
+#define NFS_CONTEXT_RESEND_WRITES	(1)
+#define NFS_CONTEXT_BAD			(2)
+	int error;
+
+	struct list_head list;    //nfs_inode->open_files
+	struct nfs4_threshold	*mdsthreshold;   
+	// nfs4_open_context把file和inode关联起来, 每个open有一个nfs4_open_context
+   #+END_SRC
+
+** nfs_lock_context
+   #+BEGIN_SRC 
+	atomic_t count;
+	struct list_head list;
+	struct nfs_open_context *open_context;
+	struct nfs_lockowner lockowner;
+	struct nfs_io_counter io_count;   
+   #+END_SRC
+
+** nfs_inode 
+   #+BEGIN_SRC 
+	/*
+	 * The 64bit 'inode number'
+	 */
+	__u64 fileid;
+
+	/*
+	 * NFS file handle
+	 */
+	struct nfs_fh		fh;
+
+	/*
+	 * Various flags
+	 */
+	unsigned long		flags;			/* atomic bit ops */
+	unsigned long		cache_validity;		/* bit mask */
+
+	/*
+	 * read_cache_jiffies is when we started read-caching this inode.
+	 * attrtimeo is for how long the cached information is assumed
+	 * to be valid. A successful attribute revalidation doubles
+	 * attrtimeo (up to acregmax/acdirmax), a failure resets it to
+	 * acregmin/acdirmin.
+	 *
+	 * We need to revalidate the cached attrs for this inode if
+	 *
+	 *	jiffies - read_cache_jiffies >= attrtimeo
+	 *
+	 * Please note the comparison is greater than or equal
+	 * so that zero timeout values can be specified.
+	 */
+	unsigned long		read_cache_jiffies;
+	unsigned long		attrtimeo;
+	unsigned long		attrtimeo_timestamp;
+
+	unsigned long		attr_gencount;
+	/* "Generation counter" for the attribute cache. This is
+	 * bumped whenever we update the metadata on the
+	 * server.
+	 */
+	unsigned long		cache_change_attribute;
+
+	struct rb_root		access_cache;
+	struct list_head	access_cache_entry_lru;
+	struct list_head	access_cache_inode_lru;
+#ifdef CONFIG_NFS_V3_ACL
+	struct posix_acl	*acl_access;
+	struct posix_acl	*acl_default;
+#endif
+
+	/*
+	 * This is the cookie verifier used for NFSv3 readdir
+	 * operations
+	 */
+	__be32			cookieverf[2];
+
+	unsigned long		npages;
+	struct nfs_mds_commit_info commit_info;
+
+	/* Open contexts for shared mmap writes */
+	struct list_head	open_files;
+
+	/* Number of in-flight sillydelete RPC calls */
+	atomic_t		silly_count;
+	/* List of deferred sillydelete requests */
+	struct hlist_head	silly_list;
+	wait_queue_head_t	waitqueue;
+
+#if IS_ENABLED(CONFIG_NFS_V4)
+	struct nfs4_cached_acl	*nfs4_acl;
+        /* NFSv4 state */
+	struct list_head	open_states;
+	struct nfs_delegation __rcu *delegation;
+	fmode_t			 delegation_state;
+	struct rw_semaphore	rwsem;
+
+	/* pNFS layout information */
+	struct pnfs_layout_hdr *layout;
+#endif /* CONFIG_NFS_V4*/
+	/* how many bytes have been written/read and how many bytes queued up */
+	__u64 write_io;
+	__u64 read_io;
+#ifdef CONFIG_NFS_FSCACHE
+	struct fscache_cookie	*fscache;
+#endif
+	struct inode		vfs_inode;   
+   #+END_SRC
+
+** nfs4_file_open(inode, filp)
+   - 这里只负责打开文件,不管创建文件.
+   - 创建nfs4_open_context
+   > nfs_rpc_ops->open_context(dir, nfs_open_context, openflags, iattr)
+   - 关联filp, nfs_open_context, nfs_inode
+
+** nfs4_file_fsync(file, start, end, datasync)
+   - 这是file_operations->fsync操作, 刷回所有的数据 
+   > filemap_write_and_wait_range(inode->address_space, start, end)
+   - 写回commit的nfs_page
+   > nfs_file_fsync_commit(file, start, end, datasync)
+   - 如果datasync == 0, 刷回metadata
+   > pnfs_layoutcommit_inode(inode, true)
+
+* file.c 
+
+** 总结
+   - 这时普通的nfs file operations的实现,对于nfsv4, 只有flush/open特殊对待
+
+** nfs_file_release(inode, file)
+   - 调用inode操作
+   > nfs_release(inode, file)
+
+** nfs_revalidate_file_size(inode, file)
+   - 在llseek/write时确定文件长度
+   - 如果有delegation, 不需要检查
+   > nfs_have_delegated_attributes(inode)
+   - 如果是O_DIRECT, 必须确认, file->f_flags & O_DIRECT
+   - 如果nfs_inode->cache_validity有NFS_INO_REVAL_PAGECACHE, 必须确认
+   - 如果inode信息超时,必须确认, nfs_inode->attrtimeo - nfs_inode->read_cache_jiffies
+   - 使用getattr获取metadata
+   > __nfs_revalidate_inode(nfs_server, inode)
+
+** nfs_file_llseek(file, offset, whence)
+   - 如果是SEEK_END, SEEK_DATA, SEEK_HOLE, 必须检查文件大小 
+   > nfs_revalidate_file_size(inode, file)
+   > generic_file_llseek(file, offset, whence)
+
+** nfs_file_flush(file, fl_owner_t)
+   - 如果有write的delegation, 只需要发起写操作
+   > nfs_rpc_ops->have_delegation(inode, FMODE_WRITE)
+   > filemap_fdatawrite(address_space)
+   - 否则需要调用fsync, 也就是
+   > vfs_fsync(file, 0)
+
+** nfs_file_read(kiocb, iovec, nr_segs, pos)
+   - 普通写操作,首先确认pagecache有效性
+   > nfs_revalidate_mapping(inode, kiocb->file->address_space)
+   > generic_file_aio_read(kiocb, iov, nr_segs, pos)
+
+** nfs_file_splice_read(file, pos, pipe_inode_info, count, flags)
+   - 每次写之前,都要检查pagecache的有效性.
+   > nfs_revalidate_mapping(inode, address_space)
+   > generic_file_splice_read(file, pos, pipe, count, flags)
+
+** nfs_file_mmap(file, vm_area_struct)
+   > generic_file_mmap(file, vm_area_struct)
+   - 设置aops = nfs_file_vm_ops
+   > nfs_revalidate_mapping(inode, address_space)
+
+** nfs_file_fsync_commit(file, start, end, datasync)
+   - fsync时写回commit的数据
+   > nfs_commit_inode(inode, FLUSH_SYNC)
+   - 如果nfs_open_context->flags有NFS_CONTEXT_ERROR_WRITE, 返回nfs_open_context->error
+   - 如果nfs_open_context->flags有NFS_CONTEXT_RESEND_WRITES, 返回-EAGAIN
+
+** nfs_file_sync(file, start, end, datasync)
+   - nfsv3使用, 只是写回数据
+
+** nfs_want_read_modify_write(file, page, pos, len)
+   - 检查是否需要读操作
+   - 如果是先先写再读,需要先把一些数据写回,再读出来,会减低效率.如果先读再改,至少数据是uptodate.
+   - 如果要写的数据不会完全覆盖page, 而且他不是PG_uptodate, 而且不在IO过程中,可以先读取数据, 防止后面的读操作.
+   - 满足这些提交,就可以读取page
+   > file->f_mode & FMODE_READ, 没有PG_uptodate, PG_private, (pos,len)没有完全覆盖page
+
+** nfs_write_begin(file, address_space, pos, len, flags, page, fsdata)
+   - 首先等待刷数据操作, 在writepages中锁住, 禁止写数据??
+   - 这样效率岂不是很低??
+   > wait_on_bit(&NFS_I(mapping->host)->flags, NFS_INO_FLUSHING, nfs_wait_bit_killable, TASK_KILLABLE)
+   - 准备pagecache, 并且锁住page. 这时page没有PG_uptodate, 没有PG_dirty
+   > grab_cache_page_write_begin(address_space, index, flags)
+   - 检查page关联的nfs_page是否和current兼容,如果不兼容,就写回去,释放nfs_page
+   > nfs_flush_incompatible(file, page)
+   - 检查是否有必要读page. 如果他原来有一些有效数据,已经写给server,但不是全部, 而且这次写的数据也不是全部,而且是读访问打开文件,所以建议读取整个page
+   > nfs_readpage(file, page)
+
+** nfs_write_end(file, address_space, pos, len, copied, page, fsdata)
+   - 如果page没有PG_uptodate, 检查文件大小,把范围外的清0
+   - 更新nfs_page,page, file等数据
+   > nfs_uptodate(file, page, offset, copied)
+   - 最后释放page的PG_locked
+
+** nfs_release_page(page, gfp)
+   - 释放page, 如果有PG_private, 不能释放它
+
+** nfs_check_dirty_writeback(page, dirty, writeback)
+   - 检查page的dirty和writeback状态
+   - 如果在commit过程中,肯定是writeback
+   - nfs_inode->flags的NFS_INO_COMMIT
+   - 如果page有nfs_page, 肯定是dirty的
+
+** nfs_launder_page(page)
+   - 释放page->private
+   > nfs_wb_page(inode, page)
+
+** nfs_need_sync_write(file, inode)
+   - inode是同步的, 应该是文件系统是同步的.
+   - 文件访问方式是同步的 inode->f_flags & O_DSYNC
+   - nfs_open_context->flags包含NFS_CONTEXT_ERROR_WRITE
+
+** nfs_file_write(kiocb, iovec, nr_segs, pos)
+   > generic_file_aio_write(kiocb, iovec, nr_segs, pos)
+   - 写完后,如果有必要刷新,使用fsync  
+   > nfs_need_sync_write(file, inode)
+   > vfs_fsync(file, 0)
+   - 这里写到pagecache后就开始刷会server
+
+** do_getlk(file, file_lock, local)
+   - 查找本地
+   > posix_test_lock(file, file_lock)
+   - 如果没有, 而且有FMODE_READ的delegation, server也没有锁
+   - 否则发送lock请求
+
+** do_unlk(file, cmd, file_lock, is_local)
+   - 先刷回数据, 对于setlk同样
+   > nfs_sync_mapping(address_space)
+
+* inode.c
+
+** nfs_drop_inode(inode)
+   - 检查inode是否该删除??
+   - 检查nfs_inode->flags的NFS_INO_STALE, 如果无效不再释放inode? 
+   - 检查inode->i_nlinks, 还有inode_unhashed
+   > generic_drop_inode(inode)
+   
+** nfs_clear_inode(inode)
+   - 释放inode的metadata资源?
+   - inode没有写回的page, inode->npages == 0, 在写回时增加它
+   - 没有被打开使用, 没有关联的nfs_open_context?
+   - 释放acl
+   - access cache是什么?
+   > nfs_access_zap_cache(inode)
+   
+** nfs_evict_inode(inode)
+   - 释放pagecache已经page map
+   > truncate_inode_pages(inode->address_space, 0)
+   - 设置inode->i_state的I_FREEING|I_CLEAR, inode不能使用了??
+   > clear_inode(inode)
+   - 释放acl, access cache
+   > nfs_clear_inode(inode)
+
+** nfs_sync_mapping(address_space)
+   - 释放page map
+   > unmap_mapping_range(address_space, 0, 0, 0)
+   - 写回缓存的数据
+   > nfs_wb_all(inode)
+
+** nfs_zap_caches_locked(inode)
+   - 删除local的缓存
+   - 重新设置nfs_inode->attrtimeo, attrtimeo_timestap = jiffies. 怎么用他们??
+   - 清除nfs_inode->cookieverf, nfsv3使用的dir cookie
+   - 设置nfs_inode->cache_validity的NFS_INO_INVALID_ATTR, NFS_INO_INVALID_LABEL, NFS_INO_INVALID_DATA, NFS_INODE_INVALID_ACL, 还有NFS_INO_REVAL_PAGECACHE
+
+** nfs_zap_caches(inode)
+   - 修改cache标志
+   > nfs_zap_caches_locked(nfs_inode)
+
+** nfs_zap_acl_cache(inode)
+   - 单独释放acl? 使用nfs_inode的回调 
+   > nfs_inode->clear_acl_cache(inode)
+   - 去掉nfs_inode->cache_validity的NFS_INO_INVALID_ACL标志
+
+** nfs_invalidate_atime(inode)
+   - atime失效, 去掉nfs_inode->cache_validity的NFS_INO_INVALID_ATIME
+
+** nfs_invalidate_inode(inode)
+   - 设置nfs_inode->flags的NFS_INO_STALE, 真个inode失效
+   > nfs_zap_caches_locked(inode)
+
+** nfs_init_locked(inode, void)
+   - 初始化inode使用, 设置fileid, nfsfh
+
+** nfs_fhget(super_block, nfs_fh, nfs_fattr, nfs_label)
+   - 根据参数查找inode, 如果找不到,会创建一个
+   - 检查nfs_fattr中fileid的来源.
+   > nfs_attr_check_mountpoint(super_block, nfs_attr)
+   - 获取inode , 计算hash
+   > nfs_fattr_to_ino_t(nfs_fattr)
+   > iget5_locked(super_block, hash, nfs_find_actor, nfs_init_locked, nfs_descriptor)
+   - 如果inode是新创建的,需要做初始化
+   - 设置inode->i_flags的S_NOATIME|S_NOCTIME, 本地不会更新这些属性,由server更新
+   - 如果nfs_fattr->valid没有NFS_ATTR_FATTR_MODE, 设置nfs_inode->cache_validity的NFS_INO_INVALID_ATTR. 基本的metadata是无效的
+   - inode_operations = nfs_rpc_ops->file_inode_ops, file_operations
+   - 如果是reg文件,设置address_space, 他使用的bdi是nfs_server->backing_dev_info, 这是每个server特有的??
+   - 如果是dir文件,nfs_fattr->valid带有NFS_ATTR_FATTR_MOUNTPOINT, inode设置为automount, inode_operations = nfs_mountpoint_inode_operations
+   - 如果nfs_fattr->valid带有NFS_ATTR_FATTR_V4_REFERRAL, 同样设置automount, inode_operations = nfs_referral_inode_operations
+   - 上面2个inode_operations只有attr的修改,没有其他操作,比如创建删除文件等
+   - 最后根据nfs_fattr更新inode
+   - 如果有NFS_ATTR_FATTR_ATIME, 设置atime, 否则如果server支持atime, 设置nfs_inode->cache_validity的NFS_INO_INVALID_ATTR, 如果需要先去server取atime属性, 所有的attr属性??
+   - mtime, ctime也同样.
+   - 如果NFS_ATTR_FATTR_CHANGE有效, 设置inode->i_version = nfs_fattr->change_attr
+   - NFS_ATTR_FATTR_NLINK设置i_nlink, 如果没有设置NFS_INO_INVALID_ATTR
+   - NFS_ATTR_FATTR_OWNER|GROUP, 设置uid/gid
+   - NFS_ATTR_FATTR_SIZE设置i_size, 如果没有,设置NFS_INO_INVALID_ATTR|NFS_INO_REVAL_PAGECACHE
+   - 上面除了size, server都可设置是否支持特定的metadata
+   - 然后设置attrtimeo, attrtimeo_timestamp
+   - 如果inode不是新创建,使用nfs_fattr修改它的属性?? 和上面不重复? 
+   > nfs_refresh_inode(inode, nfs_fattr)
+
+** nfs_setattr(dentry, iattr)
+   - 设置metadata, 检查是否需要通过rpc设置
+   - 首先检查ATTR_MODE, 不支持suid,sdig, ATTR_SIZE,检查文件大小是否需要改变
+   - nfs支持的matadata是NFS_VALID_ATTRS, 设置iattr->ia_valid &= NFS_VALID_ATTRS
+   - 如果iattr->ia_valid中除了ATTR_FILE|ATTR_OPEN没有其他属性,直接退出
+   - 如果是普通文件,把脏数据写回 
+   > nfs_inode_dio_wait(inode)
+   - 这里仅写回unstable和layout数据,metadata还是通过setattr写回
+   > nfs_wb_all(inode)
+   - 如果修改mode,uid,gid,释放delegation 
+   > nfs_rpc_ops->return_delegation(inode)
+   - 使用rpc设置attr 
+   > nfs_rpc_ops->setattr(dentry, nfs_fattr, iattr)
+   - 然后根据结果刷新nfs_inode 
+   > nfs_refresh_inode(inode, nfs_fattr)
+
+** nfs_vmtruncate(inode, offset)
+   - 在truncate操作中使用. 这是i_size 
+   > i_size_write(inode, offset)
+   - 释放vma, nonlinear等
+   - 释放pagecache时,同时锁住PG_locked, 等待PG_wirteback, 相当于写操作
+   - 调用address_space_operations->invaliatepage
+   > truncate_pagecache(inode, oldsize, newsize)
+
+** nfs_setattr_update_inode(inode, iattr)
+   - 在setattr调用之后更新inode metadata?
+   - 先处理mode, uid, gid
+   - 而且设置nfs_inode->cache_validity的NFS_INO_INVALID_ACCESS|NFS_INO_INVALID_ACL??
+   - 再处理ATTR_SIZE 
+   > nfs_vmtruncate(inode, iattr->ia_size)
+
+** nfs_getattr(mnt, dentry, kstat)
+   

@@ -1,0 +1,661 @@
+dm-io.c
+
+dm_io_client
+  * mempool_t pool
+  * bio_set bios  
+
+region是一段io数据,对应dm_io_region和dm_io_request
+
+io
+  * error_bits   
+  * count
+  * task_struct sleeper
+  * dm_io_client client
+  * io_notify_fn callback
+  * context
+  * vma_invalidate_address
+  * vm_invalidate_size
+
+
+* store_io_and_region_in_bio(bio, io, region)
+  # 把region和io一块放到bio->bi_private
+
+* retrieve_io_and_region_from_bio(bio, io, region)
+  #获取io和region.  BM_IO_MAX_REGIONS
+
+* dec_count(io, region, error)
+  # io的第region部分完成,记录结果.  如果io->count减为0, 释放io??
+  > invalidate_kernel_vmap_range(io->vma_invalidate_address, io->vma_invalidate_size)
+  > mempool_free(io, io->client->pool)
+  > io->callback(io->context)
+
+* endio(bio, error)
+  # bio的回调函数
+  > retrieve_io_and_region_from_bio(bio, io, region)
+  > bio_put(bio)
+  > dec_count(io, region, err)
+
+dpages
+  * get_page(dpages, page, len, offset)
+  * next_page(dpages)
+  * context_u, context_ptr
+  * vma_invalidate_address,  vma_invalidate_size
+
+dm_io_region
+  * block_device bdev
+  * sector, count
+从下面看这两个是一块用的,dpages表示io数据的内存位置, dm_io_region表示磁盘位置..
+
+page_list
+  * page_list next 
+  * page
+
+dm_io_mem_type
+  * dm_io_mem_type   #PAGE_LIST/BVEC/VMA/KMEM, 分别对应最后四种指针,union的四个成员.
+  * offset 
+  * page_list
+  * bvec 
+  * vma 
+  * addr 
+
+dm_io_request
+  * bi_rw
+  * dm_io_memory mem 
+  * dm_io_notify  notify
+  * dm_io_client  client
+
+
+dpages是遍历page_list的辅助结构..
+* list_get_page(dpages, page, len, offset)
+  #获取dpages中的信息page,  countext_ptr是page_list, context_u是offset
+
+* list_next_page(dpages)
+  #context_ptr是page_list, 可使用context_ptr遍历..
+
+上面是page_list, 下面是bio_vec, context_ptr是bio_vec..
+* list_dp_init(dpages, page_list, offset)
+  #构造dpages,  context_ptr指向bio_vec数组..
+
+* bvec_get_page(dpages, page, len, off)
+  # 
+
+* bvec_next_page(dpage)
+  #
+
+* bvec_dp_init(dpages, bio_vec)
+  # 
+
+dpages里面是vmalloc指针, 需要转换为page
+* vm_get_page(dpages, page, len, offset) 
+  > virt_to_page(void*)
+* vm_next_page(dpages)
+
+* vm_dp_init(dpages, data)
+
+dpages里面是地址指针,不过是kmalloc的..
+km_get_page(dpages, pages, len, offset)
+  > virt_to_page(dp->context_ptr)
+
+km_next_page(dpages)
+km_dp_init(dp, data)
+
+* do_region(rw, region, dm_io_region, dpages, io)
+  # io数据在dm_io_region中,根据get_page获取page. 先创建bio, 把page放到io中. 回调函数是endio, 释放io.
+  > bio_alloc_bioset(GFP_NOIO, num_bvecs, io->client->bios)
+    # io里面是哪里给的??
+  > store_io_and_region_in_bio(bio, io, region)
+  > bio_add_page(bio, page, logical_block_size, ..)
+  > dpages->get_page(...)  / dpages->next_page(...)
+  > submit_bio
+
+* dispatch_io(rw, num_regions, dm_io_region, dpages, io, sync)
+  # 第三个参数是dm_io_region数组, 提交io., num_regions对应error_flags的error的个数..
+  > do_region(...)
+
+* sync_io(dm_io_client, num_regions, dm_io_region, rw, dpages, error_bits)
+  # 这里没有io, region,dpages也需要吗?? 先构造io, error_bits是错误结果?? sleeper是current, client是参数dm_io_client 
+  > dispatch_io(rw, num_regions, where, dp, io, 1)
+    #提交io..然后等待io->count, 最后检查io->error_bits
+
+* async_io(dm_io_client, num_regions, dm_io_region, rw, dp, fn, context)
+  # 这里是异步,在mempools中分配io, 设置回调函数,fn/context等等..
+  > mempool_alloc(dm_io_client->pool, GFP_NOIO)
+  > dispatch_io(rw, num_regions, where, dpages, io, 0)
+
+* dp_init(dm_io_request, dpages, size)
+  # 根据dm_io_request->mem.type初始化dpages..
+  > list_dp_init
+  > bvec_dp_init
+
+* do_io(dm_io_region, num_regions, dm_io_region, sync_error_bits)
+  > dp_init(..
+  > sync_io(...
+  > async_io(..
+    # 如果dm_io_region->notify.fh有意义,就是async调用.
+
+
+================================
+dm_io
+  mapped_device md
+  int error
+  atomic_t io_count 
+  bio bio #这里是指针,释放时不干扰bio
+  long start_time 
+  spinlock_t  endio_lock
+
+dm_target_io
+  dm_io   io
+  dm_target 
+  map_info info 
+  target_request_nr..
+  bio clone  #这是嵌套不是指针
+
+dm_rq_target_io
+  mapped_device md 
+  dm_target  ti 
+  request  orig, clone  ; # 好久没看到这个request..
+  error
+  map_info  info
+
+map_info 
+  void *ptr 
+  long long ll
+
+dm_rq_clone_bio_info 
+  bio orig   #指针
+  dm_rq_target_io tio #回指, 它在bio->bi_private
+  bio clone  #嵌套
+
+
+dm_io是给bio_based的设备使用的,  dm_rq_target_io是request_based的设备使用的.. 为何看不出什么关系??
+
+mapped_device 
+  rw_semaphore io_lock
+  mutex suspend_lock 
+  rwlock_t  map_lock 
+  atomic_t holders  #使用计数
+  open_count   #open计数
+  flags 
+  request_queue queue 
+  type 
+  mutex type_lock 
+  target_type  immutable_target_type 
+  gendisk disk
+  name 
+  interface_ptr
+  pending   #request计数..
+  wait_queue_head_t wait  #等待的请求
+  work_struct work     #bio的执行函数是什么??
+  bio_list  deferred   #bio队列
+  spinlock_t  defferred_lock 
+
+  workqueue_struct wq  #bio的工作队列??
+
+  dm_table  map 
+  mempool_t io_pool,  tio_pool 
+
+  bio_set bs 
+
+  atomic_t event_nr    #怎么使用uevent
+  wait_queue_head_t eventq 
+  atomic_t uevent_seq 
+  list_head uevent_list 
+  uevent_lock
+  
+  super_block frozen_sb  #sb??
+  block_device bdev
+  
+  hd_geometry geometry
+  kobject
+
+  bio  flush_bio
+
+虽然这个数据结构很大,但也比md好多了. md 应该赶紧删除
+
+dm_init, 高科技，还定义函数指针数组, 初始化target, linear, stripe, io, kcopyd, interface...
+
+* dm_blk_open(block_device, fmode_t)
+  #block_dev->gendisk->private_data是mapped_device, 通过mapped_device管理使用计数.. gendisk是在注册设备时创建,而且是全局的.  最后还要增加mapped_device->open_count
+  > dm_get(mapped_device)  
+  
+* dm_blk_close(gendisk, fmode_t)
+
+* dm_blk_getgeo( block_device, hd_genmetry)
+  # 获取mapped_device->geometry..
+  > dm_get_geometry(mapped_deivce, hd_geometry)
+
+* dm_blk_ioctl(block_device, fmode_t, cmd, arg)
+  > dm_table_get_num_targes(dm_table) 
+    # 只支持只有一个dm_target的情况..
+  > dm_suspended_md(mapped_device)
+  > dm_target->target_type->ioctl(...)
+
+* queue_io(mapped_device, bio)
+  # mapped_device->deferred是bio队列
+  > queue_work(mapped_device->workqueue_struct, mapped_device->work_struct)
+
+* dm_get_live_table(mapped_device)
+  #获取mapped_device->dm_table
+
+* dec_pending(dm_io, error)
+  #mapped_device->flags的MDF_NOFLUSH_SUSPENDING什么意思?? 这个函数好像是bio回调函数,减小dm_io->io_count,如果为0,处理error.  如果为DM_ENDIO_REQUEUE, 把它放到mapped_device->deferred队列中, 而且没有刷新工作要做...
+  #从dm_io中获取bio, 释放dm_io,dm_io应该是bio的一个包装,dm_io的工作完成, bio应该也完成了,如果bio是REQ_FLUSH,提交bio,否则完成bio
+  > queue_io(mapped_device, bio)
+  > bio_endio(bio, io_error) 
+
+* clone_endio(bio, error)
+  # bio->bi_private是dm_target_io, 管理分裂的bio??
+  > dm_target_io->dm_target->target_type->end_io(dm_target_io->dm_target, bio, error)
+  > free_bio(mapped_device, dm_target_io)
+    #仅仅是释放dm_target_io->clone 嵌套的bio, 它也是一个bio..
+  > dec_pending(dm_io, error)
+
+* end_clone_bio(bio, error)
+  #bio->bi_private是dm_rq_clone_bio_info, 这个request_based使用的..保存error结果到dm_rq_target_io->error.  应该是dm_rq_clone_bio_info->orig/bio完成，告诉dm_rq_target_io
+  > blk_update_request(dm_rq_target_io->orig, 0, nr_bytes)
+
+* rq_completed(mapped_device, rw, run_queue)
+  > md_in_flight(mapped_device)
+  > wakeup(mapped_device->wait)
+    # 如果有等待的request, 唤醒等待的任务
+  > blk_run_queue_async(mapped_device->queue)
+    #启动request提交???
+  > dm_put(mapped_deivce)
+
+* free_rq_clone(request)
+  # 释放dm_rq_target_io, 它就是request->end_io_data, 释放dm_rq_target_io???
+  > blk_rq_unprep_clone(request)
+    # 释放request中的所有bio..
+  > free_rq_tio(dm_rq_target_io)
+    # 释放自我..
+
+* dm_end_request(request, error)
+  # request->end_io_data是dm_rq_target_io, 里面有dm_target, 还有orig/request, 
+  > free_rq_clone(request)
+  > blk_end_request_all(request, error)
+    # 这是报告完成结果, request里面也会释放bio..
+  > rq_completed(mapped_deivce, rw, true)
+
+* dm_unprep_request(request)
+  > free_rq_clone(request/clone)
+
+* dm_requeue_unmapped_request(request)
+  # 这个request是clone的, 获取dm_rq_target_io, 
+  > dm_unprep_request(request)
+    #把clone的request释放掉
+  > blk_requeue_request(request_queue, request)
+    #把dm_rq_target_io->orig/request放到队列中
+  > rq_completed(mapped_deivce, rw, 0)
+    #启动request的处理???
+
+* stop_queue(request_queue)
+  > __stop_queue(request_queue) 
+    > blk_stop_queue(request_queue)
+      # 取消workqueue..
+
+* start_queue(request_queue)
+  # 就是启动request_queue...
+  > blk_start_queue(request_queue)
+    > __blk_run_queue(request_queue)
+
+* dm_done(request, error, mapped)
+  #处理clone的request,  dm_rq_target_io, dm_target=>target_type
+  > target_type->rq_end_io(dm_target, request, error, dm_rq_target_io->map_info
+  > dm_end_request(request, error)  
+    #如果返回<=0 ...
+  > dm_requeue_unmapped_request(request)
+    # 如果返回DM_ENDIO_REQUEUE, 重新处理request..
+
+* dm_softirq_done(request)
+  > dm_one(request, dm_rq_target_io->error, mapped)
+
+* dm_complete_request(request, error)
+  # 回调函数?? 根据request获取dm_rq_target_io, 还有原来的request, 设置dm_rq_target_io->error, request->completion_data=clone/request
+  > blk_complete_request(request)
+    # 这个函数很怪，启动softirq,BLOCK_SOFTIRQ
+
+* dm_kill_unmapped_request(request, error)
+  > dm_complete_request(request, error)
+    #设置request->cm_flags的REQ_FAILED标志, 哪里使用它?  上面会结束request??
+
+* end_clone_reques(request, error)
+  > __blk_put_request(request->request_queue, request) 
+  > dm_complete_request(request, error)
+
+* max_io_len_target_boundary(sector, dm_target)
+  # dm_target->len - (sector - dm_target->start)...
+
+* max_io_len(sector, dm_target)
+  #检查sector是否合适?  还是sector开始最长io???
+
+* dm_set_target_max_io_len(dm_target, len)
+  # 设置 dm_target->max_io_len ...
+
+* __map_bio(dm_target, dm_target_io)
+  # 处理clone bio..  设置bio->bi_end_io = clone_endio, bi_private是dm_target_io
+  > dm_target->target_type->map(dm_target, bio)
+  > generic_make_request(bio)
+    # 如果map没问题,提交bio
+  > dec_pending(dm_target_io->dm_io->mapped_device, r)
+  > free_tio(mapped_deivce, dm_target_io)
+
+* split_bvec(dm_target_io, bio, sector_t, idx, offset, len, bio_set)
+  # 使用dm_target_io->bio/clone,完成一部分bvec, 磁盘位置是sector_t, 数据内存位置是bio->bi_io_vec的第idx个开始,它只IO一个io_vec, 长度len,offset都是对与io_vec内部的..这个io_vec是复制的,没有用指正指向同一个地方.   bi_sector/bi_bdev/bi_rw/bi_vcnt/bi_size/bi_io_vec->bv_offset/bv_len...最后还有integrity
+
+* clone_bio(dm_target_io, bio, sector_t, short idx, bv_count, len, bio_set)
+  # 这个和上面的区别应该是把bio clone 到dm_target_io->clone/bio中,并且记录bv_count/len, 这些是完成的io,保存在这里??
+  > __bio_clone(bio clone, bio)
+  
+clone_info
+  mapped_device md 
+  dm_table  map 
+  bio  
+  dm_io 
+  sector_t sector, sector_count 
+  short index
+
+* alloc_tio(clone_info, dm_target, int nr_iovecs)
+  # 分配一个dm_target_io,但是这里使用bio的内存管理,也就是分配的数据结构大小是sizeof(dm_target_io),而且使用dm_table->bio_set.  使用clone_info初始化dm_target_io
+  > bio_alloc_bioset(GFP_NOIO, nr_iovecs, clonet_info->dm_table
+
+* __issue_target_request(clone_info, dm_target, request_nr, len)
+  # 先构造dm_target_io, 这里的len什么意思? 它决定bio->bi_size.. 整个过程就是处理len数据量?数据对象clone_info->bio? 先创建dm_target_io, 把io信息给clone/bio,然后提交请求,最后释放dm_target_io..
+  > alloc_tio(clone_info, dm_target, clone_info->bio->bi_max_vecs)
+  > __bio_clone(bio, clone_info->bio)
+  > __map_bio(dm_target, dm_target_io)  
+  
+* __issue_target_requests(clone_info, dm_target, num_requests, len)
+  # 循环上面的过程,但是提交一样的请求?  应该是每次提交完成,数据量前移..
+
+* __clone_and_map_empty_flush(clone_info)
+  # 使用上面提交多个请求的方法，这个还靠谱一些,提交flush给底层? 为何是多个呢?? dm_target->num_flush_requests... 遍历clone_info的dm_table上的所有dm_target
+  > dm_table_get_target(clone_info->dm_table, target_nr)
+  > __isue_target_requests(clone_info, dm_target, dm_target->num_flush_requests, 0)
+
+* __clone_and_map_simple(clone_info, dm_target)
+  # 使用一个clone的bio完成所有io?? perform all io with a single clone..
+  > alloc_tio(clone_info, dm_target, clone_info->bio->bi_max_vecs)
+  > clone_bio(dm_target_io, bio, clone_info->sector, clone_info->idx, bio->bi_vcnt-clone_info->idx, clone_info->sector_count, clone_info->mapped_device->bio_set)
+    #完成clone_info中的io请求..磁盘/内存位置都使用clone_info的
+  > __map_bio(dm_target, dm_target_io)
+    #提交dm_target_io..
+
+* __clone_and_map_changing_extent_only(clone_info, get_num_requests_fn, is_split_required_fn)
+  #提交clone_info中的io, 原来这里会改变clone_info->sector,就是io的位置..
+  > dm_table_find_target(clone_info->dm_table, clone_info->sector)
+    #找到io位置对应的设备..
+  > get_num_requests_fn(dm_target)
+    # 为何会有多个request??
+  > is_split_required_fn(dm_target)
+    # 上面两个函数都是返回 dm_target的属性数据.. num_discard_requests, num_write_same_requests, split_discard_requests等.
+  > max_io_len(sector_t, dm_target)
+    # 计算dm_target适合多少io??
+  > max_io_len_target_boundary(sector_t, dm_target)
+  > __issue_target_requests(clone_info, dm_target, num_requests, len)
+    #提交io.. 最后clone_info->sector += len..但是bio->iovec,难道map的时候根据clone_info->sector和bio->bi_sector的相对位置决定io_vec???
+
+* __clone_and_map_discard(clone_info)
+  # 后面的两个回调函数返回的参数什么意思???
+  > __clone_and_map_changing_extent_only(clone_info, get_num_discard_requests, is_split_required_for_discard)
+  
+* __clone_and_map_write_same(clone_info)
+  # 过程明白,但参数意义很奇怪
+  > __clone_and_map_changing_extent_only(clone_info, get_num_write_same_requests, NULL)
+
+* __clone_and_map(clone_info)
+  # 处理clone_info, 这个结构是辅助结构,竟然这么重要..内核中经常搞一些中间包装的结构...  从clone_info中获取bio, 如果带有REQ_DISCARD标志和REQ_WRITE_SAME???
+  > __clone_and_map_discard(clone_info)
+  > __clone_and_map_write_same(clone_info)
+    #上面两种都不是, 然后就只处理一个dm_target?  获取dm_target
+  > dm_table_find_target(clone_info->dm_table, clone_info->sector)
+    # 获取最大能处理多少max_io
+  > max_io_len(clone_info->sector, dm_target)
+    # 如果clone_info->sector_count总数据量也不超过这个max_io, 一次提交clone_info->sector_count<=max
+  > __clone_and_map_simple(clone_info, dm_target)
+    #否则争取提交多个io_vec, bio->bi_io_vec[clone_info->idx].bv_len < max.. 先计算能提交多少个io_vec的len,根据信息构造一个dm_target_io
+  > alloc_tio(clone_info, dm_target, bio->bi_max_vecs)
+  > clone_bio(dm_target_io, bio, clone_info->sector, clone_info->idx, vec_count, len, clone_info->mapped_device->bio_set)
+  > __map_bio(dm_target, dm_target_io)
+    #提交之后,改变clone_info->sector/idx 这两个对应数据位置..sector_count剩余数据量.... 还有一种情况就是io_vec的数据量需要跨dm_target,分割bio.., 但这里还是必须完层一个io_vec,及时需要处理多个dm_target
+  > dm_table_find_target(clone_info->dm_table, clone_info->sector)
+    #先找到对应的dm_target
+  > max_io_len(clone_info->sector, dm_target)
+  > alloc_tio(clone_info, dm_target, 1)
+    #对,就是一个io_vec
+  > split_bvec(dm_target_io, bio, clone_info->sector, clone_info->idx, bio_vec->bv_offset+offset, len, clone_info->mapped_device->bio_set)
+    # 这里就明白上面的函数,就是处理一部分io_vec..
+  > __map_bio(dm_target, dm_target_io)
+    #最后更新clone_info->sector.. 注意上面会循环处理多个dm_target, 最后才更新clone_info->idx...
+
+* __split_and_process_bio(mapped_device, bio)
+  # 有开始一层的包装,先把bio包装成clone_info,然后提交, 获取mapped_device->dm_table, bio的sector, idx,最后是dm_io, 这个没看到上面使用阿..
+  > dm_get_live_table(mapped_device)
+  > alloc_io(mapped_device)
+    # 如果bio->bi_rw带有REQ_FLUSH, 这是flush操作,不需要这个bio,使用mapped_deviced->flush_bio..
+  > __clone_and_map_empty_flush(clone_info)
+    #否则就是正常的..sector_count是bio->bi_size,这是剩余的io数量..
+  > __clone_and_map(clone_info)
+  > dec_pending(clone_info->dm_io, error)
+  > dm_table_put(clone_info->mapped_device)
+    #上面的过程是同步的吗?? dm_io就是统计io的结果..
+
+下面是block驱动使用的函数了..
+
+bvec_merge_data
+  block_device 
+  bi_sector   # 位置
+  bi_size     # 数据量
+  bi_rw
+
+* dm_merge_bvec(request_queue, bvec_merge_data, bio_vec)
+  # 后2参数是数据的磁盘位置和内存位置. 计算这次io请求可以怎么合并??
+  > dm_table_find_target(request_queue->queuedata mapped_device)
+  > max_io_len(bvec_merge_data->bi_sector, dm_target)
+  > dm_target->target_type->merge(dm_target, bvec_merge_data, bio_vec,   
+
+* _dm_request(request_queue, bio)
+  # 提交io请求??  如果device suspend, 而且不是READ, 就把它放到delayed队列中,否则返回失败..  DMF_BLOCK_IO_FOR_SUSPEND
+  > queue_io(mapped_device, bio)
+    # 放到deferred队列中..
+  > bio_io_error(bio)
+    > end_bio(bio, -EIO)
+    # 如果没有问题,提交请求
+  > __split_and_process_bio(mapped_device, bio)
+
+* dm_request_based(mapped_device )
+  # 检查mapped_device->request_queue是否支持stackable?? QUEUE_FLAG_STACKABLE
+  > blk_queue_stackable(request_queue)
+
+* dm_request(request_queue, bio)
+  # request_queue可获取mapped_device,检查stackable
+  > blk_queue_stackable(mapped_device)
+  > blk_queue_bio(request_queue, bio)
+    # 不支持的话,request_queue怎么处理???
+  > _dm_request(request_queue, bio)
+  
+* dm_dispatch_request(request)
+  #设置request的时间
+  > blk_insert_cloned_request(request->request_queue, request) 
+    > add_acct_request(request_queue, request, where)
+    > __blk_run_queue(request_queue)
+    # 这个函数是blk实现的帮助函数,把request添加到request_queue. 如果是flush操作才出发request_queue的开始
+  > dm_complete_request(request_queue, request)
+    # 如果上面入队有错,request完成..
+
+* dm_rq_bio_constructor(bio bio, bio orig, data)
+  # dm_rq_target_io是data, 第一个bio是dm_rq_clone_bio_info,这里是建立她们的关系. bio->bi_private是dm_rq_clone_bio_info, bio->bi_end_io是end_clone_bio.  dm_rq_clone_bio_info关联orig bio, dm_rq_target_io..
+
+* setup_clone(request clone, request rq, dm_rq_target_io)
+  > blk_rq_prep_clone(request clone, request, dm_rq_target_io->mapped_device->bio_set, GFP_ATOMIC, dm_rq_bio_constructor, dm_rq_target_io)
+    # 这个函数也是blk提供,只会clone bio, 从mapped_device->bio_set中分配bio, 它们也就是dm_rq_clone_bio_info, 同时使用回调函数把bio/dm_rq_clone_bio_info关联起来,还有dm_rq_target_io,从参数传进来的.. 除了bio,还有其他cmd, cmd_len, sense, buffer, end_io是end_clone_request, end_io_data是dm_rq_target_io
+
+* clone_rq(request, mapped_device, gfp_t)
+  > alloc_rq_tio(mapped_device, gfp_mask)
+    # 从mempool中分配.. dm_rq_target_io,可通过bio=>dm_rq_clone_bio_info=>io访问,也能从request->end_io_data访问..
+  > setup_clone(clone, request,  dm_rq_target_io)
+
+* dm_prep_fn(request_queue, request)
+  > clone_rq(request, mapped_device, GFP_ATOMIC)
+    #新创建request给request->special, 然后设置cmd_flags的REQ_DONTPREP, 没事了???
+
+* map_requests(dm_target, request, mapped_device)
+  # request=>dm_rq_target_io->map_info还没看到怎么用
+  > dm_target->target_type->map_rq(dm_target, request, dm_rq_target_io->map_info)
+    # 有不同的返回结果, DM_MAPIO_SUBMITTED, 什么都不用做, DM_MAPIO_REMAPPED:
+  > dm_dispatch_request(request)
+    # DM_MAPIO_REQUEUE, 返回1??
+  > dm_kill_unmapped_request(request, r)
+
+* dm_start_request(mapped_device, request)
+  # 开始处理request?? 从request中获取clone request ...
+  > dm_get(mapped_device)
+  
+
+* dm_request_fn(request_queue)
+  # 这个函数是request_queue->request_fn, 在request_based模式下..
+  > blk_queue_stopped(request_queue)
+  > blk_peek_request(request_queue)
+    # 取一个request, 如果没有带有REQ_FLUSH, 获取io磁盘位置
+  > blk_rq_pos(request)  
+    # request->__sector
+  > dm_table_find_target(mapped_device, pos)
+  > dm_target->target_type->busy(dm_target)
+  > dm_start_request(mapped_device, request)
+  > map_requests(dm_target, request, mapped_device)
+    # 映射处理了???
+
+* dm_lld_busy(request_queue)
+  # 检查request_queue是否busy?? 检查mapped_device->flags的DMF_BLOCK_IO_FOR_SUSPEND
+  > dm_table_any_busy_target(mapped_device)
+    # 遍历dm_target...  target_type->busy
+
+* dm_any_congested(congested_data, bdi_bits)
+
+
+* specific_minor(minor)
+  # 分配一个空闲的minor,使用idr..
+
+* next_free_minor(minor)
+  > idr_alloc(....)
+
+* dm_init_md_queue(mapped_device)
+  #初始化mapped_device->request_queue, 设置QUEUE_FLAG_STACKABLE, 然后是各种回调函数...
+  > blk_queue_make_request(mapped_device->request_queue, dm_request)
+  > blk_queue_merge_bvec(mapped_device->request_queue, dm_merge_bvec)
+
+* alloc_dev(minor)
+  # 创建dm设备,先准备minor, 分配内存,创建request_queue
+  > next_free_minor(minor)
+  > blk_alloc_queue(GFP_KERNEL)
+  > dm_init_md_queue(mapped_device)
+  > mapped_device->disk = alloc_disk(1)
+    #创建gendisk
+  > add_disk(mapped_device->gendisk)
+  > alloc_workqueue("kdmflush", WQ_NON_REENTRANT|WQ_MEM_RECLAIM,0)
+    #创建自己io使用的workqueue
+  > bdget_disk(mapped_device->gendisk, 0)
+  > bio_init(mapped_device->flush_bio)
+  > idr..
+
+* __bind_mempools(mapped_device, dm_table)
+  # 准备mapped_deivce使用的内存分配器...
+
+* event_callback(context)
+  # 处理mapped_device->uevent_list
+  > dm_send_uevents(uevents, mapped_device->gendisk=>device->kobj)
+    # 这里的device什么意思???  为何会有device这个结构呢??
+  > wake_up(mapped_device->eventq)
+
+* __set_size(mapped_device, sector_t)
+  # 设置block_device->inode的大小..
+
+* dm_queue_merge_is_compulsory(request_queue)
+  # 检查设备是否有merge_bvec..request_queue->make_request_fn
+
+* __bind(mapped_device, dm_table, queue_limits)
+  # 这时候dm_table已经准备好了吗?? 先比较dm_table中的磁盘空间和mapped_disk->gendisk的大小
+  > dm_table_get_size(dm_table)
+    # 在highs树中获取最大空间
+  > __set_size(mapped_device, size)
+  > dm_table_event_callback(dm_table, event_callback, mapped_device)
+    # 如果dm_table是request_based,需要先停止底层设备的request_queue
+  > dm_table_request_based(dm_table)
+  > stop_queue(request_queue)
+  > dm_table_merge_is_optional(dm_table)
+    #下面都是多设置些参数.. 还有queue_limits
+
+* dm_create(minor, mapped_device)
+  > alloc_dev(minor)
+  > dm_sysfs_init(....
+
+* dm_init_request_based_queue(mapped_device)
+  # 初始化request_queue.. 设置回调函数
+  > blk_init_allocated_queue(mapped_device->request_queue, dm_request_fn, NULL)
+  > dm_init_md_queue(mapped_device)
+    # 然后设置dm_softirq_done / dm_prep_fn / dm_lld_busy ..
+  > elv_register_queue(mapped_device->request_queue)
+    # 这里面也没有创建elv...
+
+* dm_setup_md_queue(mapped_device)
+  > dm_init_request_based_queue(mapped_device)
+
+* dm_find_md(dev)
+  # 原来idr管理mapped_device指针..
+
+* dm_wq_work(work_struct)
+  # 从mapped_device->deferred队列中取出bio, 去提交这些bio
+  > dm_request_based(mapped_device)
+  > generic_make_request(bio)
+    # 如果是request_based的, 就像其他应用一样提交队列
+  > __split_and_process_bio(mapped_device, bio)
+    # 如果是block_based的, 它会做分割，下面就提交到dm_target的request_queue???
+
+
+
+
+================================
+dm-linear.c
+
+linear_c
+  dm_dev  #表示底层设备
+  sector_t start
+
+* linear_ctr(dm_target, unsigned int argc argv)
+  #初始化dm_target, 参数中是设备和开始扇区. 把它添加到dm_table中, dm_dev_internal..
+  > dm_get_device(dm_target, dev_t, dm_table_get_mode(dm_target->dm_table), linear_c->dm_dev)
+  # 后面设置num_flush_requests/num_discard_requests/num_write_same_requests?? 什么意义?  dm_target->private = linear_c
+
+* linear_dtr(dm_target)
+  # 释放设备和linear_c
+  > dm_put_device(dm_target, linear_c->dm_dev..
+
+* linear_map_sector(dm_target, sector_t)
+  # 把mapped_device的磁盘位置映射到底层设备的位置..这个很简单: sector_t - dm_target->start + linear_c->start..
+  > dm_target_offset(dm_target, bi_sector)
+
+* linear_map_bio(dm_target, bio)
+  #包装bio,发送给dm_target表示的设备.. bio->bi_bdev=linear_c->dm_dev->block_device, 然后映射bio->bi_sector
+  > linear_map_sector(dm_target, bio->bi_sector
+
+* linear_map(dm_target, bio)
+  # 很简单的处理,返回DM_MAPIO_REMAPPED
+  > linear_map_bio(dm_target, bio)
+
+* linear_status(dm_target, status_type_t, status_flags, resule, maxlen)
+  # 输出状态...
+
+* linear_ioctl(dm_target, cmd, arg)
+  #想底层设备发送ioctl命令, 有选择的发送。。
+  > scsi_verify_blk_ioctl(NULL, cmd)
+  > __blkdev_driver_ioctl(linear_c->dm_dev->block_devie, mode, cmd, arg)
+
+* linear_merge(dm_target, bvec_merge_data, bio_vec, max_size)
+  #这里也没有任何处理,使用底层的合并函数, 首先准备bvec_merge_data,
+  > bdev_get_queue(linear_c->md_dev->block_device)
+  > linear_map_sector(dm_target, bvec_merge_data->bi_sector)
+  > request_queue->merge_bvec_fn(request_queue, bvec_merge_data, bvec_merge_data)
+
+* linear_iterate_devices(dm_target, iterate_devices_callout_fn, data)
+  > iterate_devices_callout_fn(dm_target, dm_target->linear_c->dm_dev, start, len, data)
+
+上面就是linear_target的回调函数,非常简单.

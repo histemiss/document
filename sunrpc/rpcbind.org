@@ -1,0 +1,102 @@
+刚开始的时候不明白rpcbind/sunrpc之间的关系，rpc有rfc说明,rpcbind/portmap也有对应的rpc文档,但sunrpc是没有的, 实现来说sunrpc和rpcbind是没有关系的,sunrpc是内核对rpc协议/服务的实现,包括xdr,为内核态的nfs/lockd/nlm/nfsd提供服务。而rpcbind是整个rpc框架中的一个服务模块,为其他使用rpc的提供查询和注册服务. 系统有好多rpc服务,大家使用时建立连接,需要知道哪个服务在哪个端口上监听,所以大家就约定向rpcbind服务查询信息,服务提供者也都向rpcbind注册信息。 这个是纯用户态的东西，后来一些著名的服务也有了固定的port,当然也可以不用固定的.
+
+在sunrpc中, 它肯定也得提供这些功能,为nfs 客户端提供查询功能,为nfs服务端提供注册功能。这些功能就是要和rpcbind服务交互，它直接使用了rpc client的功能。 在FSM中，对应bind过程就是向rpcbind查询服务监听的端口.  
+rpcbind call使用数据结构包括:rpc_program/rpc_version/rpc_procedure/rpcbind_args..
+数据结构
+    rpcbind_args
+        * rpc_xprt
+        * r_prog, r_vers, r_prot, r_port
+        * r_netid, r_addr, r_owner r_owner是注册者名字
+        * r_status
+
+1. sunrpc维护全局的一些rpc_clnt,向本地的rpcbind请求服务,相关操作
+    a. rpcb_get_local(net)
+        使用一些列繁琐的数据结构,组织这些指针. net是一个全局的像命名空间/文件系统之类的一个结构,里面包括指针数组,每个都有特殊,比如sunrpc_net, 它使用sunrpc_net_id索引。sunrpc_net里面包含两个rpc_clnt。这个函数返回sunrpc_net->rpcb_users, 而且加一
+    b. rpcb_put_local(net)
+        sunrpc_net数据结构中有rpcb_clnt/rpcb_clnt4, 根据计数sunrpc_net->rpcb_users判断这两个变量的使用. rpcb_clnt4是rpcbind版本v4.rpcb_clnt是portmap,应该是v2. 这两个rpc_clnt是用于和本地rpcbind交互使用的.
+        -> rpc_shutdown_client(rpc_clnt)
+    c. rpcb_set_local(net, rpc_clnt, rpc_clnt)
+        应该是初始化rpcbind client时调用, 设置sunrpc_net->rpcb_local_clnt(4)
+    d. rpcb_create_local_unix(net)
+        创建两个rpc_clnt, rpc服务端应该是rpcbind服务,地址是使用AF_LOCAL协议的网络地址, path="/var/run/rpcbind.sock"。构造rpc_create_args, 先使用rpcbindV2, 创建rpc_clnt, 然后克隆一个rpc_clnt4.
+        -> rpc_create(rpc_create_args)
+        -> rpc_bind_new_program(rpc_clnt, rpcb_program, RPCBVERS_4)
+        -> rpcb_set_local(net, rpc_clnt, rpc_clnt4)
+    e. rpcb_create_local_net(net)
+        和上面一样，构造AF_INET协议的网络地址, 端口号是111, authflavor使用RPC_AUTH_UNIX,上面的使用RPC_AUTH_NULL. 这个和上面的函数参数应该不一样.
+    f. rpcb_create_local(net)
+        封装unix版的rpcbind使用方法, sunrpc server使用，向本地rpcbind注册服务,svc_rpcb_setup中使用.
+        -> rpcb_get_local(net)
+        -> rpc_create_local_unix(net)
+        -> rpc_create_local_net(net) 如果unix方式的rpcbind请求无法打开，使用inet的注册方式
+
+2. 实现rpcbind的注册服务
+    a. rpcb_register_call(rpc_clnt, rpc_message)
+        使用rpc请求, 为下面各样注册函数服务服务
+        -> rpc_calL_sync(rpc_clnt, rpc_message, RPC_TASK_SOFTCONN)
+    b. rpcb_register(net, prog, vers, prot, port)
+        这里注册/反注册服务(prog/vers)使用的端口(port/prot), 为何还要指定vers? 如果port是0，使用RPCBPROC_UNSET, 否则使用RPCBPROC_SET服务. 这里构造rpcbind_args, 使用RPCBINDv2, 这里只有在RPCBINDv4不成功时才使用.
+        -> rpc_register_call(rpc_local_clnt, rpc_message)
+    c. rpcb_register_inet4(sunrpc_net, sockaddr, rpc_message)
+        这个和上面的区别是使用RPCBINDv4,当然rpc_message也不一样, 而且rpcbind参数使用的地址是函数参数地址,同样根据sockaddr中的端口号决定使用SET/UNSET. rpcbind_args->r_addr是表示网络地址的字符串.
+        -> rpcb_register_call(sunrpc_net->rpcb_local_clnt4, rpc_message)
+    d. rpcb_register_inet6(sunrpc_net, sockaddr, rpc_message)
+        这个和上面相通，但函数参数sockaddr是ipv6地址，也就是注册的服务地址是ipv6的
+    e. rpcb_unregister_all_protofamilies(sunrpc_net, rpc_message)
+        rpcbind_args->r_maps="",使用RPCBPROC_UNSET, 看来rpcbindV4使用字符串的网络地址
+        -> rpcb_register_call(sunrpc_net->rpcb_local_clnt4, rpc_message)
+    f. rpcb_v4_register(net, program, version, sockaddr, netid)
+        这里的rpcbind_args使用netid, 而且有r_owner, 使用RPCBINDv4. 使用net的rpc_clnt,还是unix的rpc_clnt, 这个在创建上面准备rpc_clnt时确认。 这个函数在__svc_rpcb_register4中调用. 这个函数是和rpcb_register功能类似的,它是rpcbindv4,后者是rpcbindv2.这个函数可以注册服务地址,而后者只能注册端口号。
+        -> rpcb_register_inet4(sunrpc_net, sockaddr, message)
+        -> rpcb_register_inet6(sunrpc_net, sockaddr, message)
+
+    svc_register(svc_serv, net, family, proto, port) 接口函数, 注册svc_serv支持的所有program/version
+        -> __svc_register
+            -> __svc_rpcb_register4  这里4和6分开就是为了netid
+                -> rpcb_v4_register 
+                    -> rpcb_register_inet4
+                    -> rpcb_register_inet6
+                -> rpcb_register
+            -> __svc_rpcb_register6
+                -> rpcb_v4_register
+
+3. 实现rpcbind的服务查询，实现rpc_xprt bind操作
+    a. rpcb_wake_rpcbind_waiters(rpc_xprt, status)
+        清除rpc_xprt的XPRT_BINDING标志，唤醒rpc_xprt->binding上的任务.  binding是rpc中特有的优先级的等待队列. status是要给这个rpc_task的. XPRT_BINDING 表示rpc_xprt需要bind,它上面的任务都需要在binding队列上等待. 这里最多使用的就是错误处理,在rpc_xprt无法bind的时候.  这里还有XPRT_BOUND, 它表示已经执行bind操作。
+        -> rpc_wake_up_status(rpc_xprt->binding, status)  唤醒所有的rpc_task, 设置rpc_task->tk_status = status....
+    b. rpcb_map_release(data)  
+        data是rpcbind_args, 唤醒rpc_xprt. 这是rpc_call_ops->rpc_release 这个就是发起rpcbind请求的任务时,结束的回调函数. rpc_call_ops->rpc_release = rpcb_map_release ...  和上面的类似,这里就是FSM中的最后一环,结果处理。
+        -> rpcb_wake_rpcbind_waiter(rpcbind_args->r_xprt, rpcbind_args->r_status)
+        释放rpcbind_args, rpcbind_args->r_addr
+    c. rpcb_create(net, hostname, sockaddr, salen, proto, version)
+        构造一个rpc_clnt使用服务地址(ip/port, protocol),还有请求地址(rpc_prog,rpc_ver), 但这里可以确认rpc_prog,rpc_vers可能使用RPCBINDv2/4. 创建一个请求rpcbind服务的rpc_clnt.
+        -> rpc_create(rpc_create_args)
+    d. rpcb_call_async(rpc_clnt, rpc_bind_args, rpc_procinfo)
+        构造rpc_message, rpc_task_setup, 都忘了rpc_task_setup作用了, 使用RPC异步执行方式,返回rpc_task. rpc client 查询端口使用异步方式, server注册服务使用同步方式.  这里构造rpc_message时，设置rpc_argp/rpc_resp, 这里都使用rpc_bind_args, 返回的数据也保存在这里面. 这个函数给rpc客户端使用,rpcb_getport_async, 就是FSM中的bind环节.
+        -> rpc_run_task(rpc_task_setup)
+    e. rpcb_find_transport_owner(rpc_clnt)
+        找到rpc_clnt, rpc_clnt根据clone产生，向上找rpc_clnt->cl_parent, 直到rpc_xprt不同,或设置autobind的rpc_clnt. 没有设置autobind意思是有bind操作?... 如果设置autobind, 会有什么影响?
+    f. rpcb_getport_async(rpc_task)
+        这是请求rpcbind服务，根据rpc_task中的server ip, rpc_prog/ver,找到server port. 这是FSM过程中使用的. 上面的register函数是rpc server使用的注册函数，这里只需要GETPORT请求. 这是call_bound的实现.  这个函数参数是rpc_task, 但它操作的是rpc_xprt..  一个rpc_xprt对应多个rpc_clnt, 一个rpc_clnt对应多个rpc_task???  这里的对应关系有些乱.
+        -> rpcb_find_transport_owner(rpc_task->rpc_clnt)  这里有些混乱,rpc_clnt->cl_xprt可能为空。
+        -> rpc_sleep_on(rpc_clnt->rpc_xprt->binding, rpc_task, NULL)
+        -> xprt_test_and_set_binding / xprt_bound(rpc_xprt) 如果设置XPRT_BINDING,有人在做bound的工作,直接返回. 然后检查XPRT_BOUND,是否已经完成BOUND工作. 
+        -> rpc_peeraddr(rpc_clnt, ...) 从rpc_clnt获取server地址
+        -> rpcb_create(rpc_xprt->net, rpc_clnt->cl_server, rpc_xprt->prot, bind_version)
+        -> 找到GETPORT proc/rpcbind_version版本，对应ipv4/ipv6, 构造rpcbind_args, 填充rpc_prog/vers/protocol/netid/addr, 他还是用rpc_xprt?
+        -> rpc_call_async(rpc_clnt, rpcbind_args, proc) 调用rpcbind服务
+        -> rpc_release_client(rpc_clnt)
+        -> rpc_put_task(rpc_task)
+        -> rpcb_wake_rpcbind_waiters(rpc_xprt, status) 错误处理,发现XPRT_BOUND有效.  看到后面有些混乱了，这里就是rpc任务的嵌套, 有个任务在FSM中，发现它需要bind，获取服务端口，它请rpcb帮忙,然后这里的rpcb有发起一个rpc_task, 获取请求的端口,因此这个rpcb的回调函数rpcb_getport_done, 就是唤醒那个不知道端口的rpc_xprt....  这里需要看一下创建的rpcb是向那个机器的rpcbind服务?  是远端机器的rpcbind,而不是自己的rpcbind.
+    这里看了看XPRT_BOUND/XPRT_BINDING, 在创建rpc_xprt时，如果设定了服务端的端口(rpc_create_args->address / xprt_args->dstaddr包含端口), 则设定XPRT_BOUND  -> xprt_set_bound(rpc_xprt) ...
+    g. rpcb_getport_done(rpc_task, data)
+        这是rpc_call_ops->rpc_call_done函数，在rpc_exit中调用, 这样调用rpc请求后，不用处理结果，在回调函数中自动设置rpcbind_args->rpc_xprt.
+        -> rpc_xprt->rpc_xprt_ops->set_port(rpc_xprt, rpcbind_args->r_port) rpcbind_args并不仅仅是xdr_buf.
+
+4. 下面是xdr_encode_func_t之类的函数，还有rpc_procedure信息
+    a. rpcb_enc_mapping(rpc_rqst, xdr_stream, rpcbind_args)
+        xdr函数，编码rpcbind_args参数
+    b. rpcb_dec_getport(rpc_rqst, xdr_stream, rpcbind_args) / rpcb_dec_set / encode_rpcb_string(xdr_stream, string, maxstrlen) / rpcb_enc_getaddr(rpc_rqst, xdr_stream, rpcbind_args)
+        rpc_procinfo rpcb_procedure2/3/4
+
+这里的功能模块还是比较简单，主要提供rpcbind相关的服务接口,分别为server和client服务，为server服务时，需要对本地rpcbind做注册工作，以及注销工作。对client的服务工作是查询port, 这是FSM的一部分，对应call_bind操作, 而且不会操作很多, 一次查询就可以. 通过这里学习了如果使用rpc client功能,创建rpc_clnt, rpc_task, 调用rpc_task. rpc_xprt的创建集成到了rpc_clnt中。 单对rpc client来说,应该是没有本地rpcbind的操作，但还是有的，找找.....

@@ -1,0 +1,698 @@
+md.h
+
+md_rdev
+  # raid dev??
+  * list_head  same_set  #mddev->disks队列..
+  * sector_t sectors   #设备大小  
+  * mddev mddev   # 一个mddev包含多个md_rdev
+  * last_events   # IO event timestamp
+  * block_device  meta_bdev
+  * block_device  bdev  # dev的metadata数据是什么??
+  * page  sb_page #每个md_rdev都有sb_page..
+  * page bb_page  #??
+  * sb_loaded  #是否从设备中读回来sb_page??
+  * sb_events  
+  * sector_t data_offset  # 普通数据开始的地方,对于设备的偏移.
+  * sector_t new_data_offset  #  reshape 
+  * sector_t sb_start  # super_block的偏移,对于设备的偏移..
+  * int sb_size # 还不是到super_block转的什么?! 
+  * int preferred_minor   # autorun
+  * kobject kobject
+  * flags   #设备的状态, faulty, in_sync
+  * wait_queue_head_t  blocked_wait
+  * desc_nr  # descriptor index  superblock中的数据
+  * raid_disk # array设备角色??
+  * new_raid_disk  #
+  * saved_raid_disk  #
+  * sector_t  recovery_offset  #recovery操作偏移 
+  * atomic_t  nr_pending  #等待的requests的数量
+  * read_errors  # 连续读操作操作..
+  * last_read_error  #上次读操作错误时间
+  * corrected_error #错误修正次数
+  * work_struct del_work # delayed sysfs removal
+  * sysfs_dirent  sysfs_state  #sysfs entry
+  * badblocks  # 挺大的数据结构
+
+md_thread
+  * void run(md_thread)
+  * mddev 
+  * wait_queue_head_t  wqueue
+  * flags
+  * task_struct
+  * timeout
+  * private
+
+mddev
+  * private
+  * md_personality pers  #定制的方法
+  * dev_t  unit   #唯一的标示设备
+  * md_minor
+  * list_head disks #md_rdev设备
+  * flags 
+    # 包括MD_CHANGE_DEVS/CLEAN/PENDING
+  * suspended   #设置不工作??
+  * active_io  # 队列中的bio???
+  * ro
+  * sysfs_active
+  * ready
+  * gendisk 
+  * kobject kob 
+  * int hold_active #初始为1
+  * major_version, minor_version, patch_version
+  * persistent, external
+  * metadata_type[17]     
+    # externally set
+  * chunk_sectors
+  * ctime, utime
+  * level, layout
+  * clevel[16]
+  * raid_disks  # 是dev_t吗?? 对应md_rdev->desc_nr..
+  * max_disks
+  * sector_t dev_sectors
+  * sector_t array_sectors
+  * external_size   
+    # externally 什么意思??
+  * __u64 events
+  * can_decrease_events
+  * uuid[16]
+  * sector_t reshape_position
+  * delta_disks, new_level, new_layout, new_chunk_sectors, reshape_backwards
+  * md_thread  thread, sync_thread
+    # ?? thread
+  * sector_t curr_resync
+
+  * sector_t curr_resync_completed
+  * resync_mark
+  * sector_t resync_mark_cnt, curr_mark_cnt, resync_max_sectors, resync_mismatches
+
+  * sector_t  suspend_lo, suspend_hi
+
+  * int sync_speed_min  #最小速度?  收sysctl_speed_limit_min限制..
+  * sync_speed_max   # 最大速度?  什么速度,不能超过系统参数sysctl_speed_limit_max
+    # /proc/sys/dev/raid/speed_limit_max|speed_limit_min 两个文件
+
+  * int parallel_resync, ok_start_degraded 
+    # resync是什么概念???
+  * recovery  # recovery操作是什么东西??
+  * recovery_disabled
+  * in_sync
+
+  * mutex  open_mutex, reconfig_mutex
+  * active  #使用计数 
+  * openers # active open...
+
+  * changed, degraded
+  * merge_check_needed
+
+  * atomic_t recovery_active
+    # block scheduled...
+  * wait_queue_head_t recovery_wait
+  * sector_t  recovery_cp, resync_min, resync_max 
+ 
+  * sysfs_dirent sysfs_state, sysfs_action
+
+  * work_struct del_work   
+    # delayed sysfs removal.. 在释放mddev时,释放gendisk相关数据.
+
+  * write_lock
+  * wait_queue_head_t sb_wait  #当suspended是在这里等待
+    # for waiting on superblock
+  * pending_writes
+    # number of active ...
+
+  * safemode, safemode_delay
+  * timer_list safemode_timer
+  * request_queue queue  
+    # for plugging...
+ 
+  * bitmap bitmap
+  * bitmap_info   
+    # big structure  mddev不支持bitmap....
+
+  * list_head all_mddevs  #管理所有的mddev
+  * attribute_group to_remove
+  * bio_set bio_set  #bio的内存分配工具,里面有bio_pool和bvec_pool; 这里面bio_pool使用自己的kmem_slab, bvec_pool使用内核的某个slab支持,这里分配vec数组时,根据长度在不同的mem_pool中分配.
+  * bio  flush_bio  #flush mdev要先flush md_rdev,暂存bio
+  * flush_pending  # 记录flush的进度
+  * work_struct flush_work  #异步任务flush
+  * event_work
+  * sync_super(mddev, md_rdev)
+    # raid ???
+  
+
+* bio_alloc_mddev(gfp_mask, nr_iovecs, mddev)
+  > bio_alloc(gfp_mask, nr_iovecs)
+  # mddev如果是NULL,分配不提供内存管理
+  > bio_alloc_bioset(gfp_t, nr_iovecs, mddev->bio_set)
+  
+* bio_clone_mddev(bio, gfp_mask, mddev)
+  > bio_clone(bio, gfp_mask)
+    #bs无效
+  > bio_clone_bioset(bio, gfp_mask, mddev->bio_set)
+    > bio_alloc_mddev(gfp_mask, bio->bi->mas_vecs, bio_set)
+    #简单的复制,sector/dev/flags/rw/vcnt ...
+  > bio_integrity(bio)
+
+* md_trim_bio(bio, offset, size)
+  # 修改bio的数据位置. bio的bio_vec记录内存数据位置,bi_size记录bio中数据量,bi_sector记录磁盘位置。 后面2个容易修改,但bio_vec数据同时要移动, 数据涉及bi_io_vec,bi_idx, bi_vcnt数组长度. 这里的修改是变小.
+  > memmove(..)
+
+* md_new_event(mddev) / md_new_event_inintr(mddev)
+  # /proc/mdstat的event, 使用md_event_waiters等待队列???
+
+* md_make_request(request_queue, bio)
+  #request_queue->queuedata是mddev, 检查mddev->suspended, 在mddev->sb_wait上等待.
+  > mddev->md_personality->make_request(mddev, bio)
+  #同时还要唤醒下面的等待. 要使mddev supended, 要等待进行中的bio完成..
+
+* mddev_suspend(mddev)
+  # 设置mddev->supended, 但要等待没有bio在生成了..mddev->active_io
+  > mddev->md_personality->quiesce(mmdev, 1)
+  > del_timer_sync(mddev->safemode_timer)
+
+* mddev_resume(mddev)
+  # 设置suspended为0, 唤醒等待的任务mddev->sb_wait,  设置MD_RECOVERY_NEEDED标志, mddev->recovery, 唤醒两个线程
+  > md_wakeup_thread(mddev->thread)
+  > md_wakeup_thread(mddev->sync_thread)
+
+* md_end_flush(bio, err)
+  # bio是md_rdev的??!  bio->bi_private是md_rdev, md_rdev->mddev获取mddev.. 
+  > rdev_dev_pending(md_rdev, mddev)
+  > queue_work(md_wq, mddev->flush_work)
+    # 递减mddev->flush_pending, 如果是0, 把flush_work放到队列中.md_wq是工作队列,系统创建的.
+
+* submit_flushes(work_struct)
+  # 这个函数就是mddev->flush_work的回调函数.  一个mddev关联多个md_rdev, 遍历mddev的md_rdev. 向md_rdev->bdev提交flush操作. 前提是md_rdev->raid_disk>=0, md_rdev中没有Faulty标志..
+  > bio_alloc_mddev(GFP_NOIO, 0, mddev)
+    # 回调函数是md_end_flush, bi_private是md_rdev, bi_bdev是md_rdev->bdev..
+  > submit_bio(WRITE_FLUSH, bio)
+    # 增加mddev->flush_pending。 这里完全使用flush_pending保持同步,开始设为1,然后每刷新一个设备增1,最后减1,如果前面提交的都完成,这里也继续把这个flush_work添加到md_wq中. 这里的回调函数已经修改,看看下面的处理. 如果这里没有等到完成,回调函数my_end_flush会做这些事情.
+  > queue_work(md_wq, mddev->flush_work)
+
+* md_submit_flush_data(work_struct)
+  # 这好像是继续上面的工作,处理mddev->flush_bio, 但去掉REQ_FLUSH. 上面是处理md_rdev的设备,这里处理mddev的设备?!
+  > mddev->md_personality->make_request(mddev, bio)
+  > wake_up(mddev->sb_wait)
+    #设备继续工作? 唤醒相关的任务..
+
+* md_flush_request(mddev, bio)
+  #启动上面的刷新工作, 把bio给mddev->flush_bio,初始化flush_work,并放到md_wq中..
+  > queue_work(....)
+
+* md_unplug(blk_plug_cb(blk_plug_cb, from_schedule)
+  # blk_plug_cb->data是mddev
+  > md_wakeup_thread(mddev->thread) 
+    # 唤醒等待在md_thread->wqueue上的任务,就是md_thread.. THREAD_WAKEUP是什么标志??   md自己使用的..
+
+* mddev_put(mddev)
+  #通过mddev->active管理mddev. 释放mddev, mddev->disks队列为空, mddev->raid_disks为0, mddev->ctime=0, mddev->hold_active为0, 就释放这个mddev:  从all_mddevs中释放, mddev->bio_set, gendisk..
+  > queue_work(md_misc_wq, mddev->del_work)
+    # 回调函数是mddev_delayed_delete,删除gendisk相关元素..
+  > bioset_free(bio_set)
+  
+* mddev_find(dev_t)
+  # dev_t的MAJOR如果不是MD_MAJOR,就改成0.  先在all_mddevs中找一个,找不到就创建新的. 遍历时比较mddev->unit.  这里返回的hold_active不同,代表不同的意义..
+
+* mddev_unlock(mddev)
+  # 需要处理sysfs
+
+* find_rdev_nr(mddev, nr) / find_rdev_nr_cru(mddev, nr)
+  # 找mddev管理的第nr个md_rdev
+
+* find_rdev(mddev, dev_t)
+  # 找mddev的md_rdev的block_device,比较dev_t
+
+* find_pers(level, clevel)
+  # clevel是名称??? 遍历pers_list队列,找一个合适的md_personality
+
+* calc_dev_sboffset(md_rdev)
+  # 返回super block的偏移. 先获取磁盘设备大小,在计算一下.每个md_rdev设备中都预留64k数据,实际大小减去这个值
+  > i_size_read(md_rdev->block_device->inode) / 512
+
+* alloc_disk_sb(md_rdev)
+  #给md_rdev->sb_page分配1page
+
+* md_rdev_clear(md_rdev)
+  # 释放md_rdev->sb_page, md_rdev->bb_page, mm_rdev->badblocks.page
+
+* super_written(bio, error)
+  #bio回调函数, 如果error有错,通知mddev
+  > md_error(mddev, md_rdev)
+  > wake_up(mddev->sb_wait)
+    # 如果pending_writes为0, 就唤醒等待的.还有多个这些的写??
+  > bio_put(bio)
+
+* md_super_write(mddev, md_rdev, sector, size, page)
+  #向md_rdev->bdev写数据,每个mddev写就是多个md_rdev写,使用mddev->pending_writes/sb_wait同步这些操作. 这里会增加mddev->pending_writes
+  > bio_alloc_mddev(GFP_NOIO, 1, mddev)  
+    #这还不是io?? 然后给这个bio sector_t, bi_private = md_rdev, bi_end_io = super_written, bi_bdev...
+  > bio_add_page(bio, page, size, 0)
+  > submit_bio(WRITE_FLUSH_FUA, bio)
+
+* md_super_wait(mddev)
+  #等待mddev->pending_writes不是0..
+
+* sync_page_io(md_rdev, sector_t, size, page, rw, metadata_op)
+  # 这是想md_rdev关联的设备提交一个bio?? 还是挺简单的. 首先设置bio->bi_sector,也就是目的磁盘位置, metadata_op表示是否meta数据.如果是要使用md_rdev->meta_bdev, 位置偏移md_rdev->sb_start; 如果普通的,使用md_rdev->bdev, 位置偏移md_rdev->data_offset. 还有一种reshape情况.  然后把page添加到bio
+  > bio_add_page(....)
+  #然后设置回调函数。首先这里是同步操作,需要等待bio完成,使用了completion, 把它给bio->bi_private,使用的回调函数就是出发completion. 提交bio，等待completion
+  > submit_bio(rw, bio)
+
+
+* read_disk_sb(md_rdev, size)
+  #使用上面的操作读回来一个page,使用md_rdev->sb_loaded记录是否读回来. 注意下面的位置参数是0，函数自动处理了..
+  > sync_page_io(md_rdev, 0, size, md_rdev->sb_page, READ, 1)
+
+mdp_superblock_s 
+  #这个数据结构应该就是磁盘上的super_block. 代码中介绍很详细,就像一个文件系统的super_block一样的属性.
+
+super_type:
+  # 交给dm的使用者去处理具体的super_block, 有些是lvm用的,有些是ecryptfs使用的...
+  * char *name
+  * module owner
+  * load_super(md_rdev, rdev, md_rdev refdev, monor_version)
+  * validate_super(mddev, md_rdev)
+  * sync_super(mddev, md_rdev)
+  * rdev_size_change(md_rdev, sector_t num_sectors)
+  * allow_new_offset(md_rdev, new_offset)
+
+下面提供了2个版本, 0.90, 1.0, 只看最新的..
+* super_1_load(md_rdev, md_rdev, minor_version)
+  # 不同的minorversion, super_block位置不一样. 有这样繁琐的吗??  反正是4k,就是一个mdp_superblock_s.  1.2=>偏移是8 sectors, 这也就是md_rdev->sb_start.
+  > read_disk_sb(md_rdev, 4096)
+    # 然后从mdp_superblock_s中取出一些信息给md_rdev, data_offset, new_data_offset. 这里还有MD_FEATURE_RESHAPE_ACTIVE/NEW_OFFSET, mdp_superblock_s->new_offset ..
+
+* sync_super(mddev, md_rdev)
+  # 写回superblock
+
+* match_mddev_units(mddev, mddev)
+  #比较两个mddev是否关联相同的块设备..  mddev=>md_rdev->bd_containers, 遍历两个mddev,比较两个bd_contains..
+
+* md_integrity_register(mddev)
+  # 打开integrity机制??  检查是否需要..  
+    * mddev->disks不为空, 它关联的什么?
+    * mddev->gendisk  检查它是否已经有integrity
+      > blk_get_integrity(mddev->gendisk)   
+    * 遍历每个md_rdev, md_rdev->flags没有Faulty, rdev->raid_disk >= 0..   使用第一个md_rdev作为reference. 比较每个md_rdev和referrence的disk integrity..
+      > blk_integrity_compare(gendisk, gendisk)  
+        #比较 sector_size / tuple_size / tag_size
+  > blk_integrity_register(mddev->gendisk, bdev_get_integrity(reference->bdev))
+    #构造mddev->gendisk->integrity..
+  > bioset_integrity_create(mddev->bio_set, BIO_POOL_SIZE)
+    #构造mddev->bio_set->bio_integrity_pool...
+
+* md_integrity_add_rdev(md_rdev, mddev)
+  # 这应该是一个回调函数,但md_rdev添加到mddev时检查integrity机制是否相同. 如果不同,去掉integrity机制..
+  > blk_integrity_unregister(mddev->gendisk)
+
+* bind_rdev_to_array(md_rdev, mddev)
+  # md_rdev->sectors和mddev->dev_sectors什么关系???  md_rdev->desc_nr是dev_t, 需要保持惟一性, 或许使用它计数..
+  > find_rdev_nr(mddev, choice)  
+  > bdev_name(md_rdev->bdev, b)  
+    # 构造dev name, 给sysfs使用.  在mddev下面构造名字为dev-name的md_rdev文件夹,下面构造block指向md_rdev->bdev->bd_part,...
+  > bd_link_disk_holder(md_rdev->bdev, mddev->gendisk)
+    # 最后把md_rdev->same_set添加到mddev->disks队列, 在sysfs中把md_rdev->bdev和mddev->gendisk关联起来..
+
+*md_delayed_delete(work_struct)
+  #释放 md_rdev ->kobj
+
+* unbind_rdev_from_arry(md_rdev)
+  # 释放上面创建的md_rdev, sysfs...
+
+* lock_rdev(md_rdev, dev_t, shared)
+  # 把md_rdev和dev_t表示的block_device关联起来..
+
+* kick_rdev_from_array(md_rdev)
+  > unbind_rdev_from_arry (md_rdev)  
+  > export_rdev(md_rdev)
+    #把md_rdev从mddev中踢出去..
+
+* export_array(mddev)
+  # 释放mddev, 先释放它的md_rdev, raid_disks=0, major_version=0.   raid_disks也表示rdev的个数,md_rdev->desc_nr...
+  > kick_rdev_from_array(..)
+
+* sync_sbs(mddev, nosparce)
+  # 刷新md_rdev的super_block, 遍历mddev的md_rdev
+  > sync_super(mddev, md_rdev)
+    # 设置md_rdev->sb_loaded=1， 但还有不写的sb_loaded=2. 这里没有写回吗?  上面没有看super_1_sync...
+
+* md_update_sb(mddev, force_change)
+  # 写回super_block..  mddev->persistent, 如果它不是固存磁盘,不用写回.. 唤醒mddev->sb_wait, 还有mddev->external,表示是否有外存。。。
+  # 处理MD_CHANGE_DEVS/MD_CHANGE_CLEAN标志, 
+  > sync_sbs(mddev, nospace)
+  # 再次遍历md_rdev, 写回super_block
+  > md_super_write(mddev, md_rdev, md_rdev->sb_start, ...)
+  > md_super_wait(mddev)  
+    #等待mddev->pending_writes..
+
+* slot_store(md_rdev, char, size_t)
+  # 删除或添加md_rdev, 根据slot决定操作. 如果slot是-1/none,
+  > md_rdev->mddev->pers->hot_remove_disk(md_rdev,  md_rdev)
+    # 还要唤醒mddev->thread
+  > md_wakeup_thread(...)
+  > mddev->pers->hot_add_disk(mddev, md_rdev)
+    #设置md_rdev->raid_disk 是 slot, saved_raid_disk. 
+  > sysfs_link_rdev(mddev, md_rdev)
+
+这里是一系列的*_store, 设置mddev的参数
+* new_offset_store(md_rdev, char, len)
+  > super_type[].allow_new_offset(md_rdev, new_offset)
+
+* rdev_size_store(md_rdev, buf, len)
+  # 设置md_rdev->sectors, 设置之后需要检查,多个md_rdev可能共用一个block_device, 他们的data_offset/sectors是否重叠.
+  > super_types[].rdev_size_change(md_rdev, sectors)
+
+* recovery_start_store(md_rdev, char buf, len)
+  # 设置md_rdev->recovery_start, 还要修改md_rdev->flags的In_sync
+
+* state_store(md_rdev, char, len)
+  # 不仅仅是标志,还是命令. faulty对应md_rdev->flags的Faulty; remove要把md_rdev从mddev中删除
+  > kick_rdev_from_array(md_rdev)
+  > md_update_sb(mddev, 1) 
+    # 1 代表什么?
+  > md_new_event(mddev)
+  # writemostly 对应md_rdev->flags的WriteMostly, blocked也是标志, insync是标志, write_error, want_replacement, replacement也是. 
+
+* md_import_device(dev_t, supor_format, super_minor)
+  # 构造一个md_rdev
+  > md_rdev_init(md_rdev)
+  > alloc_disk_sb(md_rdev)
+  > lock_rdev(md_rdev, dev_t, super_format)
+  > i_size_read(md_rdev->bdev->bd_inode)
+    #获取磁盘大小
+  > super_types[].load_super(md_rdev, ...)
+
+* analyze_sbs(mddev)
+  #遍历mddev的md_rdev, 读回super_block
+  > super_types[major].load_super(md_rdev, freshest, minor_version)
+    #这个过程要获取一个比较fresh的md_rdev. 再次遍历, 验证
+  > super_types[major].validate_super(mddev, md_rdev)
+    #同时还设置md_rdev->desc_nr. 如果mddev->level==LEVEL_MULTIPATH, 设置md_rdev->raid_disk就是desc_nr, 否则raid_disk=-1..
+
+* level_store(mddev, buf, len)
+  # 设置mddev->level, 找到mddev->md_personality
+  > find_pers(level, clevel)
+    #原来md_personality是根据mddev->level来的..
+  > md_personality->takeover(mddev)
+    #替换level的准备
+  > mddev_suspend(mddev)
+  > mddev->md_personality->stop(mddev)
+    # mddev->pers->sync_request和sys的sync_action文件夹有关, mddev->sysfs_action
+  > mddev->md_personality->run(mddev)
+  > mddev->md_personality->resume(mddev)
+
+* layout_store(mddev, buf, len)
+  mddev->md_personality->check_reshape(mddev)
+* raid_disks_store(mddev, char, len)
+  > update_raid_disks(mddev, n)
+
+* array_state_store(mddev, buf, len)
+  #设置mddev的状态: clear, inactive, suspended, readonly, read_auto, clean, write_pending, active_idle;
+  #clear -> do_md_stop(mddev, 0, NULL)
+  # inactive -> do_md_stop(mddev, 2, NULL)  参数不一样
+  # readonly -> md_set_readonly(mddev, NULL)
+  # read_auto ->  参考mddev->ro, 如果为0, 原来不是readonly
+    >md_set_readonly(mddev, NULL)
+      # 如果为1, 原来就是readonly. 最后设置为mddev->ro=2
+    > restart_array(mddev)
+    > set_disk_ro(mddev->gendisk, 0)
+  # clean -> 设置mddev->flags的MD_CHANGE_CLEAN
+    > restart_array(mddev)
+  # active -> restart_array(...)
+  # write_pending / active_idle  不支持..
+
+> new_dev_store(mddev, char )
+  #mddev添加设备 dev_t
+  > md_import_device(dev, mddev->major_version, mddev->minor_version)
+  > super_type[].load_super(md_rdev, md_rdev refer, ..)
+  > bind_rdev_to_array(md_rdev, mddev)
+
+* size_store(mddev, buf, len)
+  > strict_blocks_to_sectors(buf, sectors)
+  > update_size(mddev, sectors)
+  > md_update_sb(mddev, 1)
+
+* metadata_store(mddev, buf, len)
+  # external什么意思? 好像和persistent相反..
+
+* action_store(mddev, ..)
+  #设置mddev->recovery的标志, 最后唤醒mddev->thread...
+
+* array_size_store(mddev, buf, len)
+  # 设置mddev->array_sectors, buf可能是default, 要先取一个size
+  > mdddev->md_personality->size(mddev, 0,0)
+  > revalidate_disk(mddev->gendisk)
+
+* md_alloc(dev_t, name)
+  > mddev_find(dev_t)
+  > flush_workqueue(md_misc_wq)
+  > blk_alloc_queue(GFP_KERNEL)
+    #建立request_queue
+  > blk_queue_make_request(mddev->queue, md_make_request)
+    # 自己的请求驱动..
+  > blk_set_stacking_limites(mddev->queue->limites)  
+  > alloc_disk(1<<shift)
+  > add_disk(disk)
+    # 关联gendisk/request_queue, mddev..
+  > kobject_init_and_add(mddev->kobj, md_ktype, ...)
+
+下面是上面操作mddev状态的函数
+* md_run(mddev)
+  # 启动mddev??  检查mddev->md_personality/sysfs_active都是NULL, 上一次stop是设置为NULL???  遍历md_rdev
+  > sync_blockdev(md_rdev->bdev)
+  > invalidate_bdev(md_rdev->bdev)  
+    # 刷数据, 创建bioset
+  > bioset_create(BIO_POOL_SIZE, 0) 
+  > find_pers(mddev->level, clevel)
+  > mddev->md_personality->run()
+  > md_update_sb(mddev, 0)
+
+* do_md_run(mddev)
+  #除了上面,还有线程??
+  > md_run(mddev)
+  > md_wakeup_thread(mddev->thread / sync_thread)
+
+* restart_array(mddev)
+  > set_disk_ro(mddev->gendisk, 0)
+  > md_wakeup_thread(mddev->thread / sync_thread)
+    # 设置MD_RECOVERY_NEEDED标志, 为何唤醒这2个线程..
+
+* md_clean(mddev)
+  #清除mddev的成员参数..
+
+* __md_stop_writes(mddev)
+  #设置MD_RECOVERY_NEEDED/MD_RECOVERY_INTR标志?? 也没有看到write相关参数..
+  > bitmap_flush(mddev)
+  > md_super_wait(mddev)
+
+* __md_stop(mddev)
+  # 设置mddev->ready=0 ?  write? 设置pers为NULL, MD_RECOVERY_FROZEN..
+  > mddev->md_personality->stop(mddev)
+  
+* md_set_readonly(mddev, block_device)
+  > sync_blockdev(bdev)
+  > __md_stop_writes(mddev)
+  > set_disk_ro(mddev->gendisk, 1)
+
+* do_md_stop(mddev, mode, block_device)
+  #mode表示停止模式, 0, 完全停止,释放array. 2表示进停止运行..
+  > sync_blockdev(block_device)
+  > set_disk_ro(disk, 0)
+  > __md_stop_writes(mddev)
+  > __md_stop(mddev)
+  # 还会重置mddev->request_queue, merge_bvec_fn/backing_dev_info...
+  > revalidate_disk(gendisk)
+    #下面是mode=0的处理
+  > bitmap_destroy(mddev)
+  > export_array(mddev)
+  > md_clean(mddev)
+  > blk_integrity_unregister(gendisk)
+
+my_thread
+  #这是system-thread??
+  * run(md_thread)
+  * mddev
+  * wait_queue_head_t  wqueue
+  * long flags
+  * task_struct  tsk
+  * timeout
+  * private
+
+* md_thread(void)
+  * 参数是my_thread 一直循环, 没事是等待my_thread->flags的THREAD_WAKEUP标志
+  >kthread_should_stop() 
+  > my_thread->run(my_thread)
+
+* md_register_thread( ...)
+  # 构造一个md_thread,同时启动,参数中有回调函数,mddev
+  > kthread_run(md_thread, ...)
+
+* md_error(mddev, md_rdev)
+  > mddev->md_personality->error_handler(mddev, md_rdev)
+  # 同时设置符号MD_RECOVERY_INTR/MD_RECOVERY_NEEDED标志..
+
+* md_write_start(mddev,bio)
+  # 开始写??  mddev->ro==2是read-auto模式?? 设置MD_RECOVERY_NEEDED, 启动mddev->thread/sync_thread
+  
+
+* md_write_end(mddev)
+  #减小mddev->writes_pending计数
+
+* md_allow_write(mddev)
+  # mddev->in_sync什么意思?? 设置MD_CHANGE_CLEAN/MD_CHANGE_PENDING..  flags和recovery什么关系..
+
+下面是md_thread的回调
+* md_do_sync(md_thread)
+  #和mddev->recovery互斥..  检查MD_RECOVERY_DONE, 如果有则停止.. mddev->ro, 如果是只读停止. 根据recovery的标志决定现在的任务:  MD_RECOVERY_SYNC/MD_RECOVERY_CHECK :  data-check; MD_RECOVERY_SYNC/MD_RECOVERY_REQUESTED:requested-resync; MD_RECOVERY_SYNC: resync; MD_RECOVERY_RESHAPE: reshaep; 否则是recovery.  不同的模式sync 不同的数据量:  max_sectors
+/REQUESTED/CHECK...添加MD_RECOVERY_NEEDED..添加mddev->event_work事件..
+  > md_new_event(mddev)
+
+* md_check_recovery(mddev)
+  #检查recovery任务,启动其他sync线程工作...  mddev->flags表示update_sb需要做
+  > md_update_sb(mddev, 0)
+  #设置复杂的变量,  curr_resync_completed=0, MD_RECOVERY_RUNNING, 清除MD_RECOVERY_INTR/DONE. 检查有什么任务可做
+  # mddev_reshape_position不是MaxSector,需要reshape
+  > mddev->md_personality->check_reshape(mddev),设置MD_RECOVERY_RESHAPE,清除MD_RECOVERY_RECOVER
+  > remove_and_add_spares(mddev)
+    #检查是否需要添加删除设备, 清除MD_RECOVERY_SYNC/CHECK/REQUESTED,设置MD_RECOVERY_RECOVER
+  # recovery_cp不是maxsector, 设置MD_RECOVERY_SYNC, 去除MD_RECOVERY_SYNC..
+  * 创建sync线程
+  > mddev->sync_thread = md_register_thread(md_do_sync, mddev)
+  > md_wakeup_thread(mddev->sync_thread)
+ 
+
+
+dm_io
+
+dm_io_client
+  * mempool_t pool
+  * bio_set bios  
+
+region 是什么概念??
+io
+  * error_bits   
+  * count
+  * task_struct sleeper
+  * dm_io_client client
+  * io_notify_fn callback
+  * context
+  * vma_invalidate_address
+  * vm_invalidate_size
+
+
+* store_io_and_region_in_bio(bio, io, region)
+  # 把region和io一块放到bio->bi_private
+
+* retrieve_io_and_region_from_bio(bio, io, region)
+  #获取io和region.  BM_IO_MAX_REGIONS
+
+* dec_count(io, region, error)
+  # io的第region部分完成,记录结果.  如果io->count减为0, 释放io??
+  > invalidate_kernel_vmap_range(io->vma_invalidate_address, io->vma_invalidate_size)
+  > mempool_free(io, io->client->pool)
+  > io->callback(io->context)
+
+* endio(bio, error)
+  # bio的回调函数
+  > retrieve_io_and_region_from_bio(bio, io, region)
+  > bio_put(bio)
+  > dec_count(io, region, err)
+
+dpages
+  * get_page(dpages, page, len, offset)
+  * next_page(dpages)
+  * context_u, context_ptr
+  * vma_invalidate_address,  vma_invalidate_size
+
+dm_io_region
+  * block_device bdev
+  * sector, count
+从下面看这两个是一块用的,dpages表示io数据的内存位置, dm_io_region表示磁盘位置..
+
+page_list
+  * page_list next 
+  * page
+
+dm_io_mem_type
+  * dm_io_mem_type   #PAGE_LIST/BVEC/VMA/KMEM, 分别对应最后四种指针,union的四个成员.
+  * offset 
+
+  * page_list
+  * bvec 
+  * vma 
+  * addr 
+
+dm_io_request
+  * bi_rw
+  * dm_io_memory mem 
+  * dm_io_notify  notify
+  * dm_io_client  client
+
+
+dpages是遍历page_list的辅助结构..
+* list_get_page(dpages, page, len, offset)
+  #获取dpages中的信息page,  countext_ptr是page_list, context_u是offset
+
+* list_next_page(dpages)
+  #context_ptr是page_list, 可使用context_ptr遍历..
+
+上面是page_list, 下面是bio_vec, context_ptr是bio_vec..
+* list_dp_init(dpages, page_list, offset)
+  #构造dpages,  context_ptr指向bio_vec数组..
+
+* bvec_get_page(dpages, page, len, off)
+  # 
+
+* bvec_next_page(dpage)
+  #
+
+* bvec_dp_init(dpages, bio_vec)
+  # 
+
+dpages里面是vmalloc指针, 需要转换为page
+* vm_get_page(dpages, page, len, offset) 
+  > virt_to_page(void*)
+* vm_next_page(dpages)
+
+* vm_dp_init(dpages, data)
+
+dpages里面是地址指针,不过是kmalloc的..
+km_get_page(dpages, pages, len, offset)
+  > virt_to_page(dp->context_ptr)
+
+km_next_page(dpages)
+km_dp_init(dp, data)
+
+* do_region(rw, region, dm_io_region, dpages, io)
+  # io数据在dm_io_region中,根据get_page获取page. 先创建bio, 把page放到io中. 回调函数是endio, 释放io.
+  > bio_alloc_bioset(GFP_NOIO, num_bvecs, io->client->bios)
+    # io里面是哪里给的??
+  > store_io_and_region_in_bio(bio, io, region)
+  > bio_add_page(bio, page, logical_block_size, ..)
+  > dpages->get_page(...)  / dpages->next_page(...)
+  > submit_bio
+
+* dispatch_io(rw, num_regions, dm_io_region, dpages, io, sync)
+  # 第三个参数是dm_io_region数组, 提交io., num_regions对应error_flags的error的个数..
+  > do_region(...)
+
+* sync_io(dm_io_client, num_regions, dm_io_region, rw, dpages, error_bits)
+  # 这里没有io, region,dpages也需要吗?? 先构造io, error_bits是错误结果?? sleeper是current, client是参数dm_io_client 
+  > dispatch_io(rw, num_regions, where, dp, io, 1)
+    #提交io..然后等待io->count, 最后检查io->error_bits
+
+* async_io(dm_io_client, num_regions, dm_io_region, rw, dp, fn, context)
+  # 这里是异步,在mempools中分配io, 设置回调函数,fn/context等等..
+  > mempool_alloc(dm_io_client->pool, GFP_NOIO)
+  > dispatch_io(rw, num_regions, where, dpages, io, 0)
+
+* dp_init(dm_io_request, dpages, size)
+  # 根据dm_io_request->mem.type初始化dpages..
+  > list_dp_init
+  > bvec_dp_init
+
+* do_io(dm_io_region, num_regions, dm_io_region, sync_error_bits)
+  > dp_init(..
+  > sync_io(...
+  > async_io(..
+    # 如果dm_io_region->notify.fh有意义,就是async调用.

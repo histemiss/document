@@ -1,0 +1,851 @@
+persistent-data
+
+
+==============================================
+dm-block-manager.c
+
+dm_block_manager
+  dm_bufio_client bufio
+  read_only 
+
+
+block_lock 
+  lock 
+  count #-1有一个写锁,0没有锁,>0有对应个数的读锁..
+  list_head  waiters #等待任务的队列
+  task_struct holders[MAX_HOLDERS]  #持有锁的任务
+
+
+waiter
+  list_head list   #block_lock->waiters队列
+  task_struct  task   #同步变量..
+  wants_write     #读锁还是写锁
+
+* __find_holder(block_lock, task_struct)
+  # 在block_lock->holders数组中找对应的task的索引
+
+* __add_holder(block_lock, task_struct)
+  # 在block_lock->holders数组中找一个NULL, 把task_struct放到里面
+  > __find_holder(block_lock, NULL)
+  > get_task_struct(task_struct)
+
+* __del_holder(block_lock, task_struct)
+  > put_task_struct(task_struct)
+
+* __check_holder(block_lock)
+  # block_lock->holders里面不能有current
+
+* __wait(waiter)
+  # 等待waiter->task不为空..
+
+* __wake_waiter(waiter)
+  # 唤醒waiter->task任务
+  > wake_up_process(task_struct)
+
+* __wake_many(block_lock)
+  # 读写锁的唤醒,或者唤醒连续的reader,或者唤醒一个writer.. 等待的任务在block_lock->waiters上面
+  > __add_holder(block_lock, task_struct)
+  > __wake_waiter(waiter)
+
+* bl_init(block_lock)
+  # 初始化block_lock, 设置holders为空, count为0
+
+* __available_for_read(block_lock)
+  #是否可以添加读锁?? block_lock->count>=0, 而且block_lock->waiter队列为空..  如果count>=0,没锁或有读锁,-1表示有写锁..
+
+
+* bl_down_read(block_lock)
+  # 检测是否能添加锁, 如果能就把task_struct放到holders队列中
+  > __available_for_read(block_lock)
+  > __add_holder(block_lock, task_struct)
+    # 把block_lock放到waiter队列中..
+
+* bl_down_read_nonblock(block_lock)
+  # 和上面的区别就是不会等待..
+
+* bl_up_read(block_lock)
+  # ...
+  > __wake_many(block_lock)
+
+* bl_down_write(block_lock)
+  # 添加写锁,检查条件是block_lock->count=0而且没有人等待..
+  
+* bl_up_write(block_lock)
+  > __del_holder(block_lock, current)
+
+* to_buffer(dm_block)
+  # 刚才找了半天,也找不到dm_block的定义,原来根本没有使用dm_block, 它代替了dm_buffer, developer不想原来dm_buffer,使用dm_block代替它..
+
+* dm_block_location(dm_block)
+  # 返回dm_buffer->block  应该是磁盘位置..
+  > dm_bufio_get_block_num(dm_buffer)
+
+* dm_block_data(dm_block)
+  # 返回dm_block->data..  内存数据
+  > dm_bufio_get_block_data(dm_buffer)
+
+* buffer_aux
+  dm_block_validator validator 
+  block_lock  lock
+  write_locked
+
+* dm_block_manager_alloc_callback(dm_buffer)
+  # dm_buffer的内存管理不知道在哪里,但它的内存块是和buffer_aux放在一块的..  初始化buffer_aux的block_lock
+  > dm_bufio_get_aux_data(dm_buffer)
+  
+dm_block_manager
+  dm_bufio_client bufio
+  readonly
+# 这个数据结构很简单,包装了dm_bufio, dm_bufio_client管理dm_buffer以及io对应的block_device, 它里面有一个dm_io_client,管理bio的内存管理..
+
+* dm_block_manager_create(block_device, block_size, cache_size, max_held_per_thread
+  # 构造一个dm_block_manager, 就像上面说的,构造dm_bufio_client...
+  > dm_bufio_client_create(block_device, block_size, max_held_per_thread, sizeof(buffer_axu), dm_block_manager_alloc_callback, dm_block_manager_write_callback)
+  
+* dm_block_manager_destroy(dm_block_manager)
+  > dm_bufio_client_destroy(dm_block_manager->dm_bufio_client)
+
+* dm_bm_block_size(dm_block_manager)
+  > dm_bufio_get_block_size(dm_block_manager->dm_bufio_client)
+
+* dm_bm_nr_blocks(dm_block_manager)
+  ...
+
+* dm_bm_validate_buffer(dm_buffer_manager, dm_buffer, buffer_aux, dm_block_validator)
+  > buffer_aux->validator->check(dm_block_validator, buf, dm_bufio_get_block_size(dm_block_manager->dm_bufio_client)
+
+* dm_bm_read_lock(dm_block_manager, dm_block_t, dm_block_validator, dm_block)
+  # 读回磁盘数据???
+  > dm_bufio_read(dm_block_manager->dm_bufio_client, dm_block_t, dm_buffer)
+  > dm_bufio_get_aux_data(dm_buffer)
+    # 锁是对dm_buffer的保护..
+  > bl_down_read(buffer_aux->block_lock)
+  > dm_bm_validate_buffer(dm_block_manager, dm_buffer, buffer_aux, dm_block_validator)
+    # 多提供一个dm_block_validator, 如果buffer_aux的validator无效,则使用提供的....
+
+* dm_bm_write_lock(dm_block_manager, dm_block_t, dm_block_validator, dm_block)
+  # 这个函数应该是先对一块数据加锁,为写做准备..
+  > dm_bufio_read(dm_block_manager->dm_bufio_client, dm_block_t, dm_buffer)
+    # 怎么先读出来??
+  > dm_bufio_get_aux_data(dm_buffer)
+  > bl_down_write(buffer_aux->block_lock)
+  > dm_bm_validate_buffer(dm_block_manager, dm_buffer, buffer_aux, dm_block_validator)
+
+* dm_bm_write_lock_zero(dm_block_manager, dm_block_t, dm_block_validator, dm_block)
+  # 准备一个dm_buffer?? 下面的函数是分配了内存的空间,返回内存指针..然后把这个block/chunk清空..
+  > dm_bufio_new(dm_block_manager->dm_bufio_client, dm_block_t, dm_buffer)
+  > dm_bufio_get_aux_data(dm_buffer)
+  > bl_down_write(buffer_aux->block_lock)
+    # 最后设置buffer_aux的其他属性..  write_locked为1,已经加锁..  validator..
+
+* dm_bm_unlock(dm_block)
+  # 释放锁..根据buffer_aux->write_locked决定释放读还是写锁..
+  > dm_bufio_get_aux_data(dm_buffer)
+  > dm_up_write(buffer_aux->block_lock)
+  > dm_up_read(buffer_aux->block_lock)
+
+
+* dm_bm_flush_and_unlock(dm_block_manager, dm_block)
+  # dm_block管理的block是superblock..??
+  > dm_bufio_write_dirty_buffers(dm_block_manager->dm_bufio_client)
+  > dm_bm_unlock(dm_buffer)
+  > dm_bufio_write_dirty_buffers(dm_block_manager->dm_bufio_client)
+  # 多写了一边..
+
+* dm_bm_set_read_only(dm_block_manager)
+  ..  read_only...
+
+* dm_bm_checksum(data, len, init_xor)
+  # 校验函数..
+
+
+
+==============================================
+dm-space-map-common.c  很庞大的东西...
+
+bitmap btree???
+磁盘上使用2个btree管理空间,一个是bitmap, value是disk_index_entry, 应该是叶子节点的value. disk_index_entry指向一个block,里面是bitmap, 每2位表示一个block的使用情况:0,1,2,more, 如果是more, 还使用ref btree, 这个tree的value是32-bit计数..
+
+
+disk_index_entry 
+  blocknr 
+  nr_free 
+  none_free_before
+
+disk_metadata_index
+  * csum
+  * padding
+  * blocknr
+  * disk_index_entry index[MAX_METADATA_BITMAPS]
+# 这个数据结构的大小是4k
+
+dm-space-map-common.c
+
+ll_disk
+  dm_transction_manager 
+  dm_btree_info bitmap_info
+  dm_btree_info ref_count_info  #里面只有dm_transacton_manager信息..
+  block_size 
+  entries_per_block 
+  nr_blocks 
+  nr_allocated 
+
+  dm_block_t bitmap_root 
+  dm_block_t ref_count_root
+
+  disk_metadata_index  mi_le 
+  load_ie_fn load_ie 
+  load_ie_fn save_ie
+
+  init_index_fn init_index 
+  open_index_fn open_index 
+  max_index_entries_fn max_entries 
+  commit_fn commit 
+  bitmap_index_changed
+
+disk_sm_root 
+  nr_blocks 
+  nr_allocated 
+  bitmap_root 
+  ref_count_root 
+
+disk_bitmap_header 
+  csum 
+  not_used 
+  blocknr 
+
+allocation_event 
+  SM_NONE
+  SM_ALLOC 
+  SM_FREE
+
+* index_prepare_for_write(dm_block_validator, dm_block, block_soze) 
+  # 这里应该是先申请了一个block, 把它作为metadata block, 对他初始化..dm_block里面是disk_metadata_index
+  > dm_block_data(dm_block)
+  > dm_block_location(dm_block)
+    # 设置disk_metadata_index->blocknr, 在计算这个block的checksum..
+  > dm_bm_checksum(disk_metadata_index->padding, block_size - sizeof(__le32), INDEX_CSUM_XOR)
+
+* index_check(dm_block_validator, dm_block, block_size)
+  # dm_block是metadata数据,检查是否有效.
+  > dm_block_location(dm_block)
+  > dm_bm_checksum(...)
+
+* dm_block_validator index_validator
+  name = "index" 
+  prepare_for_write = index_prepare_for_write
+  check = index_check
+# 又创建一种validator, 应该是用于bitmap tree的叶子节点..
+
+* bitmap_prepare_for_write(dm_block_validator, dm_block, block_size)
+  # dm_block里面是bitmap, 也就是disk_bitmap_header, 准备location和checksum..整个block就存储这么点数据,太浪费了吧???果然bitmap也会存在这个block上, 一个block只能用于  (block_size-sizeof(dm_bitmap_header))*8/2 ..
+  > dm_block_data(dm_block)
+  > dm_bm_checksum(disk_bitmap_header->not_used, ...)
+
+* bitmap_check(dm_block_validator, dm_block, block_size)
+
+dm_block_validator dm_sm_bitmap_validator
+  name = "sm_bitmap"
+  prepare_for_write = bitmap_prepare_for_write
+  check = bitmap_check
+
+* dm_bitmap_data(dm_block)
+  # dm_block是bitmap block, 返回用于bitmap的数据区.. 偏移就是disk_bitmap_header..
+
+* bitmap_word_used(addr, b)
+  # 复杂的位运算.. 检查任何2位都不是0,如果使用!(x==0)不能达到目的..
+
+* sm_lookup_bitmap(addr, b)
+  # 从addr中获取第b个2位..
+
+* sm_set_bitmap(addr, b, val)
+  # 设置一个2位..
+ 
+* sm_find_free(addr, begin, end, result)
+  # 找一个为00的2位..在(begin,end)之间. 先找一个不是任何双位都是0的uint64,然后在uint64内部找..
+
+* sm_ll_init(ll_disk, dm_transction_manager)
+  # 初始化ll_disk,对于bitmap_info, levels=1, 设置value_type: size=sizeof(disk_index_entry).. 然后是ref_count_info, value_ytpe: size = sizeof(uint32_t).  获取block_size..
+  > dm_bm_block_size(dm_tm_get_bm(dm_transction_manager))
+    # 然后设置entries_per_block, (ll_disk->block_size - sizeof(disk_bitmap_header))*ENTRIES_PER_BYTE...
+
+* sm_ll_extent(ll_disk, dm_block_t extra_blocks)
+  # 扩展extra_blocks??  bitmap blocks的数量是
+  > dm_sector_div_up(ll_disk->nr_blocks, ll_disk->entries_per_block)
+    # 计算ll_disk最大支持的index使用的block??  这个不能扩展??
+  > ll_disk->max_entries(ll_disk)
+    # 然后挨个添加block
+  > dm_tm_new_block(ll_disk->dm_transaction_manager, dm_sm_bitmap_validator, dm_block)
+    # 分配新的block,作为bitmap的block,同时创建一个新的dm_buffer/buffer_aux.. 创建disk_index_entry, blocknr就是新申请的block位置, nr_free=ll_disk->entries_per_block, none_free_before=0,都是0.. 然后把这个disk_index_entry插到btree中..
+  > ll_disk->save_ie(ll_disk, i, disk_index_entry)
+
+* sm_ll_lookup_bitmap(ll_disk, dm_block_t, result)
+  # 获取dm_block_t所在的disk_index_entry,然后锁住获取对应的索引数
+  > ll_disk->load_ie(ll_disk, index, disk_index_entry)
+  > dm_tm_read_lock(ll_disk->dm_transaction_manager, disk_index_entry.blocknr,  dm_sm_bitmap_validator, dm_block)
+    # 根据上面的disk_index_entry读回一个block, 建立dm_block
+
+* sm_ll_lookup(ll_disk, dm_block_t, result)
+  # 先读取bitmap,如果是3,在读取ref btree..
+  > sm_ll_lookup_bitmap(ll_disk, dm_block_t, result)
+  > dm_btree_lookup(ll_disk->ref_count_info, ll_disk->ref_count_root, dm_block_t, ref)
+    # 这个函数的实现在bt-tree中,可能会涉及多次磁盘IO..
+
+* sm_ll_find_free_block(ll_disk, dm_block_t begin, dm_block_t end, result)
+  # 计算需要遍历的block数: begin/ll_disk->entries_per_block, 读回对应的索引叶子value
+  > ll_disk->load_ie(ll_disk, i, dm_block)
+    # 先检查disk_index_entry->nr_free, 如果为0,继续遍历, 然后是读回bitmap block
+  > dm_tm_read_lock(ll_disk->dm_transaction_manager, disk_index_entry->blocknr, dm_sm_bitmap_validator, dm_block)
+  > sm_find_free(dm_bitmap_data(dm_buffer), ....)
+    # 在bitmap中找00的索引..
+  > dm_tm_unlock(ll_disk->dm_transaction_manager, dm_block)
+
+* sm_ll_insert(ll_disk, dm_block_t, ref_count, allocation_event)
+  # 分配dm_block?? 对应的disk_index_entry.
+  > ll_disk->load_ie(ll_disk, dm_block_t, disk_index_entry)
+  > dm_tm_shadow_block(ll_disk->dm_transaction_manager, 
+    # 这个函数好像构造一个新的dm_block, 让它映射刚才的disk_index_entry指向的bitmap block..
+  > dm_block_location(dm_block)
+    # 构造一个新的disk_index_entry? 获取原来的ref_count. 这个do_div的作用是修改index,返回的是余数..
+  > do_div(index, ll_disk->entries_per_block)
+  > sm_lookup_bitmap(dm_bitmap_data, bit)
+    # 设置新的refcount, 如果不超过2,直接修改bitmap block
+  > sm_set_bitmap(dm_bitmap_data, bit, ref_count)
+  > dm_tree_remove(ll_disk->ref_count_info, ll_disk->ref_count_root, dm_block_t, ll_disk->ref_count_root)
+    # 如果原来的ref_count是3,则在ref_btree上删除..如果超过2,需要做2个操作..
+  > sm_set_bitmap(dm_bitmap_data, bit, 3)
+  > dm_tm_unlock(ll_disk->dm_transaction_manager, dm_block)
+    # 这里的所谓事务就是对块的访问是互斥的..
+  > dm_btree_insert(ll_disk->ref_count_info, ll_disk->ref_count_root, dm_block_t, ref_count, ll_disk->ref_count_root)
+    # 最后修改disk_index_entry, 根据上面,可能新建了block, 也可能释放了block, event是SM_ALLOC/SM_FREE, 修嘎ll_disk->nr_allocated, disk_index_entry->none_free_block应该是不为free的索引..
+  > ll_disk->save_ie(ll_disk, index, disk_index_entry)
+
+* sm_ll_inc(ll_disk, dm_block_t, allocation_event)
+  # 这里先找一个dm_block的ref_count, 然后加1,再放到映射管理中
+  > sm_ll_lookup(ll_disk, dm_block_t, rc)
+  > sm_ll_insert(ll_disk, dm_block_t, rc+1, ev)
+
+* sm_ll_dec(ll_disk, dm_block_t, allocation_event)
+  > sm_ll_lookup(ll_disk, dm_block_t, rc)
+  > sm_ll_insert(ll_disk, dm_block_t, rc-1, ev)
+
+* sm_ll_commit(ll_disk)
+  # 检查ll_disk->bitmap_index_changed, 如果改变了
+  > ll_disk->commit(ll_disk)
+
+* metadata_ll_load_ie(ll_disk, dm_block_t, disk_index_entry)
+  # ll_disk->mi_le是disk_metadata_index,里面有一个数组,里面是dm_index_entry, 这个index应该是转换过的..
+
+* metadata_ll_save_ie(ll_disk, dm_block_t, disk_index_entry)
+  # 修改ll_disk->bitmap_index_changed, 设置disk_index_entry..
+
+* metadata_ll_init_index(ll_disk)
+  # 申请一个新的块,作为index btree node
+  > dm_tm_new_block(ll_disk->dm_transaction_manager, index_validator, dm_block)
+    # 然后把ll_disk->disk_metadata_index放到里面.. 这里的块大小是4096?? 然后把这个块的位置给ll_dis->bitmap_root, 那ll_disk->disk_metadata_index还有什么用??
+
+* metadata_ll_open(ll_disk)
+  # 读取bitmap btree root 块..
+  > dm_tm_read_lock(ll_disk->dm_transaction_manager, ll_disk->bitmap_root, index_validator, dm_block)
+    # 把块数据给ll_disk->disk_metadata_index..  这么折腾..上面是初始化新的设备,这里是打开老的设备..
+
+* metadata_ll_commit(ll_disk)
+  # 写回ll_disk->disk_metadata_index??
+  > dm_tm_shadow_block(ll_disk->dm_transaction_manager, ll_disk->bitmap_root, index_validator, dm_block, inc)
+  > dm_block_location(dm_block) 
+    # 把磁盘位置给ll_disk->bitmap_root, 为何又折腾..
+
+* sm_ll_new_metadata(ll_disk, dm_transction_manager)
+  # 初始化ll_disk, 设置属性和回调函数..
+  > sm_ll_init(ll_disk, dm_transction_manager)
+  > ll_disk->init_index(ll_disk)
+    #也就是metadata_ll_init_index(), ref_count_info是dm_btree_info, 它关联了dm_transaction_manager, 它又包含dm_space_map,它会复杂分配block..下面的函数应该会自动分配块..
+  > dm_btree_empty(ll_disk->ref_count_info, ll_disk->ref_count_root)
+
+* sm_ll_open_metadata(ll_disk, dm_transaction_manager, root_le, len)
+  # rootle是disk_sm_root, dm_transction_manager都创建好了??而且也读出一个block??
+  > sm_ll_init(ll_disk, dm_transction_manager)
+    # 初始化ll_disk, 它不是磁盘上的数据结构
+  > ll_disk->open_index(ll_disk)
+    # 也就是metadata_ll_open()
+
+* disk_ll_load_ie(ll_disk, dm_block_t, disk_index_entry)
+  # 获取dm_block_t对应的disk_index_entry,提供的参数只有root的块号..
+  > dm_btree_lookup(ll_disk->bitmap_info, ll_disk->bitmap_root, index, disk_index_entry)
+  
+* ll_disk_save_ie(ll_disk, dm_block_t, disk_index_entry)
+  # 可能会更改bitmap_root???
+  > dm_btree_insert(ll_disk->bitmap_info, ll_disk->bitmap_root, index, disk_index_entry, ll_disk->bitmap_root)
+  
+* disk_ll_init_index(ll_disk)
+  # 初始化bitmap btree..
+  > dm_btree_empty(ll_disk->bitmap_info, ll_disk->bitmap_root)
+
+* disk_ll_max_entries(ll_disk)
+  # 返回-1..
+
+* disk_ll_commit(ll_disk)
+  #为何这一串disk_ll_*的函数没有任何实现???
+
+* sm_ll_new_disk(ll_disk, dm_transction_manager)
+  # 初始化磁盘, 上面的是打开..
+  > sm_ll_init(ll_disk, dm_transction_manager)
+    # 设置回调函数
+  > ll_disk->init_index(ll_disk)
+    # disk_ll_init_index..
+  > dm_btree_empty(ll_disk->ref_count_info, ll_disk->ref_count_root)
+
+* sm_ll_open_disk(ll_disk, dm_transaction_manager, root_le, len)
+  # 这些函数怎么这么面熟,上面好像有这么一套.. root_le是disk_sm_root
+  > sm_ll_init(ll_disk, dm_transction_manager)
+    # 设置回调函数.. 从disk_sm_root中取出相关属性,  nr_blocks/nr_allocated/bitmap_root/ref_count_root...
+  > ll_disk->open_index(ll_disk)
+    # disk_ll_open
+
+#上面是metadata, 这里是普通磁盘?? 但看上去差别不大,都需要bitmap btree和ref_count btree.. 
+
+==============================================
+dm-space-map-disk.c
+
+sm_disk
+  dm_space_map 
+  ll_disk ll
+  ll_disk old_ll
+  dm_block_t begin 
+  dm_block_t nr_allocated_this_transaction
+
+# 怎么两个ll_disk??
+
+* sm_disk_destroy(dm_space_map)
+  # 难道这里使用sm_disk包装dm_space_map??  dm_space_map里面只有回调方法..  释放sm_disk
+  
+* sm_disk_extent(dm_space_map, dm_block_t)
+  # 使用dm-space-map-common.c的方法, 这里扩展的是ll_disk磁盘,而不是old.
+  > sm_ll_extent(sm_space_map=>sm_disk->ll_disk, extra_blocks)
+
+* sm_disk_get_nr_blocks(dm_space_map, dm_block_t)
+  #返回磁盘大小,这里却是dm_space_map=>sm_disk->old_ll.nr_blocks
+
+* sm_disk_get_nr_free(dm_space_map, dm_block_t)
+  # 还是old_ll, old_ll->nr_blocks - old_ll->nr_allocated - dm_space_map->nr_allocated_this_transaction
+
+* sm_disk_get_count(dm_space_map, dm_block_t, result)
+  # 返回磁盘使用的计数..
+  > sm_ll_lookup(dm_space_map->sm_disk->ll_disk, b, result)
+
+* sm_disk_count_is_more_than_one(dm_space_map, dm_block_t, result)
+  # 返回boolean值,比较一下..
+  > sm_disk_get_count(dm_space_map, dm_block_t, count)
+
+* sm_disk_set_count(dm_space_map, dm_blockt_t, count)
+  # 设置block的计数..
+  > sm_ll_insert(sm_space_map=>sm_disk->ll_disk,  dm_block_t, count, ev)
+    # 根据event, 修改sm_disk->nr_allocated_this_transaction, 如果是删除,需要检查它是否可在old_ll上释放.
+  > sm_ll_lookup(sm_disk->old_ll, dm_block_t, old_count)
+
+* sm_disk_inc_block(dm_space_map, dm_block_t)
+  # 可能会增加dm_disk->nr_allocated_this_transaction, 只看到transaction, 怎么没看到对应的commit操作??
+  * sm_ll_inc(sm_disk->ll_disk, dm_block_t, ev)
+  
+* sm_dm_dec_block(dm_space_map, dm_block_t)
+  # 减小block的计数,但要释放它需要检查old_ll..
+  > sm_ll_dec(sm_disk->ll, dm_block_t, event)
+  
+* sm_disk_new_block(dm_space_map, dm_block_t)
+  # 为何又在old ll_disk上找呢??
+  > sm_ll_find_free_block(sm_disk->old_ll, sm_disk->begin, sm_disk->old_ll->nr_blocks, dm_block_t)
+    # 更新sm_disk->begin, 下次从它的下一个开始找..增加sm_disk->nr_allocated_this_transaction
+
+* sm_disk_commit(dm_space_map)
+  # 获取free的block数..
+  > sm_disk_get_nr_free(dm_space_map, nr_free)
+  > sm_ll_commit(sm_disk->ll_disk)
+    # 这里会把sm_disk->ll的数据给sm_disk->old_ll, 清空sm_disk->nr_allocated_this_transaction.. 这个commit提交bitmap btree数据,或者什么都不做..为何有两种ll_disk呢?? 一种是metadata,一种是数据.
+  > sm_disk_get_nr_free(dm_space_map, nr_free)
+    #原来为了事务,使用2个ll_disk, 一个事务提交之前的备份,两个没什么区别..  
+  
+* sm_disk_root_size(dm_space_map, size_t)
+  # root的大小就是  disk_sm_root
+
+* sm_disk_copy_root(dm_space_map, where_le, max)
+  # dm_space_map=>sm_disk->ll_disk, 从这里面获取属性给disk_sm_root, 把这些数据写给where_le.
+
+* dm_space_map ops
+  # 使用上面的函数创建一个dm_space_map..
+
+* dm_sm_disk_create(dm_transaction_manager, dm_block_t)
+  # 创建一个sm_disk, 先创建一个空的,然后在扩展block?? 这里是普通disk,而不是metadata ll_disk.. 这里有些乱,分配磁盘需要ll_disk->bitmap_info和dm_transaction_manager, 也就是dm_space_map, 但这里dm_space_map还没成型..难道是另一个disk..
+  > sm_ll_new_disk(sm_disk->ll_disk, dm_transction_manager)
+  > sm_ll_extent(sm_disk->ll_disk, nr_blocks)
+  > sm_disk_commit(sm_disk->dm_space_map)
+  
+* dm_sm_disk_open(dm_transaction_manager, root_le, size_t len)
+  # 创建一个dm_space_map, 通过打开一个已有的磁盘实现..
+  > sm_ll_open_disk(sm_disk->ll_disk, dm_transaction_manager, root_le, len)
+  > sm_disk_commit(sm_disk->dm_space_map)
+
+==============================================
+dm-space-map-metadata.c
+
+block_op_type
+  BOP_INC
+  BOP_DEC 
+
+block_op 
+  block_op_type  type
+  dm_block_t  block
+
+sm_metadata
+  dm_space_map 
+  ll_disk  ll
+  ll_disk  old_ll
+
+  dm_block_t begin
+  recursion_count
+  allocated_this_transaction 
+  nr_uncommitted
+  block_op  uncommitted[MAX_RECURSIVE_ALLOCATIONS]  #1024
+
+* add_bop(sm_metadata, block_op_type, dm_block_t)
+  # 把block_op_type,dm_block_t组成block_op,放到sm_metadata->uncommitted数组中, 使用sm_metadata->nr_uncommitted作为数组索引..
+
+* commit_bop(sm_metadata, block_op)
+  #提交block_op的操作
+  > sm_ll_inc(sm_metadata->ll_disk, block_op->block, allocation_event)
+  > sm_ll_dec(sm_metadata->ll_disk, block_op->block, allocation_event)
+
+* in(sm_metadata)
+  # 增加sm_metadata->recursion_count
+
+* out(sm_metadata)
+  # 减小sm_metadata->recursion_count, 这里使用栈表示事务的提交?? 出栈实现事务的会滚?? 倒序遍历sm_metadata->uncommitted数组, 提交这些操作哦..
+  > commit_bop(sm_metadata, block_op)
+
+* sm_metadata_destroy(dm_space_map)
+  # 释放sm_metadata, 它内嵌dm_space_map
+
+* sm_metadata_extent(dm_space_map, dm_block_t)
+  # 不支持扩展..
+
+* sm_metadata_get_nr_blocks(dm_space_map, count)
+  # 和上面sm_disk的操作相同..
+
+* sm_metadata_get_nr_free(dm_space_map, dm_block_t)
+
+* sm_metadata_get_count(dm_space_map, dm_block_t, result)
+  # 不仅要获取bitmap tree中的使用计数,还要考虑uncommitted数组中的调整..
+  > sm_ll_lookup(sm_metadata->ll_disk, dm_block_t, result)
+
+* sm_metadata_set_count(dm_space_map, dm_block_t, count)
+  # set_count操作不能支持事务性,它不能在递归中操作?? 下面的in/out没有意义..
+  > in(sm_metadata)
+  > sm_ll_insert(sm_metadata->ll_disk, dm_block_t, count, allocation_event)
+  > out(sm_metadata)
+
+* sm_metadata_inc_block(dm_space_map, dm_block_t
+  # 支持事务嵌套,如果在事务中,就把它添加到uncommitted队列中
+  > add_bop(sm_metadata, BOP_INC, dm_block_t)
+    # 如果没有在嵌套中,开始一个..
+  > in(sm_metadata)
+  > sm_ll_inc(sm_metadata->ll_disk, dm_block_t, allocation_event)
+  > out_sm_metadata)
+
+* sm_metadata_dec_block(dm_space_map, dm_block_t)
+  # 和上面流程一样
+
+* sm_metadata_new_block_(dm_space_map, dm_block_t)
+  # 先找一个空闲的block,增加它的使用计数..
+  > sm_ll_find_free_block(sm_metadata->old_ll, sm_metadata->begin, ll_disk->nr_blocks, b)
+    
+* sm_metadata_new_block(dm_space_map, dm_block_t)
+  > sm_metadata_new_block_(dm_space_map, dm_block_t)
+
+* sm_metadata_commit(dm_space_map)
+  # 提交修改,清空begin/allocated_this_transaction
+  > sm_ll_commit(sm_metadata->ll_disk)
+  
+* sm_metadata_root_size(dm_space_map, size_t)
+  # 返回disk_sm_root
+
+* sm_metadata_copy_root(dm_space_map, where_le, max)
+  # 把sm_metadata->ll_disk给where_le
+
+* dm_space_map ops
+  # 使用上面的函数构造一个dm_space_map..
+
+* sm_bootstrap_destroy(dm_space_map)
+  # 没有操作
+
+* sm_bootstrap_extent(dm_space_map, dm_block_t)
+  # 增加,不支持...
+
+* sm_bootstrap_get_nr_blocks(dm_space_map, dm_block_t)
+  # 返回sm_metadata->ll_disk->nr_blocks
+
+* sm_bootstrap_get_nr_free(dm_space_map, dm_block_t)
+  # sm_metadata->ll_disk->nr_blocks - sm_metadata->begin..
+
+* sm_bootstrap_get_count(dm_space_map, dm_block_t, result)
+  # 返回0或1???
+
+* sm_bootstrap_set_count(dm_space_map, dm_block_t, count)
+  # 无效..
+
+* sm_bootstrap_inc_block(dm_space_map, dm_block_t)
+  > add_bop(sm_metadata, ..)
+
+上面是bootstrap_ops类型的
+
+* dm_sm_metadata_init()
+  # 构造一个sm_metadata, 使用上面这些ops,而不是bootstrap_ops.
+
+* dm_sm_metadata_create(dm_space_map, dm_transaction_manager, dm_block_t nr_blocks, dm_block_t superblock)
+  # 这里初始化sm_metadata->begin是superblock+1, 使用bootstrap_ops
+  > sm_ll_new_metadata(sm_metadata->ll_disk, dm_transaction_manager)
+  > sm_ll_extent(sm_metadata->ll_disk, nr_blocks)
+    # 在修改dm_space_map
+  > sm_ll_inc(sm_metadata->ll_disk, i, allocation_event)
+    # 从super_block从begin的block都增加1,不是1个??
+  > sm_metadata_commit_sm_metadata)
+
+* dm_sm_metadata_open(dm_space_map, dm_transaction_manager, root_le, len)
+  # 从磁盘中获取相关信息..
+  > sm_ll_open_metadata(dm_space_map->ll_disk, dm_transaction_manager, root_le, len)
+  
+# 虽然实现不能,但挺乱的..
+
+
+==============================================
+dm-transaction-manager.c  事务管理.
+shadow_info
+  hlist_node 
+  dm_block_t where
+
+dm_transaction_manager
+  is_clone 
+  dm_transaction_manager real 
+  dm_block_manager bm 
+  dm_space_map sm 
+  lock 
+  hlist_head buckets[DM_HASH_SIZE]   # 256 
+
+* is_shadow(dm_transactioN_manager, dm_block_t)
+  # dm_transaction_manager->buckets里面的hash链表是一些block? 这里检查dm_block_t是否在hash队列中,如果在就是shadow??
+
+* insert_shadow(dm_transaction_manager, dm_block_t)
+  # 创建shadow_info,就是管理dm_chunk_t? 怎么不用别的数据结构??  把它添加到dm_transaction_manager
+  > dm_hash_block(dm_block_t, DM_HASH_SIZE)
+
+* wipe_shadow_table(dm_transaction_manager)
+  # 清空dm_transaction_manager->buckes
+
+* dm_tm_create(dm_block_manager, dm_space_map)
+  # 创建dm_transaction_manager, 关联dm_block_manager, dm_space_map
+
+* dm_tm_create_non_blocking_clone(dm_transaction_manager)
+  # 创建一个shadow的,使用real关联参数中的dm_transaction_manager, shadow的没有buckets..
+
+* dm_tm_destroy(dm_transaction_manager)
+  # 释放..
+
+* dm_tm_pre_commit(dm_transaction_manager)
+  # 映射就完成了???
+  > dm_sm_commit(dm_transaction_manager->dm_space_map)
+
+* dm_tm_commit(dm_transaction_manager, dm_block)
+  # dm_block看似和dm_transaction_manager没有关系?????
+  > dm_bm_flush_and_unlock(dm_transction_manager->dm_block_manager, dm_block)
+
+
+* dm_tm_new_block(dm_transaction_manager, dm_block_validator, dm_block)
+  # 先分配一个block, 然后根据位置创建一个dm_buffer/dm_block, 然后使用dm_transaction_manager管理起来.
+  > dm_sm_new_block(dm_transaction_manager->dm_block_manager, new_block)
+  > dm_bm_write_lock_zero(dm_transaction_manager->dm_block_manager, dm_buffer, dm_block_validator, dm_block)
+  > insert_shadow(dm_transaction_manager, dm_block_t)
+
+* __shadow_block(dm_transaction_manager, dm_block_t, dm_block_validator, dm_block)
+  # 这里可以解释cow, 复制一个block,先分配一个新的,释放原来的,分配和释放通过计数完成, 把block数据复制过去.
+  > dm_sm_new_block(dm_transaction_manager->dm_block_manager, dm_block_t)
+    # 释放参数中dm_block_t对应的block??
+  > dm_sm_dec_block(dm_transaction_manager->dm_block_manager, orig)
+    # 读回数据?? 为何不先读呢??
+  > dm_bm_read_lock(dm_transaction_manager->dm_block_manager, orig, dm_block_validator, dm_buffer)
+  > dm_bm_write_lock_zero(dm_transaction_manager->dm_block_manager, dm_block_t, dm_block_validator, dm_buffer)
+    # 把origin_block的数据给new_block, 把原来的dm_buffer解锁..
+  > dm_bm_unlock(dm_block)
+
+* dm_tm_shadow_block(dm_transction_manager, dm_block_t, dm_block_validator, dm_block, inc_children)
+  # 返回参数中有一个inc_children?? 检查dm_block_t是否在dm_transaction_manager中..    为何要'复制'一个block, 就是所谓的cow??
+  > dm_sm_count_is_more_than_one(dm_transction_manager->dm_space_map, dm_block_t, inc_chilren)
+  > is_shadow(dm_transction_manager, dm_block_t)
+  > __shadow_block(dm_transction_manager, dm_block_t, dm_block_validator, dm_buffer)
+  > insert_shadow(dm_transction_manager, dm_block_location(dm_buffer)
+
+* dm_tm_read_lock(dm_transaction_manager, dm_block_t, dm_block_validator, dm_block)
+  # 如果dm_transaction_manager是clone的, 需要使用real..
+  > dm_bm_read_lock(dm_transaction_manager->dm_block_manager, dm_block_t, dm_block_validator, dm_block)
+  
+* dm_tm_unlock(dm_transction_manager, dm_block)
+  > dm_bm_unlock(dm_block)
+
+* dm_tm_inc(dm_transactioN_manager, dm_block_t)
+  # 实现需要看space manager..
+  > dm_sm_inc_block(dm_transction_manager->dm_space_map, dm_block_t)
+
+* dm_tm_dec(dm_transction_manager, dm_block_t)
+  # 为何全部使用dm_block_t  .. 作为索引..
+  > dm_sm_dec_block(dm_transction_manager->dm_space_map, dm_block_t)
+
+* dm_tm_ref(dm_transction_manager, dm_block_t, result)
+  # 获取一个block的使用计数..
+  > dm_sm_get_count(dm_transaction_manager->dm_space_map, dm_chunk_t, result)
+
+* dm_tm_create_internal(dm_block_manager, dm_block_t, dm_transaction_manager, dm_space_map, create, sm_root, sm_len)
+  # 创建一个dm_space_map
+  > dm_sm_metadata_init()
+  > dm_tm_create(dm_block_manager, dm_space_map)
+  > dm_sm_metadata_create(dm_space_map, dm_transaction_manager, dm_bm_nr_blocks(dm_block_manager),  dm_chunk_t)
+    # 这是在dm_chunk_t地方建立metadata???
+  > dm_sm_metadata_open(dm_space_map, dm_transaction_manager, sm_root, sm_len)
+
+* dm_tm_create_with_sm(dm_block_manager, dm_block_t, dm_transaction_manager, dm_space_map)
+  > dm_tm_create_internal(....)
+
+* dm_tm_open_with_sm(dm_block_manager, dm_block_t, sm_root, root_len, dm_transction_manager, dm_space_map)
+....
+
+============================================
+dm-btree-internal.h
+这个文件就是btree的管理，只看数据结构，不在看方法..
+
+node_flags
+  INTERNAL_NODE
+  LEAF_NODE
+
+node_header
+  csum
+  flags
+  blocknr  # 位置,和映射有关系吗??
+  nr_entries  # 数节点中的key数量
+  max_entries
+  value_size  #每个value的大小..
+  padding
+
+btree_node
+  node_header header
+  __le64 keys[0]
+
+但实际存储中,一个block就是一个btree_node, 它包括node_header, 然后是key数组,然后是values数组
+
+ro_spine
+  dm_btree_info  info
+  count
+  dm_block  nodes[2]
+
+
+shadow_spine
+  dm_btree_info 
+  count
+  dm_block nodes[2]
+  dm_block_t  root..
+
+
+============================================
+dm-btree.c
+  
+dm_btree_value_type
+  context
+  size
+  inc(context, value)
+  dec(context, value)
+  equal(...)
+
+dm_btree_info
+  dm_transaction_manager
+  levels
+  dm_btree_value_type
+
+frame 
+  dm_block b
+  btree_node 
+  level 
+  nr_children 
+  current_child
+
+# 这里有大量的btree操作, 而且是多层btree的嵌套,但没看到多层树的应用, dm_btree_info->level表示嵌套层数... 实际上btree不负责,它自动平衡..
+
+==============================================
+dm-btree-spine.c    spine是什么意思???  keep track of the rolling locks..
+
+dm_block_validator
+  name
+  prepare_for_write(dm_block_validator, dm_block, size_t)
+  check(dm_block_validator, dm_block, block_size)
+
+* node_prepare_for_write(dm_block_validator, dm_block, block_size)
+  # dm_block是一个数据块,在这里它里面就是btree_node. 获取btree_node, 也就是dm_buffer管理的内存数据.. 下面的磁盘位置是真实的??  设置node_header的blocknr/csum
+  > dm_block_data(dm_block)  
+  > dm_bm_checksum(node_headere->flags, block_size-sizeof(__le32), BTREE_CSUM_XOR)
+    # 计算整个block的checksum, 这里是固定的block的大小??
+  > node_check(dm_block_validator, dm_buffer, 4096)
+    
+* node_check(dm_block_validator, dm_block, block_size)
+  # 检查的东西还挺多。。 不看了..
+
+dm_block_validator  btree_node_validator
+  name = "btree_node"
+  prepare_for_write  = node_prepare_for_write
+  check = node_check
+# 构造一个dm_block_vaidator,检测btree的内部节点..
+
+* bn_read_lock(dm_btree_info, dm_block_t, dm_block)
+  # 加锁??? 这里把block manager的锁包装了..
+  > dm_tm_read_lock(dm_btree_info, btree_node_validator, result)
+    > dm_bm_read_lock(dm_transaction_manager->dm_block_manager, dm_block_t, dm_block_validator, dm_block)
+  
+* bn_shadow(dm_btree_info, dm_block_t, dm_btree_value_type, dm_block)
+  # 建立一个新的block,复制原来的origin. 增加它的children的计数,因为有2个btree node在使用那些子节点的block??
+  > dm_tm_shadow_block(dm_btree_info->dm_transaction_manager, dm_block_t, btree_node_validator, dm_buffer, inc)
+  > inc_children(dm_btree_info->dm_transaction_manager, dm_block_data(dm_buffer), dm_btree_value_type)
+
+* new_block(dm_btree_info, dm_block)
+  # 建立一个新的btree node block
+  > dm_tm_new_block(dm_btree_info->dm_transaction_manager, btree_node_validator, result)
+
+* unlock_block(dm_btree_info, dm_block)
+  > dm_tm_unlock(dm_btree_info, dm_block)
+
+* init_ro_spine(ro_spine, dm_btree_info)
+  # 初始化ro_spine..  社么用??
+
+* ro_step(ro_spine, dm_block_t)
+  # 这里用于锁btree搜索路径上两个连续的dm_block, 直接读回一个dm_block, 下面shadow是复制一个.复制的在哪里删除??
+  > bn_read_lock(ro_spine->dm_btree_info, new_child, ro_spine->nodes + ro_spine->count)
+
+* ro_node(ro_spine)
+  # 返回ro_spine的nodes队列上最后一个dm_block的数据..
+  > dm_block_data(dm_block)
+
+* init_shadow_spine(shadow_spine, dm_btree_info)
+  # 初始化shadow_spine
+
+* exit_shadow_spine(shadow_spine)
+  # 解锁.. 难道spine是锁使用的... 这里会解锁shadow_spine->nodes队列上的所有dm_block
+
+* shadow_step(shadow_spine, dm_block_t, dm_btree_value_type)
+  # shadow_spine->count = 2, 解锁 shadow_spine->nodes[0], 把nodes[1]给nodes[0], 读回一个dm_block放到nodes队列最后..
+  > bn_shadow(shadow_spine->dm_btree_info, dm_block_t, dm_btree_value_type, dm_block)
+    # 然后把shadow_spine->nodes[0]的磁盘位置给shadow_spine->root
+
+* shadow_current(shadow_spine)
+  # shadow_spine->nodes最后一个dm_block
+
+* shadow_parent(shadow_spine)
+  # 管理两个dm_block时才有parent, 返回第一个..
+
+* shadow_has_parent(shadow_spine)
+  # shadow_spine->count>=2
+
+* shadow_root(shadow_root)
+  # 返回shadow_spine->root
+

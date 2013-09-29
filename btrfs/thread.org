@@ -1,0 +1,265 @@
+
+* async-thread.c
+  - 异步线程相关的代码..
+
+** btrfs_work
+   #+begin_src 
+   	/*
+	 * func should be set to the function you want called
+	 * your work struct is passed as the only arg
+	 *
+	 * ordered_func must be set for work sent to an ordered work queue,
+	 * and it is called to complete a given work item in the same
+	 * order they were sent to the queue.
+	 */
+	void (*func)(struct btrfs_work *work);
+	void (*ordered_func)(struct btrfs_work *work);  //ordered work需要额外处理
+	void (*ordered_free)(struct btrfs_work *work);
+
+	/*
+	 * flags should be set to zero.  It is used to make sure the
+	 * struct is only inserted once into the list.
+	 */
+	unsigned long flags;
+
+	/* don't touch these */
+	struct btrfs_worker_thread *worker;
+	struct list_head list;     //普通的队列
+	struct list_head order_list;  //ordered的队列, 在btrfs_workers中.
+
+   #+end_src
+
+** btrfs_workers
+   #+begin_src 
+   	/* current number of running workers */
+	int num_workers;   //btrfs_worker_thread数量
+
+	int num_workers_starting;
+
+	/* max number of workers allowed.  changed by btrfs_start_workers */
+	int max_workers;
+
+	/* once a worker has this many requests or fewer, it is idle */
+	int idle_thresh;  //怎么指定的?
+
+	/* force completions in the order they were queued */
+	int ordered;
+
+	/* more workers required, but in an interrupt handler */
+	int atomic_start_pending;  //需要创建新的btrfs_work_thread
+
+	/*
+	 * are we allowed to sleep while starting workers or are we required
+	 * to start them at a later time?  If we can't sleep, this indicates
+	 * which queue we need to use to schedule thread creation.
+	 */
+	struct btrfs_workers *atomic_worker_start;
+
+	/* list with all the work threads.  The workers on the idle thread
+	 * may be actively servicing jobs, but they haven't yet hit the
+	 * idle thresh limit above.
+	 */
+	struct list_head worker_list;  //btrfs_worker_thread队列
+	struct list_head idle_list;
+
+	/*
+	 * when operating in ordered mode, this maintains the list
+	 * of work items waiting for completion
+	 */
+	struct list_head order_list;
+	struct list_head prio_order_list;
+
+	/* lock for finding the next worker thread to queue on */
+	spinlock_t lock;
+
+	/* lock for the ordered lists */
+	spinlock_t order_lock;
+
+	/* extra name for this worker, used for current->name */
+	char *name;
+   #+end_src
+
+** btrfs_worker_thread
+   #+begin_src 
+   	/* pool we belong to */
+	struct btrfs_workers *workers;
+
+	/* list of struct btrfs_work that are waiting for service */
+	struct list_head pending;
+	struct list_head prio_pending;
+
+	/* list of worker threads from struct btrfs_workers */
+	struct list_head worker_list;  //放在btrfs_workers->idle_list/worker_list队列, 根据idle决定放在那个队列
+
+	/* kthread */
+	struct task_struct *task;
+
+	/* number of things on the pending list */
+	atomic_t num_pending;
+
+	/* reference counter for this struct */
+	atomic_t refs;
+
+	unsigned long sequence;
+
+	/* protects the pending list. */
+	spinlock_t lock;
+
+	/* set to non-zero when this thread is already awake and kicking */
+	int working;  //在销毁或等待时使用.
+
+	/* are we currently idle */
+	int idle;  //决定它在哪个队列
+   #+end_src
+
+** worker_start
+   #+begin_src 
+        //用于创建btrfs_worker_thread
+   	struct btrfs_work work;
+	struct btrfs_workers *queue;
+   #+end_src
+
+** start_new_worker_func(btrfs_work)
+   - btrfs_work内嵌在worker_start里面. 给btrfs_workers创建线程?
+   > __btrfs_start_workers(btrfs_start->btrfs_workers)
+
+** check_idle_worker(btrfs_worker_thread)
+   - 检查btrfs_worker_thread能否变为idle状态
+   - 目前不是idle
+   - num_pending<btrfs_workers->idle_thread/2
+   - 设置btrfs_worker_thread->idle=1, 把btrfs_worker_thread->worker_list放到btrfs_workers->idle_list队列中..
+
+** check_busy_worker(btrfs_worker_thread)
+   - 检查btrfs_worker_thread能否变为busy状态
+   - btrfs_worker_thread->idle=1
+   - btrfs_worker_thread->num_pending >= btrfs_workers->idle_thresh
+   - 把它放到btrfs_workers->worker_list队列中, idle改为0
+
+** check_pending_worker_creates(btrfs_worker_thread)
+   - 检查是否需要为btrfs_workers创建新的btrfs_worker_thread, 使用worker_start结构
+   - 检查btrfs_workers->num_workers+num_workers_starting是否超过max_workers, 如果超过就不再创建
+   - 创建worker_start, 设置btrfs_work->func是start_new_worker_func, btrfs_workers是btrfs_worker_thread->btrfs_workers..
+   > btrfs_queue_worker(btrfs_workers->atomic_worker_start, btrfs_worker)
+   - 每个btrfs_workers有固定的btrfs_worker_thread用来创建新的任务?!
+   - 增加btrfs_workers->num_workers_starting
+   - 使用btrfs_workers->atomic_start_pending保护创建过程? 不允许多个同时创建?!
+
+** run_ordered_completions(btrfs_workers, btrfs_work)
+   - ordered是btrfs_workers的属性? btrfs_workers->ordered无效不再处理
+   - 设置btrfs_work->flags的WORK_DONE_BIT, 已经完成
+   - 在btrfs_workers->prio_order_list对头取一个btrfs_work, 如果为空使用btrfs_workers->order_list, 如果也为空,就退出循环.
+   - 如果btrfs_work->flags没有WORK_DONE_BIT,退出循环,只处理完成的btrfs_work. 如果能够处理设置btrfs_work->flags的WORK_ORDER_DONE_BIT.
+   > btrfs_work->ordered_func(btrfs_work)
+   > btrfs_work->ordered_free(btrfs_work)
+   - 释放btrfs_work->order_list队列, 就是上面的2个队列.
+   - ordered btrfs_work就是在原始btrfs_work基础上,多了一层处理,而且使用队列保证处理的顺序,而且在其原始工作完成之后. 
+
+** put_worker(btrfs_worker_thread)
+   - 使用btrfs_worker_thread->refs维护它的使用计数,当减为0时，回收内存. 为何没有关闭线程的操作
+
+** try_worker_shutdown(btrfs_worker_thread)
+   - 检查很多条件,决定是否释放它. 只是处理btrfs_worker_thread数据结构, 谁关闭线程? 程序退出,线程自动关闭.
+   - btrfs_workers->num_workers>1
+   - btrfs_worker_thread->idle有效 btrfs_worker_thread->working无效
+   - btrfs_worker_thread->worker_list 有效,它还在idle_list中
+   - btrfs_worker_thread->prio_pending/pending为空,的确空闲着
+   - btrfs_worker_thread->num_pending为0
+   - 释放btrfs_worker_thread->worker_list队列. 减小btrfs_worker_thread->btrfs_workers->num_workers
+   - btrfs_worker_thread->refs用来销毁数据结构
+
+** get_next_work(btrfs_worker_thread, list_head prio_head, list_head head)
+   - 为btrfs_worker_thread准备btrfs_work, 参数的2个队列就是下面填充的,它只是在循环利用.
+   - 参数的两个队列中是btrfs_work, 来自btrfs_worker_thread->prio_pending / pending. 
+   - 如果btrfs_worker_thread->prio_pending不为空,或者2个参数队列为空,就填充.
+   - 如果不填充,就先处理head队列,然后是prio_head队列. 如果填充了就先prio_head? 如果填充多个prio,也只是处理一个?
+
+** worker_loop(arg)
+   - 给btrfs_worker_thread创建线程后执行这个函数,arg是btrfs_worker_thread. 
+   - 函数不断循环, 首先处理btrfs_work
+   > get_next_work(btrfs_worker_thread, prio_head, head)
+   - 初始化时两个队列为空, 通过获取,填充2个队列. 两个都是队列, prio如何保证?
+   - 释放btrfs_work->list队列, 去掉btrfs_work->flags的WORK_QUEUE_BIT,给btrfs_worker_thread->worker
+   - btrfs_work->func(btrfs_work)
+   - 减小btrfs_worker_thread->num_pending, 这里没有btrfs_workers的事情.
+   - 这个函数在btrfs_workers->ordered无效时,没有操作, 只是保证btrfs_work的处理顺序.
+   > run_ordered_completions(btrfs_work->btrfs_workers, btrfs_work)
+   - 检查是否需要创建新的btrfs_worker_thread, 它只要保证btrfs_workers->max_workers, 不管有没有什么btrfs_work.
+   - check_pending_worker_creates(btrfs_worker_thread)
+   - 处理完成btrfs_worker_thread的2个队列后,开始等待. 先检查是否需要去idle状态.
+   - check_idle_worker(btrfs_worker_thread)
+   - 下面有3步等待的处理
+   - 首先是freeze处理
+   - 判断线程是否需要关闭
+   > kthread_should_stop()
+   - 第一次判断2个队列pending/prio_pending, 如果没有等待1s
+   - 第二次判断, 如果没有去休眠120s,等待别人唤醒. 设置btrfs_worker_thread->working=0, 休眠等待什么意思?
+   - 超时或别人唤醒后,首先判断是否需要关闭线程, 直接退出.
+   > kthread_should_stop()
+   - 如果超时就需要自己退出, 释放btrfs_worker_thread, 而且退出程序主循环,相当与撤销了线程.
+   - try_worker_shutdown(btrfs_worker_thread)
+
+** btrfs_stop_workers(btrfs_workers)
+   - work_loop中只有一个地方释放btrfs_worker_thread, 就是在很长时间没人关. 其他都是被别人关闭.
+   - 遍历btrfs_workers->idle_list/worker_list, 关闭每个btrfs_worker_thread
+   - 首先判断btrfs_worker_thread->worker_list是否为空,刚在上面取出来,怎么能为空? 如果为空,就是btrfs_worker_thread在自己关闭.
+   - 如果队列不是空,需要关闭任务,释放btrfs_worker_thread数据结构.队列的判断使用btrfs_workers->lock互斥.
+   - 释放队列关系, 同步关闭线程
+   > kthread_stop(btrfs_worker_thread->task)
+   > put_worker(btrfs_worker_thread)
+   
+** btrfs_init_workers(btrfs_workers, name, max, btrfs_workers async_helper)
+   - 初始化btrfs_workers, btrfs_workers->atommic_worker_start时async_helper, 用来创建它的btrfs_worker_thread. 
+
+** __btrfs_start_workers(btrfs_workers)
+   - 这个函数被3个地方使用,创建btrfs_workers->btrfs_worker_thread.
+   - 分配内存,初始化队列.
+   > kthread_run(worker_loop, btrfs_worker_thread, name)
+   - 把这个btrfs_worker_thread->worker_list放到btrfs_workers->idle_list队列中.社会btrfs_worker_thread->idle为1, 初始为idle状态.
+   - 增加btrfs_workers->num_workers, 减小btrfs_workers->num_workers_starting
+
+** btrfs_start_workers(btrfs_workers)
+   - 这个函数应该是启动线程的帮助函数,在初始化btrfs_fs_info时使用, 看样子启动很多btrfs_workers
+   > __btrfs_start_workers(btrfs_workers)
+
+** next_worker(btrfs_workers)
+   - btrfs_workers管理的btrfs_worker_thread分成2个队列(可能有一个创建中), idle_list/worker_list
+   - 如果btrfs_workers->idle_list有thread, 直接获取一个.
+   - 如果btrfs_workers->num_workers和num_workers_starting没有超过max_workers界线,需要创建新的. 或者worker_list也为空,btrfs_workers没有btrfs_worker_thread, 也需要创建.
+   - 否则大家都busy, 去worker_list上取第一个. 为了让btrfs_worker_thread保持平衡,把它放到队列尾部. 也不是随便放的,根据btrfs_worker_thread->sequence放置,每btrfs_workers->idle_thresh次放置.
+
+** find_worker(btrfs_workers)
+   - 先去找一个, 如果没找到,进入fallback模式,这时简单取2个队列中取一个,它保证有一个存在.
+   > next_worker(btrfs_workers)
+   - 如果返回NULL, 该创建新的,或者在创建中
+   - 检查btrfs_workers->num_workers+num_workers_starting>=btrfs_workers->max_workers, 不用创建了.
+   - btrfs_workers->atomic_worker_start有效, 在worker_loop中有相关步骤处理创建新的,但它能保证及时吗? 设置btrfs_workers->atomic_start_pending为1
+   - 如果没有辅助的btrfs_workers, 自己创建
+   > __btrfs_start_workers(btrfs_workers)
+   - 最后时fallback模式. 增加btrfs_worker_thread->num_pending, 不让他自己释放.
+
+** btrfs_requeue_work(btrfs_work)
+   - 把btrfs_work重新放到btrfs_worker_thread的队列中, 使用btrfs_work->flags的WORK_QUEUE_BIT防止重复进入队列.如果已在队列中,直接退出.
+   > test_and_set_bit(WORK_QUEUE_BIT, btrfs_work->flags)
+   - 根据btrfs_work->falgs的WORK_HIGH_PRIO_BIT,决定btrfs_worker_thread->prio_pending/pending队列.
+   - 增加btrfs_worker_thread->num_pending.. 如果发现btrfs_worker_thread->idle有效,把它放到btrfs_workers->worker_list队列.修改idle=0
+   - 如果btrfs_worker_thread->working无效,改为1,而且唤醒那个thread, 它在等待中睡眠.
+   > wake_up_process(btrfs_worker_thread->task_struct)
+
+** btrfs_set_work_high_prio(btrfs_work)
+   - 设置btrfs_work->flags的WORK_HIGH_PRIO_BIT
+
+** btrfs_queue_worker(btrfs_workers, btrfs_work)
+   - 把btrfs_work放到btrfs_workers的一个btrfs_worker_thread中.
+   - 如果btrfs_work->flags的BTRFS_QUEUE_BIT有效,不再处理.
+   - 先挑一个btrfs_worker_thread
+   > find_worker(btrfs_workers)
+   - 如果btrfs_worker_thread->ordered有效,把btrfs_worker添加到btrfs_worker_thread->prio_order_list/order_list队列中. 根据btrfs_work->falgs的WORK_HIGH_PRIO_BIT决定.
+   - 然后处理普通队列, btrfs_work->list放到btrfs_worker_thread->prio_pending/pending
+   - 改变btrfs_worker_thread的状态
+   > check_busy_worker(btrfs_worker_thread)
+   - 如果它在睡眠, btrfs_worker_thread->working无效, 唤醒它.
+   > wake_up_process(btrfs_worker_thread->task)
+
+** 总结
+   - 这个work queue实现比较简单,为何不使用workqueue呢? 这里增加了ordered work功能.
+   - 很简单.

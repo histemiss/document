@@ -1,0 +1,293 @@
+* delayed_ref.c
+  - delayed back reference update tracking.  这个是extent tree中的backref的操作.. 在处理分配extent时,延时维护backref信息，加快分配操作,而且缓存经常使用的backrefs
+
+  - 缓存的操作有4种
+    - BTRFS_ADD_DELAYED_REF    //增加backref
+    - BTRFS_DROP_DELAYED_REF   //删除backref
+    - BTRFS_ADD_DELAYED_EXTENT //分配extent
+    - BTRFS_UPDATE_DELAYED_HEAD  //更新extent
+
+** btrfs_delayed_ref_node
+   #+begin_src 
+        //注释的不错.
+	struct rb_node rb_node;   //在btrfs_delayed_ref_root->rb_root中
+
+	/* the starting bytenr of the extent */
+	u64 bytenr;
+
+	/* the size of the extent */
+	u64 num_bytes;
+
+	/* seq number to keep track of insertion order */
+	u64 seq;
+
+	/* ref count on this data structure */
+	atomic_t refs;
+
+	/*
+	 * how many refs is this entry adding or deleting.  For
+	 * head refs, this may be a negative number because it is keeping
+	 * track of the total mods done to the reference count.
+	 * For individual refs, this will always be a positive number
+	 *
+	 * It may be more than one, since it is possible for a single
+	 * parent to have more than one ref on an extent
+	 */
+	int ref_mod;
+
+	unsigned int action:8;
+	unsigned int type:8;
+	/* is this node still in the rbtree? */
+	unsigned int is_head:1;   //btrfs_delayed_ref_head
+	unsigned int in_tree:1;   //是否和btrfs_delayed_ref_root有关系.
+   #+end_src
+
+** btrfs_delayed_extent_op
+   #+begin_src 
+        //btrfs_delayed_ref_head使用它...
+   	struct btrfs_disk_key key;
+	u64 flags_to_set;
+	unsigned int update_key:1;
+	unsigned int update_flags:1;
+	unsigned int is_data:1;
+   #+end_src
+
+** btrfs_delayed_ref_head
+   #+begin_src 
+        //好像是包装btrfs_delayed_ref_node, 主要用于更新btrfs_delayed_extent_op..
+	struct btrfs_delayed_ref_node node;
+
+	/*
+	 * the mutex is held while running the refs, and it is also
+	 * held when checking the sum of reference modifications.
+	 */
+	struct mutex mutex;
+
+	struct list_head cluster;
+
+	struct btrfs_delayed_extent_op *extent_op;
+	/*
+	 * when a new extent is allocated, it is just reserved in memory
+	 * The actual extent isn't inserted into the extent allocation tree
+	 * until the delayed ref is processed.  must_insert_reserved is
+	 * used to flag a delayed ref so the accounting can be updated
+	 * when a full insert is done.
+	 *
+	 * It is possible the extent will be freed before it is ever
+	 * inserted into the extent allocation tree.  In this case
+	 * we need to update the in ram accounting to properly reflect
+	 * the free has happened.
+	 */
+	unsigned int must_insert_reserved:1;
+	unsigned int is_data:1;
+   
+   #+end_src
+
+** btrfs_delayed_tree_ref
+   #+begin_src 
+        //同样也是包装btrfs_delayed_ref_node, backref有两种,一种是树节点使用的extent,另一种是文件数据extent
+   	struct btrfs_delayed_ref_node node;
+	u64 root;
+	u64 parent;
+	int level;
+        //root是implicit backref使用的,parent是full backref使用的.
+   #+end_src
+
+** btrfs_delayed_data_ref
+   #+begin_src 
+        //文件数据使用的extent的backref
+   	struct btrfs_delayed_ref_node node;
+	u64 root;
+	u64 parent;
+	u64 objectid;
+	u64 offset;
+        //root,objectid,offset是implicit使用,parent是full backref使用
+   #+end_src
+
+** btrfs_delayed_ref_root
+   #+begin_src 
+   	struct rb_root root;  //管理btrfs_delayed_ref_node
+
+	/* this spin lock protects the rbtree and the entries inside */
+	spinlock_t lock;
+
+	/* how many delayed ref updates we've queued, used by the
+	 * throttling code
+	 */
+	unsigned long num_entries;  //btrfs_delayed_ref_node的数量..
+
+	/* total number of head nodes in tree */
+	unsigned long num_heads;    //btrfs_delayed_ref_head的数量
+
+	/* total number of head nodes ready for processing */
+	unsigned long num_heads_ready;
+
+	/*
+	 * bumped when someone is making progress on the delayed
+	 * refs, so that other procs know they are just adding to
+	 * contention intead of helping
+	 */
+	atomic_t procs_running_refs;
+	atomic_t ref_seq;
+	wait_queue_head_t wait;
+
+	/*
+	 * set when the tree is flushing before a transaction commit,
+	 * used by the throttling code to decide if new updates need
+	 * to be run right away
+	 */
+	int flushing;
+
+	u64 run_delayed_start;
+   #+end_src
+
+** keys
+   - 这里使用的key包括一下,在extent中具体说明了..
+     - BTRFS_EXTENT_ITEM_KEY
+     - BTRFS_TREE_BLOCK_REF_KEY
+     - BTRFS_EXTENT_DATA_REF_KEY
+     - BTRFS_SHARED_BLOCK_REF_KEY
+     - BTRFS_SHARED_DATA_REF_KEY
+
+** comp_tree_refs(btrfs_delayed_tree_ref ref2, ref1)
+   - 比较两个btrfs_delayed_tree_ref, 排序时使用. 先比较root,然后parent.不对不同类型排序
+
+** comp_data_refs(btrfs_delayed_data_ref ref2, ref1)
+   - 比较两个btrfs_delayed_data_ref. 如果是BTRFS_EXTENT_DATA_REF_KEY，比较 (root/objectid/offset), 否则比较parent. 这里应该不对不同的type排序
+
+** comp_entry(btrfs_delayed_ref_node ref2, ref1, compare_seq)
+   - 对backref排序.
+   - 首先根据btrfs_delayed_ref_node  (bytenr/is_head/type), 然后对不同的类型,调用上面两种函数..
+   - BTRFS_TREE_BLOCK_REF_KEY和BTRFS_SHARED_BLOCK_REF_KEY
+   > comp_tree_refs(btrfs_delayed_node_to_tree_ref(ref2), ref1)
+   - BTRFS_EXTENT_DATA_REF_KEY和BTRFS_SHARED_DATA_REF_KEY
+   > comp_data_refs(btrfs_delayed_node_to_data_ref(ref2), ref1)
+
+** tree_insert(rb_root, rb_node)
+   - rb_root应该是btrfs_delayed_ref_root
+   > comp_entry(btrfs_delayed_ref_node, btrfs_delayed_ref_node)
+
+** find_ref_head(rb_root, bytenr, btrfs_delayed_ref_node, return_bigger)
+   - 在rb_root中查找btrfs_delayed_ref_node,查找的要求是btrfs_delayed_ref_node->is_head有效.. return_bigger表示找不到时,是否使用比较大的一个..
+   - 这里仅比较bytenr/is_head..
+
+** btrfs_delayed_ref_lock(btrfs_trans_handle, btrfs_delayed_ref_head)
+   - btrfs_delayed_ref_root是btrfs_trans_handle->delayed_refs. 这里的操作是锁住它和btrfs_dela
+yed_ref_head..
+   - 锁住btrfs_delayed_ref_head->mutex,可能会等待.
+
+** drop_delayed_ref(btrfs_trans_handle, btrfs_delayed_ref_root, btrfs_delayed_ref_node)
+   - 把btrfs_delayed_ref_node从btrfs_delayed_ref_root中删除. btrfs_delayed_ref_node->in_tree表示树关系是否存在. 
+   - btrfs_delayed_ref_node->refs表示使用计数. 如果减到0就释放内存.. 而且减小btrfs_delayed_ref_root->num_entries..
+   > btrfs_put_delayed_ref(btrfs_delayed_ref_node)
+
+** merge_ref(btrfs_trans_handle, btrfs_delayed_ref_root, btrfs_delayed_ref_node, seq)
+   - btrfs_delayed_ref_node在btrfs_delayed_ref_root中,合并btrfs_delayed_ref_root中和btrfs_delayed_ref_node相同的node..
+   > rb_prev(node)
+   - 向前遍历rb tree, 停止条件是bytenr/seq
+   - 根据btrfs_delayed_ref_node->action, 如果相同，就把他的ref_mod加到参数ref->ref_mod,如果相反,就相减,然后删除next ...
+   > comp_entry(btrfs_delayed_ref_node ref, next, 0)
+   > drop_delayed_ref(btrfs_trans_handle, btrfs_delayed_ref_root, next)
+   - 如果相减的时候,要释放ref_mod小的..
+   - 经过计算参数ref->ref_mod为0,就把它也释放掉..
+   > drop_delayed_ref(btrfs_trans_handle, btrfs_delayed_ref_root, btrfs_delayed_ref_node)
+   
+** btrfs_merge_delayed_refs(btrfs_trans_handle, btrfs_fs_info, btrfs_delayed_ref_root, btrfs_delayed_ref_head)
+   - btrfs_fs_info->tree_mod_seq_list是做什么的? 管理seq_list (seq)? 从这个队列上取出第一个seq给下面使用.
+   - 需要下面处理的btrfs_delayed_ref_node->seq < seq
+   - 遍历btrfs_delayed_ref_head对应的btrfs_delayed_ref_node,遍历它能否合并其他的btrfs_delayed_ref_node.
+   > merge_ref(btrfs_trans_handle, btrfs_delayed_ref_root, btrfs_delayed_ref_node)
+   - 第一个btrfs_delayed_ref_node是从btrfs_delayed_ref_head的前一个... 这里的递归是使用rb_prev..
+
+** btrfs_check_delayed_seq(btrfs_fs_info, btrfs_delayed_ref_root, seq)
+   - seq >= btrfs_fs_info->tree_mod_seq_list的第一个seq会返回1,否则返回0
+
+** btrfs_find_ref_cluster(btrfs_trans_handle, list_head, start)
+   - 从btrfs_delayed_ref_root中找btrfs_delayed_ref_node,找到的放到list_head中.. btrfs_delayed_ref_root是btrfs_trans_handle->delayed_refs
+   - 如果start无效,使用btrfs_delayed_ref_root的第一个,否则使用start查找一个..
+   > rb_first(btrfs_delayed_ref_root->root)
+   > find_ref_head(btrfs_delayed_ref_root->root, start+1, ref, 1)
+   - 遍历时只处理btrfs_delayed_ref_head, 把btrfs_delayed_ref_head->cluster添加到list_head中..
+   > btrfs_delayed_ref_is_head(btrfs_delayed_ref_node)
+   - 修改btrfs_delayed_ref_root->run_delayed_start, btrfs_delayed_ref_root->num_heads_ready--, 把btrfs_delayed_ref_head放到cluster队列中,也要减小num_heads_ready
+   - 后面如果把它从队列中释放,而且没有释放它自己,会增加num_heads_ready
+   - 队列长度不超过32
+
+** btrfs_release_ref_cluster(list_head)
+   - 释放队列关系,队列上时btrfs_delayed_ref_head->cluster..
+
+** update_existing_ref(btrfs_trans_handle, btrfs_delayed_ref_root, btrfs_delayed_ref_node existing, btrfs_delayed_ref_node update)
+   - 更新btrfs_delayed_ref_node->ref_mode
+   - 如果btrfs_delayed_ref_node->action不一样,相减,一样就相加。 action表示add/drop
+   - 如果结果为0,就是放existing
+   > drop_delayed_ref(btrfs_trans_handle, btrfs_delayed_ref_root, btrfs_delayed_ref_node)
+   
+** update_existing_head_ref(btrfs_delayed_ref_node existing, btrfs_delayed_ref_node update)
+   - 更新btrfs_delayed_ref_head. 
+   - 更新btrfs_delayed_ref_head->must_insert_reserved
+   - 更新btrfs_delayed_ref_head->extent_op. 根据btrfs_delayed_extent_op->update_key/update_flags,更新btrfs_delayed_extent_op->btrfs_key/flags_to_set
+   - 最后更新btrfs_delayed_ref_node->ref_mod.
+
+** add_delayed_ref_head(btrfs_fs_info, btrfs_trans_handle, btrfs_delayed_ref_node, bytenr, num_bytes, action, is_data)
+   - 使用参数初始化btrfs_delayed_ref_node, 这个node是btrfs_delayed_ref_head.
+   - 根据action决定btrfs_delayed_ref_node->count_mod. 
+   - BTRFS_UPDATE_DELAYED_HEAD  是 0
+   - BTRFS_DROP_DELAYED_REF   是-1
+   - BTRFS_ADD_DELAYED_REF/BTRFS_ADD_DELAYED_EXTENT是1
+   - BTRFS_ADD_DELAYED_EXTENT表示要插入btrfs_extent_item, must_insert_reserved=1
+   > tree_insert(btrfs_delayed_ref_root->root, btrfs_delayed_ref_node->rb_node)
+   - btrfs_delayed_ref_root是btrfs_trans_handle->delayed_refs. 如果rb_root中已有,更新btrfs_delayed_ref_head
+   > update_existing_head_ref(btrfs_delayed_ref_node existing, ref)
+   - 否则增加一些计数.  btrfs_delayed_ref_root->num_heads/num_heads_ready/num_entries
+
+** add_delayed_tree_ref(btrfs_fs_info, btrfs_trans_handle, btrfs_delayed_ref_node, bytenr, num_bytes, parent, ref_root, level, action, for_cow)
+   - 处理tree block,创建新的btrfs_delayed_ref_node/btrfs_delayed_tree_ref
+   - 不许要cow的btrfs_root才需要seq, 这里应该不需要.
+   > need_ref_seq(for_cow, ref_root)
+   > btrfs_get_tree_mod_seq(btrfs_fs_info, seq_list)
+   - seq和transid有什么关系?好像是log tree中使用的
+   > btrfs_delayed_node_to_tree_ref(btrfs_delayed_ref_node)
+   - 这个node是btrfs_delayed_tree_ref, parent有效，type是BTRFS_SHARED_BLOCK_REF_KEY, 否则是BTRFS_TREE_BLOCK_REF_KEY..
+   > tree_insert(btrfs_delayed_ref_root->rb_root, btrfs_delayed_ref_node->rb_node)
+   - 如果插入重复,合并计数
+   > update_existing_ref(btrfs_trans_handle, btrfs_delayed_ref_root, btrfs_delayed_ref_node, ref)
+   - 否则增加统计数 btrfs_delayed_ref_root->num_entries/btrfs_trans_handle->delayed_ref_updates
+   - 对于非head的btrfs_delayed_ref_node, 如果action是BTRFS_ADD_DELAYED_EXTENT, 改为BTRFS_ADD_DELAYED_REF, 所以在btrfs_delayed_ref_root中没有BTRFS_ADD_DELAYED_EXTENT.
+   - 对于btrfs_delayed_ref_head, action = 0
+
+** add_delayed_data_ref(btrfs_fs_info, btrfs_trans_handle, btrfs_delayed_ref_node, bytenr, num_bytes, parent, ref_root, owner, offset, action, for_cow)
+   - 这个节点是btrfs_delayed_data_ref
+   > btrfs_delayed_node_to_data_ref(btrfs_delayed_ref_node)
+   - parent区分BTRFS_SHARED_DATA_REF_KEY/BTRFS_EXTENT_DATA_REF_KEY..
+   > tree_insert(btrfs_delayed_ref_root->rb_root, btrfs_delayed_ref_node->rb_node)
+
+** btrfs_add_delayed_tree_ref(btrfs_fs_info, btrfs_trans_handle, bytenr, num_bytes, parent, ref_root, level, action, btrfs_delayed_extent_op, for_cow)
+   - 创建btrfs_delayed_tree_ref和btrfs_delayed_ref_head. 
+   - 增加一个索引计数
+   > add_delayed_ref_head(btrfs_fs_info, btrfs_trans_handle, btrfs_delayed_ref_head->btrfs_delayed_ref_node, bytenr, num_bytes, action, 0)
+   > add_delayed_tree_ref(btrfs_fs_info, btrfs_delayed_tree_ref->btrfs_delayed_ref_node, bytenr, num_bytes, parent, ref_root, level, action, for_cow)
+
+** btrfs_add_delayed_data_ref(btrfs_fs_info, btrfs_trans_handle, bytenr, num_bytes, parent, ref_root, ...)
+   - 创建btrfs_delayed_ref_head和btrfs_delayed_data_ref..
+   - 同样也是增加一个索引计数
+   > add_delayed_ref_head(...)
+   > add_delayed_data_ref(btrfs_fs_info, ...)
+
+** btrfs_add_delayed_extent_op(btrfs_fs_info, btrfs_trans_handle, bytenr, num_bytes, btrfs_delayed_extent_op)
+   - 只增加一个btrfs_delayed_ref_head,它不修改索引计数,只会处理btrfs_delayed_extent_op.
+   > add_delayed_ref_head(btrfs_fs_info, btrfs_trans_handle, btrfs_delayed_ref_node, bytenr, num_bytes, BTRFS_UPDATE_DELAYED_HEAD, is_data)
+   - 在btrfs_delayed_ref_root中也不会有这个标志,只有在非head的btrfs_delayed_ref_node上面有BTRFS_ADD_DELAYED_REF/BTRFS_DROP_DELAYED_REF
+
+** btrfs_find_delayed_ref_head(btrfs_trans_handle, bytenr)
+   - 从btrfs_trans_handle->btrfs_delayed_ref_root中查找..
+   > find_ref_head(btrfs_delayed_ref_root->rb_root, bytenr, NULL, 0)
+
+** btrfs_delayed_ref_exit(void)
+   - 释放kmem_cache..
+     
+** 总结
+   - btrfs_delayed_ref_node->seq什么作用?
+   - 这里对外部的支持有4个,一个是在提交transaction时,获取对应的btrfs_delayed_ref_head,提交他们的backref信息
+   - 为tree block记录backref信息   btrfs_add_delayed_tree_ref, 包含BTRFS_ADD_DELAYED_REF/BTRFS_DROP_DELAYED_REF, 还有BTRFS_ADD_DELAYED_EXTENT,它使用btrfs_delayed_extent_op. BTRFS_ADD_DELAYED_REF几乎看不到.BTRFS_ADD_DELAYED_EXTENT使用insert_reserve和btrfs_delayed_extent_op
+   - 为extent data记录backref信息  btrfs_add_delayed_data_ref，包含BTRFS_ADD_DELAYED_REF/BTRFS_DROP_DELAYED_REF, 它的BTRFS_ADD_DELAYED_EXTENT不使用btrfs_delayed_extent_op
+   - 更新extent的信息              btrfs_add_delayed_extent_op, tree block使用btrfs_delayed_extent_op更新btrfs_extent_item->flags

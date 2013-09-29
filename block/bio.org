@@ -1,0 +1,166 @@
+这个文件就是给local fs准备的, 这里好像只有操作bio这个数据结构,填充bio数据等,而没有和底层request_queue的相关操作
+
+1. bio数据结构不在这里写了, 首先是一些全局的变量，表示如何分配bio内存
+bio_set
+  * kmem_cache bio_slab  这个kmem_slab就是bio_slab中的kmem_slab
+  * front_pad 这是什么?
+  * mempool bio_pool
+  * mempool bio_integrity_pool
+  * mempool bvec_pool
+
+biovec_slab : bvec_slabs数组,bio和bio_vec使用的内存不一块,这个数据结构是分配bio_vec的,看来分配的时候也是几种固定的数量. 分配了一段内存直接给bio->bvec_free_bs..
+  * nr_vecs
+  * name
+  * kmem_cache
+
+bio_slab : bio_slab_nr / bio_slabs
+  * kmem_cache
+  * slab_ref
+  * slab_size
+  * name
+
+1. 下面这些函数应该就是如何为bio分配内存，繁琐，简单记录一下
+  bio_find_or_create_slab(extra_size) 这个函数操作bio_slabs, bio_slab_nr. 创建一种新的bio-slab, 分配这种大小的bio. 创建的是bio_slab, 放到bio_slabs动态数组中. 这个函数在创建bio_set时使用
+ -> kmem_cache_create(name, size, 0, SLAB_HWCACHE_ALIGN, NULL)
+
+2. bio_put_slab(bio_set) 到了bio_set,释放它使用的bio_slab(kmem_cache)
+ -> kmem_cache_destroy(slab)
+
+3. bvec_free_bs(bio_set, bio_vec, idx) 为何要释放bio_vec? bio_vec不应该和bio的内存连续? 看来bio_vec的内存slab使用biovec_slab,而且根据数量在bvec_slabs中选一个. 除了这个biovec_slab, bio_vec还使用mempool, bio_set->bvec_pool...
+ -> mempool_free(bio_vec, bio_set->bvec_pool)
+ -> kmem_cache_free(biovec_slab[xx]->slab, bio_vec)
+
+4. bvec_alloc_bs(gfp_mask, nr, idx, bio_set) 使用bio_set分配一个bio_vec数组,nr是需要的数组大小,但biovec_slabs中不一定有正好的,所以需要分配一个满足这个需求的. 先找到合适bio_vec_slab,如果找不到使用bio_set->mempool, 如果找到使用biovec_slabs.
+
+5. bio_free(bio, bio_set)
+ -> bio_has_allocated_vec(bio), bio的bio_vec不一定是另外分配的,也可能是和bio在一块的. 看一下bio->bi_inline_vecs.
+ -> bvec_free_bs(bio_set, bio->bi_io_vec, BIO_POOL_IDX(bio)) 分配单独分配的bio_vec, bio->bi_flags中包含它属于biovec_slabs中的哪个??
+ -> bio却属于bio_set->bio_pool. 为何bio又多了一个mempool内存管理? 而且bio使用的内存还有些偏移(bio_set->front_pad..
+
+6. bio_init(bio)
+ 简单的初始化, bi_flags=BIO_UPTODATE, bi_cnt=1
+
+7. bio_alloc_bioset(gfp_mask, nr_iovecs, bio_set) nr_iovecs表示预估使用多少iovec
+ -> mempool_alloc(bio_set->bio_pool, gfp_mask) 使用mempool分配bio,然后使用bio_set->front_pad做偏移. 这个分配的bio多大呢?
+ -> bio_init(bio)
+ -> 如果nr_iovecs<=4, 使用inline的iovec(bi_inline_vecs),所以mempools的bio大小肯定容纳这些
+ -> 否则 > bvec_alloc_bs(..) 分配, 记录idx到bio->bi_flags
+ 
+8. bio_alloc(gfp_t, nr_iovecs) 包装, 下面还有另外一种内存分配方式
+ -> bio->bi_destructor = bio_fs_destructor => bio_free(bio, fs_bio_set)释放iovec
+
+9. bio_kmalloc_destructor(bio) 这是直接使用kmalloc/kfree管理bio
+ -> kfree(bio)
+ 
+   bio_kmalloc(gfp_mask, nr_iovecs) 计算总共需要的内存,使用kmalloc, 当然iovec时候用bi_inline_vecs,在bi_flags包含BIO_POOL_NONE
+
+10. bio_put(bio) bio使用 bi_cnt作为使用计数
+ -> bio_disassociate_task(bio) 释放io_context/io_cp的关系
+ -> bio->bi_destructor(bio) 释放内存
+
+11. bio_phys_segments(request_queue, bio)
+ -> bio->bi_flags的BIO_SEG_VALID 表示 bi_phys_segments是否有效
+ -> 如果无效，重新计算 > blk_recount_segments(request_queue, bio)
+
+12. __bio_clone(bio, bio_src) 复制一部分数据, bi_io_vec指向的地址信息, bi_sector/bi_bdev/bi_flags(另加BIO_CLONED)/bi_vcnt/bi_size/bi_idx
+
+ bio_clone(bio_src, gfp_t) 创建一个新的bio, 使用上面的函数复制一份
+ -> bio_alloc_bioset(gfp_t, bio->bi_max_vecs, fs_bio_set) 这个bio_set是全局的
+ -> __bio_clone(bio, bio_src)
+
+13. bio_get_nr_vecs(block_device) 获取block_device支持的一次bio中最大的page数量?还是iovec数量?
+ -> queue_max_segments()  在request_queue->queue_limits中有一些limits. BIO_MAX_PAGES
+
+14. __bio_add_page(request_queue, bio, page, len, offset, max_sectors) 向bio中添加一个biovec,操作这个page
+ -> 首先bio->bi_size不能超长(max_sectors)
+ -> 检查page表示的数据是否和bio->bi_io_vec最后一个biovec合并,他们对应的sector肯定挨着,如果他们使用的内存地址也挨着，就可以合并   bio_vec->bv_offset+bio_vec->bv_len == offset && page相同
+ -> 如果合并  request_queue->merge_bvec_fn(request_queue, bvec_merge_data, bio_vec) 
+ -> 如果不能合并 创建一个新的bio_vec, bio->bi_vcnt ++, bio->bi_phys_segments++, bio->bi_size, 设置BIO_SEG_VALID
+
+ bio_add_pc_page(request_queue, bio, page...) 包装上面的函数
+ bio_add_page(bio, page, offset, len)
+ -> bdev_get_queue(bio->bi_bdev) 根据block_device获取request_queue
+ -> __bio_add_page
+
+15. bio_set_map_data(bio_map_data, bio, sg_iovec, iov_count, is_our_pages), 使用这些参数构造一个bio_map_data, 给bio->bi_private
+ bio_map_data数据结构  这里面的指针都已经分配内存,哪里分配的?
+   * bio_vec *iovecs  来自bio
+     * sg_iovec sgvecs  scsi中使用这个东西
+    * nr_sgvecs, is_our_pages
+ 
+ bio_free_map_data 释放数据结构的指针，还有它自己
+
+ bio_alloc_map_data(nr_segs, iov_count, gfp_mask)  nr_segs表示bio_vec动态数组的长度, iov_count表示sg_iovec动态数组长度
+
+ __bio_copy_iov(bio, bio_vec, sg_iovec, iov_count, to_user, from_user, do_free_page) 在bio和sg_iovec之间搬数据, to_user/from_user控制方向, bio_vec好像有些重复
+
+ bio_uncopy_user(bio) 把bio的数据给sg_iovec, sg_iovec是用户数据使用的数组,它在bio->bi_private(bio_map_data)中维护. BIO_NULL_MAPPED表示bio中有数据
+ -> __bio_copy_iov(bio, bio_map_data->iovecs, bio_map_data->sgvecs, ...) 
+ -> bio_free_map_data 释放bio_map_data
+ -> bio_put(bio) 释放bio
+ 
+ rq_map_data 数据结构  这个东西放在哪里?
+   * page **pages
+   * page_order
+   * nr_entries
+   * offset, null_mapped, from_user
+
+ bio_copy_user_iov(request_queue, rq_map_data, sg_iovec, iov_count, write_to_vm, gfp_t) 根据用户态数据sg_iovec创建一个新的bio,并且把这些数据搬过去
+ -> 先根据sg_iovec中每段数据使用的页数，计算总的需要的biovec数量(一个biovec对应一个page) nr_pages,还有总的数据量
+ -> bio_alloc_map_data(nr_pages, iov_count, gfp_t) 分配一个bio_map_data, 包含biovec, sg_iovec
+ -> bio_kmalloc(gfp_t, nr_pages) 分配bio
+ -> 创建biovec, 它的page有两个来源,如果rq_map_data有效,则biovec的page指向它的pages数组(二维数组?) 如果无效,使用alloc_page分配新的page
+ -> bio_add_pc_page(request_queue, bio, page, bytes, offset) offset只有在第一page时有效..
+ -> __bio_copy_iov(bio, bio->bi_io_vec, iov, iov_count, map_data?0:1) 如果是写操作,把数据搬到page上...
+ 
+ bio_copy_user(request_queue, rq_map_data, uaddr, len, write_to_vm, gfp_t) 根据uaddr/len组装一个sg_iovec, 创建bio
+ -> bio_copy_user_iov(request_queue, rq_map_data, sg_iovec, 1, ...)
+
+ __bio_map_user_iov(request_queue, block_device, sg_iovec, iov_count, write_to_vm, gfp_t) 这是另外一种组装bio的方法,创建bio后,获取sg_iovec中用户地址使用的page,把它放到bio->bi_iovec中
+ bio_map_user(request_queue, block_device, uaddr, len, write_to_vm, gfp_t) 包装上面的函数
+ bio_map_user_iov(request, ...) 包装
+
+ __bio_unmap_user(bio) 这里应该是IO操作完成之后的执行的，释放pagecache的使用计数. 如果是读会数据,把page设置dirty标志?  为何bio是读，就设置page为dirty呢? 还需要写回?
+   -> set_page_dirty_lock(biovec->bv_page)
+   -> page_cache_release(page)
+   -> bio_put(bio)
+
+ bio_unmap_user(bio) 包装
+   -> __bio_unmap_user(bio) 
+   -> bio_put(bio) 双重释放?
+
+ __bio_map_kern(request_queue, data, len, gfp_t) 这个和上面__bio_map_user类似,不过data是内核地址，所以使用virt_to_page(data)获取page指针
+
+15. bio_copy_kern_endio(bio, err) 在io操作完成之后，释放page/bio等， 如果是读操作，把数据搬给bio->bio_map_data中的sg_iovec, 这里sg_iovec中只有一片连续的地址
+ -> __free_page(page) 主要还是释放page
+ -> bio_free_map_data(bio_map_data) 然后是映射数据使用的内存
+ -> bio_put(bio)
+
+16. bio_copy_kern(request_queue, data, len, gfp_t, reading) 调用上面的函数创建bio,然后填充数据,注意回调函数
+ -> bio_copy_user(q, NULL, ...)
+ -> 搬数据,data 到 page
+ -> bio->bi_end_io = bio_copy_kern_endio
+
+17. bio_set_page_dirty(bio) 遍历bio的所有biovec中的page,设置脏标志
+ -> set_page_dirty_lock(page) 设置了dirty,就要写回了？..
+
+ bio_release_page(bio) 释放每个page -> put_page(page)
+
+18. 这里多了一些全局变量和work,应该是异步提交work.  
+ * bio *bio_dirty_list, bio_dirty_work
+
+ bio_dirty_fn(work_struct) 它处理全局bio-chain: bio_dirty_list, 遍历每个bio
+   -> bio_set_pages_dirty(bio)
+   -> bio_release_pages(bio)
+   -> bio_put(bio)
+
+ bio_check_pages_dirty(bio) 这个？？ 如果page是dirty,直接释放；否则把它放到bio_dirty_list队列中,异步设置脏,然后释放.
+
+19. bio_endio(bio, error) bio完成时,回调bio->bi_end_io(bio, error) 如果bio->bi_flags中没有BIO_UPTODATE,则error=EIO
+
+20. bio_sector_offset(bio, index, offset) 获取index/offset对应的sector偏移
+
+21. 下面是cgroup的一些操作
+ bio_associate_current(bio)关联bio和current->io_context
+
+看完了，还是没有系统框架

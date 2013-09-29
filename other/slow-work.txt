@@ -1,0 +1,29 @@
+slow_work_thread_wq 
+    所有任务在循环中如果没有工作可做，等待在这个队列上. 同样当新添加了slow_work时,或需要所有任务结束时，需要结束这个任务时,唤醒这个等待队列上的任务.
+
+slow_work_execute(id)
+    所有任务使用这个函数从slow_work队列上取任务.
+
+cull功能
+    slow_work_cull 表示是否需要结束线程
+    slow_work_cull_timer 计时器 在每次cull操作后修改它(肯定, 确认下次删除线程的时候),在没有slow_work时设置它
+    结束内核线程,在线程的循环中反复判断,计时器自动触发它,如果没有工作,而且线程数据大于最小值,则不断结束线程.  当需要释放时，他会唤醒slow_work_thread_wq,让任务自己结束.
+
+自动创建线程功能
+    使用slow_work实现, slow_work_new_thread (slow_work_new_thread_ops) 在slow_work模块开始被使用时,创建这个slow_work.在每次执行slow_work时,如果有等待的任务,则创建新的线程. slow_work_may_not_start_new_thread表示是否能启动新的线程,当其他模块要是用slow_work时,它设为1,但当一个任务被创建后,它被设为0. 当oom-killer发生后,它被设为0. 所以使用的越多，线程越多,但不超过系统设置最大数量.
+
+执行任务时，先执行very_slow_work的,然后是slow_work. 而且 vslow_work_executing_count的数量小于某个界值时,才可以执行slow_work. slow_work_available(vsmax)
+
+slow_work_threads_should_exit  是否需要关闭slow_work模块的所有线程
+
+1. slow_work_sleep_till_thread_needed(slow_work, time)
+    外部使用的接口函数,如果slow_work_queue/vslow_work_queue不是空,则等待time时间,在vslow_work_queue_waits_for_occupation/slow_work_queue_waits_for_occupation这两个等待队列上等待.
+
+2. slow_work_enqueue(slow_work) 
+    入对操作, 把slow_work放到slow_work_queue/vslow_work_queue中, 唤醒线程. 如果这是第一个slow_work,则唤醒等待在两个队列上的任务,就是等待上面操作的任务. 为何不在队列为空是唤醒?
+
+3. slow_work_wait_for_items(module)
+    等待modules使用的slow_work完成.
+
+
+这个东西实在比较简单，但是什么时候slow_work会等待呢?有个bug是这样导致的.

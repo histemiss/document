@@ -1,0 +1,2740 @@
+1. svc_export/svc_expkey (fs/nfsd/export.c)
+  找一些这个文件的gitlog, 非常多，可参考性不大.
+  在export.c中， 维护一串clients，每个clients包含一串exports。要把一个fs共享给一个client，先使用NFSCTL_ADDCLIENT,添加client控制块，再使用NFSCTL_EXPORT添加fs的控制块. 感觉以前看过了，但没有笔记！
+
+a.  数据结构
+auth_domain 表示认证域名. 表示某一个客户端，还有使用什么方法映射uid和网络ID.(映射怎么实现？） (auth_domain/auth_ops)
+在这里竟然把auth_domain表示成svc_client.
+  * kref
+  * name
+  * auth_ops  =>
+      -> flavor
+      -> accept/release/domain_release/set_client (svc_rqst)
+
+svc_export 表示在exports中某项导出文件系统的配置
+  * cache_head
+  * auth_domain
+  * ex_flags
+  * ex_path -> 表示导出的文件夹
+  * ex_anon_uid/ex_auon_gid
+  * ex_fsid ex_uuid
+  * nfsd4_fs_locations  fslocation之类的信息
+  * ex_nflavors/ex_flavors(exp_flavor_info 上面的auth_domain不是auth_unix/auth_null，这里才是.  目前包含8种:null,unix,krb5,krb5i/p, skpm3,skpm3i/p
+
+svc_expkey 把filehandlefragement映射成svc_export.当client要共享时，实现这些转换. 由于不同的fsid，一个export可能有多个export key. 这个结构表示一个client共享server的某个导出的目录.
+  * cache_head
+  * auth_domain (又有这个东西)
+  * ek_fsidtype/ek_fsid 
+  * ek_path(path)
+fsidtype包含:FSID_DEV/FSID_NUM/FSID_MAJOR_MINOR/FSID_ENCODE_DEV/FSID_UUID4_INUM/FSID_UUID8/FSID_UUID16/FSID_UUID16_INUM. 使用的数据内容为dev_t/ino_t/fsid/uuid。
+
+b. 全局变量
+这里有两个sunrpc的cache, 第一个是export cache，表示exportfs导出的项，管理client+vfsmnt+dentry,第二个是expkey cache, 表示client挂载的项， 管理client+filehandle-fragement 
+sunrpc的cache和用户层交换比较多.
+svc_expkey的cache是svc_expkey_cache(cache_detail) (expkey_table).主要是作为client挂载项的索引，只有auth_domain/path/fsid。
+svc_export的cache是svc_export_cache, export_table. 用来管理已经导出的项，必须能够全部表示exports中的内容,包括path/auth_domain/flags(fsid,fsloc,sec,anonuid...)
+
+c. 操作
+  1. expkey_put(kref)
+    销毁svc_expkey
+    -> path_put(svc_expkey->ex_path)
+    -> auth_domain_put(svc_expkey->ex_client)
+    -> free(svc_expkey)
+
+  2. expkey_request(cache_detail, cache_head, char **, int *len)
+    cache_head是嵌在svc_expkey中的，把svc_expkey中的信息放到buf中. 格式为"client fsidtype fsi"
+
+  3. expkey_upcall(cache_detail, cache_head)
+    -> sunrpc_cache_pipe_upcall
+
+  4. expkey_parse(cache_detail, msg, len)
+    根据msg，解析成一个expkey。格式为："client fsidtype fsid expiry path"
+    -> auth_domain_find(name)
+    -> svc_expkey_lookup(svc_expkey)
+
+  5. expkey_show(seq_file, cache_deatil, cache_head)
+    上面函数的逆操作
+
+  6. expkey_match(cache_head, cache_head)
+    比较auth_domain, fsditype, fsid)
+
+  7. expkey_init(cache_head, cache_head)
+    只是kref的索引增加，其他都是值拷贝
+
+  8. expkey_update(cache_head, cache_head)
+    更新svc_expkey的path
+
+  9. svc_expkey_cache: 使用上面的函数.
+
+  10. svc_expkey_hash(svc_expkey)
+    计算hash值
+
+  11. svc_expkey_lookup(svc_expkey)  
+    -> sunrpc_cache_lookup 调用svc_expkey_cache->lookup
+   
+  12. svc_expkey_update(svc_expkey, svc_expkey)
+
+  下面的操作是对export的cache操作
+  13. nfsd4_fslocs_free(nfsd4_fs_locations)
+    释放nfsd4_fs_locations的内存，就是一串的path和hosts
+
+  14. svc_export_put(kref)
+    释放svc_export的path和fslocations,auth_domain
+
+  15. svc_export_request(cache_detail, cache_head, buf ...)
+    把svc_export中的信息放到buf中，格式为“client path". 这个cache_detail是什么？
+
+  16. svc_export_upcall(cache_detail, cache_head)
+    sunrpc_cache_pipe_upcall(cache_detail, cache_head, svc_export_request)
+
+  17. check_export(inode, flag, uuid)
+    根据flag检查inode和uuid是否能提供足够的信息，实现fsid. 还有inode必须是dir/reg/link。inode对应的superblock必须有export_operation支持
+
+  18. fsloc_parse(msg, buf, nfsd4_fs_locations)
+  19. secinfo_parse(msg, buf, svc_export)
+
+  20. svc_export_parse(cache_detail, msg, len)
+    把msg中的数据组合成svc_export
+    -> auth_domain_find
+    -> kern_path
+    -> cache_export
+    -> svc_export_lookup  => 还是从svc_export_cache中查找
+
+  21. svc_export_show(seq_file, cache_detail, cache_head)
+
+  22. svc_export_match
+    比较auth_domain, path
+
+  23. svc_export_init(cache_head ...)
+    (inode, flag, uuid)
+    根据flag检查inode和uuid是否能提供足够的信息，实现fsid. 还有inode必须是dir/reg/link。inode对应的superblock必须有export_operation支持
+
+  18. fsloc_parse(msg, buf, nfsd4_fs_locations)
+  19. secinfo_parse(msg, buf, svc_export)
+
+  20. svc_export_parse(cache_detail, msg, len)
+    把msg中的数据组合成svc_export
+    -> auth_domain_find
+    -> kern_path
+    -> cache_export
+    -> svc_export_lookup  => 还是从svc_export_cache中查找
+
+  21. svc_export_show(seq_file, cache_detail, cache_head)
+
+  22. svc_export_match
+    比较auth_domain, path
+
+  23. svc_export_init(cache_head ...)
+    增加kref, path的索引，fsloc清空，拷贝auth_domain
+
+  24. export_update(new, item)
+    把item的内容给new，主要有flags,anon_uid/gid,fslocks，其他使用上面init
+
+  25. svc_export_alloc()  
+    kmalloc
+
+  26. 省略很多
+
+  27. exp_find_key(svc_client, fsid_type, fsid, cache_req)
+    svc_client就是auth_domaim。 根据auth_domain和fsid构造一个svc_expkey. 这是找expkey的cache.
+    -> svc_expkey_lookup，返回找到的svc_expkey
+    -> cache_check(cache_detail, cache_head, cache_req)
+    
+  28. exp_get_by_name(svc_client, path, cache_req)
+    根据svc_client和path构造一个svc_export，在export的cache中查找, 返回找到svc_export。
+    -> svc_export_lookup(svc_export)
+    -> cache_check
+
+  29. svc_parent(svc_client, path)
+    和上面的功能类似，但使用path可能找不到svc_export，因此需要使用path.dentry的parent，当然不能越过文件系统，但path.dentry是ROOT时，停止查找.
+    -> dget/dput/dget_parent
+    -> exp_get_by_name
+
+  30. exp_rootfs(svc_client, name, knfsd_fh, size)
+    根据svc_client和name构造一个svc_export，把svc_export的数据组装到svc_fh中，把其中的knfsd_fh部分放到传入参数中.
+    * kern_path
+    * exp_path
+    * fh_init/fh_compose/fh_put fh_compose把svc_export的信息放到svc_fh中，根据svc_export的情况，决定svc_fh中的auth_type/fsid_type/fileid_type。
+    * exp_put
+
+  31. exp_find(auth_domain, fsid_type, fsidv, cache_req)
+    根据auth_domain和fsid查找svc_export，返回找到的结果.先根据auth_domain和fsid查找svc_expkey，根据svc_expkey的auth_domain和path查找svc_export。
+    -> exp_find_key(auth_domain, fsidtype, fsid, cache_req)
+    -> exp_get_by_name(auth_domain, path, cache_req)
+
+  32. check_nfsd_access(svc_export, svc_rqst)
+    检查svc_rqst的访问是否符合svc_export的导出安全限制(sec=)
+    a. gss: svc_export->ex_client == svc_rqst->rq_gssclient(svc_rqst->rq_client== NULL)
+    b. flavors: svc_export->pseudoflavor包含svc_rqst->rq_flavor
+    c. svc_rqst->rq_flavor是RPC_AUTH_NULL/RPC_AUTH_UNIX
+
+  33. rqst_exp_get_by_name(svc_rqst, path)
+    根据svc_rqst的client/gssclient（auth_domain)和path查找svc_export。
+    -> exp_get_by_name(auth_domain, path, cache_req/svc_rqst->rq_handle)
+
+  34. rqst_exp_find(svc_rqst, fsid_type, fsid)
+    -> exp_find(auth_domain, fsidtype,fsid, svc_rqst->rq_chandle)
+
+  35. rqst_exp_parent(svc_rqst, path)
+    和exp_parent类似，不过在迭代path时，使用了rqst_exp_find_by_name,而不是exp_find_by_name.
+
+  36. rqst_find_fsidzero_export(svc_rqst)
+    构造一个fsid，使用FSID_NUM, (0,0), 找到35. rqst_exp_parent(svc_rqst, path)
+    和exp_parent类似，不过在迭代path时，使用了rqst_exp_find_by_name,而不是exp_find_by_name.
+
+  36. rqst_find_fsidzero_export(svc_rqst)
+    构造一个fsid，使用FSID_NUM, (0,0),找到导出项为fsid=0的svc_export。
+    -> rqst_exp_find(svc_rqst, fsidtype, fsid)
+
+  37. exp_pseudoroot(svc_rqst, svc_fh)
+    -> rqst_find_fsidzero_export(svc_rqst)
+    -> rh_compose
+
+  38. e_start(seq_file, loff_t)/e_next/e_end/e_show
+    遍历export_table，使用的loff_t是64为，高32位表示export_table的索引，低32位表示hash链表中的索引.
+
+  39. nfsd_export_init/nfsd_export_flush/nfsd_export_shutdown
+
+2. auth_domain(fs/nfsd/auth.c)
+  nfs的auth_domain全部使用sunrpc的domain管理，因此这里没有什么实质的domain管理.
+  1. nfsexp_flags(svc_rqst, svc_export)
+    返回导出的选项svc_export->ex_flags，但是在以下sec=情况下，有子选项，因此要考虑svc_rqst使用的安全配置. 比较svc_export->ex_flavors是否函盖svc_rqst->rq_flavor，有的话返回(svc_export->ex_flavors)exp_flavor_info->flags。
+
+  2. nfsd_setuser(svc_rqst, svc_export)
+    这个可能会经常使用，因为nfsd操作实际上是替client完成的，因此需要使用client的cred代替其执行操作时的cred。
+    改变当前任务的cred, 在新的cred中使用fsuid/fsgid,groupinfo， 还有设置capability。如果fsuid=0,使用这些，否则放弃这些权限. CAP_NFSD_SET:
+(CAP_CHOWN/CAP_MKNOD/CAP_DAC_OVERRIDE/CAP_DAC_READ_SEARCH/CAP_FOWNER/CAP_FSETID/CAP_SYS_RESOURCE/CAP_MAC_OVERRIDE)
+    -> prepare_creds
+    -> override_creds
+
+3. svc_fh/knfsd_fh (include/linux/nfsd/nfsfh.h; fs/nfsd/nfsfh.c)
+  nfsd中的filehandle的组成分成两层. (nfsd还真不算大，必须看nfsfh了, 没有全局的变量组织所有的svc_fh吗？ 还有导出目录树在哪里？）
+a. 数据结构
+  knfsd_fh包含fh的内容
+    * fh_size 
+    * nfs_fhbase_new(fh_new)  =>
+      * fb_version (1)
+      * fb_auth_type 作为fh验证使用？？
+      * fb_fsid_type fsidtype和svc_expkey中fsidtype
+      * fb_fileid_type file如何组合fh
+      * fb_auth[1]  ： 表示这三个数据域的组成(fb_auth, fb_fsid, fb_fileid)
+      fb_auth_type=0， 没有验证内容； fb_auth_type=1, 表示fb_auth中对fh和某些数据的MD5的hash值
+      fb_fileid_type:
+          0: fb_fileid没有数据
+          1: fb_fileid中是32 inode, 32 generation(inode的域)
+          2: fb_fileid中是32 inode, 32 generation, 32 parent dentry inode
+
+  svc使用的fh是svc_fh
+    * knfsd_fh
+    * dentry
+    * svc_export
+    * fh_maxsize
+    * nfs v3: fh_pos_saved/fh_pre_saved/fh_pre_mtime/fh_post_attr
+
+c. 操作
+  1. nfsd_acceptable(void *expv, dentry)
+    expv就是svc_export.检查从svc_export->ex_path到dentry，是否都可以访问？如果有"nosubtreecheck", 则这个函数返回1. 否则从dentry上溯到svc_export->ex_path，以此调用inode_permission.上溯时不能跨越filesystems.
+    -> inode_permission(inode, MAY_EXEC) 这个函数还需要当前的cred。
+    需要看清楚哪里调用这个函数？？
+
+  2. nfsd_mode_check(svc_rqst, umode_t mode, umode_t requested)
+    检查mode与requested在表示文件格式上是否一致。返回的错误有讲究！！
+
+  3. nfsd_setuser_and_check_port(svc_rqst, svc_export)
+    根据svc_rqst->rq_secure检查是否使用secure port，从svc_export中取出flags，检查是否要求secure port。如果不一致报错。
+    -> nfsexp_flags(svc_rqst, svc_export)
+    -> nfsd_setuser(svc_rqst, svc_export)  => auth.c
+
+  4. check_pseudo_root(svc_rqst, dentry, svc_export)
+    不明白如果有两个导出项使用fsid=0怎么办。检查svc_export为NFSEXP_V4ROOT的情况下，svc_rqst是否可以挂载dentry。如果svc_export不是NFSEXP_V4ROOT，不考虑这些情况。否则,如果srv_rqst的client不是v4，则返回nfserr_stale.如果dentry不是文件夹或符号文件，不是svc_export->ex_path，则返回错误。这说明fsid=0的只能有1个，而且不能让v2/v3的挂载。但在此机器上不对。
+
+  5. nfsd_set_fh_dentry(svc_rqst, svc_fh)
+    使用svc_fh查找svc_export和dentry, 都放到svc_fh中. 首先找出fsidtype/fsid，找到svc_export。这里在处理knfsd_fh=>fsid时有许多限制。
+    找到svc_export，根据是否设置subtreecheck,决定是否需要检查路径的可访问性。如果没有设置，不用更正cred,否则更正。
+    获取fileid，找dentry. fileid放到fid中，这是一个exportfs中的定义。
+    -> rqst_exp_find(svc_rqst, fsidtype, fsid)
+    -> nfsd_setuser_and_check_port(svc_rqst, svc_export)
+    -> exportfs_decode_fh, 给它传递nfsd_acceptable
+
+  6. fh_verify(svc_rqst, svc_fh, umode_t, access)
+    如果svc_fh没有设置dentry，先找到，然后检查umode_t和access是否有效。都检查以下限制:
+    * 在nfsd_set_fh_dentry会判断auth/cred/subtreecheck/secure port/
+    * pseudo_root (V4ROOT)
+    * cred/port/subtreecheck
+    * file mode 
+    * auth flavor check / pseudoflavor
+    * access
+
+    -> nfsd_set_fh_dentry(svc_rqst, svc_fh)
+    -> check_pseudo_root(svc_rqst, dentry, svc_export)
+    -> nfsd_setuser_and_check_port(svc_rqst, svc_export)
+    -> nfsd_mode_check(svc_rqst, dentry->d_inode->i_mode, umode_t)检查映射的文件夹和需求的是否一致
+    -> check_nfsd_access(svc_export, svc_rqst) 在锁文件或挂载时，不使用GSS,只是用auth_sys等，因此要跳过这个检查
+    -> nfsd_permission(svc_rqst, svc_export, dentry, access)
+
+  7. _fh_update(svc_fh, svc_export, dentry)
+    根据dentry组装svc_fh->knfsd_fh=>fileid部分。如果dentry是svc_export->ex_path，则fileidtype=FILEID_ROOT.
+    -> exportfs_encode_fh(dentry, fid, maxsize, subtreecheck) 在组装的时候考虑subtreecheck，如果没有设置这个选项，说明fileid不可使用parent相关内容。
+    
+  8. _fh_update_old(dentry, svc_export, knfsd_fh)
+    设置inode/generation/dirinode
+
+  9. is_root_export(svc_export)
+    检查svc_export->ex_path.dentry是否是某个挂载的文件系统的root
+    dentry=dentry->d_sb->s_root
+
+  10. exp_sb(svc_export)
+    svc_export->ex_path.dentry->d_inode->i_sb
+
+  11. fsid_type_ok_for_exp(fsid_type, svc_export)
+    检查svc_export是否支持某种fsidtype。因为fsid需要某些信息，因此svc_export导出的dentry需要满足.
+
+  12. set_version_and_fsid_type(svc_fh, svc_export, svc_fh/ref)
+    根据svc_export设置svc_fh的fsid(type),如果ref使用svc_export,参考它设置svc_fh.和上面_fh_update功能类似，它设置fileid. 这里只是设置了fsidtype，没有设置fsid的内容，内容在下面设置.
+    
+  13. fh_compose(svc_fh, svc_export, dentry, svc_fh/ref)
+    设置fsid/fileid/dentry/svc_export
+    -> set_version_and_fsid_type
+    -> _fh_update
+
+  14. fh_update(svc_fh)
+    根据svc_fh->dentry更新fileid
+    -> _fh_update
+
+  15. fh_put(svc_fh)
+    -> dput(svc_fh->fh_dentry)
+    -> cache_put(svc_fh->fh_export->h/cache_head)
+
+  16. fsid_source(svc_fh)
+    返回fsid_source: FSIDSOURCE_DEV/FSIDSOURCE_FSID/FSIDSOURCE_UUIDo
+
+  17. fh_lock/unlock
+    锁svc_fh->fh_dentry->d_inode
+
+
+4. nfscache (fs/nfsd/nfscache.c)
+  这是请求应答缓存，把正确完成的应答结果缓存给起来.现在是全局的缓冲，以后可以改成基于client的缓冲。
+  缓冲中的数据项是svc_rqst,根据xid索引
+a. 数据结构  
+  svc_cachereq: 除了用于组织的结构域，主要用：
+    * c_state/c_type/c_secure(port<1024)
+    * sockaddr_in(c_addr)
+    * xid
+    * c_prot
+    * c_proc/c_vers
+    * c_timestamp
+    * kvec/status
+
+b. 全局变量
+  hash数组cache_hash, lru_head. 初始状态时分配CACHESIZE(1024)个svc_cachereq，放到lru_head中，当要存储时，从链表上取一个，填充内容，放到cache_hash数组中.  hash计算使用xid.
+
+c. 操作
+
+  1. nfsd_reply_cache_init()
+    初始化cache_hash和lru_head
+
+  2. nfsd_reply_cache_shutdown
+    释放lru_head中的kvec，看来要存出svc_rqst时，不会把它从lru_head队列中取出来，只会调整其在lru_head中的位置。
+    释放cache_hash
+
+  3. lru_put_end(svc_cachereq)
+   把svc_cachereq放到lru_head的末尾。
+
+  3. hash_refile(svc_cachereq)
+  把svc_cachereq从cache_hash中取出来,根据svc_cacherq->c_xid重新放进去.
+
+  4. nfsd_cache_lookup(svc_rqst)
+  从cache中查找一项，完全相同的svc_rqst,比较xid/prot/proc/vers/sockaddr_in。如果没找到，找一项c_state(状态）不是RC_INPROG的，可能是RC_UNUSED/RC_DONE. 然后把xid/prot/proc/vers/sockaddr_in填充进去。标志为没有数据（RC_NOCACHE），当前时间。同时把svc_rqst->rq_cachereq添上找到的数据项。
+  如果找到修改lrc，如果当前状态为RC_INPROG, 或时间差小于RC_DELAY(HZ/5), 这个请求是重复的。否则说明状态为RC_DONE, 而且结果是可用的，把数据给svc_rqst，然后返回这个请求。
+    RC_NOCACHE: 需要执行这个请求
+    RC_REPLSTAT: 这个请求的结果是一个状态值，只需返回svc_cachereq->c_replstat
+    RC_REPLBUFF: 结果是数组，把结果拷贝到svc_rqst. svc_cachereq->c_replvec ==>  svc_rqst->rq_res.head[0]
+
+  5. nfsd_cache_update(svc_rqst, cachetype, statp)
+    把svc_rqst的执行结果放到svc_cachereq中，结果是statp，根据cachetype，如果是RC_REPLSTAT，则直接放到svc_cachereq->c_replstat;如果是RC_REPLBUFF，需要申请内存，数据拷贝.
+    要是这么看svc_rqst执行结果都是些这东西？
+
+5. svc_serv/svc_program/svc_version (fs/nfsd/nfssvc.c)
+  svc_serv表示rpc的服务端，使用若干个网络连接传输数据，使用若干个任务处理数据
+a. 数据结构：没有新的数据结构，完全使用sunrpc的,包括svc_serv/svc_program/svc_version
+
+b. 全局变量:
+    svc_serv *nfsd_serv
+    svc_program nfsd_program ->
+        svc_version nfsd_versions
+        (pg_next) -> svc_program nfsd_acl_program
+                                svc_version nfsd_acl_versions
+
+c. 操作
+  1. nfsd_vers(vers, vers_op)
+    设置svc_versions数组，vers_op是NFSD_SET/NFSD_CLEAR，nfsd_version/nfsd_acl_version保存全部的内容，设置这个数组决定是否使用这些版本. 在启动服务时，决定启用那些版本的服务。
+
+  2. nfsd_minorversion(minorversion, vers_op)
+    设置子版本，目前应该只有nfsv4有子版本，使用全局变量nfsd_supported_minorversion。
+
+  3. nfsd_nrthreads()
+    返回svc_serv(nfsd_serv)->sv_nrthreads
+
+  4. nfsd_init_socks(int port)
+    使用sunrpc创建监听端口
+    -> svc_create_xprt(nfsd_serv/svc_serv, "udp"/"tcp", inet, PF_INET, port ...)
+
+  5. nfsd_startup(port, nrservs)
+    启动nfsd
+    -> nfsd_racache_init (fs/nfsd/vfs.c) readahead参数缓冲
+    -> nfsd_init_socks
+    -> lockd_up() (fs/lockd/svc.c)
+    -> nfsd_state_start()  (fs/nfsd/nfs4state.c) nfsv4的状态
+
+  6. nfsd_shutdown()
+    关闭nfsd服务. 怎么没有关闭svc_serv的操作, 关闭端口和任务.
+    -> nfs4_state_shutdown
+    -> lockd_down()
+    -> nfsd_racache_shutdown
+  
+  7. nfsd_last_thread(svc_serv, net)
+    这才是真正的关闭任务吗？
+    -> nfsd_shutdown
+    -> svc_rpcb_cleanup(svc_serv, net)
+    -> nfsd_export_flush
+    
+  8. nfsd_reset_versions
+    重新设置nfsd_program.pg_vers为nfsd_version的内容.那nfsd_versions什么用？
+nfsd_program.pg_vers=nfsd_versions, 没有数组复制这个东西,因为pg_vers是一个双重指针。刚测试一下:
+    int b[5] = {0};
+    struct T{ int a[5];} t = { .a = b }; 这相当与把b指针给a[0].
+    struct T{ int a[5];} t = { .a[0] = b[0] }; 着下面两个才是正确的，上面
+    struct T{ int a[5];} t = { .a[1] = b[1] }; 的也不报错
+
+  9. set_max_drc   (duplicated request cache)
+    设置公共变量nfsd_drc_mem_used
+
+  10. nfsd_create_serv()
+    -> svc_get(svc_serv)
+    -> svc_create_pooled(nfsd_program, nfsd_max_blksize, nfsd_last_thread, nfsd, THIS_MODULE) 这里有两个回调函数: nfsd_last_thread和nfsd
+    -> set_max_drc
+    -> do_gettimeofday(nfssvc_boot)
+
+  10. nfsd_nrpools()
+    返回nfsd_serv->sv_nrpools
+
+  11. nfsd_get_nrthreads
+    返回nfsd_serv->sv_pools[i].sp_nrthreads. 一个svc_serv包含若干个pool，每个pool包含若干个thread，一个pool和一个网络连接对应？
+
+  12. nfsd_set_nrthreads(n, int nthradsp])
+    nthreadsp中每个项不超过NFSD_MAXSERVS(8192,夸张), 总和也不能超过。
+    -> svc_get  
+    -> nfsd_set_num_threads(nfsd_serv, svc_pool, nthread)
+    -> svc_destroy
+
+  13. nfsd_svc(port, nrserv)
+    启动nfsd，在哪里调用？貌似这个才是启动函数
+    -> nfsd_create_serv
+    -> nfsd_startup
+    -> svc_set_num_threads
+
+  14. nfsd(svc_rqst)
+    这个nfsd的内核任务执行的函数 server kernel thread. 看到下面的函数，这个函数为什么不在sunrpc中实现？！
+    -> unshare_fs_struct (不再和init共享current->fs)
+    -> allow_signal(SIGKILL/SIGKILLUP/SIGINT/SIGQUIT)
+    -> svc_recv(svc_rqst)
+    -> schedule_timeout_uninterruptible
+    -> svc_process(svc_rqst)
+    -> svc_exit_thread(svc_rqst)
+
+  15. nfsd_dispatch(svc_rqst, statep) 
+    这个是nfsd对远程调用的处理过程。
+    -> kxdrproc/svc_procedure->pc_decode
+    -> nfsd_cache_lookup
+    -> svc_procedure->pc_func(svc_rqst, svc_rqst->rq_argp, svc_rqst->rq_resp) 把这个执行结果放到svc_rqst->rq_resq中.
+    -> nfsd_cache_update(svc_rqst, cachereqtype, state+1) 这里为什么加1呢？
+    
+  16. nfsd_pool_stats_open(inode, file)
+    -> svc_get(nfsd_serv)
+    -> svc_pool_stats_open(nfsd_serv, file)
+
+  17. nfsd_pool_stats_release
+    -> svc_destroy(nfsd_serv), 为什么没有释放pool_stats_close之类的？
+
+8. stats (fs/nfsd/stats.c: include/linux/nfsd/stats.h)
+a. 数据结构
+  nfsd_stats 包含repcache/fh/io/thread/readahead相关操作的统计技术. 这个文件是/proc/net/sunrpc/nfsd，还是比较简单
+
+9. nfsctl (fs/nfsd/nfsctl.c)
+a. 数据结构
+  好像没有数据结构,这里用于和用户层交互
+
+c. 操作
+  1. write_unlock_ip(file, buf, size)
+    这里是从用户层传下数据，解析处理. 解锁所有的ip地址，好像是nlm的东西
+    -> qword_get  获取域名/ip地址
+    -> rpc_pton(&init_net, buf, size, sap ...）把地址转化为sockaddr
+    -> nlmsvc_unlock_all_by_ip 果然是fs/lockd的东西
+
+  2. write_unlock_fs(file, buf, size)
+    释放所有local file system上面的锁，buf中是一个路径
+    -> qword_get
+    -> kern_path
+    -> nlmsvc_unlock_all_by_sb(superblock)
+    -> put_path
+
+  3. write_filehandle(file, buf, size)
+    传进domain和path，转换为filehandle。 应该是用户层的mount使用.
+    -> qword_get   
+    -> unix_domain_find() -> auth_domain
+    -> exp_rootfh(auth_domain, path, knfsd_fh , size)
+    -> qword_addhex(buf, knfsd_fh->fh_base, size)
+
+  4. write_threads(file, buf, size)
+    可以启动knfsd或报告启动多少运行的任务. 把任务数给buf.
+    -> if size>0 nfsd_svc(NFS_PORT, nrthreads)
+    -> else nfsd_nrthreads() 
+    
+  5. write_pool_threads(file, buf, size)
+    设置每个pool对应的任务数
+    -> nfsd_set_nrthreads
+
+  6. __write_versions(file, buf, size)
+    设置当前各个版本的启动情况
+
+  7. __write_ports_names(buf)
+    设置nfsd的监听端口,如果nfsd_serv没有创建，要创建。
+    -> svc_addsock(nfsd_serv, fd, buf ...)
+
+  8. __write_ports_addxprt(buf)
+    创建使用一定协议和端口的sunrpc传输结构
+    -> nfsd_create_serv
+    -> svc_create_xprt  调用两次，ipv4/ipv6
+
+  9. __write_ports_delxprt(buf)
+    关闭传输层的结构
+    -> svc_find_xprt
+
+  10. __write_ports
+    比较复杂，给nfsd_serv传入文件描述符/传输层名称 ???
+
+  11. write_maxblksize
+
+乱七八糟，必须看vfs.c了
+9. vfs(fs/nfsd/vfs.c)
+a. 数据结构
+  raparms/raparm_hbucket管理readahead使用的参数.看一下raparms结构:
+    * p_ino/inode ino_t
+    * p_dev dev_t
+    * file_ra_state这是主要的参数,这里没有对其他结构的索引，比如dentry/inode，所以使用时可以值拷贝。存储参数时把它们拷贝到raparm_hbucket的缓存中。用的时候拷贝出来
+
+b. 全局变量
+  raparm_hash[PARAM_HASH_SIZE]   (1<<4)
+
+c. 操作
+  1. nfsd_cross_mnt(svc_rqst, dentry, svc_export exp)
+    怎么到处有svc_rqst? 这里可能要用它的auth_domain。dentry与svc_export->ex_path什么关系？理应是位于同一个mnt。应该是dentry在svc_export->ex_path的下面.这里检查从svc_export的导出目录到dentry是否跨越mnt,或跨越导出项。
+    -> follow_down(path) 使用svc_export->ex_path->mnt和dentry组合一个path，然后看看是否有filesystem挂载在这里，把原来的覆盖了。
+    -> rqst_exp_get_by_name(svc_rqst, path) 
+    如果找不到,说明dentry对应的就不是一个svc_export，或者后来的mnt把这个dentry覆盖了.如果svc_export带标志NFSEXP_V4ROOT，不行了，好像它要求返回一个svc_export,因此它不允许mnt覆盖（但代码解释说V4ROOT不允许穿越挂载点continue underneath a mountpoint, 经过测试，果然是, 所以这里被mnt覆盖，则不允许？)。如果svc_export不是NFSEXP_V4ROOT，则说明没有跨越导出项，虽然可能跨越了mnt了,可能被mnt覆盖，但只要不是NFSEXP_V4ROOT, 就没事, 他好像不找导出项.
+    如果找到，假设dentry与svc_export->ex_path不同，说明跨越导出项. 肯定没有mnt覆盖。 exp2->ex_path可能是一个mnt点.那样,考虑以下情况，可以使用新的导出项: client是nfsv4，或者exp使用了CROSSMOUNT选项,或者刚找到的exp是使用了NOHIDE选项. 这里可以说CROSSMNT和NOHIDE是对应的吗？对于nfsv3是.
+  刚才做了一些测试：nfsv4自带nohide,自带对应的crossmnt功能. crossmnt功能比nohide对应的多一点.
+    * 在nfs service启动时，导出点的挂载情况不影响nfs server.但导出后被mnt覆盖就不一样了. 测试时需要有以下情况：导出点被覆盖,导出点子目录被覆盖；nfsv2/3/4；fsid=0/其他
+    * 不能穿越子挂载点，这对nfsv3/4都一样，如果想共享子挂载点，必须带nohide导出它,或者使用crossmnt. 子导出项也就在这里有意义，否则就是设置不同权限.
+
+  2. follow_to_parent(path)
+    综合下面两个函数功能，为何dentry不提供呢？
+    * follow_up , 向上传越挂载点
+    * dget_parent
+
+  3. nfsd_lookup_parent(svc_rqst, dentry/in, svc_export, dentry/out)
+    使用dentry的parent查找svc_export。如果没找到,返回传入的dentry，否则返回找到的dentry和svc_export
+    -> follow_to_parent
+    -> rqst_exp_parent
+    -> dget/path_put/dput/exp_put
+
+  4. nfsd_mountpoint(dentry, svc_export)
+    检查dentry是否是挂载点.
+    * d_mountpoint
+    * nfsd4_is_junction
+    * svc_export->ex_flags & NFSEXP_V4ROOT 并且dentry没有对应的inode.o
+
+  5. nfsd_lookup_dentry(svc_rqst, svc_fh, name, len, svc_export, dentry out)
+    在svc_fh下面查找name对应的文件/文件夹.
+    * 如果name="."，返回svc_fh->fh_dentry和svc_fh->fh_export
+    * 如果是"..", 如果svc_fh对应的不是svc_export->ex_path，则返回dget_parent.,返回传入的dentry，否则返回找到的dentry和svc_export
+    -> follow_to_parent
+    -> rqst_exp_parent
+    -> dget/path_put/dput/exp_put
+
+  4. nfsd_mountpoint(dentry, svc_export)
+    检查dentry是否是挂载点.
+    * d_mountpoint
+    * nfsd4_is_junction
+    * svc_export->ex_flags & NFSEXP_V4ROOT 并且dentry没有对应的inode.o
+
+  5. nfsd_lookup_dentry(svc_rqst, svc_fh, name, len, svc_export, dentry out)
+    在svc_fh下面查找name对应的文件/文件夹.
+    * 如果name="."，返回svc_fh->fh_dentry和svc_fh->fh_export
+    * 如果是"..", 如果svc_fh对应的不是svc_export->ex_path，则返回dget_parent.这种情况下有疑问
+        如果svc_export不是nohide，返回svc_fh->fh_dentry,像/..一样处理.
+        其他情况是nfsd_lookup_parent
+    * 如果name是正常名称，找到子目录，检查是否是挂载点。没有处理子导出项之类的.
+      -> lookup_one_len
+      -> nfsd_mountpoint
+    做测试，子挂载项好像不起作用
+
+  6. nfsd_lookup(svc_rqst, svc_fh, name, len, svc_fh out)
+    -> fh_verify
+    -> nfsd_lookup_dentry
+    -> check_nfsd_access
+    -> fh_compose
+
+  7. nfsd_break_lease(inode)
+    这是什么东西？ 还只能在inode是reg文件时使用
+    break_lease(inode, O_WRONLY|O_NONBLOCK)
+
+  8. commit_metadata(svc_fh)
+    -> svc_fh->fh_dentry->d_inode->i_sb->s_export_op->commit_metadata
+    -> sync_inode_metadata(inode, 1)
+
+  9. nfsd_setattr(svc_rqst, svc_fh, iattr, check_guard, guardtime)
+    link文件不能改变attr;只有reg文件才能改变size.
+    -> fh_verify 验证accmode和type是否符合.
+    -> inode_change_ok(inode, iattr)检查是否可以改变文件属性
+    -> nfsd_permission(... NFSD_MAY_TRUNC|NFSD_MAY_OWNER_OVERRIDE) 如果要改size
+    -> get_write_access/put_write_access
+    -> locks_verify_truncate 检查是否有锁冲突（强制锁），没有还要加锁
+    -> nfsd_break_lease  与check_guard/guardtime有关
+    -> fh_lock/fh_unlock
+    -> nofity_change
+    -> commit_metadata
+
+  10. nfsd_getxattr(dentry, key, buf)
+    在nfs aclv2/3和nfsv4时使用
+    -> vfs_getxattr(dentry, key, buf, len) 自己申请内存返回给buf
+
+  11. set_nfsv4_acl_one(dentry, posix_acl, key)
+    -> posix_acl_xattr_size
+    -> posix_acl_to_xattr(posix_acl, buf, len)
+    -> vfs_setxattr(dentry, key, buf ...)
+
+  12. nfsd4_set_nfs4_acl(svc_rqst, svc_fh, nfs4_acl)
+    -> fh_verify(... NFSD_MAY_SATTR)
+    -> nfs4_acl_nfsv4_to_posix(nfs4_acl, posix_acl, posix_acl ...) 第一个是access acl，第二个是给dir使用的default acl
+    -> set_nfsv4_acl_one(dentry, posix_acl, POSIX_ACL_XATTR_ACCESS) "system.posix_acl_access"
+    -> set_nfsv4_acl_one(dentry, posix_acl, POSIX_ACL_XATTR_DEFAULT "system.posix_acl_default"
+    -> posix_acl_permission
+
+  13. _get_posix_acl(dentry, key)
+    获取posix_acl, key估计就两个值:access和default
+    -> nfsd_getxattr(dentry, key, buf)
+    -> posix_acl_from_xattr(buf ...)
+
+  14. nfsd4_get_nfs4_acl(svc_rqst, dentry, nfs4_acl)
+    nfs4_acl并不是使用xattr直接存储，而且转化为posix_acl存储的。
+    -> _get_posix_acl(dentry, POSIX_ACL_XATTR_ACCESS/DEFAULT)获取access/default的posix_acl
+    -> posix_acl_from_mode(umode_t ) 如果没设置POSIX_ACL, 根据文件模式设定acl
+    -> nfs4_acl_posix_to_nfsv4(acl, dacl, flags) 上面分别取两种acl，转换为nfs4_acl
+    -> posix_acl_release
+
+  15. nfsd4_is_junction(dentry)
+    nfs 的junction信息，存储在xattr中。它是一个存在的文件,必须有inode,而且不能被执行访问S_IXUGO/S_ISVTX
+    -> vfs_getxattr(dentry, NFSD_JUNCTION_XATTR_NAME ...) "junction.nfs"
+
+  16. nfsd_access(svc_rqst, svc_fh, access, supported)
+    检查svc_rqst对文件svc_fh的可访问性, 只对nfsv3使用. access是nfsv3定义的访问控制
+    -> nfsd_permission
+
+  17. nfsd_open_break_lease(inode, access)
+    -> break_lease(inode, O_NONBLOCK)
+
+  18. nfsd_open(svc_rqst, svc_fh, umode_t, access, filp)
+    NFSD_MAY_OWNER_OVERRIDE什么意思.当fsuid=inode->i_uid时,不检查open操作.为文件所有者做特殊检查，而不使用底层文件系统的检查。
+    -> fh_verify(svc_rqst, svc_fh, type, access)
+    -> nfsd_open_break_lease(inode, access)
+    -> dentry_open(dentry, vfsmnt, flags ...)
+
+  19. nfsd_close(file)
+    -> fput(file)
+
+  20. nfsd_get_raparms(dev_t, inode_t)
+    根据dev_t,inode_t在raparm_hash表中找一个raparms。如果找不到，就找一个没有使用的raparms->p_count=0，调整它在hash链中的顺序。如果也没有，返回空。
+
+  21. nfsd_spliced_actor(pipe_inode_info, pipe_buffer, splice_desc)
+    不了解splice的机制，nfs server的读写使用splice?
+
+  22. nfsd_direct_splice_actor(pipe_inode_info, splice_desc)
+    -> __splice_from_pipe(pipe_inode_info, splice_desc, nfsd_splice_actor)
+
+  23. nfsd_vfs_read(svc_rqst, svc_fh, file, loff_t offset, kvec, len, count)
+    -> splice_direct_to_actor(svcfile, splice_desc, nfsd_direct_splice_actor)
+    -> 如果不支持splice使用vfs_readv(file, kvec, len, offset)
+    
+  24. kill_suid(dentry)
+    iattr使用ATTR_KILL_SUID/ATTR_KILL_SGID/ATTR_KILL_PRIV
+    -> notify_change(dentry, iattr)
+
+  25. wait_for_concurrent_writes(file)
+    这是nfs2使用的延迟刷新数序的方式。在写之后，发现还有其他任务写这个文件，等待10s，再刷新. inode->i_writecount
+    -> vfs_fsync(file, 0)
+
+  26. nfsd_vfs_write(svc_rqst, svc_fh, file, offset, kvec, len, count, stable)
+    好像专用于nfsv2. 检查是否支持write gather，还有导出同步，写同步等。
+    * 检查是否是nfsv2的write gather, 如果使用了，要使用刷新延时,不使用同步。
+    * 如果文件不支持f_op->fsync，要同步写
+    * 导出项使用同步选项，需要同步，没有，则不需要
+    使用O_SYNC进行文件写操作
+    -> vfs_writev(file, kvec, len ...)
+    -> kill_suid 当文件被写覆盖后，去掉suid
+    如果是同步写以及使用write gather， 调用等待刷新操作
+    -> wait_for_concurrent_writes(file)
+    stable返回是否是同步写操作
+
+  27. nfsd_read(svc_rqst, svc_fh, offset, kvec, len, count)
+    好像这个操作是带打开/读取/关闭一套的操作
+    -> nfsd_open(svc_rqst, svc_fh ..., file)
+    -> nfsd_get_raparms(file->f_path.dentry->d_inode->i_sb->s_dev, inode_t)
+    -> nfsd_vfs_read(svc_rqst, svc_fh ...)
+    -> 更新raparm
+    -> nfsd_close(file)
+
+  28. nfsd_read_file(svc_rqst, svc_fh, file, offset, kvec, len)
+    和上面的区别是提供了file, 不用打开关闭文件.
+    -> nfsd_permission(svc_rqst, svc_export, dentry)
+    -> nfsd_vfs_read
+    -> nfsd_read 如果file为NULL
+
+  29. nfsd_write(svc_rqst, svc_fh, file, offset, vec ...)
+    和上面的文件类似
+    -> nfsd_permission
+    -> nfsd_vfs_write 
+    上面是提供了file，如果没提供，则要打开/关闭
+    -> nfsd_open
+    -> nfsd_vfs_write
+    -> nfs_close
+
+  30. nfsd_commit(svc_rqst, svc_fh, offset, count)
+    这是nfsv3使用的操作. 上面的操作应该是nfsv2/3都使用的，不确定nfsv4是否也使用.
+    把数据提交到磁盘中， 但没有锁文件的操作。
+    -> nfsd_open(svc_rqst, ... , NFSD_MAY_NOT_BREAK_LEAE ...)
+    -> 当svc_fh->svc_export是同步导出时，才使用
+        vfs_fsync_range(file, offset ...)
+    -> nfsd_close
+
+  31. nfsd_create_setattr(svc_rqst, svc_fh, iattr)
+    -> nfsd_setattr
+
+  32. nfsd_check_ignore_resizing(iattr)
+    设置文件的大小为0需要有一定的权限，当然对不同的文件系统，要求不一样。这里当文件大小为0时，在检查修改权限是不检查能否设置文件大小，把iattr->ia_valid中的ATTR_SIZE去掉. 因为这个函数在创建文件(nfsd_create)中调用，所以文件大小为0.
+
+  33. nfsd_create(svc_rqst, svc_fh, name, namelen, iattr, type, dev_t, svc_fh)
+    两个svc_fh， 一个为目录？创建文件，设置文件属性，返回svc_fh
+    -> fh_verify(svc_fh父, S_IFDIR, NFSD_MAY_CREATE)
+    -> 检查svc_fh 子->fh_dentry是否有效，如果有效
+        -> lookup_one_len(name, dentry ...)
+        -> fh_compose(svc_rqst, svc_fh, dentry ...)
+    -> 如果无效，创建文件，设置属性
+        -> fh_want_write  它检查vfsmnt是否可写
+        -> vfs_create
+        -> vfs_mkdir
+        -> vfs_mknod
+        -> nfsd_create_setattr
+        -> fh_drop_write
+        -> fh_update
+
+  34. nfsd_create_is_exclusive(createmode)
+    这个是nfsv4的东西，那这个文件看来是不限于nfsv2/3了
+    createmode == NFS3_CREATE_EXCLUSIVE/NFS4_CREATE_EXCLUSIVE4_1,为啥是4.1呢？    
+  35. do_nfsd_create(svc_rqst, svc_fh, name, len, iattr, svc_fh, createmode, verifier, trunc, create)
+    上面是nfsv2的，这个是nfsv3/4的创建文件的函数
+    -> fh_verify(svc_rqst... S_IFDIR, NFSD_MAY_EXEC)
+    -> fh_lock_nested
+    -> lookup_one_len(name, dentry ...) 查找dentry,有也没事，还要检查inode
+    -> fh_verify(svc_rqst, svc_fh, S_IFDIR, NFSD_MAY_CREATE) 再次检查,如果没有inode
+    -> fh_compose没有inode也组装，因为用不到inode的资料,现在明白了为何有__fh_update.
+    -> nfsd_create_is_exclusive,verifier中有mtime和atime
+    -> fh_want_write
+    -> 如果文件已存在dentry->d_inode有效
+        NFS3_CREATE_UNCHECKED:
+            如果存在的文件不是REG，则返回nfserr_exist
+            如果trunc不是NULL,把文件大小返回
+            否则把文件大小改为0
+        NFS3_CREATE_EXCLUSIVE:
+            如果文件的mtime和atime和verifier一样，大小为0，则通过,否则错误
+        NFS4_CREATE_EXCLUSIVE4_1:
+            如果mtime和atime，size检查通过，设置setattr，否则错误
+        NFS3_CREATE_GUARDED:
+            报错
+    -> vfs_create
+    -> nfsd_check_ignore_resizing
+    -> nfsd_create_setattr
+    -> fh_update
+    -> fh_unlock
+
+  36. nfsd_readlink(svc_rqst, svc_fh, buf, len)
+    -> fh_verify
+    -> inode->i_op->readlink
+
+  37. nfsd_symlink(svc_rqst, svc_fh, name, len ,path, len, svc_fh, iattr)
+    -> fh_verify
+    -> lookup_one_line
+    -> vfs_symlink
+    -> fh_unlock
+    -> fh_compose
+
+  38. nfsd_link(svc_rqst, svc_fh, name, len, svc_fh)
+    -> fh_verify 两个svc_fh都要检查，第二个应该没有意义
+    -> lookup_one_len创建dentry，第二个svc_fh->fh_dentry有存在的inode
+    -> nfsd_break_lease(dentry_old->d_inode) 建立link时，还要检查lease！！！
+    -> vfs_link(old, dir, new)
+    -> commit_metadata对两个svc_fh使用
+
+  39. nfsd_rename(svc_rqst, svc_fh, name, len, svc_fh, name, len)
+    为何link和symlink都要先打开两个svc_fh呢？和dentry对应吗？原来这两个都是父文件夹. 这两个没有返回svc_fh，上面的都要返回有效的.
+    -> fh_verify
+    -> lock_rename
+    -> lookup_one_name 找到两个name对应的dentry. 老的dentry有inode
+    -> nfsd_break_lease两个文件都可能会破坏lease
+    -> vfs_rename
+    -> commit_metadata
+
+  40. nfsd_unlink(svc_rqst, svc_fh, type, name, len)
+    -> fh_verify
+    -> lookup_one_len
+    -> nfsd_break_lease
+    -> vfs_unlink/vfs_rmdir/commit_metadata
+
+  41. readdir操作buffered_dirent/readdir_data, 现在没看
+
+  42. nfsd_buffered_filldir(buf, name, len ...)
+
+  43. nfsd_buffered_readdir
+
+  44. nfsd_readdir(svc_rqst, svc_fh, off, readdir_cd, firdir_t)
+
+  45. nfsd_statfs(svc_rqst, svc_fh, kstatfs, access)
+    -> fh_verify(... access)
+    -> vfs_statfs(path, kstatfs)
+
+  46. exp_rdonly(svc_rqst, svc_export)
+    检查flags是否有NFSEXP_READONLY
+    -> nfsexp_flags(svc_rqst, svc_export)
+
+  47. nfsd_permission(svc_rqst, svc_export, dentry, acc)
+
+  48. nfsd_racache_shutdown/init
+
+  49. nfsd_get_posix_acl(svc_fh, type)
+    -> nfad_getxattr(dentry, name, value) svc_export
+    -> posix_acl_from_xattr
+
+  50. nfsd_set_posix_acl
+
+10. lockd (fs/nfsd/lockd.c)
+  这个文件主要是调用lockd的功能，所以也就是提供一些接口
+a. 数据结构
+  nfs_fh和knfsd_fh对应(size, buf)
+
+b. 全局变量
+  nlmsvc_binding nfsd_nlm_ops定义了一个包含回调函数的变量，nfsd_nlm_ops(nlm_fopen/nlm_fclose),初始化时给lockd的全局变量nlmsvc_ops.不知道后者是干什么的。
+
+c. 操作
+  1. nlm_fopen(svc_rqst, nfs_fh, file)
+    根据nfs_fh创造一个svc_fh, 调用nfsd_open.
+    -> nfsd_open(svc_rqst, svc_fh, S_IFREG, NFSD_MAY_LOCK, file)   
+
+  2. nlm_fclose(file)
+    咋不是用nfsd_close呢？！
+    -> fput(file)
+
+  3. nfsd_lockd_init/nfsd_lockd_shutdown
+    操作nlmsvc_ops
+
+6. nfsv2 (fs/nfsd/proc.c;fs/nfsd/nfsxdr.c;fs/nfsd/xdr.h)
+  这里介绍nfsv2的情况，包括xdr和proc. 因为有nfs{3,4}xdr.c，所以这里应该只有nfsv2的。
+a. 数据结构
+
+svc_fh/nfsd_fhandle     decode_fh/encode_fh/nfssvc_decode_fhandle
+filename(string)        decode_filename/decode_pathname 
+iattr/kstat             decode_sattr/encode_fattr   nfs2svc_encode_fattr
+nfsd_sattrargs          nfssvc_decode_sattrargs
+  * svc_fh
+  * iattr
+nfsd_diropargs          nfssvc_decode_diropargs 
+  * svc_fh
+  * char *name
+  * len
+nfsd_readargs           nfssvc_decode_readargs(把svc_rqst->rq_respages放到
+  * svc_fh                         svc_rqst->rq_vec中,准备返回数据)
+  * offset/count
+  * vlen
+nfsd_writeargs          nfssvc_decode_writeargs(把svc_rqst->rq_pages放到
+  * svc_fh                         svc_rqst->rq_vec中)
+  * offset/len
+  * vlen
+nfsd_createargs         nfssvc_decode_createargs
+  * svc_fh
+  * name/len
+  * iattr
+nfsd_renameargs         nfssvc_deocde_renameargs
+  * svc_fh ffh
+  * fname/flen
+  * svc_fh tfh
+  * tname/tlen
+nfsd_readlinkargs       nfssvc_decode_readlinkargs
+  * svc_fh
+  * buffer
+nfsd_linkargs           nfssvc_decode_linkargs
+  * svc_fh ffh
+  * svc_fh tfh
+  * tname/tlen
+nfsd_symlinkargs        nfssvc_decode_symlinkargs
+  * svc_fh ffh
+  * fname/flen
+  * tname/tlen
+  * iattr
+nfsd_readdirargs        nfssvc_decode_readdirargs (从svc_rqst->rq_respages
+  * svc_fh                      取出一页，给buffer使用)
+  * cookie
+  * count
+  * buffer
+nfsd_attrstat           nfssvc_encode_attrstat
+  * svc_fh
+  * kstat
+nfsd_diropres           nfssvc_encode_diropres
+  * svc_fh
+  * kstat
+nfsd_realinkres         nfssvc_encode_readlinkres
+  * len
+nfsd_readres            nfssvc_encode_readres(竟然没有buffer的事)
+  * svc_fh
+  * count
+  * kstat
+nfsd_readdirres         nfssvc_encode_readdirres/nfssvc_encode_entry
+  * count
+  * readdir_cd
+  * buffer/buflen
+  * offset
+nfsd_statfsres          nfssvc_encode_statfsres
+  * kstatfs
+
+b. 全局变量
+    svc_procedure nfsd_procedures2[18], 对应下面的所有操作，还是比较简单的。
+
+c. 操作
+  主要介绍proc.c. 这里数据结构与vfs中定义的对应，因此几乎全调用vfs_*函数
+  1. nfsd_return_attrs(err, nfsd_attrstat)
+    -> vfs_getattr(nfsd_attrstat->fh.fh_export->ex_path.mnt, nfsd_attrstat->fh.fh_dentry, nfsd_attrstat->stat)
+
+  2. nfsd_return_dirop(err, nfsd_diropres)
+    -> vfs_getattr(和上面一样)
+
+  3. nfsd_proc_getattr(svc_rqst, nfsd_fhandle, nfsd_attrstat)
+    获取文件的属性, 文件除了属性和数据还有啥？！
+    -> fh_verify(svc_rqst, knfsd_fh, NFSD_MAY_NOP|NFSD_MAY_BYPASS_GSS_ON_ROOT)
+    -> nfsd_return_attrs(err, nfsd_attrstat)
+ 
+ 4. nfsd_proc_setattr(svc_rqst, nfsd_sattrargs, nfsd_attrstat)
+    设置文件属性,使用iattr设置属性，返回使用kstat
+    -> fh_copy(knfsd_fh ...)
+    -> nfsd_setattr(svc_rqst, knfsd_fh, iattr ...)
+    -> nfsd_return_attrs(...)
+
+  5. nfsd_proc_lookup(svc_rqst, nfsd_diropargs, nfsd_diropres)
+    返回这个要查找的fh，放到nfsd_diropres中,还带kstat.
+    -> fh_init/fh_put
+    -> nfsd_lookup(svc_rqst, knfsd_fh, name, len, result knfsd_fh)
+    -> nfsd_return_dirop(err, result nfsd_diropres)
+
+  6. nfsd_proc_readlink(svc_rqst, nfsd_readlinkargs, nfsd_readlinkres)
+    竟然是args中提供buf，而res中只有结果的长度。
+    -> nfsd_readlink(svc_rqst, nfsd_readlinkargs->fh, buf, &len)
+
+  7. nfsd_proc_read(svc_rqst, nfsd_readargs, nfsd_readres)
+    nfsd_readargs和nfsd_readres好像都没有buf啊.在rfc中，有个nfsdata，它在nfsd_readres->kstat的后面. NFSV2的数据操作(读/写)最大不超过8K。在nfsd_readres中只有长度,而且使用svc_rqst中的rq_vec存数据。
+    -> svc_reserve_auth
+    -> nfsd_read(svc_rqst, svc_fh, offset, svc_rqst->rq_vec, len, res)
+    -> vfs_getattr(nfsd_readres->fh.fh_export->ex_path.mnt, dentry, kstat)
+    -> nfsd_read
+
+  8. nfsd_proc_write(svc_rqst, nfsd_writeargs, nfsd_attrstat)
+    和上面分析的差不多, 结果返回写的长度,还要返回stat
+    -> nfsd_write(svc_rqst, knfsd_fh ...)
+    -> nfsd_return_attrs(nfsd_attrstat)
+
+  9. nfsd_proc_create(svc_rqst, nfsd_createargs, nfsd_diropres)
+    CREATE processing is complicated.The keyword here is `overloaded'. 不得了！！父目录被锁住。锁目录/文件通过inode->i_mutex. 返回父目录的kstat。
+    -> fh_verify(svc_rqst, knfsd_fh, S_IFDIR, NFSD_MAY_EXEC)
+    -> lookup_one_len(name, dentry, len)
+    -> fh_init/fh_compose
+    -> nfsd_create
+    -> nfsd_setattr
+    -> nfsd_return_dirop
+
+  10. nfsd_proc_remove(svc_rqst, nfsd_diropargs, void *resp)
+    -> nfsd_unlink
+
+  11. nfsd_proc_rename(svc_rqst, nfsd_renameargs, void *)
+    -> nfsd_rename(svc_rqst, knfsd_fh, ...)
+
+  12. nfsd_proc_link(svc_rqst, nfsd_linkargs, void *)
+    在一个目录下面创建一个link文件，与另一个文件共享磁盘。nfsd_linkargs使用两个fh.但是没有返回新创建的文件的fh。
+    -> nfsd_link_svc_rqst, knfsd_fh, name, len, knfsd_fh)
+    -> fh_put
+
+  13. nfsd_proc_symlink(svc_rqst, nfsd_symlinkargs, void)
+    nfsd_symlink会返回新创建的文件的fh，但这里没有使用.
+    -> nfsd_symlink(svc_rqst, knfsd_fh, fname, len, tname, len, knfsd_fh new, iattr)
+    
+  14. nfsd_proc_mkdir(svc_rqst, nfsd_createargs, nfsd_diropres)
+    返回刚创建的文件夹的svc_fh和kstat
+    -> nfsd_create(svc_rqst ...)
+    -> nfsd_return_dirop(err, nfsd_diropres)
+
+  15. nfsd_proc_rmdir(svc_rqst, nfsd_diropargs, void)
+    -> nfsd_unlink(...)
+
+  16. nfsd_proc_readdir(svc_rqst, nfsd_readdirargs, nfsd_readdirres)
+    -> nfsd_readdir(.. 需要针对每个entry的xdr_encoder函数  nfssvc_encode_entry
+
+  17. nfsd_proc_statfs(svc_rqst, nfsd_fhandle, nfsd_statfsres)
+    使用hfsd_fhandler对应文件，调用vfs_statfs，这样能出什么东西呢？ 又不是挂载点。不过导出点也不是挂载点。
+    -> nfsd_statfs(...  kstatfs
+
+7. nfsv3
+  它与nfsv2比起来，多了nlm(后面介绍)，还有wcc和commit(异步操作)
+
+a. 数据结构
+  timespec          encode_time3/decode_time3
+  svc_fh            nfs3svc_decode_fh(decode_fh/nfs3svc_decode_fhandle)/encode_fh/encode_fsid
+  filename          decode_filename
+  iattr             decode_sattr3(nfs3svc_decode_sattrargs)
+  kstat             encode_fattr3/encode_saved_post_attr/encode_post_op_attr(nfs3svc_encode_post_op_attr/encode_wcc_data
+  nfsd3_diropargs   nfs3svc_decode_diropargs (看到下面的结构域，就知道调上面那些函数)
+    * svc_fh
+    * name/len
+  nfsd3_accessargs  nfs3svc_decode_accessargs
+    * svc_fh
+    * access
+  nfsd3_readargs    nfs3svc_decode_readargs (除了解析数据，还要准备read使用的bug,从
+    * svc_fh                        svc_rqst->respages中取出page，放到rq_vec的kvec中.
+    * offset/count
+      /vlen
+  nfsd3_writeargs   nfs3svc_decode_writeargs (除了解析数据，还要把rq_arg放到svc_rqst->rq_vec
+    * svc_fh                                   中，还有把svc_rqst->rq_pages放到rq_vec中.
+    * offset/count
+    * stable/len
+    * vlen(rpc使用)
+  nfsd3_createargs  nfs3svc_decode_createargs（创建有3中UNCHECKED/GUARDED/EXCLUSIVE)
+    * svc_fh
+    * name/len
+    * createmode
+    * iattr
+    * verf
+  nfsd3_symlinkargs nfs3svc_decode_symlinkargs(tname可能会很大，放到单独的一页中
+    * svc_fh                            从svc_rqst->rq_respages中取出一页，把数据从rq_arg中
+    * fname/len                         取出来，拷贝到页中。把此页放到tname上。数据来源在
+    * tname/len                         rq_arg.head[0]，还可能在rq_arg.pages中.
+    * iattr
+  nfsd3_mknodargs   nfs3svc_decode_mknodargs (数据在rpc包中的顺序要看rfc)
+    * svc_fh
+    * name/len
+    * type/maj/min
+    * iattr
+  nfsd3_renameargs  nfs3svc_decode_renameargs
+    * from svc_fh
+    * name/len
+    * to svc_fh
+    * name/len
+  nfsd3_readlinkargs nfs3svc_decode_readlinkargs(和read一样，从svc_rqst->rq_respages中取内存)
+    * svc_fh
+    * buffer
+  nfsd3_linkargs    nfs3svc_decode_linkargs
+    * svc_fh
+    * svc_fh
+    * name/len
+  nfsd3_readdirages nfs3svc_decode_readdirargs(和上面一样
+    * svc_fh        nfs3svc_decode_readdirplusargs(读取的dir不止一个page
+    * cookie
+    * dircount/count
+    * verf
+    * buffer
+  nfsd3_commitargs  nfs3svc_decode_commitargs
+    * svc_fh
+    * offset/count
+  nfsd3_attrstat    nfs3svc_encode_attrstat/encode_wcc_data
+    * status
+    * svc_fh
+    * kstat
+  nfsd3_diropres    nfs3svc_encode_diropres(lookup)/nfs3svc_encode_createres(create/mknod
+    * status                                                       /symlink/mkdir)
+    * svc_fh parent
+    * svc_fh
+  nfsd3_accessres   nfs3svc_encode_accessres -> encode_post_op_attr
+    * status
+    * svc_fh
+    * access
+  nfsd3_readlinkres nfs3svc_encode_readlinkres(估计data又在rfc中定义在最后了
+    * status            需要看一下encode_post_op_attr，它只需要svc_fh就把stat放到rpc包中
+    * svc_fh
+    * len
+  nfsd3_readres     nfs3svc_encode_readres(这里使用svc_rqst->rq_res.tail.如果count不是4的倍数
+    * status            从svc_rqst->rq_res.tail中补足数据，使它对其。但其实它和rq_res.head使用
+    * svc_fh            相同的内存。如果对其，就不处理了。看了数据在rq_res.pages中了。
+    * count/eof
+  nfsd3_writeres    nfs3svc_encode_writeres,啥都没有
+    * status
+    * svc_fh
+    * count/committed
+  nfsd3_renameres   nfs3svc_encode_renameres
+    * status
+    * svc_fh两个
+  nfsd3_linkres     nfs3svc_encode_linkres
+    * status
+    * svc_fh
+  nfsd3_readdirres  nfs3svc_encode_readdirres(够复杂的）
+    * status        encode_entry_baggage(inode,name/len)
+    * svc_fh        compose_entry_fh(read..,svc_fh, name/len)根据readdirres->fh和name参数，
+    * count          查找子文件/目录,组装到svc_fh中
+    * verf          encode_entryplus_baggage(name/len)  -> compose_enctry_fh. 他和readdir
+    * readdir_cd        的区别是它的rpc包里多了fh
+    * buf/len       encode_entry(readdir_cd, name/len, offset, ino, type, plus)
+    * offset          -> encode_entry(plus)_baggage, 把name/len这些信息放到nfsd3_readdirres中
+    * svc_rqst???   nfs3svc_encode_entry(_plus)  -> encode_entry
+  nfsd3_fsstatres   nfs3svc_encode_fsstatres
+    * status
+    * kstatfs   
+  nfsd3_fsinfores   nfs3svc_encode_fsinfores    
+    * status 
+    * f_rtmax/f_rtpref/f_rtmult/f_wrmax ...
+  nfsd3_pathconfres nfs3svc_encode_pathconfres
+    * status
+    * p_link_max/p_name_max ...
+  nfsd3_commitres   nfs3svc_encode_commitres   rpc的数据包中还有两个时间，nfssvc_boot
+    * svc_fh
+
+b. 全局变量
+  nfsd_version3函数上面的xdr函数和下面的procedure.
+
+c. 操作
+  需要先看看有关svc_fh以及属性的encode/decode的操作
+  1. decode_fh(p, svc_fh)  <- nfs3svc_decode_fh  据说acl用这个东西！
+    把p拷贝到svc_fh->knfsd_fh
+
+  2. encode_fh(p, svc_fh)
+    和上面的过程相反
+
+  3. encode_fattr3(svc_rqst, q, svc_fh, kstat)
+    都有kstat了，为何还有svc_fh?? 这里组装的信息比较全:format/mode/nlink/uid/gid/size/blocks/major/minor/fsid/inode/atime/mtime/ctime
+
+  4. encode_saved_post_attr(svc_rqst, p, svc_fh)
+    这个函数可是经常用的,而且不带kstat,kstat是svc_fh->fh_post_attr
+
+  5. encode_post_op_attr(svc_rqst, p, svc_fh)
+    这个函数和上面的区别是，他的kstat从从vfs_getattr中取出来的
+    -> encode_fattr3(...)
+
+  6. encode_wcc_data(svc_rqst, p, svc_fh)
+    weak caceh consistency data. 如果svc_fh中有保存的stat信息，则返回这些，否则返回新鲜的.为啥返回保存的呢？保存的有操作之前和操作之后的。操作之前的可以理解，操作之后的啥用，还不如用新鲜的.
+    -> if svc_fh->fh_post_saved  
+         if svc_fh->fh_pre_saved : 保存fh_pre_size/fh_pre_mtime/fh_pre_ctime
+         else 保存xdr_zero，因为没有pre 信息
+         -> encode_saved_post_attr
+       else 保存xdr_zero
+         -> encode_post_op_attr 
+  7. fill_post_wcc(svc_fh)
+    取出kstat，放到svc_fh->fh_post_attr中
+    -> vfs_getattr
+    添加了wcc还有pre/post的attr
+
+下面是fs/nfsd/nfs3proc.c的操作，应该不是很多22个操作
+  1. nfsd3_proc_getattr(svc_rqst, nfsd_fhandle, nfsd3_attrstat)
+    把nfsd_fhandle拷贝到nfsd3_attrstat, 再获取stat
+    -> fh_copy/fh_verify(... NFSD_MAY_BYPASS_GSS_ON_ROOT) NFSD_MAY_BYPASS_GSS_ON_ROOT当访问
+                                           导出项对应的目录时，不用判断是否满足GSS安全要求
+    -> vfs_getattr(vfsmnt, dentry, stat)
+
+  2. nfsd3_proc_setattr(svc_rqst, nfsd3_sattrargs, nfsd3_attrstat)
+    把nfsd3_sattrargs的fhandle拷贝到nfsd3_attrstat
+    -> nfsd_setattr(svc_rqst, svc_fh, iattr, check_guard, guardtime) 怎么没有取stat数据的操作，哪里初始化nfsd3_attrstat呢？看看rfc，这里应该是返回wcc数据，所以xdr_encode有特别操作:encode_wcc_data
+
+  3. nfsd3_proc_lookup(svc_rqst, nfsd3_diropargs, nfsd3_diropres)
+    和nfs2差不多
+    -> nfsd_lookup(svc_rqst, svc_fh, name/len, svc_fh/res)
+
+  4. nfsd3_proc_access(svc_rqst, nfsd3_accessargs, nfsd3_accessres)
+    -> nfsd_access(svc_rqst, svc_fh, access ...)
+
+  5. nfsd3_proc_readlink(svc_rqst, nfsd3_readlinkargs, nfsd3_readlinkres)
+    buf的数据在args数据结构中,根据rpc风格，它会主动提供本地内存.然后把数据放在返回的rpc包最后面. nfsd3_readlinkres中只有length.
+    -> nfsd_readlink(svc_rqst, svc_fh, buf, len)
+
+  6. nfsd3_proc_read(svc_rqst, nfsd3_readargs, nfsd3_readres)
+    这里有个预留结果空间，其他命令怎么没有呢？而且预约的也不是确切的。把数据读到svc_rqst->rq_vec这个kvec中
+    -> svc_reserve_auth
+    -> nfsd_read
+
+  7. nfsd3_proc_write(svc_rqst, nfsd3_writeargs, nfsd3_writeres)
+    根据nfsd3_writeargs的参数，设置nfsd3_writeres中的参数，并没有rfc上的那么复杂。
+    -> nfsd_write(svc_rqst, svc_fh, NULL, offset, svc_rqst->rq_vec, len, cnt, commit)
+
+  8. nfsd3_proc_create(svc_rqst, nfsd3_createargs, nfsd3_diropres)
+    把iattr->ia_mode上添加S_IFREG标志，只能创建文件
+    -> do_nfsd_create(..., verf ...)
+
+  9. nfsd3_proc_mkdir(svc_rqst, nfsd3_createargs, nfsd3_diropres)
+    创建文件夹不能设置文件大小 iattr.ia_valid &= ~ ATTR_SIZE
+    -> nfsd_create(...)
+
+  10. nfsd3_proc_symlink(svc_rqst, nfsd3_symlinkargs, nfsd3_diropres)
+    -> nfsd_symlink(svc_rqst, dirfh, fname/flen, tname/len, resfh, stat)
+
+  11. nfsd3_proc_mknod(svc_rqst, nfsd3_mknodargs, nfsd3_diropres)
+    创建socket/fifo/device
+    -> nfsd_create(svc_rqst, svc_fh, name/len, iattr ...)
+
+  12. nfsd3_proc_remove(svc_rqst, nfsd3_diropargs, nfsd3_attrstat)
+    -> nfsd3_unlink(...)
+
+  13. nfsd3_proc_rmdir(svc_rqst, nfsd3_diropdirs, nfsd3_attrstat)
+    和上面相同。它们返回的都是wccstat
+
+  14. nfsd3_proc_rename(svc_rqst, nfsd3_renameargs, nfsd3_renameres)
+    结果只有两个svc_fh.一个从args中拷贝，另一个从下面函数中返回
+    -> nfsd_rename(svc_rqst, svc_fh, name/len, svc_fh, name/len)
+
+  15. nfsd3_proc_link(svc_rqst, nfsd3_linkargs, nfsd3_linkres)
+    返回刚创建的fhandle
+    -> nfsd_link (...)
+
+  16. nfsd3_proc_readdir(svc_rqst, nfsd3_readdirargs, nfsd3_readdirres)
+    注册回调函数. args和res中都有buf指针，而且指向同一地址，估计是svc_rqst->rq_respages中的内存。而xdr_encode的函数是nfs3svc_encode_readdirres.估计它要多处理一遍
+    -> nfsd_readdir(... nfs3svc_encode_entry)
+
+  17. nfs3_proc_readdirplus(svc_rqst, nfsd3_readdirargs, nfsd3_readdirres)
+    和上面类似，不过它使用的内存不止一页
+    -> nfsd_readdir(svc_rqst, svc_fh, ...)
+
+  18. nfsd3_proc_fsstat(svc_rqst, nfsd_fhandle, nfsd3_fsstatres)
+    -> nfsd_statfs(...)
+
+  19. nfsd3_proc_fsinfo(svc_rqst, nfsd_fhandle, nfsd3_fsinfores)
+    这个获取的参数部分是nfsd设定的，部分是从底层文件系统获取的.而且上面两个的参数都是fh
+
+  20. nfsd3_proc_pathconf(svc_rqst, nfsd_fhandle, nfsd3_pathconfres)
+    这个也是获取路径的一些信息
+
+  21. nfsd3_proc_commit(svc_rqst, nfsd3_commitargs, nfsd3_commitres)
+    nfsd_commit(...)
+
+8. nfsv4
+  它比nfs2/3增加了许多，它变成一个stateful protocol
+a. 数据结构
+  下面是state相关数据结构(fs/nfsd/state.h)
+  1. clientid_t 这应该是server分配的clientid(64位)。
+    u32 cl_boot, cl_id;
+
+  2. stateid_opaque_t 
+    clientid_t; u32 so_id;
+
+  3. stateid_t  stateid包含clientid
+    u32 si_generation; stateid_opaque_t
+
+  4. nfs_stid 这应该是最外层包装的stateid
+    sc_type(open/lock/delegation/close)/stateid_t/nfs_client
+
+  5. nfsd4_callback 都是一些啥东西！！
+    * cp_op
+    * nfs4_client
+    * list_head cb_per_client
+    * cb_minorversion
+    * rpc_message cb_msg
+    * rpc_call_ops cb_ops
+    * work_struct cb_work
+    * cb_done
+
+  6. nfs4_delegation
+    * nfs4_stid
+    * list_head: dl_perfile/dl_perclnt/dl_recall_lru
+    * dl_count / dl_type / dl_time / dl_retries
+    * nfs4_file
+    * knfsd_fh
+    * nfsd4_callback
+
+  7. nfs4_cb_conn
+    * sockaddr_storage cb_addr / cb_saddr 怎么两个地址 
+    * cb_addrlen
+    * cb_prog / cb_ident
+    * svc_xprt 
+  
+  8. nfsd4_slot 都是一些啥东西！！！
+    * sl_inuse / sl_cachethis / sl_opcnt/ sl_seqid / sl_status / sl_datalen / sl_data
+
+  9. nfsd4_channel_attrs (4.1的东西，包含session/channel)
+  10. nfsd4_create_session 
+
+  11. nfsd4_bind_conn_to_session
+    * nfs4_sessionid / dir
+
+  12. nfsd4_clid_slot 包装session
+    * sl_seqid / sl_status 
+    * nfsd4_create_session 
+
+  13. nfsd4_conn
+    * list_head cn_persession 每个session分多个channel??
+    * svc_xprt / svc_xpt_user
+    * nfsd4_session
+    * cn_flags CDFC4_FORE / CDFC4_BACK
+
+  14. nfsd4_sessionid
+    clientid_t
+    sequence / reserved
+
+  15. nfsd4_session
+    * kref ??
+    * list_head se_hash / se_perclnt
+    * se_flags
+    * nfs4_client
+    * nfs4_sessionid
+    * nfsd4_channel_attrs  se_fchannel / se_bchannel
+    * list_head se_conns
+    * se_cb_prog / se_cb_nr 
+    * nfsd4_slot []
+
+  16. nfs4_client
+
+  17. nfs4_replay
+    * rq_status / rq_buflen / rq_buf
+    * knfsd_fh / rp_ibuf
+
+  18. nfs4_stateowner
+    * list_head so_strhash / so_stateids / so_client
+    * so_seqid  / so_is_open_owner
+    * xdr_netobj  什么东西！就是一个字符串
+    * nfs4_replay
+
+  19. nfs4_openowner
+    * nfs4_stateowner
+    * list_head oo_perclient / oo_close_lru
+    * nfs4_ol_stateid
+    * oo_time / oo_flags
+    
+  20. nfs4_lockowner
+    * nfs4_stateowner
+    * list_head lo_owner_ino_hash / lo_erstateid / lo_list
+
+  21. nfs4_file
+    * 
+
+  22. nfs4_ol_stateid
+    * nfs4_stid
+    * list_head : perfile / perstateowner / lockowners /
+    * nfs4_stateowner / nfs4_file
+    * access_bmap / deny_bmap
+    * nfs4_ol_stateid openstp
+b. 全局变量 
+
+c. 操作
+  1. save_buf(nfsd4_compoundargs, nfsd4_saved_compoundargs) / restore_buf
+    交换两个数据结构的p/end/pagelen/pagelist,都是rpc包的指针
+
+  2. read_buf(nfsd4_compoundargs, nbytes)
+    把svc_rqst中的数据放到nfsd4_compoundargs->tmp/tmpp中. 数据本来存放在args->p/end指向的一段内存中，还可能后面的数据存放在pagelist中，pagelist包括若干page，最后一个page的大小不是PAGE_SIZE.
+    READ_BUF宏，把数据从nfsd4_compoundargs->p中(应该是svc_rqst的)取出来，放到指针p。当数据不超过end,直接取指针；否则，要跨页访问，需要找个连续的内存块，暂存数据，调用read_buf,或者把数据放到nfsd4_compoundargs->tmp，或者申请内存给tmpp，暂存数据。然后使用defer_free释放掉;或者使用savemem把数据放到别的地方，再释放掉。不能老是占者地方！
+    READ32(arg) 把p指向的内存数据给arg,p递增。
+    经过使用这个宏，处理数据有多了一遍，先把nfsd4_compoundargs->p(svc_rqst)的数据放到临时内存p（宏返回的指针给p),再把p的数据给有意义的变量。当然p估计之用一次.
+
+  3. zero_clientid(clientid_t)
+    判断clientid_t的cl_boot/cl_id是否全是0
+
+  4. defer_free(nfsd4_compoundargs, void(*release)(), void *)
+    在nfsd4_compoundargs定义中，有tmpbuf,构成一个单链表，存储延时释放的内存.构造一个tmpbuf,放到nfsd4_compoundargs->to_free
+
+  5. savemem(nfsd4_compoundargs, p, nbytes)
+    把nfsd4_compoundargs->tmp/tmpp中的数据拷贝到其他内存，而且把这些内存放到延时释放列表中。如果tmp，则要申请内存，存里面的数据，如果tmpp，则把这个指针取出来，使tmpp=NULL.
+    -> defer_free
+
+  6. nfsd4_decode_bitmap(nfsd4_compoundargs, bmap)
+    解析acl的map数据
+    -> READ_BUF / READ32
+
+  7. nfsd4_decode_fattr(nfsd4_compoundargs, bmap, iattr, nfs4_acl)
+    文件属性大大增加，使用3个u32的位图表示。但结果还是iattr和nfs4_acl
+    -> nfsd4_decode_bitmap
+
+  8. nfsd4_decode_stateid(nfsd4_compoundargs, stateid_t)
+    回忆一下stateid_t: si_generation(u32),  stateid_opaque_t(clientid_t; so_id) 都是32位。
+
+  9. nfsd4_decode_access(nfsd4_compoundargs, nfsd4_access)
+    access请求只有一个request,但nfd4_access数据结构比较复杂
+    * ac_req_access
+    * ac_supported
+    * ac_resq_access
+
+  10. nfsd4_decode_bind_conn_to_session(nfsd4_compoundargs, nfsd4_bind_conn_to_session)
+    nfs4.1中的sessionid, dir是啥？ session还有方向？fore/back/fore_both/back_both,用于BIND_CONN_TO_SESSION操作。还是来是不了解session的使用。sessionid是opaque结构
+
+  11. nfsd4_decode_close(nfsd4_compoundargs, nfsd4_close)
+    直接介绍nfsd4_close的定义
+    * cl_seqid u32
+    * stateid_t
+    -> nfs4_decode_stateid(nfsd4_compoundargs stateid_t)
+
+  12. nfsd4_decode_commit(nfsd4_compoundargs, nfsd4_commit)
+    nfsd4_commit
+    * offset/count
+    * nfs4_verifier  (字符串)
+
+  13. nfsd4_decode_create(nfsd4_compoundargs, nfsd4_create)
+    nfsd4_create把reg/dir/dev/sock/link等都放在一块
+    * name/len
+    * type
+    * name/len (link) / dev_t
+    * bmap / iattr / nfs4_acl
+    * nfsd4_change_info (有关时间)
+    当然解析的时候要根据rpc中的数据填充数据结构。
+    -> check_filename判断文件名是否有效，有错误就放回
+    -> nfsd4_decode_fattr
+
+  14. nfsd4_decode_delegreturn(nfsd4_compoundargs, nfsd4_delegreturn)
+    这个数据结构只有一个stateid
+    -> nfsd4_decode_stateid
+
+  15. nfsd4_decode_getattr(nfsd4_compoundargs, nfsd4_getattr)
+    nfsd4_getattr是干什么的？看来没有数据结构把iattr和nfs4_acl结合在一块，它也没有，只有bmap
+    * u32 ga_bmval[32]
+    * svc_fh 
+    -> nfsd4_decode_bitmap(arg, nfsd4_getattr->ga_bmval)
+
+  16. nfsd4_decode_link(nfsd4_compoundargs, nfsd4_link)
+    都有了create了，怎么还要它呢？ 直解析了名称。
+    * name/len
+    * nfsd4_change_info
+
+  17. nfsd4_decode_lock(nfsd4_compoundargs, nfsd4_lock)
+    介绍nfsd4_lock，比较复杂
+    * type / reclaim 
+    * offset / len / new
+    * open_seqid / open_stateid stateid_t / lock_seqid / clientid stateid /
+        xdr_netobj
+    * stateid_t lockstateid / seqid
+    //response
+    * stateid_t 
+    * nfsd4_lock_denied  这个好像是冲突的锁
+    -> READ_BUF/READ32/READ64
+    -> nfsd4_decode_stateid
+    -> COPYMEM / READMEM
+
+  18. nfsd4_decode_lockt(nfsd4_compoundargs, nfsd4_lockt)
+    又多了lockt和locku，是干什么的？
+    * type
+    * clientid_t    
+    * xdr_netobj    owner 这是字符串
+    * offset / length 
+    * nfsd4_lock_denied
+
+  19. nfsd4_decode_locku(args, nfsd4_locku)
+    * type 
+    * seqid
+    * stateid_t
+    * offset / length
+    -> nfsd4_decode_stateid
+
+  20. nfsd4_decode_lookup(arg, nfsd4_lookup)
+    这个比nfs2/3的简单多了，只有name/len
+
+  21. nfsd4_decode_share_access(arg, x)
+    返回文件访问的共享方式: 读/写 读代理/写代理
+
+  22. nfsd4_decode_share_deny(arg, x)
+    返回x,还检查只是否有效
+
+  23. nfsd4_decode_opaque(arg, xdr_netobj)
+    xdr_netobj是字符串
+    -> SAVEMEM / READ_BUF
+
+  24. nfsd4_decode_open(arg, nfsd4_open)
+    nfsd4_open很复杂，只能这么说
+    * op_claim_type
+    * xdr_netobj
+    * op_delegate_type
+    * stateid_t
+    * op_create / op_createmode
+    * op_bmval  / iattr / nfs4_acl
+    * nfs4_verifier (EXCLUSIVE4)
+    * clientid_t
+    * xdr_netobj op_owner
+    * seq_id 
+    * op_share_access
+    * op_share_deny
+    * op_stateid response
+    * op_recall
+    * nfsd4_change_info
+    * op_rflags
+    * op_truncate
+    * op_created
+    * nfs4_openowner
+    * nfs4_file 
+    * nfs_ol_stateid
+    这里不对初始化它的全部，但是大部分，其他部分可能在操作中初始化，或使用.
+
+  25. nfsd4_decode_open_confirm(nfsd4_compoundargs, nfsd4_open_confirm)
+    nfsd4_open_comfirm，不清楚哪里使用
+    * stateid_t oc_req_stateid  / op_resq_stateid
+    * seqid 
+    这里直解析req_stateid和seqid
+
+  26. nfsd4_decode_open_downgrade(nfsd4_compoundargs, nfsd4_open_downgrade)
+    说一下nfsd4_open_downgrade, 这里解析什么看rfc吧，代码也很简单
+    * stateid_t 
+    * seqid / share_access / share_deny
+    
+  27. nfsd4_decode_putfh(nfsd4_putfh)
+    nfsd4_putfh据说是代替mount的。len / string
+    
+  28. nfsd4_decode_read(nfsd4_compoundargs, nfsd4_read)
+    nfsd4_read的结构
+    * stateid_t
+    * offset / length 
+    * vlen
+    * file 这里为什么是file,而不是nfsd4_file??
+    * svc_rqst / svc_fh
+
+  29. nfsd4_decode_readdir(arg, nfsd4_readdir
+    nfsd4_readdir解释
+    * cookie (u64)
+    * nfsd4_verifier
+    * dircount / maxcount
+    * bmap 这个bmap和fattr的应该不一样
+    * svc_rqst / svc_fh 返回时使用
+    * readdir_cd
+    * buffer / buflen 
+    * offset
+
+  30. nfsd4_decode_remove(arg, nfsd4_remove)
+    nfsd4_remove 和上面的比较像
+    * name / len
+    * nfsd4_change_info
+
+  31. nfsd4_decode_rename(nfsd4_compoundargs, nfsd4_rename)
+    突然不想写了，这些都没用,需要先看state,再看proc中的实现
+  
+  32. nfsd4_decode_compound(nfsd4_compoundargs)
+    看一下nfsd4_compoundargs的解释
+    * p / end / pagelist / pagelen
+    * tmp / tmpp
+    * tmpfu to_free ( defer_free)
+    * svc_rqst
+    * taglen / tag ??
+    * minorversion
+    * opcnt 
+    * nfsd4_op ops / iops[8]
+    * cachetype
+    解析rpc数据包过程根据rfc定义，这里会把所有的op都记录下来，放到iops/ops. 然后从rpc中挨个取出请求，根据相应操作号，解析数据。在nfs4中，使用DRC(depulicated request cache),而在nfs41中，session说不用这个了
+
+  33. nfsd4_op
+    * opnum 这个变量表示那个操作
+    * status 操作状态
+    * union 操作使用的变量。这个与nfs3的区别是，它把args和res大都放在一个变量里面。
+    * nfs4_replay
+    
+  35. nfsd4_compoundres
+    * p / end
+    * xdr_buf / svc_rqst
+    * tag / len
+    * opcnt / nfsd4_compound_state 
+
+  36. nfsd4_compound_state
+    * svc_fh    current_fh / svae_fh
+    * nfs4_stateowner
+    * nfsd4_session 
+    * nfsd4_slot
+    * data 
+    * iovlen
+    * minorversion / status
+
+(fs/nfsd/nfsd4state.c)
+0. stateid_t
+    a. nfs4_stid / stateid_t
+        cl_boot + cl_id    -> clientid_t
+                   + so_id -> stateid_opaque_t
+           + so_generation -> stateid_t
+
+        stateid是server的state标识，对于client也是，但它的内容对client不懂. 它包括:
+        * 验证信息cl_boot so_generation，表示stateid是有效的
+        * cl_id 区分不同的client  还不知道这个是怎么生成
+        * so_id 区分不同的state
+
+        在nfs4.1中，state用来open,lock,delegation,layout. 同时stateid还要和state owner关联起来。
+        * 表示文件的open，关联clientid/open-owner/filehandle
+        * 表示锁，关联lock owner/file/seqid
+        * 表示delegation, 关联clientid和filehandle
+        * 表示layout,关联clientid和filehandle,还有seqid,相关操作是LAYOUTGET/LAYOUTRETURN.
+    
+        nfs4_stid 包装stateid_t, 它表示是什么类型state, 它关联什么nfs4_client。看来cl_id无法索引到client. 
+        * type : OPEN / LOCK / DELEGATION / CLOSE
+        * stateid_t
+        * nfs4_client
+        在nfs4_client->cl_stateids是idr树，使用id索引nfs4_stid指针。如果根据指针直接知道cl_id或so_id.(nfs4_stid->stateid_t(sc_stateid)->stateid_opaque_t(si_opaque)->so_id). 知道nfs4_client和cl_id可以找到一个nfs4_stid. 
+关系:
+        * nfs4_client <> nfs4_stid (指向和包含)
+        操作:
+        * update_stateid(stateid_t)
+            增加stateid_t->si_generation
+        * gen_clid(nfs4_client)
+            它分配nfs4_client->cl_clientid.cl_id，这里是分配clientid,而不是stateid.clientid使用线性分配，一般不会太多。但stateid使用xdr，太多了，而且会不断的创建销毁。
+        * nfs4_alloc_stateid(nfs4_client)
+            从stateid_slab中分配一个nfs4_stid,然后转化为nfs4_ol_stateid
+            -> nfs4_alloc_stid(...)
+            -> openlockstateid(nfs4_stid)
+        * init_stid(nfs4_stid, nfs4_client, type)
+            从nfs4_client中拷贝clientid_t，分配stateid,使用类型type
+        * find_stateid(nfs4_client, stateid_t) 
+        * find_stateid_by_type(nfs4_client, stateid_t, type)
+        * unhash_stid(nfs4_stid) 把clientid从idr树中删除.从nfs4_stid->nfs4_client->stateids，获取idr树根.然后so_id
+        * nfs4_alloc_stid(nfs4_client, kmem_cache)
+            这里应该有两种可能，一种是分配nfs4_ol_stid，另一种是分配nfs4_delegation。 这里和nfs4_client有什么关系，都没有调用gen_stid
+            -> idr_pre_get(nfs4_client->cl_stateids)
+            -> kmem_cache_alloc(slab, GFP_KERNEL)
+        * get_new_stid(nfs4_stid)
+            这是从nfs4_stid->nfs4_client->cl_stateids这个idr数中分配一个id,代表nfs4_stid指针。
+
+    b. nfs4_ol_stateid
+        open/lock对nfs4_stid的包装
+        * nfs4_stid
+        * list_head : perfile  对应nfs4_file->fi_stateids
+        * perstateowner 对应nfs4_stateowner->so_stateids
+        * lockowners 表示一个队列,对应nfs4_lockowner->lo_perstateid
+        * nfs4_stateowner 
+        * nfs4_file
+        * access_bmap / deny_bmap
+        * nfs4_ol_stateid openstp 如果这个nfs4_ol_stateid是lock state，它会关联一个open state, 通过open state索引nfs4_file.
+
+        关系:
+        * nfs4_client <> stateid  这个nfs4_stid的作用
+        * nfs4_file <> stateid  st_perfile 一对多
+        * nfs4_stateowner <> stateid  下面说这个数据结构 ,st_perstateowner，一对多
+        * 自己与自己的关系
+        * 还有lockowners是什么关系？ st_lockowners 多对一,什么用
+
+        操作: 为何没有nfs4_stid的释放动作，难道它都被nfs4_ol_stateid包装了？应该是，因为nfs4_delegation没有使用nfs4_stid,而是clinetid_t
+        * free_generic_stateid 把nfs4_ol_stateid放回到stateid_slab.
+        * unhash_generic_stateid 破解nfs4_ol_stateid的file(队列)和client(idr)的关系
+        * close_generic_stateid(nfs4_ol_stateid) nfs4_ol_stateid->access_bmap位图表示文件的使用情况，需要释放对nfs4_file的索引.
+        * release_lock_stateid(nfs4_ol_stateid)
+            释放stateid对应的文件的nfs4_file的文件的所有posix锁。这个和unhash_open_stateid类似，但还是有不同. 这里是完全释放，包括stid和内存
+            -> unhash_generic_stateid
+            -> unhash_stid
+            -> find_any_file
+            -> locks_remove_posix(file, fl_owner_t(nfs4_lockowner))
+            -> close_generic_stateid
+            -> free_generic_stateid
+
+        * unhash_open_stateid(nfs4_ol_stateid)
+            这里释放state关联的lockowner队列.可能上面的没有。
+            -> unhash_generic_stateid(nfs4_ol_stateid)
+            -> release_stateid_lockowners(nfs4_ol_stateid) 这里看出lockowner的作用，为何在这里有一个与lock关联的队列呢？
+            -> close_generic_stateid
+        * release_open_stateid(nfs4_ol_stateid)
+            这个和上面的函数的功能相当于上上个lockstate释放的功能
+            -> unhash_open_stateid(nfs4_ol_stateid)
+            -> unhash_stid(nfs4_ol_stateid->nfs4_stid)
+            -> free_generic_stateid
+
+        * release_stateid_lockowners(nfs4_ol_stateid)
+            -> release_lockowner对nfs4_ol_stateid->sl_lockowners列表
+
+        * nfsd4_free_lock_stateid(nfs4_ol_stateid)
+            释放lock state
+            -> release_lock_stateid
+  
+    c. nfs4_stateowner
+        它表示状态的所有者，这里应该不仅是clientid,要不和nfs4_client有什么区别？或者它只是一个超集。
+        * list_head so_strhash 这个对应ownerstr_hash表
+        * so_stateids  这个明显对应nfs4_ol_stateid->st_perstateowner
+        * nfs4_client
+        * so_seqid ?? 在许多操作中使用它，有什么意义呢？
+        * xd4_netobj so_owner
+        * nfs4_replay so_replay  对于缓冲的请求使用
+        * bool so_is_open_owner 这里只有open和lock?
+        关系：这里并没有太多的内容，主要是怎么管理stateowner的两个hash表.nfs4_client和xdr_netobj是不重复吗？lock与state是一对多的关系，使用so_stateids链表管理所有的nfs4_ol_stateid 
+
+        nfs4_openowner，应该是继承nfs4_stateowner
+            * nfs4_stateowner
+            * list_head oo_perclient  针对nfs4_client->cl_openowners
+            * oo_close_lru
+            * nfs4_ol_stateid oo_last_closed_stid
+            * oo_time  oo_flags
+            这里只是把openowner关联到nfs4_client的表上. 使用openowner_slab管理nfs4_openowner.
+
+            操作:
+            a. nfs4_free_opwnowner(nfs4_openowner)
+                释放nfs4_openowner->so_owner(xdr_netobj)->data，字符串
+                -> kmem_cache_free(openowner_slab, oo)
+            b. unhash_openowner(nfs4_openowner)
+                释放掉nfs4_openowner与client(openowner)和hash表的关系(stateowner), 而且释放掉它所关联的所有的nfs4_ol_stateid，当然那都是open_state
+                -> release_open_stateid
+            c. release_last_closed_stateid(nfs4_openowner)
+                释放nfs4_openowner->oo_last_closed_stid (nfs4_ol_stateid), 这里只有stateid_t和内存的操作，没有nfs4_stid的操作。
+                -> unhash_stid
+                -> free_generic_stateid
+            d. release_openowner(nfs4_openowner)
+                为何在这里释放一个nfs4_ol_stid?它关联了许多stateid.
+                -> unhash_openowner
+                -> release_last_closed_stateid
+                -> nfs4_free_openowner
+
+        nfs4_lockowner这里还是统一管理lockowner,使用lockowner_slab管理nfs4_lockowner.
+            * nfs4_stateowner 
+            * list_head lo_owner_ino_hash 对应lockowner_ino_hash表
+            * lo_perstateid 对应nfs4_ol_stateid->st_lockowners
+            * lo_list  临时队列
+            操作：
+            a. nfs4_free_lockowner(nfs4_lockowner)
+                和上面差不多
+
+            b. unhash_lockowner(nfs4_lockowner)
+                破坏lockowner使用的关系，并且把它关联的nsf4_ol_stateid释放掉,关联的也都是lockstate. 关系包含nfs4_lockowner->nfs4_stateowner->so_strhash;perstateid;lo_owner_ino_hash. 
+                -> release_lock_stateid 遍历的是nfs4_stateowner->so_stateids
+            b. release_lockowner(nfs4_lockowner)
+                释放nfs4_lockowner的关系，释放它使用的内存
+                -> unhash_lockowner
+                -> nfs4_free_lockowner
+
+    d. nfs4_delegation
+        应该算一种state,所以把它放到上面. 使用deleg_slab管理nfs4_delegation
+        * nfs4_stid dl_stid  <> nfs4_client
+        * list_head    dl_perfile  对应nfs4_file->fi_delegations
+        * dl_perclnt  cl_delegations
+        * dl_recall_lru; 
+        * dl_count / dl_type / dl_time
+        * nfs4_file    
+        * knfsd_fh    
+        * dl_retries;
+        * nfsd4_callback   dl_recall;
+        操作:
+        a. nfs4_put_deleg_lease(nfs4_file)
+            只有delegation使用lease? 这个函数应该放到nfs4_file.
+            -> vfs_setlease(file, F_UNLCK, nfs4_file->lease)
+        b. nfs4_put_delegation
+            检查nfs4_delegation->dl_count,当减到0时,释放内存给deleg_slab
+            -> put_nfs4_file
+        c. alloc_init_deleg(nfs4_client, nfs4_ol_stateid, svc_fh, type)
+            -> init_stid(nfs4_ol_stateid->nfs4_stid, nfs4_client, NFS4_DELEG_STID)   
+            -> get_nfs4_file(nfs4_ol_stateid->nfs4_file)
+            -> fh_copy_shallow(nfsd_fh)
+        d. unhash_delegation
+            释放nfs4_delegation使用的关系
+            -> unhash_stid
+            -> nfs4_put_deleg_lease
+            -> nfs4_put_delegation
+        e. nfs4_set_delegation(nfs4_delegation, flag)
+            -> 根据nfs4_delegation->nfs4_file，建立链表关系。
+
+        总结以下nfs4_ol_stateid和nfs4_lockowner/nfs4_openowner的关系
+        * nfs4_lockowner和nfs4_openowner都是nfs4_stateowner的子类
+        * nfs4_lockowner维护一的nfs4_ol_stateid的队列
+        * nfs4_ol_stateid维护一个nfs4_lockowner的队列
+        * nfs4_lockowner和nfs4_openowner应该由各一个hash表
+        * nfs4_ol_stateid和nfs4_lockowner和nfs4_openowner各有slab管理
+        * nfs4_ol_stateid和nfs4_file关联
+        * nfs4_stateowner和nfs4_client关联
+        * nfs4_openowner共用nfs4_client->openowners队列
+        * nfs4_lockowner应该和inode有关系，或有独立的hash表
+        * nfs4_client有一个队列的nfs4_openowner, nfs4_openowner有一对列的nfs4_ol_stateid，nfs4_ol_stateid有一队列的nfs4_lockowner.
+        * nfs4_delegation关联两个队列nfs4_client和nfs4_file,他还有callback的数据.
+
+  1. nfs4_client
+    * list_head cl_idhash / cl_strhash  对应(un)conf_id_hashtbl/(un)conf_str_hashtbl
+    * openowners 关联nfs4_openowner
+    * delegations / lru 
+    * idr 管理和client相关的stateid
+    * xdr_netobj
+    * recdir[] 回复使用的目录
+    * nfs4_verifier
+    * time_t time (last lease renewal)
+    * sockaddr_storage
+    * flavor setclientid使用
+    * principal 
+    * svc_cred(uid/gid/groups)
+    * clientid_t
+    * nfs4_verify   confirm
+    * firststate / minorversion
+
+    * nfs4_cb_conn
+    * cb_flags
+    * rpc_clnt *cl_cb_client
+    * cl_cb_ident
+    * cl_cb_state
+    * nfs4_callback 
+    * nfs4_session
+    * list_head cl_callbacks
+    
+    * list_head cl_sessions
+    * nfsd4_clid_slot cl_cs_slot
+    * cl_exchange_flags
+    * refcount
+    * cl_cb_slot_busy
+    * rpc_wait_queue    cl_cb_waitq
+
+
+  2. nfs4_file
+    * kref
+    * list_head hash  file_hashtbl表
+    * stateids 关联的nfs4_ol_stateid->st_perfile
+    * delegations
+    * file * fi_fds[3] O_RDONLY / W_WRONLY / W_RDWR
+    * access[2] read / write
+    * file * fi_deleg_file  atomic: delegees
+    * file_lock lease
+    * inode 
+    * bool had_conflict
+        
+
+  3. session 必须看看nfs4.1的session
+    sessionid_hashtable 保存sessionid？什么是sessionid?
+    nfs4_sessionid:
+        char [NFS4_MAX_SESSIONID_LEN](16)
+    nfsd4_sessionid
+        * clientid_t clientid
+        * sequence / reserved
+        上面两个数据结构应该表示一个东西，只不过一个结构，有意义。
+
+    nfsd4_session
+        * kref
+        * head_list hash / perclnt / 
+        * se_flags
+        * nfs4_client
+        * nfs4_sessionid
+        * nfsd4_channel_attrs  fchannel / bchannel
+        * head_list se_conns
+        * se_cb_prog / se_cb_seq_nr
+        * nfsd4_slot
+    nfsd4_slot 可见这个结构没什么有效信息
+        * sl_inuse / sl_cachethis
+        * sl_opcnt / sl_seqid / sl_status / sl_datalen
+        * sl_data []
+    nfsd4_chann
+        * list_head cn_persession
+        * svc_xprt  cn_xprt
+        * svc_xpt_user
+        * nfsd4_session
+        * cn_flags
+    nfsd4_create_session
+        这应是rfc中某个procedure使用的数据结构
+        * clientid_t
+        * nfsd4_sessionid
+        * seqid / flags
+        * nfsd4_channel_attrs fore_channel / back_channel
+        * callback_prog 
+        * uid / gid
+
+    a. gen_sessionid(nfsd4_session)
+        初始化nfsd4_session-> nfs4_session
+        复制clientid_t; 使用全局变量current_sessionid初始化nfsd4_session->nfsd4_sessionid->clientid_t
+    b. free_session_slots(nfsd4_session)
+        释放nfsd4_session->se_slots使用的内存,目前看slot用来缓存rpc请求。
+    c. alloc_session(slotsize, numslot)
+        不仅分配nfsd4_session，而且分配slots使用的内存。
+    d. init_forechannel_attrs(nfsd4_channel_attrs, nfsd4_channel_attrs, numslots, slotsize)
+        nfsd4_channel_attrs应该是一个rpc命令使用的结构, 用与改变channel的属性
+    e. free_conn(nfsd4_conn)
+        -> svc_xprt->put(nfsd4_conn->cn_xprt   
+
+    f. nfsd4_conn_lost(svc_xprt_user)
+        -> free_conn
+    g. alloc_conn(svc_xqrt, flags)        
+        channel为何svc_xprt有关联呢？rpc也提供svc_xprt_user这个结构？
+    h. __nfsd4_hash_conn(nfsd4_conn, nfsd4_session)
+        每个channel都关联在一个session上.
+        nfsd4_conn->cn_persession <-> nfsd4_session->se_conns
+    i. nfsd4_hash_conn
+        使用nfsd4_session->se_client(nfsd4_session)->cl_lock
+        -> __nfsd4_hash_conn
+    j. nfsd4_register_conn
+        -> register_xpt_user(nfsd4_conn->cn_xprt / svc_xprt, nfsd4_conn->cn_xpt_user / svc_xpt_user)
+    k. nfsd4_new_conn(svc_xprt, nfsd4_session, dir)
+        -> alloc_conn(svc_rqst, dir)
+        -> nfsd4_hash_conn(nfsd4_conn, nfsd4_session) 把channel关联到session
+        -> nfsd4_register_conn(svc_xprt, svc_xpt_user) 向rpc注册nfsd4_channel
+    l. nfsd4_new_conn_from_crses(svc_rqst, nfsd4_session)
+        session也有BACK的？
+        -> nfsd4_new_conn(svc_rqst, nfsd4_session, dir)
+    m. nfsd4_del_conns(nfsd4_session)
+        对nfsd4_session->se_conns中的每个nfsd4_conn调用下面的函数，调用注册的回调注销函数nfsd4-conn_lost?
+        -> unregister_xpt_user(svc_rqst, svc_xpt_user)
+    n. free_session(kref)
+        一个session只有channels/slots(drc)
+        -> nfsd4_del_conns
+        -> free_session_slots
+    o. alloc_init_session(svc_rqst, nfs4_client, nfsd4_create_session)
+        -> alloc_session
+        -> init_forechannel_attrs
+        -> gen_sessionid
+        -> nfsd4_new_chann_from_crses
+        -> nfsd4_probe_callback  (callback 中的)
+    p. find_in_sessionid_hashtbl(nfsd4_sessionid)
+        从sessionid_hashtbl根据nfsd4_sessionid查找nfsd4_session
+    q. unhash_session(nfsd4_session)
+        把nfsd4_session从hash表和se_perclnt中删除，后者应该是nfs4_client
+    r. renew_client_locked(nfs4_client) / renew_client
+        更新nfs4_client->cl_time
+    s. STALE_CLIENTID(clientid_t)
+        检查clientid_t是否有效， 通过判断clientid_t->cl_boot
+    t. alloc_client(xdr_netobj)
+        申请nfs4_client的内存, 没有任何创建任务.
+    u. free_client(nfs4_client)
+        和上面的比，除了释放内存，做了许多工作
+        -> nfsd4_put_session(nfs4_client->se_sessions)
+        -> put_group_info
+    v. release_session_client(nfs4_session)
+        这是要释放吗？ 减小nfs4_client->cl_refcount. 如果减到0，检查是否过期，过期的话释放。
+        -> free_client
+        -> renew_client_locked
+    w. unhash_client_locked(nfs4_client)
+        清空nfs4_client->cl_session链表，没有释放工作
+        -> mark_client_expired(nfs4_client)
+
+    x. expire_client(nfs4_client)
+        释放nfs4_client的delegation/openowner, 把它从idhash和strhash中删除。为什么只有openowner，没有lockowner?
+        -> unhash_delegation
+        -> release_openowner
+        -> nfsd4_shutdown_callback
+        -> svc_xprt_put
+        -> unhash_client_lockd
+    y. copy_verf / copy_clid / copy_cred / save_name / same_verf / same_clid / save_cred            
+    z. create_client(xdr_netobj, recoverydir, svc_rqst, nfs4_verifier)
+        -> alloc_client
+        -> svc_gss_principal
+        -> idr_init(nfs4_client->cl_stateids)
+        -> rpc_init_wait_queue
+        -> copy_verf / copy_cred / gen_confirm
+        -> rpc_copy_addr
+
+    z1. move_to_confirmed(nfs4_client)
+        把nfs4_client添加到两个hash表:conf_id_hashtbl / conf_str_hashtbl.
+        -> renew_client
+
+    z2. find_confirmed_client(clientid_t)  / find_confirmed_client_by_str
+        在conf_id_hashtbl查找nfs4_client    conf_str_hashtbl
+
+    z3. find_unconfirmed_client(clientid_t) / find_unconfirmed_client_by_str
+        还有一个unconf_id_hashtbl表 / unconf_str_hashtbl
+
+    z4. gen_callback
+
+    z5. nfsd4_store_cache_entry(nfsd4_compoundres)
+        -> read_bytes_from_xdr_buf
+
+    z6. nfsd4_enc_sequence_replay(nfsd4_compoundargs, nfsd4_compoundres)
+        组装nfsd4_compoundres中的最后一个op的结果, 并且把下一个的状态设为nfserr_retry_uncached_rep。可能因为下一个过程还没有执行。最后一个是根据nfsd4_compoundres->opcnt，下一个也是根据这个参数计算。把结果state放到nfsd4_compoundres->p，整个compound就一个state. 把其他结果放到nfsd4_op->u中. 这有什么意义？
+        -> nfsd4_encode_operation
+    z7. nfsd4_replay_cache_entry(nfsd4_compoundres, nfsd4_sequence)
+        介绍一下nfsd4_sequence:
+            * nfs4_sessionid
+            * seqid / slotid
+            * maxslots / cachethis / status_flags
+        还有nfsd4_compound_state
+            * svc_fh    current_fh / save_fh
+            * nfs4_stateowner replay_owner
+            * nfsd4_session session
+            * nfsd4_slot slot
+            * datap
+            * iovlen
+            * minorversion / status
+            
+        先组装nfsd4_compountres的结果，再把nfsd4_compoundres->cstate(nfsd4_compound_state)->slot->sl_data的数据放到nfsd4_compoundres->cstate(nfsd4_compound_state).statp中。nfsd4_compoundres->p就是nfsd4_compoundres->cstate->datap的指针. 把结果都放到nfsd4_compoundres->cstate中？
+        -> nfsd4_enc_sequence_replay(nfsd4_compoundres->svc_rqst->nfsd4_compoundargs, nfsd4_compoundres)
+
+    z8. nfsd4_set_ex_flags(nfs4_client, nfsd4_exchange_id)
+        介绍一下nfsd4_exchange_id
+            * nfs4_verifier verifier
+            * xdr_netobj clname
+            * flags / clientid(clientid_t) / seqid / spa_how
+        修改nfsd4_exchange_id->flags，linux nfsd 不支持pnfs/migration,支持referral
+
+    z9. nfsd4_exchange_id(svc_rqst, nfsd4_compound_state, nfsd4_exchange_id)
+        -> nfs4_make_rec_clidname( 从recovery机制中，回复状态
+        -> find_confirmed_client_by_str(name) 根据name查找clientid /nfs4_client
+        -> save_verf / expire_client
+        -> save_cred / expire_client 如果找到，而且内容不一致，说明老的过期
+        -> copy_verf 
+        -> find_unconfirmed_client_by_str / expire_client如果找到没有confirmed的，让他过期
+        -> create_client / gen_clid / add_to_unconfirmed / nfsd4_set_ex_flags
+
+    z10. nfsd4_cache_create_session(nfsd4_create_session, nfsd4_clid_slot)
+        介绍这两个数据结构 nfsd4_create_session,nfsd4_clid_slot (参考上面), 把nfsd4_create_session拷给nfsd4_clid_slot->sl_cr_es
+         
+    z11. nfsd4_replay_create_session(...)
+        和上面相反，拷贝回去。 这里为什么要replay??
+
+    z12. nfsd4_create_session(svc_rqst, nfsd4_compound_state, nfsd4_create_session)
+        根据nfsd4_create_session创建session. 先根据nfsd4_create_session的clientid查找确定的或等待确定的nfs4_client. 如果有已经确定的，则检查seq,可能是是replay, 可能是错误的，也可能是正确的. 如果有未确认的，同样检查seq，同时让这个clientid变成确认状态。
+        -> find_unconfirmed_client(nfsd4_create_session->clientid)
+        -> find_confirmed_client(nfsd4_create_session->clientid)
+        -> check_slot_seqid根据slot检查seq
+        -> nfsd4_replay_create_session
+        -> alloc_init_session
+        -> nfsd4_cache_create_session
+        -> move_to_confirmed
+
+    z13. nfsd4_bind_conn_to_session(svc_rqst, nfsd4_compound_state, nfsd4_bind_conn_to_session)
+        后来的操作，都多了一个nfsd4_compound_state. 
+        -> find_in_sessionid_hashtbl(nfsd4_bind_conn_to_session->sessionid)
+        -> nfsd4_get_session
+        -> nfsd4_map_bcts_dir 改变nfsd4_bind_conn_to_session->dir
+        -> nfsd4_new_conn(svc_rqst, nfsd4_session, dir)
+
+    z14. nfsd4_compound_in_session(nfsd4_session, nfs4_sessionid)
+        比较sessionid 与 nfsd4_session->se_sessionid, 字符串比较
+
+    z15. nfsd4_destroy_session(svc_rqst, nfsd4_compound_state, nfsd4_destroy_session)
+        对应DESTROY_SESSION procedure
+        -> nfsd4_compound_in_session(nfsd4_compound_state->nfsd4_session, nfsd4_destroy_session->nfs4_sessionid) 判断要销毁的dession是否compound中的session,需要和下一步配合，如果是，则保证compound没有其他op
+        -> nfsd4_last_compound_op(svc_rqst)  判断当前op是compound的最后一个op
+        -> find_in_sessionid_hashtbl(nfsd4_destroy_session->sessionid)找到nfsd4_session,它不一定是nfsd4_compound_state->nfsd4_session
+        -> unhash_session(nfsd4_session)  把它从hashtlb中删除，从clnt维护的队列中删除
+        -> nfsd4_probe_callback_sync(nfs4_clinet) 刷新callback中的操作
+        -> nfsd4_del_conns(nfsd4_session) 销毁nfsd4_session->se_conns队列上的所有nfsd4_conn
+        -> nfsd4_put_session(nfsd4_session) 释放nfsd4_session->kref，估计kref释放session使用的内存。
+
+    z16. __nfsd4_find_conn(svc_xprt, nfsd4_session)
+         遍历nfsd4_session->se_conns,找一个nfsd4_conns,它使用svc_xprt. nfsd4_conns->cn_xprt
+
+    z17. nfsd4_squence_check_conn(nfsd4_conn, nfsd4_session)
+        相当与注册一个nfsd4_conn，如果nfsd4_session已经有了类似的nfsd4_conn，则把新的删除。
+        -> __nfsd4_find_conn(svc_xprt, nfsd4_session)
+        -> free_conn(nfsd4_conn) 释放新的，nfsd4_conn数据结构管理的就是svc_xprt(_user),还有session的关系
+        -> __nfsd4_hash_conn(nfsd4_conn, nfsd4_session) 只是把它放到nfsd4_session的队列中
+        -> nfsd4_register_conn(nfsd4_conn) 注册xpt_user.
+        -> nfsd4_conn_lost 如果注册失败,自己销毁nfsd4_conn. 
+        xpt_user就是维护一个关系，底层xprt与nfsd4_session的关系. 当销毁nfsd4_conn是，会出发callback的操作。
+
+    z18. nfsd4_session_too_many_ops / nfsd4_request_too_big(svc_rqst, nfsd4_session)
+        检查svc_rqst->xdr_buf的缓冲是否太大，超过nfsd4_session->nfsd4_channel_attrs的相关属性。 
+    z19. nfsd4_sequence(svc_rqst, nfsd4_compound_state, nfsd4_sequence)
+        这对应SEQUENCE procedure, 刚才看到SEQUENCE的介绍，并不复杂，但不清初slotid是什么东西。但在这里操作挺多，需要建立connection. nfsd4_compoundres, nfsd4_session, nfsd4_slot, nfsd4_conn. nfsd4_slot中的数据是缓存的请求（结果），还有seqid等其他属性，标志。 nfsd4_sequence就是sequence的参数. 输入参数是seq，根据它里面的参数，查看这个compound请求如何处理，并修改compound_state中的参数。
+        -> alloc_anon
+        -> find_in_sessionid_hashtbl
+        -> nfsd4_session_too_many_ops / nfsd4_request_too_big
+        -> check_slot_seqid
+        -> nfsd4_replay_cache_entry 根据SEQUENCE请求中的slotid,检查slot中的sequence是否对应。每个session有若干个slot, 每个slot维护一个sequence. 这个一个队列有什么区别？如何做到cache. 如果这是一个重复的消息，把之前的结果取出来,并把nfsd4_compound_state->status设为nfserr_replay_cache,说明这个请求是重复的。
+        -> nfsd4_sequence_check_conn  检查是否需要建立新的channel,这样岂不会重复的建立conn
+        -> nfsd4_get_session / atomic_inc(nfs4_client->cl_refcount) 访问session/client，获取callback的状态，设到seq中。
+
+    z20. hash_resources(nfs4_client)
+        nfs4_client关联openowner/delegation/session
+
+    z21. nfsd4_destroy_clientid
+        这个对应DESTROY_CLIENTID, 参数只有一个clientid. 根据clientid找到nfsd4_client,让它过期.
+        -> find_unconfirmed_client
+        -> find_confirmed_client
+        -> is_client_expired / has_resource 没有过期，而且有资源
+        -> expire_client
+
+    z22. nfsd4_reclaim_complete(svc_rqst, nfsd4_compound_state, nfsd4_reclaim_complete)
+        这个对应RECLAIM_COMPLETE, 它表示client已经重新确认lock，无论是server重启，还是fs转移.
+        -> nfsd4_create_clid_dir 创建recovery使用的目录
+
+    z23. nfsd4_setclientid(svc_rqst, nfsd4_compound_state, nfsd4_setclientid)
+        对应SETCLIENTID,参数包含id,callbac,verf,clientid等信息
+        -> nfs4_make_rec_clidname(name, xdr_netobj) 根据xdr_netobj，创造一个目录名称，使用md5计算xdr_netobj的hash值。
+        -> find_confirmed_client_by_str(name, hash) 在strhash表中找nfsd4_client,如果找到,正在使用，则什么都不做？
+        -> clp_used_exchangeid
+        -> same_creds, 没在启用，检查creds是否一致. creds比较uid，应该都是root？而且返回错误是字符串已经在别的ip地址使用
+        -> expire_client(nfsd4_client)
+        -> create_verf(clientname, dname, svc_rqst, nfsd4_verifier)
+        -> gen_callback(nfs4_client, nfsd4_setclientid, svc_rqst) 根据nfsd4_setclientid创建一个nfs4_cb_conn，给nfs4_client->cl_cb_conn, 并没有建立连接
+
+    z24. nfsd4_setclientid_confirm(svc_rqst, nfsd4_compound_state, nfsd4_setclientid_confirm)
+        -> STALE_CLIENTID  根据clientid的boot时间，检查clientid是否有效
+        -> find_confirmed_client(clientid_t)
+        -> find_unconfirmed_client(clientid_t)
+        -> same_creds / save_verif verify比较的是setclientid返回的verify. same_creds比较uid，为何总是比较uid?
+        -> nfsd4_change_callback(nfs4_client, nfs4_client->cl_cb_conn)
+        -> nfsd4_probe_callback
+        -> expire_client(nfs4_client)
+        -> move_to_confirm(nfs4_client) 把它从unconfirm的两个hash表移到confirm的hash表,更新它的lease
+       
+    z25. nfsd4_alloc_file
+        从file_slat中分配一个nfs4_file
+
+    z26. nfsd4_init_file(nfs4_file, inode)
+        初始化nfs4_file
+
+    z27. nfsd4_free_slab(kmem_cache)
+        销毁kmem_cache
+
+    z28. nfsd4_free_slabs(void)
+        销毁openowner_slab, lockowner_slab, file_slab, stateid_slab, deleg_slab
+
+    z29. nfsd4_init_slabs
+        创建上面的那些slabs
+
+    z30. nfs4_free_openowner(nfs4_openowner) / nfs4_free_lockowner(nfs4_lockowner)
+
+    z31. init_nfs4_replay(nfs4_replay)
+        初始化nfs4_replay. nfs4_replay包含nfs4_fh,还有一块内存rp_buf/rp_ibuf
+
+    z32. alloc_stateowner(kmem_cache, xd4_netobj, nfs4_client)
+        分配一个stateowner, 它主要表示client(xdr_netobj), 但还有nfs4_client的指针,nfs4_replay,为何这里只有一个op的缓冲？ 还有两个队列：hash和stateid.每个owner关联许多stateid?
+
+    z33. hash_openowner(nfs4_openowner, nfs4_client, strhashval)
+        nfs4_openowner关联perclient队列,nfs4_ol_stateid,把openowner放到hash队列中ownerstr_hashtbl, 同时放到nfs4_client->cl_openowners队列中
+
+    z34. alloc_init_open_stateowner(strhashval, nfs4_client, nfsd4_open)
+        分配并初始化一个openowner
+        -> alloc_stateowner
+        -> hash_openowner
+
+    z35. init_open_stateid(nfs4_ol_stateid, nfs4_file, nfsd4_open)
+        使用nfs4_file和nfsd4_open初始化nfs4_ol_stateid, 
+        -> init_stid(nfs4_stid, nfs4_client, NFS4_OPEN_STID) nfs4_stid是对stateid的包装, 使用nfs4_client初始化它的clientid，分配一个stateid. clientid->id是怎么来的？
+        -> 建立链表关系, 把nfs4_ol_stateid->st_perstateowner添加到nfsd4_openowner->oo_owner.so_stateids中， 把nfsd4_openowner->st_perfile添加到nfs4_file->fi_stateids中.
+
+    z36. move_to_close_lru(nfs4_openowner)
+        lru队列close_lru, 把nfs4_openowner添加到lru队列末尾
+
+    z37. same_owner_str(nfs4_stateowner, xdr_netobj, clientid_t)
+        判断nfs4_stateowner->so_owner和xdr_netobj是否相通，还有nfs4_sateowner->nfs4_stid和clientid_t是否相同。
+
+    z38. find_openstateowner_str(hashval, nfsd4_open)
+        查找ownerstr_hashtbl表中匹配的nfs4_open->nfsd4_openowner
+        -> renew_client(nfs4_openowner->oo_owner.so_client(nfs4_client))
+
+    z39. find_file(inode)
+        根据inode从file_hashtbl中查找nfs4_file. 这里inode是指针。
+
+    z40. nfs4_share_conflict(svc_fh, deny_type)
+        svc_fh->fh_dentry->d_inode => nfs4_file -> fi_stateids
+        -> find_file
+        遍历上面的列表，对每个nfs4_ol_stateid,检查nfs4_ol_stateid->st_deny_bmap是否有与deny_type重合的, 如果有，则退出
+
+    z41. nfsd_break_one_deleg(nfs4_delegation)
+        这里维护一个delegation的lru列表.
+        -> nfsd4_cb_recall
+
+    z42. nfsd_break_deleg_cb(file_lock)
+        这是一个回调函数,file_lock->fl_owner是nfs4_file, 对nfs4_file->fl_delegations队列上每个nfs4_delegation都执行nfsd_break_one_deleg
+
+    z43. nfsd_change_deleg_cb(file_lock, int arg)
+        需要对kernel的lease学习一下
+        -> lease_modify(file_lock, arg)
+
+    lock_manager_operations数据结构的实例nfsd_lease_mng_ops,可能是在lease中使用。
+
+    z44. nfsd4_check_seqid(nfsd4_compound_state, nfs4_stateowner, seqid)
+        -> nfsd4_has_session  返回nfs_ok
+        -> seq == nfs4_stateowner->so_seqid-1  这个包是重复的
+        -> seq == nfs4_stateowner->so_seqid, nfs_ok
+        -> nfserr_bad_seqid
+
+    z45. nfsd4_process_open1(nfsd4_compound_state, nfsd4_open)
+        这可能对应OPEN操作，填充nfsd4_open信息, nfsd4_openowner和nfs4_ol_stateid.
+        -> STALE_CLIENTID
+        -> nfsd4_alloc_file
+        -> find_openstateowner_str(hash(clientid->cl_id, nfsd4_open->op_owner))
+        -> find_confirmed_client(clientid_t)  如果没找到openstateowner,找nfsd4_client
+        -> alloc_init_open_stateowner(hash, nfs4_client, nfsd4_open)
+        -> nfsd4_check_seqid(nfsd4_compound_state, nfs4_openowner->nfs4_stateowner, nfs4_open->op_seqid)
+        -> nfs4_alloc_stateid(nfs4_client)
+    
+    z46. nfs4_check_delegmode(nfs4_delegation, flags)
+        检查flags和nfs4_delegation->dl_type
+
+    z47. share_access_to_flags(share_access)
+        NFS4_SHARE_ACCESS_READ > RD_STATE
+
+    z48. find_deleg_stateid(nfs4_client, stateid_t)
+        -> find_stateid_by_type 根据nfs4_client和stateid_t->id找到nfs4_stid,检查标志是否为NFS4_DELEG_STID.
+
+    z49. nfs4_is_deleg_cur(nfs4_open)
+        检查nfs4_open->op_claim_type. open操作带有标志，表示使用delegation.
+
+    z50. nfs4_check_deleg(nfs4_client, nfs4_file, nfsd4_open)
+        检查nfsd4_open中的delegation信息是否有效
+        -> find_deleg_stateid
+        -> share_access_to_flags
+        -> nfs4_check_delegmode
+        -> nfsd4_is_deleg_cur
+
+    z51. nfs4_check_open(nfs4_file, nfsd4_open, nfs4_ol_stateid)
+        检查nfs4_open->fi_stateids链表上的所有openstateid(nfs4_ol_stateid), 查找对应的stateowner是nfs4_ol_stateid->oo_owner. 
+        -> test_share(local, open)  检查两者是否共享冲突
+
+    z52. nfs4_free_stateid(nfs4_ol_stateid)
+        释放nfs4_ol_stateid
+
+    z53. nfs4_access_to_access(nfs4_access)
+        把NFS4_SHARE_ACCESS_READ/WRITE转换为NFSD_MAY_READ/WRITE
+
+    z54. nfs4_get_vfs_file(svc_rqst, nfs4_file, svc_fh, nfsd4_open)
+        -> nfs4_access_to_omode(nfsd4_open->op_share_access)
+        -> nfs4_access_to_access(nfsd4_open->op_share_access)
+        -> nfsd_open(svc_rqst, svc_fh, S_IFREG, access, nfs4_file->fi_fds[flag(mode)]
+        -> nfs4_file_get_access（nfs4_file, flag) 根据flag增加nfs4_file->fi_fds的使用计数
+
+    z55. nfsd4_truncate(svc_rqst, svc_fh, nfsd4_open)
+        把文件大小改为0
+        nfsd_setattr(svc_rqst, svc_fh, iattr, 0, 0)
+
+    z56. nfs4_upgrage_open(svc_rqst, nfs4_file, svc_fh, nfs4_ol_stateid, nfsd4_open)
+        判断nfs4_open->op_share_access是否需要新的访问，升级delegation.
+        -> nfs4_get_vfs_file(...)
+        -> nfsd4_truncate 这里为何要truncate呢？ 要写文件就要truncate？
+        -> nfs4_access_to_omode / nfs4_file_put_access
+        -> 修改nfs4_ol_stateid->st_access_bmap / deny_bmap
+
+
+    z57. nfs4_set_claim_prev(nfs4_open)
+        把nfs4_op_stateowner->nfs4_stateowner状态改为confirmed.
+    
+    z58. nfsd4_cb_channel_good(nfs4_client)
+        检查nfs4_client->cl_cb_state是否正常
+
+    z59. nfs4_alloc_init_lease(nfs4_delegation, flag)
+        创建一个file_lock, 它的lock_manager_operation是nfsd_lease_mng_ops.
+
+    z60. nfs4_setlease(nfs4_delegation, flag)
+        给nfs4_delegation建立关系，创建lease. 同时nfs4_delegation->fi_deleg_file是某个file.
+        -> nfs4_alloc_init_lease
+        -> vfs_setlease
+
+    z61. nfs4_set_delegation(nfs4_delegation, flag)
+        建立nfs4_delegation的关系,lease已经创建，如果没有，则调用上面的函数
+        -> nfs4_setlease(nfs4_delegation, flag)
+
+    z62. nfs4_open_delegation(svc_fh, nfsd4_open, nfs4_stateid)
+        nfs4_delegation关联file,client，还有file_lock，这应该用于lease.还有stateid_t,knfsd_fh,filehandle应该可用nfs4_file找到，还有nfsd4_callback信息。
+        -> alloc_init_deleg
+        -> nfs4_set_delegation
+
+    z63. nfsd4_process_open2(svc_rqst, svc_fh, nfsd4_open)
+        这里不了解open操作，所以以后再看
+
+    z64. nfsd4_cleanup_open_state(nfsd4_open, status)
+        nfsd4_open结构太乱！
+        -> release_openowner
+        -> nfs4_free_file
+        -> nfs4_free_stateid
+
+    z65. nfsd4_renew(svc_rqst, nfsd4_compound_state, clientid_t)
+        要做的就是更新nfs4_client->cl_time,这个操作很深
+        find_confirmed_client->renew_client->renew_client_locked
+        这个函数还做了许多检测工作。
+    
+    z66. nfsd4_end_grace()
+        -> nfs4_recdir_purge_old()
+        -> locks_end_grace(nfsd4_manager lock_manager)
+        更新nfsd4_grace
+
+    z67. nfs4_landromat()
+        这是一个kthread的执行体，目前不清楚谁调用它，应该删除过期的client.
+        遍历client_lru, 好像所有的nfs4_client都在这个链表上,而且以时间先后排序，因为在renew时，调整nfs4_client的顺序。根据nfs4_client->cl_time和nfs4_client->cl_refcount，判断是否过期,放到reaplist上。 遍历reaplist,调用下面两个函数
+        -> nfsd4_remove_clid_dir(nfs4_client)
+        -> expire_client(nfs4_client)
+        遍历del_recall_lru,这个队列上是nfs4_delegation，过期的delegation就放到上面.当然也是根据时间顺序排列。过期的放到reaplist，遍历调用下面的函数
+        -> unhash_delegation
+        遍历close_lru,队列上放到是nfs4_openowner,他是nfsd4_close中释放的nfs4_openowner. 上面过期的nfs4_openowner调用
+        -> release_openowner(nfs4_openowner) 
+
+    z68. landromat_main(work_struct)
+        它是work_struct中执行的函数，它调用nfs4_landromat, 然后等待一段时间。保证每秒调用一次
+        -> nfs4_landromat
+        -> queue_delayed_work
+
+    z69. nfs4_check_fh(svc_fh, nfs4_ol_stateid)
+        比较svc_fh->fh_dentry->d_inode 和 nfs4_ol_stateid->st_file->fi_inode
+
+    z70. STALE_STATEID(stateid_t)
+        更不用说，比较stateid_t->...cl_boot是否是boot_time.
+
+    z71. access_permit_read/write(access_bmap)
+        判断access_bmap是否包含NFS4_SHARE_ACCESS_READ/BOTH/WRITE的位
+
+    z72. nfs4_check_openmode(nfs4_ol_stateid, flags)
+        flas是WR_STATE/RD_STATE
+        -> access_permit_write/read(nfs4_ol_stateid->st_access_bmap, flags)
+
+    z73. check_special_stateids(svc_fh, stateid_t, flags)
+        检查flags和要访问的文件是否冲突
+        -> nfs4_share_conflict(svc_fh, NFS4_SHARE_DENY_WRITE/READ)
+
+    z74. grace_disallows_io(inode)
+        只对支持强制锁的文件进行grace保护
+        -> locks_in_graces()
+        -> mandatory_lock(inode)
+
+    z75. stateid_generation_after(stateid_t, stateid_t)
+        比较stateid_t->si_generation
+
+    z76. check_stateid_generation(stateid_t, stateid_t, has_session)
+        检查两者generation是否相通
+
+    z77. nfs4_validate_stateid(nfs4_client, stateid_t)
+        检查stateid_t对应的nfs4_stid是否有效
+        -> find_stateid(nfs4_client, clientid_t)
+        -> check_stateid_generation(nfs4_stid->sc_stateid, stateid_t, 1)
+        检查nfs4_openowner->st_stateowner->so_is_open_owner,还有nfs4_openower标志是否有NFS4_OO_CONFIRMED
+
+    z78. nfs4_lookup_stateid(stateid_t, char typemask, nfs4_stid)
+        找一个nfs4_stid，先使用cl_id找一个nfs4_client，然后使用st_id找nfs4_stid. 原来stateid_t->so_clid是用来计算hash的，nfs4_client根据hash值存储在confirmed_表中
+        -> find_confirmed_client
+        -> find_stateid_by_type(nfs4_client, stateid_t, type)
+
+    z79. nfs4_preprocess_stateid_op(nfsd4_compound_state, stateid_t, flags, file)
+        根据stateid_t，找到一个nfs4_stid(nfs4_ol_stateid/nfs4_delegation),然后根据nfs4_compound_state中的参数检查是否有效
+        -> grace_disallows_io()
+        -> check_special_stateids(curreht_fh, stateid, flags) 检查特殊stateid,ZERO_STATEID或ONE_STATEID
+        -> nfsd4_lookup_stateid
+        -> check_stateid_generation
+        -> nfs4_check_delegmode(nfs4_delegation, flags) 如果state是delegation,则使用这个函数检查
+        -> nfs4_check_openmode(nfs4_ol_stateid, flags) 如果是open/lock state
+        -> find_readable_file / find_writable_file(nfs4_file) 把找到file给参数
+
+    z80. nfsd4_free_lock_stateid(nfs4_ol_stateid)
+        释放lock state, 同时检查它对应的lockowner是否有锁，锁住lock state对应的锁
+        -> check_for_locks(nfs4_ol_stateid->nfs4_file, nfs4_lockowner(nfs4_ol_stateid->nfs4_stateowner))
+        -> release_lock_stateid(nfs4_ol_stateid)
+    z81. nfsd4_free_stateid(svc_rqst, nfsd4_compound_state, nfsd4_release_lockowner)
+        不清楚nfsd4_release_lockowner对应什么数据结构，它很简单包含
+        * clientid_t
+        * xdr_netobj  xdr_netobj看来不是表示client，而是表示client的某个对象
+        这里要释放的stateid，应该是lock state,如果其他的都放回错误
+
+    z82. setlkflg(type)
+        把NFS4_READW_LT/NFS4_READ_LT映射为RD_STALE/WR_STALE
+
+    z83. nfs4_seqid_op_checks(nfsd4_compound_state, stateid_t, seqid, nfs4_ol_stateid)
+        检查seqid, generation, inode.
+        -> nfsd4_check_seqid(nfs4_compound_state, nfs4_stateowner, seqid) nfs4_stateowner是从nfs4_ol_state获取
+        -> check_stateid_generation
+        -> nfs4_check_fh(nfsd4_compound_state->svc_fh, nfs4_ol_stateid) 检查inode的值
+
+    z84. nfs4_preprocess_seqid_op(nfsd4_compound_state, stateid_t, typemask, nfs4_ol_stateid)
+        检查sequence id,同时找nfs4_ol_stateid返回给nfs4_compound_state->replay_owner
+        -> nfsd4_lookup_stateid(stateid_t, typemask, nfs4_stid)
+        -> nfs4_seqid_op_checks(nfsd4_compound_state, stateid_t, seqid, nfs4_ol_stateid)
+
+    z85. nfs4_preprocess_confirmed_seqid_op(nfsd4_compound_state, seqid, stateid_t, nfs4_ol_stateid)
+        检查open state, 先找到nfs4_ol_stateid，同时检查它是否有效，再检查open owner是否是NFS4_OO_CONFIRMED
+        -> nfs4_preprocess_seqid_op(nfs4_compound_state, seqid, stateid_t, NFS4_OPEN_STID, nfs4_ol_state)
+        -> nfs4_ol_state->nfs4_stateowner->nfs4_openowner->oo_flags && NFS4_OO_CONFIRMED
+
+    z86. nfsd4_open_confirm(svc_rqst, nfsd4_compound_state, nfsd4_open_confirm)
+        这应该对应OPEN_CONFIRM操作
+        -> fh_verify(svc_rq, nfs4_compound_state->current_fh, S_IFREG, 0)
+        -> nfs4_preprocess_seqid_op(nfs4_compound, nfsd4_open_confirm->oc_seqid, nfsd4_open_confirm->oc_req_stateid, NFS4_OPEN_STID, nfs4_ol_stateid) 找到对应的nfs4_ol_stateid，它是open state
+        -> update_stateid(nfs4_ol_stateid->nfs4_stid.sc_stateid), 把这个stateid拷贝给nfsd4_open_confirm->oc_resp_stateid
+        -> nfsd4_create_clid_dir(nfs4_openowner->nfs4_stateowner->so_client) 创建所有的recovery dir?
+
+    z87. nfs4_stateid_downgrade_bit(nfs4_ol_stateid, access)
+        把nfs4_ol_stateid->nfs4_file的文件访问权限降低，修改它的st_access_bmap
+
+    z88. nfs4_stateid_downgrade(nfs4_ol_stateid, access)
+        把对nfs4_file的文件访问降到access, 如果NFS4_SHARE_ACCESS_READ,降低NFS4_SHARE_ACCESS_WRITE/BOTH, 如果NFS4_SHARE_ACCESS_WRITE，降低READ/BOTH
+        -> nfs4_stateid_downgrade_bit
+        
+    z89. reset_union_bmap_deny(deny, bmap)
+        把bmap中deny位去掉  bmap &= ~deny
+
+    z90. nfsd4_open_downgrade(svc_rqst, nfsd4_compound_state, nfsd4_open_downgrade)
+        这应该对应OPEN_DOWNGRADE操作. 奇怪这里只有修改nfs4_ol_stateid和nfs4_file的属性，并没有和client的互动，取回delegation之类的操作.
+        -> nfs4_preprocess_confirmed_seqid_op(nfs4_compound_state, seqid, stateid_t, nfs4_ol_stateid)
+        -> 检查nfsd4_open_downgrade中定义的access和deny是nfs4_ol_stateid的access/deny的子集
+        -> nfs4_stateid_downgrade(nfs4_ol_stateid, access)
+        -> reset_union_bmap_deny(nfs4_ol_stateid->od_deny_bmap, nfs4_open_downgrade->od_share_deny)
+        -> update_stateid
+        -> 把新的stateid给nfsd4_open_downgrade
+
+    z91. nfsd4_purge_closed_stateid(nfs4_stateowner)
+        把关闭的open state删除, 根据nfs4_openowner->oo_flags的NFS4_OO_PURGE_CLOSE标志。
+        -> release_last_closed_stateid(nfs4_openowner)
+
+    z92. nfs4_close_open_stateid(nfs4_ol_stateid)
+        把nfs4_ol_stateid的关系释放掉，然后把nfs4_ol_stateid->stateid_t.sc_type改为NFS4_CLOSED_STID. 这是另一种释放open state的方法，毕竟有若干个lock state共享open state
+        -> unhash_open_stateid
+
+    z93. nfsd4_close(svc_rqst, nfsd4_compound_state, nfsd4_close)
+        很可惜，这里的CLOSE操作只有两个简单的参数stateid_t和seqid
+        -> nfs4_preprocess_seqid_op(nfsd4_compound_state, seqid, clientid_t, NFS4_OPEN_STID|NFS4_CLOSED_STID, nfs4_ol_stateid)
+        -> nfsd4_close_open_stateid(nfs4_ol_stateid) 把nfs4_ol_stateid改为CLOSED state, 并且把这个close state该nfs4_ol_stateid对应的openowner
+        -> update_stateid
+        -> move_to_close_lru(nfs4_openowner) 如果nfs4_ol_state->nfs4_stateowner->so_stateids链表为空，这个状态的所有者没有状态，则把openowner放到lru队列中，准备回收。 close_lru
+
+    z94. nfsd4_delegreturn(svc_rqst, nfsd4_compound_state, nfsd4_delegreturn)
+        这里处理nfs4_delegation,检查是否有效
+        -> fh_verify(svc_rqst, nfs4_compound_state->current_fh)
+        -> nfsd4_lookup_stateid(stateid_t, NFS4_DELEG_STID, nfs4_stid)
+        -> check_stateid_generation(stateid, nfs4_stid.stateid_t, nfsd4_has_session(nfsd4_compound_state)) 看来这里如果有session,会简单很多
+        -> unhash_delegation(nfs4_delegation) 这里如果检查到nfs4_delegation没有使用，则直接释放掉
+
+    z95. end_offset(start, len) / last_byte_offset(start, len) 
+        lockowner_ino_hashval(inode, cl_id, xdr_netobj) 计算lockowner使用的hash值,包括clientid, xdr_netobj,inode
+        nfs4_transform_lock_offset(file_lock) 虽然nfsv4的lock使用64位，但是vfs的lock使用有符号64位,检查fl_end/fl_start是否有效
+        lock_manager_operation 没有实质的东西
+
+    z96. nfs4_set_lock_denied(file_lock, nfsd4_lock_denied)
+        这是LOCKD使用的？ 根据file_lock填充nfsd4_lock_denied. file_lock->fl_owner是一个nfs4_lockowner，从里面获取nfs4_client->cl_clientid,和xdr_netobj.从file_lock中获取start,length,type等
+
+    z97. same_lockowner_ino(nfs4_lockowner, inode, clientid_t, xdr_netobj)
+        检查nfs4_lockowner是否和其他参数符合
+        nfs4_lockowner->nfs4_stateowner->nfs4_client->clientid_t
+        nfs4_lockowner->nfs4_stateowner->xdr_netobj
+        nfs4_lockowner->nfs4_stateowner->so_stateids=>nfs4_ol_stateid->nfs4_file->inode
+
+    z98. find_lockowner_str(inode, clientid_t, xdr_netobj)
+        先调用hash计算函数，然后比较
+        -> lockowner_ino_hashval
+        -> same_lockowner_ino
+
+    z99. hash_lockowner(nfs4_lockowner, strhashval, nfs4_client, nfs4_ol_stateid)
+        这里只建立nfs4_lockowner的关系，其他的参数都是用来建立联系, 就不能从nfs4_lockowner中推出这些需要的数据？ 注意这个nfs4_ol_stateid是一个open state.
+        -> lockowner_ino_hashval
+        -> nfs4_lockowner->lo_owner.so_strhash <> ownerstr_hashtbl
+        -> nfs4_lockowner->lo_owner_ino_hash <> lockowner_ino_hashtbl
+        -> nfs4_lockowner->lo_perstateid <> nfs4_ol_state->st_lockowners
+    
+    z100. alloc_init_lock_stateowner(strhashval, nfs4_client, nfs4_ol_stateid, nfsd4_lock)
+        nfs4_lock还挺复杂的,不过这里只使用xd4_netobj, nfs4_lock->lk_new_owner, 这里有一个nfs4_ol_state作为open state. 创建一个lockowner,然后放到hash表中
+        -> alloc_stateowner(lockowner_slab, xdr_netobj, nfs4_client)
+        -> hash_lockowner(nfs4_lockowner, strhashval, nfs4_client, nfs4_ol_stateid)
+
+    z101. alloc_init_lock_stateid(nfs4_lockowner, nfs4_file, nfs4_ol_stateid)
+        这个应该放到lock state的地方，创建一个nfs4_ol_stateid作为lock state, nfs4_ol_stateid关联nfs4_client(nfs4_stid), nfs4_file, nfs4_stateowner, 还关联了nfs4_ol_stateid作为open state.
+        -> nfs4_alloc_stateid(nfs4_client)
+        -> init_stid(nfs4_stid, nfs4_client, NFS4_LOCK_STID)
+        -> 建立2种联系, 上面建立了nfs4_client的联系
+        -> get_nfs4_file
+        -> access_bmap 为0; deny_bmap使用open_state的deny_bmap
+
+    z102. check_lock_length(offset, length) / get_lock_access(nfs4_ol_stateid, access) 
+        修改nfs4_ol_stateid->st_access_bmap,同时修改nfs4_file中打开文件的计数
+        -> nfs4_file_get_access
+
+    z103 lookup_or_create_lock_state(nfs4_compound_state, nfs4_ol_stateid, nfsd4_lock, nfs4_ol_stateid, new)
+        根据参数找到nfs4_lockowner,找到的话，把它关联的第一个nfs4_ol_stateid给传出参数，如果找不到，创建一个，并用参数帮他建立联系，同时建立一个nfs4_ol_stateid,给传出参数
+        -> find_lockowner_str(nfs4_ol_stateid->nfs4_file, nfs4_ol_stateid->nfs4_stateowner=>nfs4_openowner->nfs4_stateowner->nfs4_client->cl_clientid, nfs4_lock->xdr_netobj)
+        -> alloc_init_lock_stateowner(hash, nfs4_client, nfs4_ol_stateid, nfsd4_lock)
+        -> alloc_init_lock_stateid(nfs4_lockowner, nfs4_file, nfs4_ol_stateid)
+
+
+    z104. nfsd4_lock(svc_rqst, nfsd4_compound_state, nfsd4_lock)
+        这个对应LOCK操作，先做大量的检查，获取open state, open owner，然后如果创建lock，则创建lock owner,lock state,如果回收锁，则找到一个。然后创建file_lock,使用vfs_lock...锁文件，把结果放到nfsd4_lock.同时更新lock stateid.
+        -> check_lock_length
+        -> fh_verify(svc_rqst, nfsd4_compound_state->current_fh...
+        -> nfsd4_has_session
+        -> nfs4_preprocess_confirmed_seqid_op(nfsd4_compound_state, seqid, stateid) 这个检查不确定是什么类型的stateid,这里可能把它看作open state. 因为这个函数返回nfs4_ol_stateid，它是open state
+        -> same_clid(nfs4_ol_stateid->nfs4_stateowner->nfs4_client, clientid) 这里比较nfsd4_lock中的clientid和找到的nfs4_ol_stateid对应的clientid是否相通.这里严重冗余，nfs4_ol_state已经指向nfsd4_client,为何还有nfs4_ol_state->nfsd4_stateowner->nfs4_client. 
+        -> lookup_or_create_lock_state(nfs4_compound_state, nfs4_ol_stateid, nfsd4_lock, nfsd4_ol_state(返回), bool(返回))
+        -> nfs4_preprocess_seqid_op(nfs4_compound_state, seqid, stateid_t, NFS4_LOCK_STID, nfs4_ol_stateid) 这应该找回(reclaim)锁,需要找到nfs4_ol_stateid
+        -> nfs4_check_openmode(nfs4_ol_stateid, lkfl)  检查lock state中对应的访问权限和锁权限是否一直
+        -> locks_in_grace()  检查是否在grace time, 在的时候才能reclaim,不在的时候才能创建
+        -> find_readable_file / get_lock_access 根据锁的类型，增加nfs4_file中文件计数
+        -> 创建file_lock, vfs_lock_file
+        -> 处理结果，如果0, update_stateid(nfs4_ol_state->stateid_t, 把它给nfsd4_lock
+                如果EGAIN, 锁冲突，把冲突的结果给nfsd4_close
+                如果死锁，给status,返回
+
+    z105. nfsd_test_lock(svc_rqst, svc_fh, file_lock)
+        打开文件，尝试加锁，返回结果. 这里需要看一下nfsd4_open和close
+        -> nfsd_open(svc_rqst, svc_fh, S_IFREG, NFSD_MAY_READ, file)
+        -> vfs_test_lock(file, file_lock)
+        -> nfsd_close(file)
+
+    z106. nfsd4_lockt(svc_rqst, nfsd4_compound_state, nfsd4_lockt)
+        这个对应LOCKT，测试lock是否可锁文件。这有什么用呢？直接锁呗。同样这里需要创建file_lock,不过他不需要lock state,它需要lock owner.但如果没找到也没关系        -> locks_in_grace / check_lock_length 检查状态
+        -> fh_verify / nfsd4_has_session / STALE_CLIENTID,  如果有session，则clientid过期也没事
+        -> locks_init_lock(file_lock) 然后根据nfsd4_lockt组装file_lock
+        -> find_lockowner_str(inode, nfsd4_lockt->clientid_t, nfsd4_lockt->xdr_netobj)
+        -> nfsd_test_lock(svc_rqst, nfsd4_compound_state, file_lock) 结果同时也在file_lock中
+        -> nfs4_set_lock_denied(file_lock, nfsd4_lockt)把结果放到返回参数中
+
+    z107. nfsd4_locku(svc_rqst, nfsd4_compound_state, nfsd4_locku)
+        对应LOCKU操作，释放锁操作。它与锁文件操作区别很大，因为在参数中有lock state,直接可找到lockowner
+        -> nfs4_preprocess_seqid_op(nfs4_compound_state, seqid, stateid_t, NFS4_LOCK_STID, nfs4_ol_state) 检查seqid，返回nfs4_ol_stateid
+        -> find_any_file(nfs4_file) 获取file指针
+        -> locks_init_lock(file_lock) 创建file_lock
+        -> last_byte_offset / nfs4_transform_lock_offset
+        -> vfs_lock_file(file, F_SETLK, file_lock, NULL)
+        -> update_stateid(stateid)更新lock state, 把它给nfsd4_locku,这里为什么没有释放nfs4_ol_state.
+
+    z108. check_for_locks(nfs4_file, nfs4_lockowner) 
+        检查nfs4_file使用的文件上是否有nfs4_lockowner使用的锁,遍历nfs4_file->inode->i_flock队列，检查file_lock->fl_owner
+
+    z109. nfsd4_release_lockowner(svc_rqst, nfsd4_compound_state, nfsd4_release_lockowner)
+        释放lockowner,这对应一个RELEASE_LOCKOWNER. 参数中有clientid_t和xdr_netobj，从ownerstr_hashval表中取出相关lockowner。为何会有多个lock owner?
+        遍历ownerstr_hashval，找出lock owner，检查符合参数，检查它所拥有的lock states，这些状态使用的文件上是否有锁属于这个lockowner,没有才能释放。
+        -> same_owner_str / check_for_lock(nfs_ol_stateid->nfs4_file, nfs4_lockowner)
+        -> release_lockowner(nfs4_lockowner)
+
+    z110. alloc_reclaim / nfs4_has_recliamed_sate(name, use_exchange_id)
+        reclaim操作, 后者是检查是否有confirmed client对应name
+
+    z111. nfs4_client_to_reclaim(name)
+        创建一个nfs4_client_recliam,管理name，放到clientstr_hashval表中。
+
+    z112. nfs4_release_reclaim()
+        释放clientstr_hashval表
+
+    z113. nfs4_find_reclaim_client(clientid_t clid)
+        根据clientid_t找到nfs4_client,检查它是否在clientstr_hashval中，有的话返回nfs4_client_reclaim.
+        -> find_confirmed_client(clid)
+
+    z114. nfs4_check_open_recliam(clientid_t)
+        -> nfs4_find_reclaim_client 包装以下，返回ok / bad
+
+终于看完了nfs4state.c，下面是一些综合性的管理操作
+    z115. nfs4_state_init()
+        初始化所有的hash操作
+        * conf_id_hashtbl / conf_str_hashtbl
+        * unconf_id_hashbtl / unconf_str_hashtbl
+        * reclaim_str_hashtbl
+        
+        * sessionid_hashtbl
+        * file_hashtbl
+    
+        * ownerstr_hashtbl
+        * lockowner_ino_hashtbl
+
+        close_lru / client_lru / del_recall_lru
+
+    z116. nfsd4_load_reboot_recovery_data()
+        还不清楚什么是recdir.
+        -> nfsd4_init_recdir()
+        -> nfsd4_recdir_load
+
+    z117. set_max_delegations()  设置delegation数
+    z118. __nfs4_state_start()
+        -> 初始化boot_time 
+        -> locks_start_grace() 启动grace
+        -> set_callback_cred
+        -> create_singlethread_workqueue("nfsd4")
+        -> nfs4_create_callback_queue
+        -> queue_delayed_work(laundry_wq, ...) 启动laundary任务
+        -> set_max_delegations
+
+    z119. nfs4_state_start()
+        -> nfsd4_load_reboot_recovery_data()
+        -> __nfs4_state_start
+
+    z120. __nfs4_state_shutdown
+        -> expire_client
+        -> nfsd4_shutdown_recdir
+
+    z121. nfs4_state_shutdown
+        slab操作在sysctl中创建,在nfsd模块启动时就创建. 而这些是在注册RPC服务时使用
+
+(fs/nfsd/nfs4recover.c)
+这里只是说明了每个nfs4_client使用一个子目录表示它有reclaim的状态，但是它应该有那些状态这里没有说明，可能要是太多了，不方便效率。而且没有根据recdir名字也没法创建nfs4_client ,只能说判断某个nfs4_client是否有对应的recdir，然后确认它是否是可recliam
+
+1. nfs4_save_creds(cred) / nfs4_reset_creds(cred)
+    保存和回复cred,这里修改fsuid/fsgid
+
+2. nfs4_make_rec_clidname(dname, xdr_netobj)
+    根据xdr_netobj计算一个字符串，计算方法使用md5,好像是扩展成16字节.
+
+3. nfsd4_create_clid_dir(nfs4_client)
+    根据nfs4_client->cl_recdir在目录(user_recovery_dirname /var/lib/nfs/v4recovery)下面建立子目录
+
+4. nfsd4_build_namelist(arg, name, namlen, offset, ino, d_type)
+    这个函数是reddir的回调函数，它把user_recovery_dirname下面的所有目录取出来，然后组成一个字符串列表
+
+5. nfsd4_list_rec_dir(recdir_func)
+    从user_recovery_dirname目录下面取出所有子目录名，然后对他们调用recdir_func函数. recdir_func(dentry parent, dentry child)
+
+6. nfsd4_unlink_clid_dir(name, namlen)
+    删除user_recovery_dirname下面的name
+
+7. nfsd4_remove_clid_dir(nfs4_client)
+    -> nfsd4_unlink_clid_dir(recdirname, len)
+
+8. purge_old(dentry, dentry)
+    删除子文件夹，应该作为recdir_func下面调用
+
+9. nfsd4_recdir_purge_old()
+    同时调用两个函数
+    -> nfsd4_list_rec_dir(purge_old)
+
+10. load_recdir(dentry, dentry)
+    也是一个回调函数, 把dentry 添加到reclaim_str_hashtbl列表中，让state使用
+    -> nfs4_client_to_reclaim(name)
+
+11. nfsd4_recdir_load()
+    应该是启动使，把recovery目录下面的文件夹名取出来
+    -> nfs4_list_rec_dir(load_recdir)
+
+12. nfsd4_init_recdir() / nfsd4_shutdown_recdir
+    打开user_recovery_dirname文件夹,或关闭
+    -> file_open / fput
+
+13. nfs4_reset_recoverydir / nfs4_recoverydir
+    
+
+(fs/nfsd/nfs4_callback.c)
+1. 数据结构
+    nfs4_cb_compound_hdr  这表示一个callback数据包的结构?
+        * ident
+        * nops
+        * nops_p
+        * minorversion
+        * status
+
+
+2. xdr相关操作
+    a. xdr_encode_empty_array(p)
+
+    b. encode_nfs_cb_opnum4(xdr_stream, nfs_cb_opnum4)
+        保存op数
+    
+    c. encode_nfs_fh4(xdr_stream, knfsd_fh)
+
+    d. encode_stateid4(xdr_stream, statid_t)
+
+    e. encode_sessionid4(xdr_stream, nfsd4_session
+
+    f. decode_cb_op_status(xdr_stream, nfs_opnum4, nfsstat4)
+        取出nfs_opnum4和nfsstat4，检查opnum是否与传入参数相通，返回nfsstat4
+
+    g. encode_cb_compound4args(xdr_stream, nfs4_cb_compound_hdr)
+        格式应该和nfsd4_compoundargs相通
+            tag (empty)
+            minorversion
+            callback_ident
+            argarray
+        这些都是从nfs4_cb_compound_hdr中获取. nfs4_cb_compound_hdr->nops_p指向xdr_stream中argarray的数组个数.
+
+    10. encode_cb_nops(nfs4_cb_compound_hdr)
+        根据nfs4_cb_compound_hdr->nops更新nfs4_cb_compound_hdr->nops_p, 因为nops_p指向xdr_stream中的数组个数
+
+    11. decode_cb_compound4res(xdr_stream, nfs4_cb_compound_hdr)
+        CB_COMPOUND4res格式如下
+            nfsstat4 status
+            tag(empty)
+            nfs_cb_resop4
+        这里只解出status和nfs_cb_resops的个数
+
+    12. encode_cb_recall4args(xdr_stream, nfs4_delegation, nfs4_cb_compound_hdr)
+        可以参考RECALL调用
+    13. encode_cb_sequence4args(xdr_stream, nfsd4_callback, nfs4_cb_compound_hdr)
+    14. decode_cb_sequence4resok(xd4_stream, nfsd4_callback)
+    15. decode_cb_sequence4res(xdr_stream, nfsd4_callback)
+    16. nfs4_xdr_enc_cb_null(rpc_rqst, xdr_stream, void)
+    17. nfs4_xdr_enc_cb_recall(rpc_rqst, xdr_stream, nfsd4_callback)
+        CB_RECALL操作
+    18. nfs4_xdr_dec_cb_null(rpc_rqst, xdr_stream, void)
+    19. nfs4_xdr_dec_cb_recall(rpc_rqst, xdr_stream, nfsd4_callback)
+    
+所有的xdr操作就这些，因为目前只实现了delegation的RECALL操作
+定义了一些PRC client相关变量
+rpc_procinfo nfs4_cb_procedures[2] 包含NULL和COMPOUND操作，但COMPOUND只有recall
+rpc_version nfs_cb_version4
+rpc_program cb_program
+
+    20. max_cb_time 
+        这是一个callback最大的时间
+
+    21. setup_callback_client(nfs4_client, nfs4_cb_conn, nfsd4_session)
+        这样参考RPC的操作
+        -> rpc_timeout 包含to_initval = max_cb_time
+        -> 创建rpc_create_args 根据nfsd4_cb_conn和timeout, cb_program等
+        -> rpc_create创建 rpc_clnt
+
+    22. warn_no_callback_path(nfs4_client, reason)
+    23. nfsd4_mark_cb_down(nfs4_client, reason)
+        修改nfs4_client->cl_cb_state 为NFSD4_CB_DOWN
+        wran_no_callback_path
+    24. nfsd4_cb_probe_done(rpc_task, calldata)
+        修改nfs4_client->cl_cb_state为NFSD4_CB_FAULT
+        warn_no_callback_path
+    25. nfsd4_cb_probe_done(rpc_task, calldata)
+        calldata是nfs4_client, 这是个回调函数,根据rpc_task->tk_status设置nfs4_client
+        -> nfsd4_mark_cb_down
+        -> nfs4_client->cl_cb_state = NFSD4_CB_UP, 如果没有问题，则设置这个标志
+    26. nfsd4_probe_ops 这是rpc中使用的回调函数rpc_call_ops,使用了rpc_call_done, 就是nfsd4_cb_probe_done
+
+    27. set_callback_cred
+        这里比较奇怪，没有使用uid=0,而是找一个'nfs'的cred
+        -> rpc_lookup_machine_cred("nfs")
+        
+下面是workqueue相关操作
+    28. run_nfsd4_cb(nfsd4_callback)
+        callback_wq是全局变量，表示某个workqueue, 添加某个work
+        queue_work(callback_wq, nfsd4_callback->cb_work)
+
+    29. do_probe_callback(nfs4_client)
+        组装nfsd4_callback nfs4_client->cl_cb_null, 填充rpc_message, rpc_call_ops等，添加给workqueue
+        -> run_nfsd4_cb(nfsd4_client->cl_cb_null
+
+    30 nfsd4_probe_callback(nfs4_client)
+        探测callback是否可用，使用NULL调用, 把nfs4_client->cl_cb_state设为NFSD4_CB_UNKNOWN
+        -> do_probe_callback
+
+
+    31. nfsd4_probe_callback_sync(nfs4_client)
+        同步方式探测
+        -> nfsd4_probe_callback(nfs4_client)
+        -> flush_workqueue(callback_wq) 这应该是等待工作队列的操作
+
+    32. nfsd4_change_callback(nfs4_client, nfs4_cb_conn)
+        nfs4_client->cl_cb_state = NFSD4_CB_UNKNOWN,不清楚这里做了什么，可能需要看一下nfs4_cb_conn. 他是client的delegation callback的信息，包括sockaddr_storage，cb_prog，可能是program号,还有ident,svc_xprt
+        把nfs4_cb_conn拷贝nfs4_client
+
+    33. nfsd41_cb_get_slot(nfs4_client, rpc_task)
+        这是slot操作，不大清楚
+
+    34. nfsd4_cb_prepare(rpc_task, callback)
+        这应该是RPC的一个回调函数, 检查nfsd41的slot相关操作，把nfs4_callback添加到nfs4_client,然后启动PRC. callback是nfsd4_callback变量，nfsd4_callback又属于nfsd4_delegation.
+
+    35. nfsd4_cb_done(rpc_task, callback)
+        只有在nfsd41时才有有效操作,管理session相关操作，唤醒下一个task
+        -> rpc_wake_up_next(rpc_wait_queue)
+
+    36. nfsd4_cb_recall_done(rpc_task, callback)
+        这应该callback调用的回调函数，那上面的算什么？
+        callback对应nfsd4_callback，nfs4_callback->nfs4_delegation->nfs4_stid->nfs4_client, 判断rpc_task->ck_client 是否和nfs4_client->cl_cb_client，都是rpc_clnt。
+        如果rpc_task->tk_state OK，则把nfs4_callback->cb_done设为true
+        如果有问题，修改nfs4_callback状态，重新启动任务
+        -> nfsd4_mark_cb_down
+        -> rpc_restart_call_prepare
+        
+    37. nfsd4_cb_recall_release(callback)
+        如果nfs4_callback->cb_done为true，则释放它对应的delegation, 把它从nfs4_client->cl_callbacks,释放delegation
+        -> nfs4_put_delegation
+    rpc_call_ops nfsd4_cb_recall_ops使用上面的三个回调函数
+
+    38. nfsd4_create_callback_queue / nfsd4_destroy_callback_queue
+        -> create_singlethread_workqueue("nfsd4_callbacks")
+        
+    39. nfsd4_shutdown_callback(nfs4_client)
+        刷新掉callback队列
+        -> do_probe_callback(nfs4_client)
+        -> flush_workqueue(callback_wq) 为什么要刷新整个工作队列？
+
+    40. nfsd4_release_cb(nfsd4_callback)
+        为何这里要主动调用回调函数？
+        -> nfsd4_callback->cb_ops->rpc_release
+
+    41. __nfsd4_find_backchannel(nfs4_client)
+        在nfs4_client->cl_sessions中找一个nfs4_conn,根据其标志NFS4_CDFC4_BACK.
+
+    42. nfsd4_process_cb_update(nfsd4_callback)
+        检查rpc client是否有效
+        -> rpc_shutdown_client(nfs4_client->cl_cb_client) 因为要更新，所以把原来的关闭
+        -> svc_xprt_put(nfs4_client->cl_cb_conn.cb_xprt)
+        -> setup_callback_client根据nfs4_callback->nfs4_client->nfs4_conn装备nfs4_client,其实初始化nfs4_client的rpc任务。
+        -> run_nfsd4_cb(nfs4_callbacks) 启动nfs4_client->cl_callbacks上的所有cb任务
+
+    43. nfsd4_do_callback_rpc(work_struct)
+        这应该workqueue的回调函数, work_struct是nfs4_callback的
+        -> nfsd4_propress_cb_update(nfsd4_callback)
+        -> nfsd4_release_cb 怪不得自己调用了，因为nfsd4_client->cl_cb_client为空
+        -> rpc_call_async(rpc_clnt ...)这里启动rpc任务
+        先确定nfsd4_callback->work_struct->work_func_t, 在alloc_init_deleg中初始化work_struct,就是使用这个函数。
+
+    44. nfsd4_cb_recall(nfs4_delegation)
+        recall调用,初始化nfsd4_callback,然后把它放到callback_wq中.看了callback的work_struct如何调用，再看看哪里放入队列
+        <- nfsd_break_one_deleg(nfs4_delegation)
+        <- nfsd_break_deleg_cb
+        <- lock_manager_operation 这是lock/lease的break函数
+        这里需要了解workqueue和lease/lock的机制
+
+
+现在已经把所有的nfs server看完了，当然要了解还需要看SUNRPC,下面就是需要解决的疑问：
+1. 会不会有pseudo file system维护？ public file handle 和 root file handle如何确认？ 

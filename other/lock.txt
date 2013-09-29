@@ -1,0 +1,302 @@
+vfs的lock操作 (fs/locks.c; fl/lease.c)
+
+数据结构
+file_lock 
+    * file_lock fl_next 单链表,inode->i_flock链表
+    * list_head fl_link  blocked 锁放在blocked_list上,否则file_lock_list.仅限posix锁
+    * fl_block  fl_block  所有blocked锁队列，包括lease,flock,posix
+    * fl_owner fl_owner 这里就是files_struct, 对所有的file_lock都是，但flock不用
+    * fl_type  
+        * FL_POSIX 
+        * FL_FLOCK 
+        * FL_LEASE 
+        * FL_EXISTS 在解锁时保证锁存在
+        * FL_ACCESS 测试是否可以锁文件;
+        * FL_SLEEP 表示加锁的进程是否可等待
+        * FL_CLOSE close表示关文件解锁
+        * FL_UNLOCK_PENDING, FL_DOWNGRADE_PENDING 表示being downgraded/being broken. 
+    * fl_type  F_RDLCK / F_UNLCK / F_WRLCK
+    * fl_pid  
+    * pid fl_nspid 为啥有两个呢？
+    * fl_wait wait_queue_head_t 唤醒使用这个锁的进程
+    * file 关联的文件 posix lock应该不用.
+    * fl_start / fl_end
+    * fasync_struct fl_fasync 这个东西只在fcntl.c和一些驱动中使用. lease发送信号使用.
+    * fl_break_time / fl_downgrade_time lease使用的时间
+    * file_lock_operation fl_ops   
+    * lock_manager_operation fl_lmops  两个回调方法
+    * nfs_lock_info
+    * nfs4_lock_info 这两个是nfs client端使用的,怪不得和nfsd4_lockowner不一样,server端简单
+    * list_head , state  -> afs使用  
+            这些是fl_u 附带一些private信息
+
+file_lock_operation
+    fl_copy_lock(file_lock, file_lock)
+    fl_release_private(file_lock) 在注销锁的时候使用
+
+lock_manager_operation
+    lm_compare_owner(file_lock, file_lock)
+    lm_notify(file_lock) 这是在唤醒blocked锁时使用, 只在lockd中使用了.
+    lm_grant(file_lock, file_lock, int)  在rhel6中竟然没有这个东西！在lockd和nlm中使用
+    lm_release_private(file_lock) 在释放锁时调用
+    lm_break(file_lock) lease使用,nfsd的lease也提供自己的东西
+    lm_change(file_lock) lease使用,在升级/降级lease时使用
+
+操作, 既然已经看了一遍,就把posix/flock/lease分开
+下面是锁共有的创建/注销/拷贝函数
+1. lock_flocks / unlock_flocks()  
+    好大的锁, 锁整个lock系统
+
+2. locks_init_lock_heads(file_lock) / locks_alloc_lock()
+    初始化表示关系的变量,全部清空; 
+    从filelock_cache中分配锁, 调用 locks_init_lock_heads
+
+3. locks_release_private(file_lock)  / locks_free_lock(file_lock)
+    前者是释放锁
+    -> file_lock->fl_ops->fl_release_private
+    -> file_lock->fl_lmops->lm_release_private
+    后者是注销锁, 释放锁使用的内存
+    -> locks_release_private
+
+4. locks_init_lock(file_lock)
+    外部使用这个接口
+    -> memzero
+    -> locks_init_lock_heads(file_lock)
+
+5. locks_copy_private(file_lock, file_lock)
+    拷贝private数据, 并且拷贝两个回调函数 file_lock_operation / lock_manger_operation
+    -> fl_fl_ops->fl_copy_lock(new, fl)
+
+6. __locks_copy_lock(file_lock, file_lock)
+    和上面就不一样了,简单的拷贝lock使用的变量  fl_owner/fl_pid/fl_flags/fl_type/star/end,其他都置空
+
+7. locks_copy_lock(file_lock, file_lock)
+    拷贝之前先释放private数据,锁分了4步
+    -> locks_release_private(new)
+    -> __locks_copy_lock()
+    -> 设置fl_file / fl_ops / fl_lmops
+    -> locks_copy_private()
+
+8. __locks_delete_block(file_lock)
+    释放blocked的file_lock的关系,它不再是blocked
+
+9. locks_delete_block(file_block)
+    -> __locks_delete_block
+
+10. locks_insert_block(file_block blocker, file_block waiter)
+    blocker把waiter阻塞,把waiter放到blocker->fl_block队列中,同时如果是POSIX锁,把waiter放到全局链表blocked_list中,准备死锁检查, waiter->fl_next = blocker,这是个标志. 在flock/posix/lease中都会调用它,而再最外层中实现wait操作。因为这里只有链表操作,估计使用wait_event之类的操作,进程等待在自己使用的锁的等待队列上(file_block->fl_wait是wait_queue_head_t)
+
+11. locks_wake_up_blocks(file_lock)
+    全部释放file_lock->fl_block队列的blocked锁, 这是一个队列,而唤醒各个锁的等待队列.这个锁可能是lease,flock,posix. 
+    -> __locks_delete_block(file_lock)
+    -> file_lock->lock_manger_ops->lm_notify(file_lock) 
+    -> wake_up(file_lock->fl_wait) 这个等待队列上可能有多个进程吗？
+
+12. locks_insert_lock(file_lock pos, file_lock fl)
+    pos 是inode->locks单边表,把fl放到pos位置,同时设置fl_nspid. 把file_lock放到file_lock_list上面.这应该是加锁成功,放到inode->i_flock
+
+13. locks_delete_lock(file_lock)
+    把file_lock从inode->i_flock链表中取出来,同时释放在file_lock_list的关系
+    -> fasync_helper
+    -> put_pid(file_lock->fl_nspid)
+    -> locks_wake_up_blocks
+    -> locks_free_lock
+
+14. locks_conflict(file_lock, file_lock)
+    判断两个锁是否互斥,只要有一个是F_WRLCK,就互斥, 估计flock就直接使用这个了!
+
+下面是flock操作:
+1. flock_translate_cmd(cmd)
+    posix锁使用F_RDLCK/F_WRLCK/F_UNLCKs而flock使用LOCK_SH/LOCK_EX/LOCK_UN. 这里为何有LOCK_MAND和LOCK_RW? 运行共同读写？ 把flock的标志装好为posix的标志
+
+2. flock_make_lock(file, file_lock, cmd)
+    根据cmd创建一个file_lock, 没有设置fl_owner, 不清楚在插入时会不会补上？
+
+3. flock_locks_conflict(file_lock, file_lock)
+    这里比较file_lock->fl_file. 不同进程打开一个文件(无论symlink/link)肯定互斥,而且同意进程两次open一个文件,在两个fd上加锁也互斥. 为何LOCK_MAND不互斥? LOCK_MAND是flock的一个标志,不是POSIX的强制锁.这里不看.
+
+4. flock_lock_file(file, file_lock)
+    在inode->file_lock队列中,lease放在前面,其次是flock,最后面是posix lock. 为何inode有多个file呢？多次调用open在一个文件上,会产生多个files关联一个inode. 这里比较简单,不看了.
+
+5. flock_lock_file_wait(file, file_lock)
+    实现等待方式插入flock锁，循环的插入锁，如果被阻塞则等待，等待完成继续循环.
+    -> flock_lock_file
+    -> wait_event_interrruptible(file_lock->fl_wait, file_lock->fl_next==0) 在返回FILE_LOCK_DERFERED时才等待.
+
+下面是posix操作
+1. assign_type(file_lock, type)
+    file_lock->fl_type = type  不过做了检查
+
+2. flock_to_posix_lock(file, file_lock, flock)
+    把fcntl使用的flock转换为file_lock, 这里只使用了start/len/type,说明一下其他的东西
+    fl_owner = files_struct 相当于一个进程,posix创建的线程无法互斥锁
+    fl_pid = current->tgid 线程组id
+    fl_file = file 这个有用吗？
+    fl_flags = FL_POSIX
+    fl_ops / fl_lmops 都是空,无法调用用户态的东西,看lease的！
+
+3. flock64_to_posix_lock 
+    和上面差不多
+
+4. posix_same_owner(file_lock, file_lock)  / locks_overlap(file_lock, file_lock)
+    如果没有回调函数,直接比较fl_owner. 这个lease也会使用
+    -> file_lock->lock_manger_ops->lm_compare_owner
+
+5. posix_locks_conflict(file_lock, file_lock)
+    要求这两个锁都是posix, 判断: posix_same_owner, 锁的范围, 锁的类型
+
+6. posix_test_lock(file, file_lock)
+    遍历file->f_path.dentry->d_inode->i_flock,找是否有和file_lock冲突的锁, 怎么不在加锁的地方实现,可以使用FL_ACCESS.
+    -> posix_locks_conflict(file_lock, file_lock)
+    -> __locks_copy_lock 如果有,则返回锁的信息
+    
+7. what_owner_is_waiting_for(file_lock)
+    在blocked_list链表上找一个file_lock,它和file_lock有相同的owner
+    -> posix_same_owner
+
+8. posix_locks_deadlock(file_lock caller, file_lock blocker)
+    检查死锁的函数, 如果caller被blocker阻塞,会不会引发死锁. 如果blocker的owner有一个锁等待caller的owner的锁(间接),则引发死锁。所以找一个锁,它和blocker有相同的所有者,检查它等待的锁和caller有相同的owner. 这里做了优化,最多检查10层间接关系,测试一下。 测完了,是11层.
+    -> what_owner_is_waiting_for(blocker)
+    -> posix_same_owner(caller, blocker)
+
+9. __posix_lock_file(inode, file_lock, file_lock) / posix_lock_file(file, file_lock, file_lock)
+    第二个参数是要添加的锁,输入参数,第三个是与与这个锁冲突的锁,输出参数.这个是加/解锁的处理过程,各种情况.  
+    -> 先遍历一遍,检查是否有冲突,如果有冲突,再判断是否要睡眠等待(file_lock->fl_flags&FL_SLEEP),如果要等待,需要判断是否死锁,一切正常,把锁放到等待队列,返回FILE_LOCK_DEFERED
+        -> __locks_copy_lock 返回冲突的锁
+        -> posix_locks_deadlock
+        -> locks_insert_block(file_lock ...)
+    -> 锁在inode->file_lock队列中是有序的,相同owner的放在一块. 这里锁的升级降级也做了处理. 添加锁后,最多会产生3个新的锁,left, request, right. 对与request的锁,需要把它覆盖的锁释放掉。而针对两端的锁,只需要改变其范围就可以. 但要唤醒等待这些锁上的进程。这里针对锁的唤醒也非常配合,唤醒的时候把整个队列都唤醒,让等待的进程重新加锁. 如果是有被完全覆盖的锁,还要判断是否是相同类型,如果是的话修改范围,如果不是虽然也是修改范围,但还释放了private数据. 针对相同类型的锁,扩展是没有释放和替换private数据?
+    第二个函数只是对第一个封装. 
+    
+10. posix_lock_file_wait(file, file_lock)
+    如果无法获取到锁,等待直到获取锁.如果posix_lock_file返回FILE_LOCK_DEFERED,说明锁冲突,等待直到file_lock->fl_next为NULL,这时说明它从blocked的锁的block链表中释放. 终于有wait操作,果然使用wait_event_interruptible,而且这里像wait-wake一样,需要循环,确定自己能加上锁。不一定被谁唤醒。
+    -> posix_lock_file 判断其返回FILE_LOCK_DEFERED
+    -> wait_event_interruptible(wait_queue ...)
+
+11. locks_mandatory_locked(inode) 
+        判断inode上是否有posix锁,不属于当前进程.
+    mandatory_lock(inode) 
+        判断inode上是否要求强制锁（通过superblock和inode->i_mode决定)
+    locks_verify_locked 这个才是重要的
+        判断文件上是否有强制锁,当然是对自己进程来说的。锁是强制的,取决于文件。 如果文件已经被别的进程加锁,而且文件说它是强制锁,则它就是强制锁。
+
+12. locks_mandatory_area(int read_write, inode, file, offset, count)
+    这应该是在读写操作时判断是否有强制锁。先尝试加锁,如果成功,则继续。如果失败,检查操作模式是不是阻塞的,如果不是,则一直睡眠,知道拿到锁.这里使用FL_ACCESS,不会真正加锁,还是用FL_SLEEP. 最后保证inode上没有其他进程的锁,或者这个文件不再使用强制锁。 这里等待的条件是file_lock->fl_next == NULL, 因为在blocked是sfile_lock->fl_next是blocker。
+
+13. locks_verify_truncate(inode, file, size)
+    -> locks_mandatory_areas 进程是否可以对减/增的那块文件进行操作.
+
+下面应该是lease操作,上面对于lock的操作,只有加锁/去锁操作,所以没有什么好说的,还有强制锁,也是在open/read/write使用。mapping方式不能使用锁。
+
+1. lease_breaking / target_leasetype(file_lock)
+    判断lease是否在释放中
+2. lease_break_callback
+    好像还挺复杂,fcntl为啥这么多实现? 下面函数的任务是给lease所有者发送SIGIO信号.
+    -> kill_fasync(file_lock->fasync_struct, SIGIO, POLL_MSG)
+
+3. lease_release_private_callback(file_lock)
+    这是释放lease操作, 必须有file_lock->fl_file, 把file上的信号清空
+    -> f_delown 为何删除own?  -> modown 好像把文件上的信号删掉
+
+4. lock_manager_operations lease_manager_ops
+    lm_break = lease_break_callback
+    lm_release_private = lease_release_private_callback
+    lm_change = lease_modify
+
+5. lease_init(file, type, file_lock)
+    初始化lease, 细说一下: type 就是传入参数, fl_flags是FL_LEASE
+    fl_owner  current->files 还是当前进程,和posix一样
+    fl_pid   current->tgid
+    fl_file file
+    fl_lmops = lease_manager_ops
+
+6. lease_alloc(file, type)
+    -> locks_alloc_lock
+    -> lease_init
+    -> locks_free_lock 如果lease_init失败
+
+7. lease_clear_pending(file_lock, arg)
+    lease通知完成,改变lease使用的file_lock的fl_flags。lease通知应该有三种,从WR降级到RD,从RD到UNLCK,从WR到UNLCK. 根据args,有两种情况：
+    -> F_UNLCK 去掉标志FL_UNLOCK_PENDING 
+    -> F_RDLCK 去掉标志FL_DOWNGRADE_PENDING
+    
+8. lease_modify(file_lock, arg)
+    它在lease释放,降级时使用. 这里会唤醒lease的操作进程。
+    -> lease_clear_pending(file_lock, arg)
+    -> locks_wake_up_blocks(file_lock) 
+    -> locks_delete_lock(file_lock)  系统删除这个file_lock,没有让lease所有者删除它
+
+9. past_time(then)
+    jiffies > then
+
+10. time_out_leases(inode)
+    遍历inode->i_flock上的所有lease,如果它的lease在被破坏中,而且时间已过,修改lease的状态.判断时间还有两种情况. 都通过调用lease_modifys实现lease的降级或删除.
+    -> file_lock->fl_downgrade_tiem <> F_RDLCK <> FL_DOWNGRADE_PENDING
+    -> file_lock->fl_break_time <> F_UNLCK <> FL_UNLCK_PENDIGN
+    -> lease_modify
+
+11. __break_lease(inode, mode)
+    这个函数在open和truncate中使用,打破使用的lease,通过break_lease调用(包装一下). 这里先使用inode->f_flock做简单的判断,难道第一个lease是要求最严的？ 应该是或者只有一个读写的lease,或者有许多读的lease.
+    -> 首先根据mode创建一个lease用的file_lock,检查第一个file_lock和访问是否冲突, 如果不冲突就完成操作.
+    -> 检查是否有一个lease,属于当前进程. 一个进程可以打开文件两次,产生不同的file.第二次打开如果和第一次互斥的话,就有问题. 目前还没想出其他情况.
+    -> 遍历文件上的所有lease, 要破坏这些lease.根据访问权限,设置其他锁的破坏标志,调用file_lock->lock_manager_ops->lm_break. 这里会发送SIGIO给lease所有者进程.
+    -> 如果是NONBLOCK,则退出,因为进程要等待lease过期.lease应该是按时间顺序排列,所以等待在最晚的lease上面。 如果等待操作后,又添加lease怎么办？
+    -> 把这个锁放到第一个lease的等待队列上,试进程变为等待状态, 首先确定文件是NONBLOCK操作. 等待的时间是第一个lease的fl_break_time. 这个时间是谁设的？如果等待结束,发现又有人添加leases则继续等待。
+
+12. lease_get_mtime(inode, timespec )
+    获取文件的最后访问时间,如果文件上面有lease,而且是wrlck,则它的最后访问时间就是当前时间. 据说给NFS使用.
+
+13. fcntl_getlease(file)
+    遍历file->path.dentry->d_inode->i_flock,如果没有lease,返回F_UNLCK,然后返回这个文件拥有的锁。还是没看出来为何lease的file_lock->fl_owner是file.
+
+14. generic_add_lease(file, arg, file_lock)
+    加锁操作,要求是
+    * 如果读锁,不能对文件有写访问 inode->i_writecount = 0
+    * 如果写锁,只能此进程打开文件 dentry->d_count=1 inode->i_count=1
+    遍历i_node->i_flock队列,如果找到属于同一个file的file_lock,则修改这个file_lock
+    -> file_lock->lock_manage_ops->lm_change(file_lock, file_lock)
+    如果找到lease锁,而且要添加WRLCK,则出问题,说明有其他进程打开文件,这是不可能的.而状态是FL_UNLCK_PENDING,说明这个lease被破坏,在释放过程中,不能继续添加lease,否则等待lease的进程会一直等待下去.
+
+15. generic_delete_lease(file, file_lock)
+    这里并不是真正的删除锁,像lock操作一样,而且使用UNLCK锁。遍历inode->i_flock,发现file拥有的锁,该比其状态. 最后调用的是lease_modify,如果arg是F_UNLCK,他会注销lease。
+    file_lock->lock_manage_ops->lm_change(file_lock, F_UNLCK)
+
+16. generic_setlease(file, arg, file_lock)
+    简单传入传出参数,有升级或降级lease, 可以返回原来的结果
+    -> generic_delete_lease
+    -> generic_add_lease
+
+17. __vfs_setlease  / vfs_setlease
+    -> file->f_op->setlease
+    -> generic_setlease
+
+18. do_fcntl_delete_lease(file)
+    初始化一个F_UNLCK的lease,调用vfs_setlease
+
+19. do_fcntl_add_lease(fd, file, arg)
+    使用了fasync_struct. 它会调用__vfs_setlease, 同时如果添加lease,还要注册fasync_struct.
+
+其他都是fcntl中涉及lease的操作, 还有FLOCK, POSIX_LOCK
+
+20. lock_may_read(inode, start, len)
+    检查文件是否可以读取一段数据,以下情况不允许
+    * posix 写锁在这段空间上
+    * file lock 的强制锁 
+    * file lock 的写锁
+
+21. lock_may_write(inode, start, len)
+    检查一个文件的写操作不会违反文件上的锁操作
+    * posix的任何锁都不能覆盖这段
+    * file lock不是强制锁,而且不是写锁
+
+总结:
+1. lease添加不会阻塞. 不像lock一样，需要在添加时阻塞。 如果添加WRLCK的lease，则只有它自己open文件,而且inode上没有lease。如果添加RDLCK的lease, 则其他打开文件的任务都是读，所以不会conflict，直接插入.
+2. lease不像lock,它不需要UNLCK释放file_lock, 而是使用lm_change/lease_modify释放file_lock. lm_break/lease_break_callback发送SIGIO,没有看如何发送,但应该不复杂.
+3. 总结一下lease使用:
+  添加lease，注册fasync_struct
+  break_lease, 修改lease,发送信号, 等待lease_time
+
+4. 在inode->i_flock中的顺序是
+    lease  按插入时间排序,后插入的在前面
+    flock  先加的锁在前面
+    posix  按照lockowner排序，先加的锁在前面.

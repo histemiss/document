@@ -1,0 +1,141 @@
+* configfs总结
+   - configfs是内核的实现,定义了辅助的数据结构和接口函数, 可以直接使用 config_item, config_group, config_item_type.
+   - config_item应该和inode对应, config_group对应文件夹类型的.
+   - config_group是一种特殊的config_item, 类似于文件夹，对应configfs_subsystem  config_group->cg_children链表中是config_item, 和config_item->ci_group构成树型结构.
+   - config_item_type对应于config_item管理的信息. 使用configfs_attribute数组, 还包括configs_group_operations, configs_item_operations. 
+   - configfs_attribute相当于叶子节点,最小的配置项, 具体的属性需要包装它,还有2个方法,show/store.  CONFIGFS_ATTR_STRUCT定义一种数据类型,包装configfs_attribute
+   - 所有的config_item构成一个树的内部节点,但每个树都可以有叶子节点.
+   - config_group貌似有2种树型关系, 一种是固定的, 使用config_group->default_groups数组; 另一种是变化的, 使用config_group->ci_group链表.
+   
+
+* config.c
+   - /spaces/<space>/nodes/<nodes>/nodeid
+   - /spaces/<space>/nodes/<nodes>/weight
+   - /comms/<comm>/nodeid
+   - /comms/<comm>/local
+   - /comms/<comm>/addr
+   - /comms/<comm>/addr_list
+   - gfs使用dlm管理集群信息??
+   - 根目录对应一个dlm_cluster
+   - 2种配置文件,对应2个文件夹
+   - spaces对应dlm_spaces, comms对应dlm_comms
+
+** dlm_clusters
+   - 它使用configfs_subsystem, 但只有一个目录, 就是dlm, 也就是上面的根目录.它使用了subsystem??
+
+** dlm_cluster
+   #+begin_src 
+	struct config_group group;
+	unsigned int cl_tcp_port;
+	unsigned int cl_buffer_size;
+	unsigned int cl_rsbtbl_size;
+	unsigned int cl_recover_timer;
+	unsigned int cl_toss_secs;
+	unsigned int cl_scan_secs;
+	unsigned int cl_log_debug;
+	unsigned int cl_protocol;
+	unsigned int cl_timewarn_cs;
+	unsigned int cl_waitwarn_us;
+	unsigned int cl_new_rsb_count;
+	unsigned int cl_recover_callbacks;
+	char cl_cluster_name[DLM_LOCKSPACE_LEN];   
+   #+end_src
+** cluster_attribute
+   - 操作dlm_cluster->ci_cluster_name, 或者操作name/字符串
+
+** 总结
+   - 这里使用宏,针对config_attribute的每个成员/域构造数据类型,构造一个相应的对象. 所有的这些对象以及上面的cluster_attribute/cluster_attr_cluster_name构成一个configfs_attribute数组, 为config_item_type准备. cluster_attrs. 只有数据结构无法构造对象.
+   - 虽然show/store操作参数是configfs_attribute,但它实际上就是dlm_cluster.
+   - 针对dlm_cluster, 有2中config_item_type
+   - 一种是cluster_type, 它使用configfs_attribute数组cluster_attrs, 对应的config_item_type是cluster_type, 还有configfs_item_operations cluster_ops. 
+   - cluster_ops里面有show/store函数, 对于show函数, show_attribute中处理(config_item, configfs_attribute), 间接调用configfs_attribute外层数据结构的show函数, store同理.
+   - 虽然configfs_attribute看似有数据,但它还只是代表一组操作,可以读写某个对象.这个对象属于config_item,在这里是dlm_cluster的属性. configfs_attribute还是提供了操作的入口名称和限制，这种限制使用文件的属性.
+   - 另一种是clusters_ops, 它只包含configfs_group_operations对象,里面应该是创建和删除dlm_cluster
+   - make_group是make_cluster, 它构造一个dlm_cluster以及它的子目录dlm_spaces/dlm_comms. 貌似这个函数只使用一次!!
+
+** dlm_comms
+   - 管理comms子文件夹, 可以这里创建dlm_comm. 它使用config_group.
+
+** dlm_comm
+   - 包装什么信息?  一个节点? 
+   #+begin_src 
+	struct config_item item;
+	int seq;
+	int nodeid;
+	int local;
+	int addr_count;
+	struct sockaddr_storage *addr[DLM_MAX_ADDR_COUNT];   
+   #+end_src
+** 总结
+   - 对应comm也有2种config_item_type
+   - 一种是config_item_type comm_type
+     #+begin_src 
+	.ct_item_ops = &comm_ops,
+	.ct_attrs = comm_attrs,
+	.ct_owner = THIS_MODULE,     
+     #+end_src
+   - comm_attrs是configfs_attribute数组,里面的接口用来修改dlm_comm的属性.
+   - comm_ops里面和cluster_ops相同.
+   - 另一种是comms_type, 它用来创建或删除dlm_comm
+     #+begin_src 
+	.ct_group_ops = &comms_ops,
+	.ct_owner = THIS_MODULE,     
+     #+end_src
+   - 对于config_group_operations->make_item是make_comm, 构造一个dlm_comm, 使用上面的config_item_type/comm_type初始化它.
+
+** dlm_spaces
+   - 使用sysconfig_group管理子节点
+
+** dlm_space 
+   #+begin_src 
+	struct config_group group;
+	struct list_head members;
+	struct mutex members_lock;
+	int members_count;   
+   #+end_src
+   - 它没有属性可操作,它只是管理dlm_nodes
+
+** 总结
+   - 它也有2种config_item_type
+   - 一种是spaces_type用于构造或释放dlm_space
+     #+begin_src 
+	.ct_group_ops = &spaces_ops,
+	.ct_owner = THIS_MODULE,     
+     #+end_src
+   - 函数是make_space, dlm_space只有一个子文件夹nodes, 对应dlm_nodes, 一块创建.
+   - 另一种是space_type, 只是维护config_group, 因为它没有自己的属性
+
+** dlm_nodes
+   - 使用config_group管理子节点
+
+** dlm_node
+   - 这是什么属性??
+     #+begin_src 
+	struct config_item item;
+	struct list_head list; /* space->members */
+	int nodeid;
+	int weight;
+	int new;
+	int comm_seq; /* copy of cm->seq when nd->nodeid is set */
+     #+end_src
+** 总结
+   - 对应2种config_item_type
+   - 一种是nodes_type, 用于创建新的节点
+     #+begin_src 
+	.ct_group_ops = &nodes_ops,
+	.ct_owner = THIS_MODULE,     
+     #+end_src
+   - 对应的是make_node
+   - 另一个是node_type, 修改dlm_node的属性
+
+** dlm_config_node
+   - 它是外部使用的数据结构,用来包装dlm_node的数据
+     #+begin_src 
+	int nodeid;
+	int weight;
+	int new;
+	uint32_t comm_seq;     
+     #+end_src
+
+** dlm_config_info
+   - 它和dlm_cluster, 肯定是根据它构造dlm_cluster

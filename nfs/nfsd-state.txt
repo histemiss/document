@@ -1,0 +1,294 @@
+学习nfs server端内核对state的管理
+
+nfsd的状态管理好混乱
+
+clientid_t: 这是server给client的一个id
+stateid_opaque_t
+ * clientid_t
+ * so_id: 某个state的id
+stateid_t: 这是交互使用的stateid.
+ * si_generation: stateid包含2部分,在client分得更清楚,这个就是seq,但nfs41不用了啊.
+ * stateid_opqaue_t si_opaque, 这些对于client来说是不理解的
+
+nfs4_stid 用着个数据结构管理state
+* sc_type: 4种? 添加了CLOSE?
+* stateid_t sc_stateid: stateid不可少的
+* nfs4_client sc_client: 统一管理,应该使用idr管理
+
+nfs4_delegation, 看来delegation属于某个file,它应该有client的信息
+* nfs4_stid dl_stid
+* list_head dl_perfile: 多个READ delegation
+* list_head dl_perclnt: 关联同一个nfs4_client
+* list_head dl_recall_lru:??
+* dl_count:
+* nfs4_file dl_file
+* dl_type, dl_time
+* knfsd_fh dl_fh: 这是file handle,和nfs4_file重复了吧
+* nfsd4_callback  dl_recall: 这里不是指针?
+
+nfsd4_callback, 看来没人统一管理callback, 只能让他们各顾各的
+* cb_op
+* nfs4_client *cb_clp
+* list_head cb_per_client 
+* cb_minorversion
+* rpc_message cb_msg
+* rpc_call_ops cb_ops
+* work_struct cb_work
+* cb_done
+
+nfs4_ol_stateid: 这是open/lock类型的state, 关联stateowner,还有访问权限
+* nfs4_stid st_stid: 里面是共有的id, 管理nfs4_client
+* list_head st_perfile: 这是nfs4_file的? 幸亏没有nfs4_inode.
+* list_head st_perstateowner, 这里是nfs4_stateowner
+* list_head st_lockowners
+* nfs4_stateowner st_stateowner
+* nfs4_file st_file
+* st_access_bmap, st_deny_bmap: 这里应该保存访问权限
+* nfs4_ol_stateid *st_openstp: 这个应该为lock准备的
+
+nfs4_client
+* list_head cl_idhash
+* list_head cl_strhash
+* list_head cl_openowners: 关联所有的nfs4_openowner->oo_perclient
+* idr cl_stateids: id占位符
+* list_head cl_delegations: 关联所有的nfs4_delegation->dl_perclnt
+* list_head cl_lru
+* xdr_netobj cl_name: 客户端网络地址
+* cl_recdir:  状态回复的目录名
+* nfs4_verifier: 在exchange id过程中,client提供的verifier
+* cl_time: lease更新时间
+* sockaddr_storage cl_addr: 客户端ip地址,包括端口地址
+* svc_cred: 包括uid等信息,还有flavor/principal
+* clientid_t cl_clientid: server产生的client id
+* nfs4_verifier cl_confirm: server产生的verifier
+* cl_minorversion
+* nfs4_cb_conn cl_cb_conn
+* cl_flags
+
+* rpc_clnt cl_cb_client
+* cl_cb_ident
+* cl_cb_state: callback的状态
+* nfsd4_callback cl_cb_null
+* nfsd4_session cl_cb_session
+* list_head cl_callbacks
+
+* list_head cl_sessions: 关联所有的nfsd4_session->se_perclnt
+* nfsd4_clid_slot cl_cs_slot  这个不是session的slot,而是EXCHANGE_ID中的sequence计数,而且里面有create_session的数据
+* cl_exchange_flags
+
+* cl_cb_slot_busy
+* rpc_wait_queue cl_cb_waitq
+
+callback就是个麻烦！
+
+nfsd4_session
+* list_head se_hash: hash表,根据sessionid计算hash值
+* list_head se_perclnt: 关联同一个nfs4_client
+* se_flags
+* nfs4_client *se_client
+* nfs4_sessionid se_sessionid
+* nfsd4_channel_attrs se_fchannel
+* nfsd4_channel_attrs se_bchannel
+* list_head se_conns  所有的nfsd4_conn
+* se_cb_prog / se_cb_seq_nr
+* nfsd4_slot se_slots:这是接受的slot计数数组, 在服务端复杂一些
+
+nfsd4_slot 这里需要缓存之前的结果,所以不止一个seqid
+* sl_seqid
+* sl_status
+* sl_datalen
+* sl_opcnt
+* sl_flags
+* sl_data: 这里存数据,上面是相关属性
+
+nfsd4_channel_attrs
+* headerpadsz
+* maxreq_sz
+* maxresp_sz
+* maxresp_cached
+* maxops
+* maxreqs
+* nr_rdma_attrs
+* rdma_attrs
+
+nfsd4_conn
+* list_head cn_persession: 关联共享nfsd4_session的nfsd4_conn
+* svc_xprt cn_xprt: 指针,为何和下层关联这么密切?
+* svc_xpt_user cn_xpt_user
+* nfsd4_session cn_session
+* cn_flags : 两种情况, CDFC4_FORE, CDF4C_BACK, 为何要分FORE, BACK??
+
+nfsd4_cb_conn 相关信息是通过exchangeid获取的
+* sockaddr_storage cb_addr, cb_saddr: 两个地址
+* cb_addrlen
+* cb_prog: 应该是从setsession中获取, nfsd4_create_session
+* cb_ident
+* svc_xprt cb_xprt: 这应该是某一类的svc_xprt
+
+
+nfs4_stateowner: 这里没有管理state(和client的命名方式很相似,仅差一个_)
+* list_head so_strhash: 使用全局hash数组管理所有的nfs4_stateowner,根据xdr_netobj计算hash值
+* list_head so_stateids: 关联所有的nfs4_ol_stateid
+* nfs4_client so_client
+* so_seqid  没用了!
+* xdr_netobj so_owner: 这个代表了一个stateowner的id,它在client仅有一个id,但对server来说,是一个24字节的字符串,包含时间,id,fs信息.(refer to encode_openhdr)
+* nfs4_replay so_replay: 这应该是对应state中的seqid的重复处理,因为使用相通stateowner的state相关操作是串行的,所以这个可以保存上一次操作
+* so_is_open_owner
+
+nfs4_openowner, 还是没有看出来哪里管理state. 这是普通的stateowner,没有任何多的东西
+* nfs4_stateowner oo_owner
+* list_head oo_perclient: 关联同一个client的openowner
+* list_head oo_close_lru:这缓存没有使用的nfs4_openowner
+* nfs4_ol_stateid oo_last_closed_stid:
+* oo_time
+* oo_flags
+
+nfs4_file
+* list_head fi_hash: file_hashtlb表
+* list_head fi_stateids: 所有关联的nfs4_ol_stateid->st_perfile
+* list_head fi_delegations: 关联  nfs4_delegation->dl_perfile
+* file fi_fds[3]:对应O_RDONLY,O_WRONLY,O_RDWR, 这里会使用fput释放file.
+* fi_access[2]:对应读写. 当任何一个减到0时,释放对应的fi_fds,同时还要检查是否释放fi_fds[O_RDWR], 好像对于RPC的open来说,它的访问会改变, upgrade,或downgrade,所以这里没有使用3个计数. 而是要不断检查O_RDWR的文件关闭。
+* file fi_deleg_file  这个file是为了lease操作而打开的
+* file_lock fi_lease
+* fi_delegees
+* inode fi_inode: 为何有了inode,还有file
+* fi_had_conflict
+
+
+
+stateid的处理,内存管理使用kmem_cache,nfsd分两种,一种是openlock,另一种是delegation,所以有两种kmem_cache
+* nfs4_alloc_stid(nfs4_client, kmem_cache) 这个函数仅仅从kmem_cache中分配一个对象
+* init_stid(nfs4_stid, nfs4_client, type) 这里初始化nfs4_stid,关联nfs4_client,拷贝clientid, 设置si_generation为0,这个si_generation实际上对client不可见.
+  > get_new_stid(nfs4_stid) 从nfs4_stid->nfs4_client->cl_stateids这个idr中取一个id, 给si_opaque.so_id.
+
+nfs4_ol_stateid的处理
+* nfs4_alloc_stateid(nfs4_client) 这里仅仅是分配一个nfs4_ol_stateid使用的内存, stateid是对于一个nfs4_client来说唯一的
+* release_open_stateid(nfs4_ol_stateid)
+  > unhash_open_stateid(nfs4_ol_stateid)
+    > unhash_generic_stateid(nfs4_ol_stateid) 释放nfs4_ol_stateid和nfs4_file/nfs4_stateowner的关系
+    > release_stateid_lockowners(nfs4_ol_stateid) 关联一串的nfs4_lockowner, 释放那些对象
+    > close_generic_stateid(nfs4_ol_stateid) 释放和nfs4_file的联系
+      -> release_all_access(nfs4_ol_stateid) 释放nfs4_ol_stateid的访问记录
+      -> put_nfs4_file(nfs4_ol_stateid->nfs4_file) nfs4_file使用计数方式
+  > unhash_stid(nfs4_ol_stateid->nfs4_stid) 释放idr中的占位符
+  > free_generic_stateid(nfs4_ol_stateid) 回收内存
+* init_open_stateid(nfs4_ol_stateid, nfs4_file, nfsd4_open) nfs4_ol_stateid已经分配,建立和nfs4_openowner/nfs4_file的联系,还有从nfsd4_open中取出来access/deny
+
+nfs4_openowner的处理
+* release_openowner(nfs4_openowner) 释放nfs4_openowner, 它包含nfs4_stateowner, nfs4_openowner没有使用计数之类的,释放就直接释放
+  > unhash_openowner(nfs4_openowner) 释放nfs4_openowner->nfs4_stateowner的hash关系, 和nfs4_openowner和nfs4_client关系
+    > release_open_stateid(nfs4_ol_stateid) 释放所有关联的nfs4_ol_stateid
+  > list_del(nfs4_openowner->oo_close_lru) 在nfs4.0中, 当stateowner释放后会先保留一段时间
+  > release_last_closed_stateid(nfs4_openowner) 这里处理nfs4_openowner->oo_last_closed_stid这个nfs4_ol_stateid,  这里是很简单的释放,难道又是缓存一个nfs4_ol_stateid??
+    > unhash_stid(nfs4_ol_stateid->st_stid) 从idr中释放
+    > free_generic_stateid(nfs4_ol_stateid) 释放内存
+  > nfs4_free_openowner(nfs4_openowner) xdr_netobj的内存是动态的! 释放内存给kmem_slab
+* alloc_init_open_stateowner
+  > alloc_stateowner(kmem_slab, xdr_netobj, nfs4_client)  申请内存,初始化ownername, 构造的不单是nfs4_stateowner,而是nfs4_openowner或者nfs4_lockowner.. nfs4_stateowner使用全局hash表, ownerstr_hashtbl,根据name计算hash值,而且使用nfs4_client管理
+  > hash_openowner(nfs4_openowner, nfs4_client, hash)  建立联系
+
+
+delegation管理
+* alloc_init_deleg(nfs4_client, nfs4_ol_stateid, svc_fh, type) 这里要创建一个delegation, 首先得有nfs4_ol_stateid,它只是传进来nfs4_file, 而且这里会拷贝filehandle, 初始化callback相关变量
+  > nfs4_alloc_stid(nfs4_client, deleg_slab)
+* unhash_delegation(nfs4_delegation)
+  > unhash_stid(nfs4_delegation->nfs4_stid)
+  > 释放和nfs4_client/nfs4_file/dl_recall_lru的关系
+  > nfs4_put_deleg_lease(nfs4_file) 释放nfs4_file在文件上使用的lease, 所有的delegation使用一个lease??
+  > nfs4_put_delegation(nfs4_delegation) 回收内存
+    > put_nfs4_file(nfs4_delegation->nfs4_file)
+    
+
+nfsd4_session管理, 使用kref维持计数
+* __alloc_session(slotsize, numslots) 这里创建nfsd4_session,分配它自己还有slot需要使用的内存
+* nfs4_put_session(nfsd4_session) 调用free_session
+  > nfs4_del_conns(nfsd4_session) 释放对svc_xprt的关联,撤销回调函数,直接释放nfs4_conn
+  > __free_session(nfsd4_session)
+    > nfsd4_put_drc_mem(nfs4_channel_attrs)  啥都不做
+	> free_session_slots(nfsd4_session)  这两个共同释放两次申请的内存
+    > kfree
+* init_session(svc_rqst, nfsd4_session, nfs4_client, nfsd4_create_session) 这里初始化nfsd4_session, 建立和nfs4_client的关联,有callback相关参数, 把nfsd4_session放到全局hash表中, 根据sessionid计算hash值
+* 
+
+nfsd4_conn 这个数据对象的作用是把nfsd4_session和svc_xprt关联起来. nfsd4_conn只是表示某种链接状态,它也不会干扰nfsd4_session的状态.
+* alloc_conn(svc_rqst, flags)
+* alloc_conn_from_crses(svc_rqst, nfsd4_create_session) 这里是在创建session时创建新的nfsd4_conn, 仅仅需要和svc_rqst关联,后面会和nfsd4_session关联
+  > alloc_conn(svc_rqst, dir) dir和nfsd4_create_session->flags有关,BACK/FORE, 建立和svc_rqst的关联，没有其他操作
+* nfsd4_init_conn(svc_rqst, nfsd4_conn, nfsd4_session) 这里要初始化一个新的nfsd4_conn,建立该有的联系
+  -> nfsd4_hash_conn(nfsd4_conn, nfsd4_session) 关联两者关系
+  > nfsd4_register_conn(nfsd4_conn) 初始化nfsd4_conn->svc_xpt_user, 也就是注册回调函数, nfsd4_conn_lost, 可能当svc_rqst销毁时,通知nfsd4_conn.
+
+nfs4_client
+* create_client(xdr_netobj, recdir, svc_rqst, nfs4_verifier) 这几个参数是从SETCLIENTID/EXCHANGEID中获取的,能唯一的标示某个nfs4_client. 这个xdr_netobj是从client端直接传过来的. 参考nfs4_init_uniform_client_string, 包括version/minorversion/nodename.
+  > alloc_client(xdr_netobj)
+  > copy_cred(nfs4_client->cl_cred, svc_rqst->rq_cred) 为何使用这个cred? 是svc_cred,包括uid/gid/groupinfo/gss等数据
+  > 初始化state idr, recdir, 一系列队列
+  > 保存verifier, 产生confirm/clientid等..
+
+nfs4_file管理 使用slab管理内存: file_slab
+* nfsd4_init_file(nfs4_file, inode) 使用inode指针计算hash值, 仅使用file_hashtbl管理nfs4_file
+
+nfsd4_compound_state 这是compound包中的共有的东西
+* svc_fh current_fh, save_fh
+* nfs4_stateowner replay_owner?? : nfs server给每个stateowner的seqid设置了cache, 缓冲上次的state操作
+* nfsd4_session session:
+* nfsd4_slot slot: 这里使用nfs session的缓冲. 为何对缓存的使用和state没有关系,仅仅是compound的要求
+* datap :内存指针，指向res->xbuf中的内存
+* iovlen
+* minorversion status
+* current_stateid, save_stateid:  这两个是哪里来的?
+* sid_flags
+
+nfsd4_slot和nfsd4_compoundres, nfsd4_compound_state
+nfsd4_store_cache_entry, 把nfsd4_compoundres的一些数据放到放到slot中,这里看应该是一段连续的数据
+
+EXCHANGE_ID/CREATE_SESSION
+* nfsd4_exchange_id(svc_rqst, nfsd4_compound_state, nfsd4_exchange_id) 参数是nfsd4_exchange_id, 输入参数有flags表示exchange_id的用途,这里就是提交client_owner4(包括name,verifier),换一个clientid4/sequenceid4,当然还有protect/server_owner4的东西.
+  > nfs4_make_rec_clidname(output, nfsd4_exchange_id->clname) 根据name计算hash值,去hash列表中查找
+  > clientstr_hashval(output)
+  > find_confirmed_client_by_str(output, hash)
+  > create_client(nfsd4_exchange_id->clname, output, svc_rqst, verifier) 如果上面找不到,创建一个新的
+
+* nfsd4_create_session(svc_rqst, nfsd4_compound_state, nfsd4_create_session) 上面只是互相介绍一下,记住名字,这里会有实质性的动作. 这个命令是建立session,约定session的资源,还有回调rpc的程序号.
+  > alloc_session(nfsd4_create_session->fore_channel) 创建nfsd4_session,还有对应的nfsd4_slot
+  > alloc_conn_from_crses(svc_rqst, nfsd4_create_session) 创建nfsd4_conn, 和svc_rqst关联
+  > init_session(svc_rqst, nfsd4_session, nfs4_client, nfs4_create_session) 初始化的信息包括回调rpc程序,sessionid
+  > nfsd4_init_conn(svc_rqst, nfsd4_conn, nfsd4_session) 建立nfsd4_conn
+    > nfsd4_hash_conn(nfsd4_conn, nfsd4_session) 建立关系
+    > nfsd4_register_conn(nfsd4_conn)
+    > nfsd4_probe_callback(nfsd4_session->nfs4_client)
+  > nfsd4_cache_create_session(nfsd4_session, nfsd4_clid_slot, status) 把create_session数据给nfs4_client 
+
+* nfsd4_bind_conn_to_session(svc_rqst, nfsd4_compound_state, nfsd4_bind_conn_to_session)和上面比起来简单多了! 把nfsd4_conn和nfsd4_session关联起来
+  > find_in_sessionid_hashtbl(sessionid)
+  > alloc_conn(svc_rqst, dir)
+  > nfsd4_init_conn(svc_rqst, nfsd4_conn, nfsd4_compound_state->nfsd4_session)
+
+* nfsd4_destroy_session(svc_rqst, nfsd4_compound_state, nfsd4_destroy_session) DESTROY_SESSION,根据rfc解释,只会释放slot/conn资源,而lock/state/delegation不会释放. 整体来看session管理还是比较简单!
+  > find_in_sessionid_hashtbl(sessionid)
+  > unhash_session(nfsd4_session) 和nfs4_client断开联系
+  > nfsd4_probe_callback_sync(nfs4_client) 为啥 ?? 刷新掉所有的cb操作
+  > nfsd4_del_conns(nfsd4_session)
+    > unregister_xpt_user(nfsd4_conn->cn_xpt_user)  注销回调函数
+    > free_conn(nfsd4_conn)
+  > nfsd4_put_session(nfsd4_session)  => free_session(nfsd4_session)  释放内存
+
+* nfsd4_sequence(svc_rqst, nfsd4_compound_state, nfsd4_sequence) SEQUENCE操作,参数仅仅有session/slot, slot还有自己的sequence
+  > find_in_sessionid_hashtbl(nfsd4_sequence->sessionid)
+  > check_slot_seqid(nfsd4_sequence->seqid, nfsd4_slot->sl_seqid, NFSD4_SLOT_INUSE) 检查这个slot是否在使用
+  > 最后给nfsd4_compount_state提供slot/session
+
+* nfsd4_destroy_clientid(svc_rqst, nfsd4_compound_state, nfsd4_destory) 销毁nfs4_client, 包括session, state等一切东西
+  > expire_client(nfs4_client)
+    > nfs4_client_record_remove(nfs4_client)
+    > destroy_client(nfs4_client)  释放delegation, openstateowner, callback, 但是没有session的操作,根据refcount,在关闭session时处理?
+
+* nfsd4_process_open1(nfsd4_compound_state, nfsd4_open) 根据OPEN参数,找相关资源给nfsd4_open: nfs4_openowner, nfs4_file, nfsd4_ol_stateid
+  > find_openstateowner_str(...)
+  > nfsd4_check_seqid(..
+  > alloc_init_open_stateowner(hash, nfs4_client, openname)
+  > nfs4_alloc_stateid(nfs4_client) 必须初始化一个nfs4_ol_stateid
+
+* nfsd4_process_open2(svc_rqst, svc_fh, nfsd4_open)
+

@@ -1,0 +1,1504 @@
+* pagelist.c
+
+** nfs_page状态
+    #+BEGIN_SRC 
+enum {
+	PG_BUSY = 0,
+	PG_MAPPED,
+	PG_CLEAN,
+	PG_NEED_COMMIT,
+	PG_NEED_RESCHED,
+	PG_COMMIT_TO_DS,
+};
+    #+END_SRC
+
+** nfs_page
+   #+BEGIN_SRC 
+	struct list_head	wb_list;	/* Defines state of page: */ //数组是nfs_pageio_descriptor->pg_list
+	struct page		*wb_page;	/* page to read in/write out */
+	struct nfs_open_context	*wb_context;	/* File state context info */
+	struct nfs_lock_context	*wb_lock_context;	/* lock context info */
+	pgoff_t			wb_index;	/* Offset >> PAGE_CACHE_SHIFT */
+	unsigned int		wb_offset,	/* Offset & ~PAGE_CACHE_MASK */
+				wb_pgbase,	/* Start of page data */
+				wb_bytes;	/* Length of request */
+	struct kref		wb_kref;	/* reference count */
+	unsigned long		wb_flags;
+	struct nfs_write_verifier	wb_verf;	/* Commit cookie */
+   #+END_SRC
+
+** nfs_pageio_ops
+   #+BEGIN_SRC 
+	void	(*pg_init)(struct nfs_pageio_descriptor *, struct nfs_page *);
+	bool	(*pg_test)(struct nfs_pageio_descriptor *, struct nfs_page *, struct nfs_page *);
+	int	(*pg_doio)(struct nfs_pageio_descriptor *);
+   #+END_SRC
+
+** nfs_pageio_descriptor
+   #+BEGIN_SRC 
+	struct list_head	pg_list;   //nfs_page的链表
+	unsigned long		pg_bytes_written;
+	size_t			pg_count;  //nfs_page的数量
+	size_t			pg_bsize;  //请求的数据量,他们在文件中偏移必须相邻
+	unsigned int		pg_base;   //文件偏移
+	unsigned char		pg_moreio : 1,
+				pg_recoalesce : 1;
+
+	struct inode		*pg_inode;
+	const struct nfs_pageio_ops *pg_ops;
+	int 			pg_ioflags;
+	int			pg_error;
+	const struct rpc_call_ops *pg_rpc_callops;
+	const struct nfs_pgio_completion_ops *pg_completion_ops;
+	struct pnfs_layout_segment *pg_lseg;
+	struct nfs_direct_req	*pg_dreq;
+	void			*pg_layout_private;
+   #+END_SRC
+
+** nfs_pgio_completion_ops
+   #+BEGIN_SRC 
+	void	(*error_cleanup)(struct list_head *head);
+	void	(*init_hdr)(struct nfs_pgio_header *hdr);
+	void	(*completion)(struct nfs_pgio_header *hdr);   
+   #+END_SRC
+
+** nfs_pgio_header
+   #+BEGIN_SRC 
+	struct inode		*inode;
+	struct rpc_cred		*cred;
+	struct list_head	pages;  //已经提交请求的nfs_pages
+	struct list_head	rpc_list;
+	atomic_t		refcnt;
+	struct nfs_page		*req;   //当前处理的nfs_page, 从nfs_pageio_descriptor中获取
+	struct nfs_writeverf	*verf;
+	struct pnfs_layout_segment *lseg;
+	loff_t			io_start;
+	const struct rpc_call_ops *mds_ops;
+	void (*release) (struct nfs_pgio_header *hdr);
+	const struct nfs_pgio_completion_ops *completion_ops;
+	struct nfs_direct_req	*dreq;
+	void			*layout_private;
+	spinlock_t		lock;
+	/* fields protected by lock */
+	int			pnfs_error;
+	int			error;		/* merge with pnfs_error */
+	unsigned long		good_bytes;	/* boundary of good data */
+	unsigned long		flags;   
+   #+END_SRC
+    
+** nfs_page_array
+   #+BEGIN_SRC 
+	struct page		**pagevec;
+	unsigned int		npages;		/* Max length of pagevec */
+	struct page		*page_array[NFS_PAGEVEC_SIZE];   
+   #+END_SRC
+
+** nfs_lockowner
+   #+BEGIN_SRC 
+	fl_owner_t l_owner;
+	pid_t l_pid;   
+   #+END_SRC
+ 
+** nfs_io_counter
+   #+BEGIN_SRC 
+	unsigned long flags;
+	atomic_t io_count;
+	//lock使用它,统计一个Lock负责的数据?? 在释放lock时等待IO完成
+   #+END_SRC
+
+** nfs_lock_context 
+   #+BEGIN_SRC 
+	atomic_t count;
+	struct list_head list;
+	struct nfs_open_context *open_context;
+	struct nfs_lockowner lockowner;
+	struct nfs_io_counter io_count;   
+	//这里并不是文件的锁操作. 而是追踪page的操作
+   #+END_SRC
+
+** nfs_pgarray_set(nfs_page_array, pagecount)
+   - 设置nfs_page_array->npages, 如果pagecount > NFS_PAGEVEC_SIZE, 构造指针数组
+
+** nfs_pgheader_init(nfs_pageio_descriptor, nfs_pgio_header, release)
+   - 根据nfs_pageio_descriptor构造nfs_pgio_header. nfs_pgio_header用于构造rpc?
+   - nfs_page / req是nfs_pageio_descriptor->pg_list中的第一个
+   - rpc_cred是nfs_page->nfs_open_context->rpc_cred
+   - io_start = req_offset(nfs_page), 他是文件偏移
+   - good_bytes = nfs_pageio_descriptor->pg_count??
+   - layout_private = nfs_pageio_descriptor->pg_layout_private
+   - 传递release回调函数,释放什么??  nfs_pgio_completion_ops
+   > nfs_pgio_completion_ops->init_hdr(nfs_pgio_header)
+
+** nfs_set_pgio_error(nfs_pgio_header, error, pos)
+   - 如果io没有完成, pos < io_start + good_bytes, 设置错误??
+   - 设置nfs_pgio_header->flags的NFS_IOHDR_ERROR, good_bytes = pos - io_start
+
+** nfs_page_alloc() /  nfs_page_free(nfs_page)
+   - 使用cache管理nfs_page数据结构, nfs_page_cachep.
+
+** nfs_iocounter_inc(nfs_io_counter) / nfs_iocounter_dec(nfs_io_counter) 
+   - 修改nfs_io_counter->io_count
+   - 在减为0时,唤醒等待的任务, 去掉nfs_io_counter->flags的NFS_IO_INPROGRESS
+   > wake_up_bit(&c->flags, NFS_IO_INPROGRESS)
+
+** __nfs_iocounter_wait(nfs_io_counter)
+   - 等待nfs_io_counter->io_count == 0, 设置nfs_io_counter->flags的NFS_IO_INPROGRESS
+   > nfs_wait_bit_killable(&c->flags)
+
+** nfs_iocounter_wait(nfs_io_counter)
+   > __nfs_iocounter_wait(c)
+
+** nfs_create_request(nfs_open_context, inode, page, offset, count)
+   - 创建一个nfs_page, page已经锁住.
+   - 对于读,在nfs_readpage中, 构造nfs_page, 发送请求等
+   - 对于写,在nfs_write_end后,更新nfs_page
+   - 首先检查nfs_open_context->flags的NFS_CONTEXT_BAD
+   - 这里没有检查nfs_inode的pagecache等.
+   - 针对nfs_open_context构造nfs_lock_context?? 给nfs_page->wb_lock_context, writeback使用的??
+   > nfs_get_lock_context(nfs_open_context)
+   - 对于写操作,当前创造的nfs_lock_context应该和nfs_open_context->nfs_lock_context不一样.但读应该是一样的??
+
+** nfs_unlock_request(nfs_page)
+   - 这里使用了nfs_page->wb_flags的PG_BUSY标志,同时唤醒等待这个标志的任务. 它应该是在修改page标志时使用.
+   > nfs_release_request(nfs_page)
+
+** nfs_unlock_and_release_request(nfs_page) 
+   - 释放nfs_page
+   > nfs_unlock_request(nfs_page)
+   > nfs_release_request(nfs_page)
+
+** nfs_clear_request(nfs_page)
+   - 先释放page 
+   > page_cache_release(page)
+   - 释放nfs_lock_context
+   > nfs_iocounter_dec(nfs_lock_context->nfs_io_counter)
+   > nfs_put_lock_context(nfs_lock_context)
+   - 释放nfs_open_context 
+   > put_nfs_open_context(nfs_open_context)
+
+** nfs_free_request(kref) 
+   > nfs_clear_request(nfs_page)
+   - 释放自己
+   > nfs_page_free(nfs_page)
+
+** nfs_release_request(nfs_page)
+   > kref_put(kref, nfs_free_request)
+
+** nfs_wait_on_request(nfs_page)
+   - 等待nfs_page->wb_flags的PG_BUSY标志, 不可被中断
+   > wait_on_bit(&req->wb_flags, PG_BUSY, nfs_wait_bit_uninterruptible,	TASK_UNINTERRUPTIBLE)
+
+** nfs_generic_pg_test(nfs_pageio_descriptor, nfs_page, nfs_page)
+   - 这时nfs_pageio_ops->pg_test. 他处理的是nfs_pageio_descriptor
+   - 检查nfs_pageio_descriptor是否可以合并
+   - pg_bsize是mount的rsize/wsize, 如果小于PAGE_SIZE, 不再合并
+   - nfs_pageio_descriptor->pg_bsize < PAGE_SIZE, 返回0
+   - 如果合并后,一次rpc无法容纳,也不合并
+   - nfs_pageio_descriptor->pg_count + nfs_page->wb_bytes <= pg_bsize
+
+** nfs_pageio_init(nfs_pageio_descriptor, inode, nfs_pageio_ops, bsize, io_flags)
+   - 初始化nfs_pageio_descriptor. 除了参数都设为0
+   - nfs_pgio_completion_ops处理nfs_pgio_header
+   - nfs_pageio_ops 处理nfs_pageio_descriptor
+
+** nfs_can_coalesce_request(nfs_page prev, nfs_page req, nfs_pageio_descriptor)
+   - 2个nfs_page是否可以合并
+   - nfs_open_context->rpc_cred相同, nfs_open_context->state相同
+   - nfs_lock_context->nfs_lockowner相同
+   - prev->wb_pgbase + prev->wb_bytes == PAGE_CACHE_SIZE, req->wb_pgbase=0, 边界处理
+   - 文件偏移相邻  req_offset, 
+   - 检查nfs_pageio_descriptor是否允许合并
+   > nfs_pageio_descriptor->pg_ops->pg_test()
+
+** nfs_pageio_do_add_request(nfs_pageio_descriptor, nfs_page)
+   - 在__nfs_pageio_add_request中使用,把nfs_page添加到nfs_pageio_descritptor管理的队列中, 可以一块提交rpc请求.
+   - 如果nfs_pageio_descriptor已经有nfs_page, 首先检查能否合并
+   > nfs_can_coalesce_requests(nfs_pgae, nfs_page, nfs_pageio_descriptor) 
+   - 如果不能合并, 返回0, 估计会创建新的nfs_pageio_descriptor
+   - 如果nfs_pageio_descriptor没有nfs_page, 初始化, 设置nfs_pageio_descriptor>pg_base = nfs_page->wb_pgbase, wb_pgbase是page内部偏移
+   > nfs_pageio_descritpor->pg_ops->pg_init(nfs_pageio_descriptor, nfs_page) 
+   - 把nfs_page->wb_list添加到nfs_pageio_descriptor->pg_list中
+   > nfs_list_add_request(nfs_page, nfs_pageio_descriptor->pg_list) 
+   - 设置nfs_pageio_descriptor>pg_count += nfs_page->wb_bytes
+
+** nfs_pageio_doio(nfs_pageio_descriptor)
+   - 提交nfs_pageio_descriptor管理的nfs_page的IO请求
+   > nfs_pageio_descriptor->pg_ops->pg_doio(nfs_pageio_descriptor) 
+   - 如果没有错误,设置nfs_pageio_descriptor>pg_bytes_written += nfs_pageio_descriptor->pg_count
+
+** __nfs_pageio_add_request(nfs_pageio_descriptor, nfs_page)
+   - 尝试把nfs_page放到nfs_pageio_descriptor中
+   > nfs_pageio_do_add_request(nfs_pageio_descriptor, nfs_page)
+   - 如果添加不进去,启动IO操作
+   > nfs_pageio_doio(nfs_pageio_descriptor)
+   - 检查nfs_pageio_descriptor->pg_error, 如果有错误直接返回
+   - 如果nfs_pageio_descriptor->pg_recoalesce !=0, 表示需要把原来的nfs_page重新合并? 直接返回
+   - 继续循环添加
+
+** nfs_do_recoalesce(nfs_pageio_descriptor)
+   - 把nfs_pageio_descriptor->pg_list上的nfs_page取下来，重新添加到nfs_pageio_descriptor中.
+   - 重新合并nfs_page, 在pnfs中使用
+   - 释放链表关系
+   > nfs_list_remove_request(nfs_page)
+   - 添加nfs_req
+   > __nfs_pageio_add_request(nfs_pageio_descriptor, nfs_page)
+
+** nfs_pageio_add_request(nfs_pageio_descriptor, nfs_page)
+   - 循环处理nfs_page, 添加到nfs_pageio_descriptor
+   > __nfs_pageio_add_request(nfs_pageio_descriptor, nfs_page)
+   - 如果nfs_pageio_descriptor->pg_error < 0, 返回错误
+   - 否则重构nfs_page
+   > nfs_do_recoalesce(nfs_pageio_descriptor)
+
+** nfs_pageio_complete(nfs_pageio_descriptor)
+   - 循环提交nfs_pageio_descriptor中的nfs_page
+   - 启动写操作
+   > nfs_pageio_doio(nfs_pageio_descriptor)  
+   - 如果不需要重排列,直接退出 nfs_pageio_descriptor->pg_recoalesce
+   > nfs_do_recoalesce(nfs_pageio_descriptor) 
+
+** nfs_pageio_cond_complete(nfs_pageio_descriptor, pgoff_t index)
+   - 有条件使用的提交nfs_pageio_descriptor中的nfs_page
+   - 当index和最后一个nfs_page不相邻时提交,否则就可以合并.
+   - index = nfs_page->wb_index + 1
+   > nfs_pageio_complete(nfs_pageio_descriptor)
+
+** nfs_init_nfspagecache() / nfs_destroy_nfspagecache()
+   - 初始化nfs_page_cachep, 分配nfs_page. 后面的是销毁
+
+* read.c
+
+** nfs_readargs
+   #+BEGIN_SRC 
+	struct nfs4_sequence_args	seq_args;
+	struct nfs_fh *		fh;
+	struct nfs_open_context *context;
+	struct nfs_lock_context *lock_context;
+	nfs4_stateid		stateid;
+	__u64			offset;
+	__u32			count;
+	unsigned int		pgbase;
+	struct page **		pages;   
+   #+END_SRC
+
+** nfs_readres
+   #+BEGIN_SRC 
+	struct nfs4_sequence_res	seq_res;
+	struct nfs_fattr *	fattr;
+	__u32			count;
+	int                     eof;   
+   #+END_SRC
+
+** nfs_read_data
+   #+BEGIN_SRC 
+	struct nfs_pgio_header	*header;
+	struct list_head	list;
+	struct rpc_task		task;
+	struct nfs_fattr	fattr;	/* fattr storage */
+	struct nfs_readargs args;
+	struct nfs_readres  res;
+	unsigned long		timestamp;	/* For lease renewal */
+	int (*read_done_cb) (struct rpc_task *task, struct nfs_read_data *data);
+	__u64			mds_offset;
+	struct nfs_page_array	pages;
+	struct nfs_client	*ds_clp;	/* pNFS data server */   
+   #+END_SRC
+
+** nfs_read_header 
+   #+BEGIN_SRC 
+	struct nfs_pgio_header	header;
+	struct nfs_read_data	rpc_data;   
+	//nfs_pageio_header和nfs_readargs都嵌在一块,他肯定是rpc使用的
+   #+END_SRC
+
+** nfs_readhdr_alloc(nfs_pgio_header, pagecount)
+   - 分配一个nfs_read_header, 返回nfs_pgio_header指针
+   - 初始化nfs_pgio_header->pages/rpc_list
+
+** nfs_readdata_alloc(nfs_pgio_header, pagecount) 
+   - 检查nfs_pgio_header->nfs_read_data是否可用.
+   - 如果nfs_read_data->header == NULL, 可以使用
+   - 否则分配内存创建一个, 给它构造nfs_page_array
+   > nfs_pgarray_set(nfs_read_data->pages, pagecount)
+   - 设置nfs_read_data->header = nfs_pgio_header
+   - 多个rpc共用nfs_pgio_header??
+
+** nfs_readhdr_free(nfs_pgio_header) 
+   - 释放nfs_read_header
+
+** nfs_readdata_release(nfs_read_data)
+   - 释放nfs_read_data
+   - 首先是nfs_open_context 
+   > put_nfs_open_context(nfs_read_data->nfs_readargs->nfs_open_context)
+   - nfs_read_data->pages页队列
+   - 如果nfs_read_data属于nfs_read_header,不需要单独释放nfs_read_data释放, 否则需要.
+   > nfs_pgio_header->completion_ops->completion(nfs_pgio_header)
+	
+** nfs_return_empty_page(page)
+   - 没有数据可读,page清0
+   > zero_user(page, 0, PAGE_CACHE_SIZE)
+   - 释放page锁, 在end_io中使用
+   > SetPageUptodate(page)
+   > unlock_page(page)
+
+** nfs_pageio_init_read(nfs_pageio_descriptor, inode, nfs_pgio_completion_ops)
+   - 初始化nfs_pageio_descriptor,看到了nfs_pageio_descriptor->pg_bsize
+   > nfs_pageio_init(nfs_pageio_descriptor, inode, nfs_pgio_completion_ops, NFS_SERVER(inode)->rsize, 0)
+
+** nfs_pageio_reset_read_mds(nfs_pageio_descriptor)
+   - 重新设置nfs_pageio_descriptor>pg_ops = nfs_pageio_read_ops
+   - pg_bsize = nfs_server->rsize
+
+** nfs_readpage_async(nfs_open_context, inode, page)
+   - 读回page的数据, 构造nfs_pageio_descriptor, 他提及完成nfs_pgio_header之后,可以释放它
+   - 先检查page在文件范围内的长度
+   > nfs_page_length(page) 
+   - 如果为0,返回空page, 比较负责,只是还清0
+   > nfs_return_emptry_page(page) 
+   - 构造nfs_page
+   > nfs_create_request(nfs_open_context, inode, page, 0, len) 
+   - 如果上面计算的长度不是PAGE_CACHE_SIZE, 把后部分清0
+   > zero_user_segment(page, len, PAGE_CACHE_SIZE)
+   - 构造nfs_pageio_descriptor, pnfs_pageio_init_read
+   > NFS_PROTO(inode)->read_pageio_init(nfs_pageio_descriptor, inode, nfs_async_read_completion_ops)
+   - 提交nfs_page
+   > nfs_pageio_add_request(nfs_pageio_descriptor, nfs_page)
+   - 提交IO请求, 应该去执行nfs_pgio_ops->pg_doio
+   > nfs_pageio_complete(nfs_pageio_descriptor)
+   - 最后更新nfs_server->read_io += nfs_pageio_descriptor->pg_bytes_written
+
+** nfs_readpage_release(nfs_page)
+   - 要把数据放到fscache中,而nfs_page却是要释放掉, 释放page锁
+   > nfs_readpage_to_fscache(inode, nfs_page->page, 0)
+   - 释放nfs_page, 哪里他page锁起来???
+   > unlock_page(nfs_page->page)
+   > nfs_release_request(nfs_page)
+
+** nfs_read_completion(nfs_pgio_header) 
+   - nfs_pgio_header->pages管理多个nfs_page,检查结果nfs_pgio_header->flags, 更新page状态
+   - 如果nfs_pgio_header->flgs有NFS_IOHDR_REDO, 直接退出?
+   - 遍历nfs_pgio_header->pages链表
+   - 如果没有错误 nfs_pgio_header->flags & NFS_IOHDR_ERROR, 或者nfs_page在nfs_pgio_header->good_bytes范围内
+   > SetPageUptodate(page)
+   - nfs_page从nfs_pgio_header中释放
+   > nfs_list_remove_request(nfs_page)
+   - 释放nfs_page, 这里会释放PG_locked
+   > nfs_readpage_release(nfs_page)
+   - 最后释放nfs_pgio_header
+   > nfs_pgio_header->release(nfs_pgio_header)
+   - 这个函数就是nfs_readhdr_free(nfs_pgio_header), 直接释放nfs_pgio_header
+
+** nfs_initiate_read(rpc_clnt, nfs_read_data, rpc_call_ops, flags)
+   - 这里构造rpc_task,使用异步方式,所以创建了rpc_task,不再管理
+   - rpc_task_setup->rpc_task不是动态构造的,这里可以重复提交.
+   - 根据nfs_read_data构造rpc_message, nfs4_proc_read_setup
+   > NFS_PROTO(inode)->read_setup(nfs_read_data, rpc_message)
+   - 启动rpc
+   > rpc_run_task(rpc_task_setup)
+   > rpc_put_task()
+
+** nfs_read_rpcsetup(nfs_read_data, count, offset)
+   - 初始化nfs_read_data中的nfs_readargs, nfs_readres
+   - nfs_readargs->fh 来自nfs_read_data->nfs_pgio_header->nfs_inode
+   - offset是文件偏移,来自nfs_read_data->nfs_pgio_header->nfs_page, 这是第一个nfs_page??
+   - pgbase是page内部偏移?? pages是nfs_read_data->nfs_page_array->pagevec. 接受数据时直接放到这里面?
+   - nfs_open_context来自nfs_req->nfs_open_context, lock_context同样
+   - nfs_readres->fattr是nfs_read_data->fattr, count = count, eof = 0
+   > nfs_fattr_init(nfs_read_data->fattr)
+
+** nfs_do_read(nfs_read_data, rpc_call_ops)
+   - 发送rpc请求, nfs_read_data->nfs_pgio_header->inode
+   > nfs_initiate_read(inode=>nfs_inode=>rpc_clnt, nfs_read_data, rpc_call_ops, 0)
+
+** nfs_do_multiple_reads(list_head, rpc_call_ops)
+   - list_head是nfs_read_data队列,这个队列就是nfs_pgio_header->list, 发起请求
+   > nfs_do_read(data, rpc_call_ops)
+
+** nfs_async_read_error(list_head)
+   - list_head是nfs_page队列,释放他们使用的资源. 
+   > nfs_list_remove_request(nfs_page)
+   - 释放page, nfs_page
+   > nfs_readpage_release(nfs_page)
+
+** nfs_pgio_completion_ops nfs_async_read_completion_ops
+   #+BEGIN_SRC 
+	.error_cleanup = nfs_async_read_error,   
+	.completion = nfs_read_completion
+	//处理nfs_pgio_header, 在rpc中使用??
+   #+END_SRC
+
+** nfs_pagein_error(nfs_pageio_descriptor, nfs_pgio_header)
+   - 处理错误情况
+   - 遍历nfs_read_data, 释放他们的资源
+   > nfs_readdata_release(nfs_read_data)
+   - 最后释放整个nfs_pgio_header, 就是上面的函数
+   > nfs_pageio_descriptor->pg_completion_ops->error_cleanup(nfs_pageio_descriptor->pg_list)
+
+** nfs_pagein_multi(nfs_pageio_descriptor, nfs_pgio_header)
+   - 这个函数是通过多次rpc请求处理一个nfs_pageio_descriptor, 也就是处理一个page.因为rsize太小
+   - 构造多个nfs_read_data, 每个处理的数据量是nfs_pageio_descriptor->pg_bsize
+   - nfs_read_data放到nfs_pgio_header->rpc_list队列中
+   > nfs_readdata_alloc(nfs_pgio_header, 1)
+   - 直接把page放到nfs_read_data->nfs_page_array->pagevec[0], 只有一个page
+   - 创建nfs_read_data的nfs_readargs, nfs_readres
+   > nfs_read_rpcsetup(nfs_page, nfs_read_data, len, offset)
+   - offset和len需要步进修改
+   - 当前处理的是nfs_pgio_header->nfs_page, 从nfs_pageio_descriptor中释放
+   > nfs_list_remove_request(nfs_page)
+   - 放到nfs_pgio_header->pages中
+   > nfs_list_add_request(nfs_page, nfs_pgio_header->pages)
+   - 设置nfs_pageio_descriptor->pg_rpc_callops = nfs_read_common_ops,应该会传递给nfs_pgio_header??
+
+** nfs_pagein_one(nfs_pageio_descriptor, nfs_pgio_header)
+   - 这个和上面相同,处理一个读请求使用一个nfs_read_data
+   - 这里分配的page指针数组长度就需要计算nfs_pageio_descriptor的请求长度
+   > nfs_readdata_alloc(nfs_pgio_header, nfs_page_array_len(nfs_pageio_descriptor->pg_base, nfs_pageio_descriptor->pg_count))
+   - 遍历nfs_pageio_descriptor, 把nfs_page放到nfs_page_array->pagevec中, 以及nfs_pgio_header->pages中
+   > nfs_list_remove_request(nfs_page)
+   > nfs_list_add_request(nfs_page, nfs_pgio_header)
+   - 构造nfs_read_data的参数
+   > nfs_read_rpcsetup(nfs_read_data, nfs_pageio_descriptor->pg_count, 0)
+   - 最后把nfs_read_data给nfs_pgio_header->list
+   - 设置nfs_pageio_descriptor->pg_rpc_callops为nfs_read_common_ops
+
+** nfs_generic_pagein(nfs_pageio_descriptor, nfs_pgio_header)
+   - 如果rsize < PAGE_CACHE_SIZE, 使用多个nfs_read_data, 否则使用1个
+   > nfs_pagein_multi(nfs_pageio_descriptor, list_head)
+   > nfs_pagein_one(nfs_pageio_descriptor, list_head)
+
+** nfs_generic_pg_readpages(nfs_pageio_descriptor)
+   - 处理nfs_pageio_descriptor, 是pg_doio的实现,提交他管理的nfs_pageio_descriptor
+   - 首先构造一个nfs_pgio_header
+   > nfs_readhdr_alloc()
+   - 如果分配失败, 使用回调函数释放
+   > nfs_pageio_descriptor->pg_completion_ops->error_cleanup(nfs_pageio_descriptor->pg_list)
+   - 初始化nfs_pgio_header, nfs_pgio_header->nfs_page果然是nfs_page链表的第一个
+   > nfs_pgheader_init(nfs_pageio_descriptor, nfs_pgio_header, nfs_readhdr_free)
+   - 上面应该使用nfs_pgio_completion_ops->init_hdr, 但nfs_async_read_completions_ops没有定义
+   - 然后构造nfs_read_data
+   > nfs_generic_pagein(nfs_pageio_descriptor, nfs_pgio_header)
+   - 发送rpc请求. 为何不把nfs_pageio_descriptor->pg_rpc_callops给nfs_pgio_header??
+   > nfs_do_multiple_reads(list_head, nfs_pageio_descriptor->pg_rpc_callops)
+
+** nfs_pageio_ops nfs_pageio_read_ops
+   #+BEGIN_SRC 
+	.pg_test = nfs_generic_pg_test,
+	.pg_doio = nfs_generic_pg_readpages,
+	//合并使用标准的, 提交io使用上面的实现
+   #+END_SRC
+
+** nfs_readpage_result(rpc_task, nfs_read_data)
+   - 这里应该是nfs_read_data对应的rpc call完成后操作
+   - 检查nfs_readaregs,nfs_readres是否有错误, nfs4_read_done
+   > NFS_PROTO(nfs_read_data->inode)->read_done(rpc_task, rpc_read_data)
+   - 如果rpc_task->tk_status == ESTALE, 这时特殊的错误,无效nfs_inode
+   > nfs_mark_for_revalidate(nfs_read_data->inode) 
+   - 设置nfs_inode->flags的NFS_INODE_STALE标志, nfs_inode->cache_validity
+
+** nfs_readpage_retry(rpc_task, nfs_read_data)
+   - 重新启动rpc call
+   - 如果nfs_read_data->nfs_readres->count ==0, 返回-EIO
+   - 否则就已经接受一些数据, 增加mds_offset, offset, pgbase, count -= nfs_readres->count
+   > rpc_restart_call_prepare(rpc_task)
+
+** nfs_readpage_result_common(rpc_task, calldata)
+   - calldata是一个nfs_read_data, 这个函数是rpc_callback_done, 在rpc_task完成后调用
+   - 处理rpc结果,如果返回非0,直接退出?? 是EAGAIN?
+   > nfs_readpage_result(rpc_task, nfs_read_data)
+   - 如果rpc_task->tk_status<0, rpc的错误,nfs_readargs->offset在重新发送rpc时会改变,所以之前的rpc请求的结果是可以用的
+   - 说明完成一部分, 当然设置nfs_pgio_header->flags的错误标志
+   > nfs_set_pgio_error(nfs_pgio_header, rpc_task->tk_status, nfs_readargs->offset)
+   - 如果eof!=0, 设置nfs_pgio_header->flags的NFS_IOHDR_EOF
+   - 如果nfs_read_data->res.count不是args.count,没有完成
+   > nfs_readpage_retry(rpc_task, nfs_read_data)
+   - 如果rpc_task没有错误,而且没有eof, 而且nfs_readres->count不是请求的, 重新发送rpc 
+   > nfs_readpage_retry(rpc_task, rpc_read_data)
+
+** nfs_readpage_release_common(calldata)
+   - 释放rpc_read_data
+   > nfs_readdata_release(nfs_read_data)
+   - 它可能会释放nfs_pgio_header, 他才会去设置page状态, 也就是completion工作, 里面释放nfs_pgio_header
+
+** nfs_read_prepare(rpc_task, calldata)
+   - 在启动rpc时使用, 也就是nfs4_proc_read_rpc_prepare
+   > NFS_PROTO(nfs_read_data->nfs_pgio_header->inode)->read_rpc_prepare(rpc_task, rpc_read_data)
+
+** nfs_read_common_ops
+   #+BEGIN_SRC 
+	.rpc_call_prepare = nfs_read_prepare,
+	.rpc_call_done = nfs_readpage_result_common,
+	.rpc_release = nfs_readpage_release_common,   
+   #+END_SRC
+
+** nfs_readpage(file, page)
+   - 读取一个page.它是address_space_operations中的函数
+   - 首先写回page?? 当然会检查PG_dirty, PG_writeback, 等待写回过程
+   > nfs_wb_page(inode, page)
+   - 然后检查PageUptodate
+   - 获取nfs_open_context, file什么时候是NULL??
+   > nfs_find_open_context(inode, NULL, FMODE_READ)
+   - 如果file !=NULL, 使用file->private_data
+   > get_nfs_open_context(nfs_open_context)
+   - 这里要检查inode->flags的S_SYNC和inode->super_block->s_flags的MS_SYNCHRONOUS标志
+   > nfs_readpage_from_fscache(nfs_open_context, inode, page) 
+   - 这是开始的一个实现, 这里会使用栈上的nfs_pageio_descriptor, 创建nfs_page
+   - 在提交nfs_pageio_descriptor时,创建nfs_pgio_header/nfs_read_data, 提交rpc_task
+   > nfs_readpage_async(nfs_open_context, inode, page) 
+
+** nfs_readdesc
+   #+BEGIN_SRC 
+	struct nfs_pageio_descriptor *pgio;
+	struct nfs_open_context *ctx;   
+   #+END_SRC
+
+** readpage_async_filler(data, address_space, list_head, nr_pages)
+   - data是一个nfs_readdesc, 下面使用到他
+   - 构造nfs_page
+   > nfs_create_request(nfs_open_context, inode, page, 0 ...)
+   - 把nfs_page放到nfs_readdesc->nfs_pageio_descriptor中
+   > nfs_pageio_add_request(nfs_readdesc->nfs_pageio_descriptor, nfs_page) 
+
+** nfs_readpages(file, address_space, list_head pages, nr_pages)
+   - 因为同时处理多个page, 所以使用nfs_readdesc->nfs_pageio_descriptor收集nfs_page
+   - 找到nfs_open_context 
+   > nfs_find_open_context(inode, NULL, FMODE_READ)
+   - 初始化nfs_pageio_descriptor
+   > NFS_PROTO(nfs_inode)->read_pageio_init(nfs_pageio_descriptor, inode, nfs_async_read_completion_ops)
+   - 使用标准的函数处理page,把它放到pagecache中, 同时构造nfs_page, 放到nfs_pageio_descriptor中
+   > read_cache_pages(address_space, pages, readpage_async_filler, nfs_readdesc) 
+   - 发射nfs_pageio_descriptor
+   > nfs_pageio_complete(nfs_pageio_descriptor)
+   > put_nfs_open_context(nfs_open_context)
+
+** nfs_init_readpagecache / nfs_destroy_readpagecache()
+   - nfs_rdata_cachep,分配nfs_read_data
+   - nfs_page也有人管
+   - nfs_pageio_descriptor是栈的的变量,效率更高
+
+
+** 总结
+   - nfs_pageio_descriptor是栈变量, nfs_pgio_header/nfs_read_data使用kmem_cache分配
+   - 接受readpages参数, list_head
+   > nfs_readpages()
+   - 包装到nfs_pageio_descriptor中的nfs_page
+   > read_cache_pages(address_space, pages, readpage_async_filler, nfs_pageio_descriptor)
+   - 构造nfs_pageio_descriptor
+   > nfs_create_request(nfs_open_context, inode, page, 0, len)
+   - 把nfs_page放到nfs_pageio_descriptor中
+   > nfs_pageio_add_request(nfs_pageio_descriptor, nfs_page)
+   - 合并,合并中可能有发射
+   > __nfs_pageio_add_request(nfs_pageio_descriptor, nfs_page)
+   > nfs_pageio_do_add_request(nfs_pageio_descriptor, nfs_page)
+   - 添加时的初始化nfs_pageio_descriptor
+   > nfs_pageio_descriptor->nfs_pageio_ops->pg_init()
+   > nfs_can_coalesce_requests(nfs_page, nfa_page, nfs_pageio_descriptor)
+   - 添加时,如果不能合并,发射
+   > nfs_pageio_doio(nfs_pageio_descriptor)
+   > nfs_pageio_descriptor->nfs_pageio_ops->pg_doio(nfs_pageio_descriptor)
+   - 构造nfs_pgio_header
+   > nfs_generic_pg_readpages(nfs_pageio_descriptor)
+   - 构造nfs_read_data, 并且把nfs_page转移到nfs_pgio_header
+   > nfs_generic_pagein(nfs_pageio_descriptor, nfs_pgio_header)
+   > nfs_pageio_one(nfs_pageio_descriptor, nfs_pgio_header)
+   - 构造rpc args, res, 把准备好的nfs_read_data给nfs_pgio_header->rpc_list.
+   - 设置nfs_pageio_descriptor->rpc_callops为nfs_read_common_ops
+   > nfs_read_rpcsetup(nfs_read_data, nfs_pageio_descriptor->pg_count, 0)
+   - 最后发送nfs_read_data请求
+   > nfs_do_multiple_reads(nfs_pgio_header->rpc_list, nfs_pageio_descriptor->pg_rpc_callops)
+   > nfs_do_read(nfs_read_data, rpc_call_ops)
+   > nfs_initiate_read(nfs_client, nfs_read_data, rpc_call_ops, 0)
+   - nfs_read_data->nfs_page_array是源头, 它的初始化在nfs_pageio_one,把nfs_page从nfs_pageio_descriptor队列中放到nfs_pgio_header,而且把nfs_page里面的page指针给nfs_page_array
+   - 在nfs_read_rpcsetup中构造nfs_readargs时,nfs_readargs->pages = nfs_read_data->nfs_page_array->pagevec, 在nfs4_xdr_enc_read中,把page数组给xdr_buf.
+   - 结果返回在rpc的回调函数中,只有释放PG_locked
+   > nfs_pageio_complete(nfs_pageio_descriptor)
+   > nfs_pageio_doio(nfs_pageio_descriptor)
+
+* write.c
+
+** nfs_writeargs 
+   #+begin_src 
+	struct nfs4_sequence_args	seq_args;
+	struct nfs_fh *		fh;
+	struct nfs_open_context *context;
+	struct nfs_lock_context *lock_context;
+	nfs4_stateid		stateid;
+	__u64			offset;
+	__u32			count;
+	enum nfs3_stable_how	stable;
+	unsigned int		pgbase;
+	struct page **		pages;
+	const u32 *		bitmask;   
+   #+end_src
+
+** nfs_writeres
+   #+begin_src 
+	struct nfs4_sequence_res	seq_res;
+	struct nfs_fattr *	fattr;
+	struct nfs_writeverf *	verf;
+	__u32			count;
+	const struct nfs_server *server;   
+   #+end_src
+
+** nfs_write_data 
+   #+begin_src 
+	struct nfs_pgio_header	*header;
+	struct list_head	list;
+	struct rpc_task		task;
+	struct nfs_fattr	fattr;
+	struct nfs_writeverf	verf;
+	struct nfs_writeargs	args;		/* argument struct */
+	struct nfs_writeres	res;		/* result struct */
+	unsigned long		timestamp;	/* For lease renewal */
+	int (*write_done_cb) (struct rpc_task *task, struct nfs_write_data *data);
+	__u64			mds_offset;	/* Filelayout dense stripe */
+	struct nfs_page_array	pages;
+	struct nfs_client	*ds_clp;	/* pNFS data server */   
+   #+end_src
+
+** nfs_write_header
+   #+begin_src 
+	struct nfs_pgio_header	header;
+	struct nfs_write_data	rpc_data;
+	struct nfs_writeverf	verf;
+	//和nfs_read_header很想
+   #+end_src
+
+** nfs_commitdata_alloc() / nfs_commit_free()
+   - 从nfs_commit_mempool中分配nfs_commit_data
+
+** nfs_writehdr_alloc() 
+   - 从nfs_wdata_mempool中分配nfs_write_header, 初始化nfs_pgio_header
+
+** nfs_writedata_alloc(nfs_pgio_header, pagecount)
+   - 又和read很想, 检查nfs_write_header->nfs_write_data->nfs_pgio_header == NULL, 说明它还没有被占用, 可以使用它
+   - 否则使用kzalloc分配一个
+
+** nfs_writehdr_free(nfs_pgio_header)
+   - 释放nfs_write_header
+
+** nfs_writedata_release(nfs_write_data)
+   - 释放nfs_write_data,首先是使用的资源 
+   > put_nfs_open_context(nfs_write_data->nfs_writeargs->context)
+   - nfs_write_data->nfs_page_array->pagevec指针数组
+   > 如果nfs_write_data属于nfs_write_header, 释放对应的nfs_write_header 
+   > nfs_pgio_completion_ops->completion(nfs_pgio_header)
+   - 否则直接kfree(nfs_write_data)
+
+** nfs_context_set_write_error(nfs_open_context, error)
+   - 设置nfs_open_context->error = error, nfs_open_context->flags的NFS_CONTEXT_ERROR_WRITE
+
+** nfs_page_find_request_locked(page)
+   - 从page中获取nfs_page, 就在page->private中
+   - 如果nfs_page交换到外面, 去nfs_inode->commit_info->list中查找
+   > PageSwapCache(page)
+
+** nfs_page_find_request
+   > nfs_page_find_request_locked(NFS_I(inode), page);
+
+** nfs_grow_file(page, offset, count)
+   - 如果page的offset+count对应的文件偏移,超过文件大小,修改i_size
+   > i_size_write(inode, size)
+
+** nfs_set_pageerror(page)
+   - 在错误处理中使用, 设置nfs_inode->cache_validity的NFS_INO_INVALID_DATA标志
+   > nfs_zap_mapping(page->address_space->host, page->address_space) 
+
+** nfs_mark_uptodate(page, base, count)
+   - 如果已经是PG_uptodate,直接返回
+   > PageUptodate(page)
+   - (base, count) == (0, PAGE_CACHE_SIZE)时才设置PG_uptodate
+   > SetPageUptodate(page)
+
+** wb_priority(writeback_control)
+   - writeback_control->for_reclaim使用FLUSH_HIGHER, 需要回收内存
+   - writeback->for_kupdate或者for_background, 使用FLUSH_LOWPRI | FLUSH_COND_STABLE
+   - 否则返回FLUSH_COND_STABLE.  最后的结果是值越小,优先级越过
+
+** nfs_set_page_writeback(page)
+   - 设置PG_writeback, 原来应该没有.
+   > test_set_page_writeback(pge)
+   - 如果nfs_server->writeback > NFS_CONGESTION_ON_THRESH, 阻塞bdi?
+   > set_bdi_congested(nfs_server->backing_dev_info, BLK_RW_ASYNC)
+
+** nfs_end_page_writeback(page)
+   - 看来是主要是page, 唤醒等待PG_writeback的任务, 去掉那个标志
+   > end_page_writeback(page)
+   - 根据nfs_server->writeback --, 去掉congest
+   > clear_bdi_congested()
+
+** nfs_find_and_lock_request(page, nonblock)
+   - 获取nfs_page, 如果找不到直接退出
+   > nfs_page_find_request_locked(page)
+   - 锁住nfs_page, 也就是nfs_page->wb_flags的PG_BUSY. 如果能锁住直接返回
+   > nfs_lock_request(nfs_page)
+   - 现在不能锁住, 如果nonblock !=0, 返回EAGAIN
+   - 等待PG_BUSY标志
+   > nfs_wait_on_request(nfs_page) 
+
+** nfs_page_async_flush(nfs_pageio_descriptor, page, nonblock)
+   - 获取并锁住nfs_page
+   > nfs_find_and_lock_request(page, nonblock)
+   - 设置PG_writeback
+   > nfs_set_page_writeback()
+   - 把nfs_page添加到nfs_pageio_descriptor
+   > nfs_pageio_add_request(nfs_pageio_descriptor, nfs_page)
+   - 如果返回0,表示无法添加,nfs_pageio_descriptor有问题, 当前nfs_page不能处理, 返回nfs_pageio_descriptor->pg_error
+   > nfs_redirty_request(nfs_page)
+
+** nfs_do_writepage(page, writeback_control, nfs_pageio_descriptor)
+   - 有条件的提交nfs_pageio_descriptor, 根据page
+   > nfs_pageio_cond_complete(nfs_pageio_descriptor, page->index)
+   - 提交nfs_page
+   > nfs_page_async_flush(nfs_pageio_descriptor, nfs, writeback_control->sync_mode == WB_SYNC_NONE)
+   - 如果有错误
+   > redirty_page_for_writepage(writeback_control, page)
+
+** nfs_writepage_locked(page, writeback_control)
+   - 使用local的nfs_pageio_descriptor, 初始化
+   > nfs_client->nfs_rpc_ops->write_pageio_init(nfs_pageio_descriptor, inode, wb_priority(writeback_control), nfs_async_write_completion_ops)
+   - 提交nfs_page给它
+   > nfs_do_writepage(page, writeback_control, nfs_pageio_descriptor)
+   - 提交操作
+   > nfs_pageio_complete(nfs_pageio_descriptor)
+
+** nfs_writepage(page, writeback_control)
+   - 只处理一个page
+   > nfs_writepage_locked(page, writeback_control)
+   - 唤醒等待的, 好像比read简单
+   > unlock_page(page)
+
+** nfs_writepages_callback(page, writeback_control)
+   - 这个是write_cache_pages函数中使用的回调函数,相当于写一个page, 用来实现writepages
+   - 他和上面类似,把nfs_page放到nfs_pageio_descriptor中.
+   - 这里不会构造nfs_page, 因为在write时已经构造.
+   > nfs_do_writepage(page, writeback_control, data)
+   > unlock_page(page)
+   - 如果能合并,这里不会提交nfs_pageio_descriptor
+
+** nfs_writepages(address_space, writeback_control)
+   - 在文件刷新过程中不要写操作. 在nfs_write_begin中使用他
+   > wait_on_bit_lock(nfs_inode->flags, NFS_INO_FLUSHING)
+   - 构造一个本地的nfs_pageio_descriptor
+   > nfs_pageio_init_write(nfs_pageio_descriptor, inode, wb_priority(writeback_control)
+   - 使用标准的接口
+   > write_cache_pages(address_space, writeback_control, nfs_writepages_callback, nfs_pageio_descriptor)
+   - 提交nfs_pageio_descriptor管理的nfs_page的IO请求
+   > nfs_pageio_complete(nfs_pageio_descriptor)
+   - 唤醒等待NFS_INO_FLUSHING的任务
+   > clear_bit_unlock(NFS_INO_FLUSHING, nfs_inode->flags)
+   > wake_up_bit(...) 
+
+** nfs_inode_add_request(inode, nfs_page)
+   - 这里的意思应该是把nfs_page给nfs_inode管理
+   - 锁住nfs_page->wb_flags的PG_BUSY标志
+   > nfs_lock_request_dontget(nfs_page)
+   - 如果nfs_inode->npage为0?? 没有缓存?? 而且有write的delegation, 增加inode->i_version++ ??
+   - 设置PG_private标志, page->private = nfs_page
+   > Set_page_private(nfs_page->wb_page, nfs_page) 
+   - 在read中没有这些??
+
+** nfs_inode_remove_request(nfs_page)
+   - 去掉page和nfs_page的练习, 释放nfs_page
+   > nfs_release_request(nfs_page)
+
+** nfs_mark_request_dirty(nfs_page)
+   - 设置PG_dirty, pagecache和inode
+   > __set_page_dirty_nobuffers(nfs_page->page)
+         
+** nfs_commit_info 
+   #+begin_src 
+	spinlock_t			*lock;
+	struct nfs_mds_commit_info	*mds;
+	struct pnfs_ds_commit_info	*ds;
+	struct nfs_direct_req		*dreq;	/* O_DIRECT request */
+	const struct nfs_commit_completion_ops *completion_ops;   
+   #+end_src
+
+** nfs_commit_completion_ops
+   #+BEGIN_SRC 
+	void (*error_cleanup) (struct nfs_inode *nfsi);
+	void (*completion) (struct nfs_commit_data *data);   
+   #+END_SRC
+
+** nfs_request_add_commit_list(nfs_page, list_head, nfs_commit_info)
+   - 把nfs_page放到list_head队列中,这是一个commit操作使用的队列
+   - 设置nfs_page->wb_flags的PG_CLEAN标志, nfs_inode->ncommit++
+   - 使用nfs_page->wb_list, 他的IO已经完成
+   > nfs_list_add_request(nfs_page, list_head)
+   - nfs_commit_info->mds->ncommit++, metadata
+   > __mark_inode_dirty(inode, I_DIRTY_DATASYNC)
+
+** nfs_request_remove_commit_list(nfs_page)
+   - PG_CLEAN表示nfs_page在commit列表中, 释放这个链表关系
+   > nfs_list_remove_request(nfs_page)
+
+** nfs_init_cinfo_from_inode(nfs_commit_info, inode)
+   - 初始化nfs_commit_info, 他管理普通文件的metadata, 还有pnfs的数据
+
+** nfs_init_cinfo(nfs_commit_info, inode, nfs_direct_req) 
+   - commit有2种,什么时候使用?
+   > nfs_init_cinfo_from_dreq(cinfo, dreq);
+   > nfs_init_cinfo_from_inode(cinfo, inode);
+
+** nfs_mark_request_commit(nfs_page, pnfs_layout_segment)
+   - 把nfs_page添加到commit管理中
+   - 首先尝试pnfs
+   > pnfs_mark_request_commit(nfs_page, pnfs_layout_segment, nfs_commit_info)
+   - 如果上面失败,使用metadata
+   > nfs_request_add_commit_list(nfs_page, nfs_inode->commit_list, nfs_commit_info)
+
+** nfs_clear_page_commit(page)
+   - 当page从commit中释放时使用
+   - 修改统计数据 减小NR_UNSTABLE_NFS, 减小BDI_RECLAIMABLE
+    
+** nfs_clear_request_commit(nfs_page)
+   - 清除PG_clean标志, 它表示nfs_page是否在nfs_commit_info管理中
+   - 为何使用一个新的nfs_commit_info?  inode来自nfs_page->nfs_open_context->dentry->inode
+   - nfs_commit_info只是组合传递各种数据
+   > nfs_init_cinfo_from_inode(nfs_commit_info, inode)
+   - pnfs释放给nfs_commit_info?
+   > pnfs_clear_request_commit(nfs_page, nfs_commit_info)
+   - 如果pnfs不支持
+   > nfs_request_remove_commit_list(nfs_page, nfs_commit_info)
+   > nfs_clear_page_commit(page)  这个修改统计数
+
+** nfs_write_need_commit(nfs_write_data)
+   - 是否需要commit操作
+   - 如果nfs_write_data->verf.commited == NFS_DATA_SYNC, metadata不需要? 
+   - 检查pnfs, nfs_write_data->nfs_pgio_header->pnfs_layout_segment
+   - 否则检查nfs_write_data->verf.committed != NFS_FILE_SYNC
+   - 如果数据有效,检查pnfs或者NFS_FILE_SYNC??
+
+** nfs_write_completion(nfs_pgio_header)
+   - 如果nfs_pgio_header->flgs有NFS_IOHDR_REDO, 直接退出??
+   - 构造一个nfs_commit_info 
+   > nfs_init_cinfo_from_inode(nfs_commit_info, nfs_pgio_header->inode)
+   - 遍历nfs_pgio_header->pages链表中的nfs_page
+   > nfs_list_remove_request(nfs_page)
+   - 如果nfs_pgio_header->flgs有NFS_IOHDR_ERROR, 而且nfs_page->pg_bytes不在nfs_pgio_header->good_bytes范围内, 设置错误
+   > nfs_set_pageerror(nfs_req->wb_page)
+   > nfs_context_set_write_error(nfs_open_context, nfs_pgio_header->error)
+   - 如果nfs_pgio_header->flgs有NFS_IOHDR_NEED_RESCHED, 把page重新设为dirty 
+   > nfs_mark_request_dirty(nfs_page)
+   - 如果nfs_pgio_header->flgs有NFS_IOHDR_NEED_COMMIT, 复制nfs_write_verifier
+   > memcpy(&req->wb_verf, &hdr->verf->verifier, sizeof(req->wb_verf));
+   - 把nfs_page添加到commit管理中, 要不是pnfs中,也不是nfs_mds_commit_info的链表中
+   > nfs_mark_request_commit(req, hdr->lseg, &cinfo);
+   - 如果不用commit, 释放page->private
+   > nfs_inode_remove_request(nfs_page)
+   - 释放nfs_page的锁
+   - 如果没有错误, 或者需要重新提交page, 释放nfs_page的锁和page的PG_wirtepage
+   > nfs_unlock_request(nfs_page)
+   - 唤醒等待page的任务
+   > nfs_end_page_writeback(nfs_page->wb_page)
+   - 最后释放nfs_page 
+   > nfs_release_request(page)
+   - 最后释放nfs_pgio_header 
+   > nfs_pgio_header->release(nfs_pgio_header)
+   
+** nfs_scan_commit_list(list_head src, list_head dst, max, lock)
+   - list_head是nfs_mds_commit_info中的队列, 遍历他里面的nfs_page
+   - 首先锁住nfs_page, 如果锁不住,在IO过程中,不再处理
+   > nfs_lock_request(nfs_page) 
+   - 把nfs_page从nfs_commit_info中释放
+   > nfs_request_remove_commit_list(nfs_page)
+   - 放到另一个队列, 去提交写回??
+   > nfs_list_add_request(nfs_page, list_head)
+
+** nfs_scan_commit(inode, list_head, nfs_commit_info)
+   - 查找可以提交的nfs_page?  nfs_commit_info->nfs_mds_commit_info和pnfs的数据必须是一致的??
+   - nfs_mds_commit_info->ncommit表示需要commit的nfs_page, 如果==0, 直接退出
+   - 首先处理mds的nfs_page
+   > nfs_scan_commit_list(nfs_mds_commit_info->list, dst, nfs_commit_info, max)
+   - 然后是pnfs
+   > pnfs_scan_commit_lists(nfs_inode, nfs_commit_info, max-ret)
+
+** nfs_try_to_update_request(inode, page, offset, bytes)
+   - 在写nfs_page时使用, 检查要写的位置是否已经有nfs_page管理起来
+   - 如果page没有PG_private, 说明没有nfs_page, 返回NULL
+   - 查找nfs_page
+   > nfs_page_find_request_locked(nfs_inode, page)
+   - 如果(offset, bytes)在nfs_page的(wb_offset,wb_bytes)范围外不再处理
+   - 锁住nfs_lock
+   > nfs_lock_request(nfs_page)
+   - 如果锁不住,等待nfs_page. 可能在写回过程中??
+   > nfs_wait_on_request(nfs_page)  
+   - 然后释放它,循环查找.
+   > nfs_releast_request
+   - 锁住后,2者范围覆盖,扩大nfs_page, 重复使用它
+   - 并且从commit管理中释放, 必须再次提交写.
+   > nfs_clear_request_commit(nfs_page)
+   - 如果2个范围不覆盖,写回原来的nfs_page
+   > nfs_wb_page(inode, page) 
+    
+** nfs_setup_write_request(nfs_open_context, page, offset, bytes)
+   - 在page写之前,准备nfs_page
+   - 首先检查是否已经有nfs_page
+   > nfs_try_to_update_request(inode, page, offset, bytes)
+   - 如果没有,构造一个
+   > nfs_create_request(nfs_open_context, inode, page, offset, bytes)
+   - 锁住nfs_page, 设置page的PG_private, nfs_page的PG_MAPPED
+   > nfs_inode_add_request(inode, nfs_page)
+
+** nfs_writepage_setup(nfs_open_context, page, offset, count)
+   - 在nfs_write_end中使用
+   - 创建nfs_page, 它会设置page, 锁住nfs_page
+   > nfs_setup_write_request(nfs_open_context, page, offset, count)
+   - 修改i_size
+   > nfs_grow_file(page, offset, count)
+   - 如果(offset,count)覆盖整个page, 设置PG_uptodate
+   > nfs_mark_uptodate(page, nfs_page->wb_pgbase, nfs_page->wb_bytes)
+   - 设置PG_dirty, pagecache, inode的dirty
+   > nfs_mark_request_dirty(nfs_page)
+   - 释放nfs_page的lock, 还有计数
+   > nfs_unlock_request(nfs_page)
+
+** nfs_flush_incompatible(file, page)
+   - 在写page时使用, 检查page中是否有其他数据?? 都要写回,为何不能覆盖??
+   - 找到page对应的nfs_page,
+   > nfs_page_find_request(page)
+   - 如果他的nfs_open_context和file->nfs_open_context, nfs_lock_context和current不兼容,或者nfs_page->page != page
+   > nfs_wb_page(inode, page)
+   - nfs_page使用不同的nfs_open_context/nfs_lock_context好理解, nfs_page关联不同的page怎么理解?
+
+** nfs_write_pageuptodate(page, inode)
+   - 检查page中的数据是否最新
+   - 如果有delegation, 可以相信PG_uptodate, 不用检查cache_validate
+   > nfs_have_delegated_attributes(nfs_inode)
+   - 否则检查nfs_inode->cache_validate & NFS_INO_INVALID_DATA|NFS_INO_REVAL_PAGECACHE, 他的数据不是最新的 
+   - 最后返回PG_uptodate
+
+** nfs_can_extent_write(file, page, inode)
+   - 检查是否可以写这个page 
+   - 如果文件是O_DSYNC使用, 不能使用page?? 
+   - 如果有FMODE_WRITE的delegation,可以扩展写
+   - 如果page的数据有效,而且有写锁flock, 也可以 
+   > nfs_write_pageuptodate(nfs_page, inode)
+
+** nfs_uptodate(file, page, offset, count)
+   - 在nfs_write_end后设置page? 这时数据已经写到page? 
+   > nfs_can_extent_write(file, page, inode)
+   - 现在要修改了page的(offset, count), 检查是否需要把整个page写回, 
+   - 如果可以,设置(offset,count) = (0, PAGE_CACHE_SIZE)
+   - 根据这个范围,构造nfs_page 
+   > nfs_writepage_setup(nfs_open_context, page, offset, count)
+   - 如果没有问题,设置PG_dirty 
+   > __set_page_dirty_nobuffers(page)
+
+** flush_task_priority(how)
+   - 把flush优先级,转化为rpc有限加
+   - FLUSH_HIGHPRIO对应RPC_PRIORITY_HIGH
+   - FLUSH_LOWPRI对应RPC_PRIORITY_LOW
+   - 其他情况RPC_PRIORITY_NORMAL
+
+** nfs_initiate_write(rpc_clnt, nfs_write_data, rpc_call_ops, how, flags)
+   - 构造rpc_task_setup, rpc_message, rpc_task使用nfs_write_data
+   - 准备rpc_messages参数
+   > nfs_client->nfs_rpc_ops->write_setup(nfs_write_data, rpc_message)
+   - 启动rpc 
+   > rpc_run_task(rpc_task_setup)
+   - 如果how有FLUSH_SYNC, 等待rpc任务, 等待rpc_task的RPC_TASK_ACTIVE
+   > rpc_wait_for_completion_task(rpc_task)
+   > rpc_put_task(task)
+   
+** nfs_write_rpcsetup(nfs_write_data, count, offset, how, nfs_commit_info)
+   - 根据参数初始化nfs_write_data, 在转化nfs_pageio_descriptor中使用 
+   - 主要设置nfs_write_data->nfs_writeargs/nfs_writeres
+   - 根据how设置nfs_writeargs->stable
+   - 如果是FLUSH_STABLE, stable = NFS_FILE_SYNC
+   - 如果是FLUSH_COND_STABLE, nfs_mds_commit_info->ncommit > 0, 可以使用NFS_UNSTABLE, 否则使用NFS_FILE_SYNC
+   > nfs_reqs_to_commit(nfs_commit_info)
+   - 否则使用NFS_UNSTABLE
+   
+** nfs_do_write(nfs_write_data, rpc_call_ops, how)
+   - 启动rpc 
+   > nfs_initiate_write(NFS_CLIENT(inode), data, call_ops, how, 0);
+
+** nfs_do_multiple_writes(list_head, rpc_call_ops, how)
+   - 遍历list_head中的nfs_write_data, 启动rpc 
+   > nfs_do_write(nfs_write_data, rpc_call_ops, how)
+
+** nfs_redirty_request(nfs_page)
+   - 在nfs_flush失败时使用, 释放nfs_page链表,把他们重设为dirty 
+   > nfs_mark_request_dirty(nfs_page)
+   - 释放nfs_page的锁
+   > nfs_unlock_request(nfs_page)
+   - 释放PG_writeback
+   > nfs_end_page_writeback(nfs_page)
+   - 最后释放nfs_page 
+   > nfs_release_request(nfs_page)
+   - 这里为何没有释放PG_private??
+
+** nfs_async_write_error(list_head)
+   - 错误处理, error_cleanup使用的回调 
+   - 释放list_head中的nfs_page 
+   > nfs_redirty_request(nfs_page)
+
+** nfs_async_write_completion_ops
+   - nfs_pgio_completion_ops
+     #+BEGIN_SRC 
+	.error_cleanup = nfs_async_write_error,
+	.completion = nfs_write_completion,     
+     #+END_SRC
+
+** nfs_flush_error(nfs_pageio_descriptor, nfs_pgio_header)
+   - 在构造nfs_write_data时使用,这时nfs_page在nfs_pageio_descriptor中
+   - 先释放nfs_pgio_header中的nfs_write_data
+   > nfs_writedata_release(nfs_write_data)
+   - 然后释放nfs_page, 为何使用nfs_pgio_header的函数??
+   > nfs_pageio_complete_ops->error_cleanup(nfs_pageio_descriptor->pg_list)
+
+** nfs_flush_multi(nfs_pageio_descriptor, nfs_pgio_header)
+   - 构造多个nfs_write_data, 提交一个page 
+   - 准备nfs_commit_info 
+   > nfs_init_cinfo(nfs_commit_info, nfs_pageio_descriptor->pg_inode, nfs_pageio_descriptor->nfs_direct_req)
+   - 如果nfs_pageio_descriptor->pg_moreio !=0, 或者pg_count > wsize, 或者nfs_commit_info->mds->ncommit !=0, 去掉FLUSH_COND_STABLE ??
+   - 遍历构造nfs_write_data 
+   > nfs_writedata_alloc(nfs_pgio_header, 1)
+   - 如果失败,释放nfs_pageio_descriptor, 返回-ENOMEM 
+   > nfs_flush_error(nfs_pageio_descriptor, nfs_pgio_header)
+   - 如果没问题,初始化nfs_write_data, pg_ioflags决定write的方式
+   > nfs_write_rpcsetup(nfs_write_data, len, offset, nfs_pageio_descriptor->pg_ioflags, nfs_commit_info)
+   - 把nfs_write_data给nfs_pgio_header
+   - 把nfs_page从nfs_pageio_descriptor队列中放到nfs_pgio_header
+   - 设置nfs_pagio_descriptor->pg_rpc_callops = nfs_write_common_ops
+
+** nfs_flush_one(nfs_pageio_descriptor, nfs_pgio_header)
+   - 创建一个nfs_write_data 
+   > nfs_writedata_alloc(nfs_pgio_header, nfs_page_array_len(nfs_pageio_descriptor->pg_base, pg_count))
+   - 如果失败,释放nfs_pageio_descriptor的nfs_page 
+   > nfs_flush_error(nfs_pageio_descriptor, nfs_pgio_header)
+   - 构造nfs_common_info 
+   > nfs_init_cinfo(nfs_commit_info, nfs_pageio_descriptor->pg_inode, nfs_pageio_descriptor->pg_drep)
+   - 转移nfs_page, 并别page指针给nfs_write_data->nfs_page_array->pagevec
+   - 修改nfs_pageio_descriptor->pg_ioflags ???
+   > 构造nfs_write_data的nfs_writeargs/nfs_writeres 
+   > nfs_write_rpcsetup(nfs_write_data, nfs_pageio_descriptor->pg_count, 0, nfs_pageio_descriptor->pg_ioflags, nfs_commit_info)
+   - 把nfs_write_data给nfs_pgio_header, 设置rpc_callops
+
+** nfs_generic_flush(nfs_pageio_descriptor, nfs_pgio_header)
+   - 如果nfs_pageio_descriptor->pg_bsize < PAGE_CACHE_SIZE
+   > nfs_flush_multi(nfs_pageio_descriptor, nfs_pgio_header)
+   - 否则 
+   > nfs_flush_one(###)
+
+** nfs_generic_pg_writepages(nfs_pageio_descriptor)
+   - 提交一个nfs_pageio_descriptor的IO请求,也就是下面的pg_doio函数 
+   - 先构造nfs_write_header, 里面有nfs_pgio_header
+   > nfs_writehdr_alloc()
+   - 如果失败,释放nfs_pageio_descriptor的nfs_page 
+   > nfs_pgio_completion_ops->error_cleanup(nfs_pageio_descriptor->pg_list)
+   - 初始化nfs_pgio_header 
+   > nfs_pgheader_init(nfs_pageio_descriptor, nfs_pgio_header, nfs_writehdr_free)
+   - 提交nfs_page 
+   > nfs_generic_flush(nfs_pageio_descriptor, nfs_pgio_header)
+   - 发起rpc请求
+   > nfs_do_multiple_writes(nfs_pgio_header->rpc_list, rpc_call_ops, nfs_pageio_descriptor->pg_ioflags)
+   - 释放nfs_pgio_header, 如果上面完成,就是没人使用它,释放nfs_pgio_header, 以及它使用的nfs_page
+   > nfs_pgio_completion_ops->completion(nfs_pgio_header)
+   - 这里也没有释放PG_lock, 和error_cleanup类似
+
+** nfs_pageio_write_ops 
+   - nfs_pageio_ops 
+     #+BEGIN_SRC 
+	.pg_test = nfs_generic_pg_test,
+	.pg_doio = nfs_generic_pg_writepages,     
+     #+END_SRC
+   
+** nfs_pageio_init_write(nfs_pageio_descriptor, inode, ioflags, nfs_pgio_completion_ops)
+   - 初始化nfs_pageio_descriptor
+   > nfs_pageio_init(nfs_pageio_descriptor, inode, nfs_pageio_write_ops, nfs_pgio_completion_ops, nfs_server->wsize, ioflags)
+   - 这里有2个回调函数指针 
+   - nfs_pgio_completion_ops, 处理nfs_pgio_header, 在rpc完成后使用
+   - nfs_pageio_ops, 给nfs_pageio_descriptor, 用于合并和发射nfs_pageio_descriptor
+
+** nfs_pageio_reset_write_mds(nfs_pageio_descriptor)
+   - 重新设置nfs_pageio_descriptor??
+   - 设置nfs_pageio_descriptor->pg_ops = nfs_pageio_write_ops 
+   - nfs_pageio_descriptor->pg_bsize = nfs_server->wsize
+
+** nfs_write_prepare(rpc_task, calldata)
+   - 准备nfs_write_data, 也就是nfs4_proc_write_rpc_prepare
+   - 用于设置sequence, stateid, current fh已经在nfs_write_data中
+   > nfs_server->nfs_rpc_ops->write_rpc_prepare(rpc_task, nfs_write_data)
+
+** nfs_commit_prepare(rpc_task, callback)
+   - 和上面类似,不过是用于commit请求, nfs4_proc_commit_rpc_prepare
+   > nfs_server->nfs_rpc_ops->commit_rpc_prepare(rpc_task, nfs_write_data)
+
+** nfs_writeback_done_common(rpc_task, calldata)
+   - 接受rpc返回的结果,更新到nfs_writeres中
+   > nfs_writeback_done(rpc_task, nfs_write_data)
+
+** nfs_writeback_release_common(callback)
+   - 释放rpc_task的回调 
+   - 如果rpc_task->tk_status >=0, 而且需要commit , 根据nfs_write_data->nfs_writeverf->committed
+   > nfs_write_need_commit(nfs_write_data)
+   - 如果需要commit, 先检查nfs_pgio_header->flags的NFS_IOHDR_NEED_RESCHED, 什么都不做
+   - 如果nfs_pgio_header->flags没有NFS_IOHDR_NEED_COMMIT, 设置标志,而且复制verifier给nfs_pgio_header->verf
+   - 如果已经有,但2这不一样, 设置NFS_IOHDR_NEED_RESCHED
+   - 最后释放nfs_write_data / nfs_pgio_header, 他会处理nfs_pgio_header->flags的错误
+   > nfs_writedata_release(nfs_write_data)
+     
+** nfs_write_common_ops 
+   - rpc_call_ops 
+     #+BEGIN_SRC 
+	.rpc_call_prepare = nfs_write_prepare,
+	.rpc_call_done = nfs_writeback_done_common,
+	.rpc_release = nfs_writeback_release_common,     
+     #+END_SRC
+
+** nfs_writeback_done(rpc_task, nfs_write_data)
+   - 在write的rpc_task完成时调用 rpc_call_done = nfs_writeback_done_comon
+   - 调用nfs_rpc_ops里面的回调, 应该会处理sequence, stateid??
+   > nfs_rpc_ops->write_done(rpc_task, nfs_write_data)
+   - 如果status !=0, 返回
+   - 如果rpc_task->tk_status < 0, 检查请求的IO长度是否有问题
+   > nfs_set_pgio_error(nfs_pgio_header, tk_status, offset)
+   - 如果rpc_writeres->count < nfs_writeargs->count, 没有写完, 重新启动rpc_task
+   - 如果rpc_writeres->count == 0, 返回EIO
+   - 如果是NFS_UNSTABLE方式写, 修改数据指针
+   - 增加mds_offset, offset, pgbase, 减小count 
+   - 否则使用NFS_FILE_SYNC
+   > rpc_restart_call_prepare(rpc_task)
+
+** nfs_commit_set_lock(nfs_inode, may_wait)
+   - 使用nfs_inode->flags的NFS_INO_COMMIT标志同步commit操作
+   > test_and_set_bit(NFS_INO_COMMIT, nfs_inode->flags)
+   - 如果已经设置, 等待 
+   > out_of_line_wait_on_bit_lock(###)
+
+** nfs_commit_clear_lock(nfs_inode)
+   - 唤醒上面的等待
+   > wake_up_bit(&nfsi->flags, NFS_INO_COMMIT);
+
+** nfs_commit_data 
+   #+begin_src 
+	struct rpc_task		task;
+	struct inode		*inode;
+	struct rpc_cred		*cred;
+	struct nfs_fattr	fattr;
+	struct nfs_writeverf	verf;
+	struct list_head	pages;		/* Coalesced requests we wish to flush */
+	struct list_head	list;		/* lists of struct nfs_write_data */
+	struct nfs_direct_req	*dreq;		/* O_DIRECT request */
+	struct nfs_commitargs	args;		/* argument struct */
+	struct nfs_commitres	res;		/* result struct */
+	struct nfs_open_context *context;
+	struct pnfs_layout_segment *lseg;
+	struct nfs_client	*ds_clp;	/* pNFS data server */
+	int			ds_commit_index;
+	const struct rpc_call_ops *mds_ops;
+	const struct nfs_commit_completion_ops *completion_ops;
+	int (*commit_done_cb) (struct rpc_task *task, struct nfs_commit_data *data);   
+   #+end_src
+
+** nfs_commitdata_release(nfs_commit_data)
+   - 释放nfs_open_context
+   > put_nfs_open_context(nfs_commit_data->nfs_open_context)
+   > nfs_commit_free(nfs_commit_data)
+
+** nfs_initiate_commit(rpc_clnt, nfs_commit_data, rpc_call_ops, how, flags)
+   - 提交commit操作. 构造rpc_messae, rpc_task_setup 
+   > nfs_rpc_ops->commit_setup(nfs_commit_data, rpc_task_setup)
+   > rpc_run_task(rpc_task_setup)
+   - 如果how是FLUSH_SYNC, 等待rpc_task 
+   > rpc_wait_for_completion_task(task);
+
+** nfs_init_commit(nfs_commit_data, list_head, pnfs_layout_segment, nfs_commit_info)
+   - 初始化nfs_commit_data, 把list_head的nfs_page给nfs_commit_data->pages
+
+** nfs_retry_commit(list_head, pnfs_layout_segment, nfs_commit_info)
+   - 重新把nfs_page放到commit的管理中
+   - 遍历list_head中的nfs_page 
+   > nfs_list_remove_request(nfs_page)
+   > nfs_mark_request_commit(nfs_page, pnfs_layout_segment, nfs_commit_info)
+   - 释放nfs_page 
+   > nfs_unlock_and_release_request(nfs_page)
+
+** nfs_commit_list(inode, list_head, how, nfs_commit_info)
+   - 发送rpc请求,这里没有nfs_pgio_header/nfs_pageio_descriptor等
+   - 构造nfs_commit_data 
+   > nfs_init_commit(nfs_commit_data, list_head, NULL, nfs_commit_info)
+   - 增加nfs_commit_info->nfs_mds_commit_info->rpcs_out计数
+   > nfs_initiate_commit(nfs_server, nfs_commit_data, nfs_commit_completion_ops, how, 0)
+   - 如果上面无法创建nfs_commit_data, 重新把nfs_page放到commit的管理中 
+   > nfs_retry_commit(list_head, NULL, nfs_commit_info)
+   > nfs_commit_completion_ops->error_cleanup(nfs_inode)
+
+** nfs_commit_done(rpc_task, calldata)
+   > nfs_rpc_ops->commit_done(rpc_task, rpc_commit_data)
+
+** nfs_commit_release_pages(nfs_commit_data)
+   - 处理nfs_commit_data->pages中的nfs_page
+   > nfs_list_remove_request(nfs_page)
+   - 修改计数
+   > nfs_clear_page_commit(nfs_page->page)
+   - 比较commit返回的verifier
+   > memcpy(nfs_page->wb_verf, nfs_commit_data->verf->verifier)
+   - 如果相同,可以释放这个page/nfs_page
+   > nfs_inode_remove_request(nfs_page)
+   - 否则,把page重新设为dirty 
+   > nfs_mark_request_dirty(nfs_page)
+   - 设置nfs_open_context->flags的NFS_CONTEXT_RESEND_WRITES
+   - 最后释放nfs_page的锁和计数 
+   > nfs_unlock_and_release_request(nfs_page)
+   - 最后修改nfs_mds_commit_info 
+   > nfs_init_cinfo(nfs_commit_info, nfs_inode, nfs_commit_data->dreq)
+   - 减小nfs_commit_info->nfs_mds_commit_info->rpcs_out, 如果减为0, 唤醒NFS_INO_COMMIT的任务
+   > nfs_commit_clear_lock(nfs_inode)
+
+** nfs_commit_release(calldata)
+   - 释放rpc_task调用的,释放rpc_commit_data 
+   > nfs_commit_completion_ops->completion(nfs_commit_data)
+   > nfs_commitdata_release(nfs_commit_data)
+
+** nfs_commit_ops 
+   - rpc_call_ops
+     #+BEGIN_SRC 
+	.rpc_call_prepare = nfs_commit_prepare,
+	.rpc_call_done = nfs_commit_done,
+	.rpc_release = nfs_commit_release,     
+     #+END_SRC
+
+** nfs_commit_completion_ops
+   - nfs_commit_completion_ops
+     #+BEGIN_SRC 
+	.completion = nfs_commit_release_pages,
+	.error_cleanup = nfs_commit_clear_lock,     
+     #+END_SRC
+
+** nfs_generic_commit_list(inode, list_head, how, nfs_commit_info)
+   - 收集需要commit的数据
+   > pnfs_commit_list(inode, list_head, how, nfs_commit_info)
+   - 如果上面返回PNFS_NOT_ATTEMPTED, 说明没有pnfs
+   > nfs_commit_list(inode, list_head, how, nfs_commit_info)
+
+** nfs_commit_inode(inode, how)
+   - 如果how有FLUSH_SYNC, 等待其他commit任务的完成
+   - 使用nfs_inode->flags的NFS_INO_COMMIT同步commit任务
+   > nfs_commit_set_lock(nfs_inode, may_wait)
+   - 如果不等待就设置I_DIRTY_DATASYNC??
+   - 构造nfs_commit_info
+   > nfs_init_cinfo_from_inode(nfs_commit_info, inode)
+   - 收集nfs_page 
+   > nfs_scan_commit(inode, list_head, nfs_commit_info)
+   - 发送请求 
+   > nfs_generic_commit_list(inode, list_head, how, nfs_commit_info)
+   - 如果how不等待,同样设置I_DIRTY_DATASYNC
+   - 等待nfs_inode->flags的NFS_INO_COMMIT
+
+** nfs_commit_unstable_pages(inode, writeback_control)
+   - nfs_inode->nfs_mds_commit_info->ncommit == 0, 表示没有需要commit的page, 直接返回
+   - 如果writeback_control->sync_mode == WB_SYNC_NONE
+   - ncommit <= npages /2 , 表示unstable的太少,不管
+   - 否则提交unstable的nfs_page. flags = writeback_control->sync_mode
+   > nfs_commit_inode(nfs_inode, flags)
+   - 如果上面没有提交,设置I_DIRTY_DATASYNC
+
+** nfs_write_inode(inode, writeback_control)
+   - ???
+   > nfs_commit_unstable_pages(inode, writeback_control)
+
+** nfs_wb_all(inode)
+   - 写回inode, 包含pagecache, metadata
+   > sync_inode(inode, writeback_control)
+
+** nfs_wb_page_cancel(inode, page)
+   - 释放nfs_page, 在invalidate操作中使用
+   - 循环处理,首先等待PG_writeback 
+   > wait_on_page_writeback(page)
+   - 获取nfs_page的锁 
+   > nfs_page_find_request(nfs_page)
+   - 如果没有nfs_page, 直接退出
+   - 锁住nfs_page
+   > nfs_lock_request(nfs_page)
+   - 如果能锁住, 去掉PG_CLEAN? 他表示在commit管理中??
+   > nfs_clear_request_commit(nfs_page)
+   - 释放page. nfs_page在释放时,才会释放对page的计数,page可以很早就释放PG_private
+   > nfs_inode_remove_request(nfs_page)
+   - 清除PG_dirty
+   > cancel_dirty_page(page, PAGE_CACHE_SIZE)
+   - 最后释放nfs_page 
+   > nfs_unlock_and_release_request(nfs_page)
+   - 如果不能锁住nfs_page,等待然后重新查找
+   > nfs_wait_on_request(nfs_page)
+
+** nfs_wb_page(inode, page)
+   - 同步写回一个page
+   - 循环处理,首先等地PG_writeback 
+   > wait_on_page_writeback(page)
+   > clear_page_dirty_for_io(page)
+   > nfs_writepage_locked(page, writeback_control)
+   - 如果page没有PG_private, 说明他已经被释放, 没有commit数据,直接退出
+   - 否则还要再刷新unstable的数据? 
+   > nfs_commit_inode(inode, FLUSH_SYNC)
+
+** nfs_migrate_page(address_space, newpage, page, migrate_mode)
+   - 如果page在commit中, 不允许migrate 
+   > PagePrivate(page)
+   - 否则可以 
+   > migrate_page(address_space, newpage, page, mode)
+
+** 总结
+   - write使用的优先级分3种
+     - 回收内存使用FLUSH_HIGHPRI|FLUSH_STABLE
+     - background/kupdate使用FLUSH_LOWPRI|FLUSH_COND_STABLE
+     - 普通写使用FLUSH_COND_FLUSH
+   - 在准备nfs_write_data时,根据它计算nfs_writeargs->stable, 对于FLUSH_COND_STABLE, 如果有commit的nfs_page, 就使用NFS_UNSTABLE
+   - 看来只有在reclaim的写使用NFS_FILE_SYNC, 或者没有commit数据时,才使NFS_FILE_SYNC
+   - 这里根本没有使用NFS_DATA_SYNC, 怪不得效率这么低!
+       
+   - readpages
+     - 使用NFS_INO_FLUSHING同步处理
+     - 构造nfs_pageio_descriptor, 使用writeback_control构造ioflags
+     - 使用标准接口扫描pagecache, 回调函数和nfs_readpage使用相同的函数, 
+     > nfs_cache_pages(address_space, writeback_control, nfs_writepages_callback, nfs_pageio_descriptor)
+     - 这里把nfs_page放到nfs_pageio_descriptor之后,就释放PG_locked
+     > nfs_do_writepage
+     - 尝试发射已经收集的nfs_pageio_descriptor
+     > nfs_pageio_cond_complete(nfs_pageio_descriptor, offset)
+     - 遍历page, 收集到nfs_pageio_descriptor中
+     > nfs_page_async_flush
+     - 如果碰到nfs_lock, 根据writeback_control->sync_mode决定是否等待
+     > nfs_find_and_lock_request(page, nonblock)
+     - 放入nfs_pageio_descriptor之前设置PG_writeback
+     > nfs_set_page_writeback(nfs_page)
+     - 收集nfs_page 
+     > nfs_pageio_and_request(nfs_pageio_descriptor, nfs_page)
+     - 最后扫面完成后再提交一边nfs_pageio_descriptor
+
+   - nfs_writepage
+     - 在这里page是锁住, 使用一个nfs_pageio_descriptor处理page  
+     - 提交给nfs_pgio_header, 发送rpc请求
+     > nfs_writepage_locked(page, writeback_control)
+     - 构造nfs_pageio_descriptor
+     > nfs_rpc_ops->write_pageio_init(nfs_pageio_descriptor, inode, ioflags, nfs_async_write_completion_ops)
+     - 添加nfs_page
+     > nfs_do_writepage(page, writeback_control, nfs_pageio_descriptor)
+     > nfs_pageio_complete(nfs_pageio_descriptor
+     - 释放PG_locked
+     > unlock_page(page)
+
+   - nfs_pageio_ops->pg_doio = nfs_generic_pg_writepages
+     - 构造nfs_pgio_header / nfs_write_header
+     > nfs_writehdr_alloc()
+     - 初始化
+     > nfs_pgheader_init(nfs_pageio_descriptor, nfs_pgio_header, nfs_writehdr_free)
+     - 转移nfs_page 
+     > nfs_generic_flush(nfs_pageio_descriptor, nfs_pgio_header)
+     > nfs_flush_one(nfs_pageio_descriptor, nfs_pgio_header)
+     - 收集完成nfs_page, 修改nfs_pageio_descriptor->pg_ioflags的FLUSH_COND_STABLE
+     - 如果有更多的io, nfs_pgeio_descriptor无法合并nfs_page, 或者已经有commit的page, 以后也可以使用UNSTABLE的,所以就去掉unstable
+     - 构造nfs_write_data的nfs_writeargs/nfs_writeres
+     > nfs_write_rpcsetup(nfs_write_data, nfs_pageio_descriptor->pg_count, 0, pg_ioflags, nfs_commit_info)
+     - 提交rpc 
+     > nfs_do_multiple_writes(list_head, rpc_call_ops, ioflags)
+     > nfs_do_write(nfs_write_data, rpc_call_ops,how)
+     > nfs_initiate_write(rpc_clnt, nfs_write_data, rpc_call_ops, how, flags)
+     - 这里创建rpc_message / rpc_task, 发送rpc请求
+     - 如果how是FLUSH_SYNC, 还要等待rpc结果.
+     - 但这里没有找到同步的情况
+     - 完成之后的处理,可能在rpc的callback中 
+     > nfs_pgio_completion_ops->completion(nfs_pgio_header)
+
+   - rpc_call_ops nfs_write_common_ops
+     - write的rpc使用的回调函数
+     - nfs_write_prepare
+       > nfs_rpc_ops->write_rpc_prepare(rpc_task, nfs_write_data)
+       - 准备rpc中的sequence, stateid
+     - nfs_writeback_done_common(rpc_task, nfs_write_data)
+       > nfs_writeback_done(rpc_task, nfs_write_data)
+       - 检查sequence,stateid结果
+       > nfs4_write_done
+       - 检查rpc的错误
+     - nfs_writeback_release_common(nfs_write_data)
+       - 处理verifier的保存, 在nfs_pgio_header的释放才会集体处理nfs_page
+       > nfs_writedata_release(nfs_write_data)
+
+   - nfs_async_write_completion_ops
+     - nfs_pgio_completion_ops
+     - nfs_write_completion
+       - nfs_pgio_header完成后的处理
+       - 检查nfs_pgio_header->flags的NFS_IOHDR_REDO, NFS_IOHDR_NEED_RESCHED, NFS_IODHR_NEED_COMMIT
+       - 这里的处理包括去掉PG_writeback, 释放nfs_page的PG_BUSY锁, 释放nfs_page/page的关系, 释放nfs_page
+
+   - nfs_write_begin
+     - 为写准备page
+     > nfs_flush_incompatible(file, page)
+     - 如果之前有数据,而且是别人写的,需要先刷回.
+     > nfs_wb_page(inode, page)
+
+   - nfs_write_end
+     > nfs_uptodate(file, page, offset, count)
+     - 先检查是否能写整个page 
+     > nfs_can_extent_write(file, page, inode)
+     - 然后处理nfs_page
+     > nfs_writepage_setup(nfs_open_context, page, offset, count)
+     - 首先找到或构造nfs_page,如果互斥,把救数据写回,释放nfs_page
+     > nfs_setup_write_request(nfs_open_context, page, offset, count)
+     - 如果找不到,写回之后会等待原来的释放, 所以也需要创建新的
+     > nfs_create_request(nfs_open_context, ###)
+     - 锁住nfs_page的PG_BUSY, 关联nfs_page/page
+     > nfs_inode_add_request(inode, nfs_request)
+     - 最后修改文件大小, 更新PG_uptodate, PG_dirty
+     - 最后释放nfs_lock的PG_BUSY锁
+
+   - 在generic_file_aio_write写先锁住inode->i_mutex
+   - 在generic_perform_write中,锁住PG_lock
+
+   - commit
+     - 在释放nfs_pgio_header时,如果page需要commit,把它给nfs_mds_commit_info
+     > nfs_mark_request_commit
+
+   - nfs_commit_inode(inode, how)
+     - 写回commit的nfs_page
+
+   - nfs_commit_ops
+     - rpc_call_ops
+     - nfs_commit_prepare(rpc_task, nfs_commit_data)
+       - 为rpc准备sequence
+       > nfs_rpc_ops->commit_rpc_prepare(rpc_task, nfs_commit_data)
+     - nfs_commit_done(rpc_task, nfs_commit_data)
+       - 处理sequence结果
+       > nfs_rpc_ops->commit_done(rpc_task, nfs_commit_data)
+       > nfs_commit_data->commit_done_cb(rpc_task, nfs_commit_data)
+     - nfs_commit_release
+       > nfs_commit_completion_ops->completion(nfs_commit_data)
+       > nfs_commitdate_release(nfs_commit_data)
+       - 如果nfs_mds_commit_info->rpcs_out --, 如果减为0, 释放nfs_inode->flags的NFS_INO_COMMIT
+
+    - nfs_commit_completion_ops 
+      - nfs_commit_completion_ops 
+      - nfs_commit_release_pages
+	- 在释放nfs_commit_data时使用
+	- 如果verifier一致,可以释放nfs_page/page的关系
+	> nfs_inode_remove_request(nfs_page)
+	> nfs_unlock_and_release_request(nfs_page)
+	- 否则需要设置PG_dirty, 重新处理nfs_open_context
+	  
+    - nfs_commit_inode(inode, how)
+      - 先锁住nfs_inode->flags的NFS_INO_COMMIT 
+      - 构造一个nfs_commit_info
+      - nfs_init_cinfo_from_inode(nfs_commit_info, inode)
+      - 收集nfs_page 
+      > nfs_scan_commit(inode, list_head, nfs_commit_info)
+      - 发送rpc请求 
+      > nfs_generic_commit_list(inode, list_head, how, nfs_commit_info)
+      - 等待nfs_inode的NFS_INO_COMMIT, 在释放nfs_commit_data时使用
+
+    - nfs_write_inode(inode, writeback_control) 
+      - super_block_ops中写回metadata的函数, 写回commit的nfs_page
+      > nfs_commit_unstable_pages(inode, writeback_control)
+      > nfs_commit_inode(inode, flags)
+
+    - nfs_wb_all(inode)
+      - 使用fs-writeback的接口,inode->i_state的I_SYNC同步操作
+      - 先写回pagecache, 再写回metadata, 就是使用上面的接口
+      > write_inode(inode, writeback_control)
+      > super_operations->write_inode(inode, writeback_control)
+
+    - nfs_wb_page(inode, page)
+      - 写回nfs_page, 如果还有commit, 就提交整个文件?? 
+      > nfs_writepage_locked(page, writeback_control)
+      > nfs_commit_inode(inode, FLUSH_SYNC)

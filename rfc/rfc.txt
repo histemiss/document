@@ -1,0 +1,199 @@
+========
+NO      : 
+    1094
+NAME    : 
+    NFS: Network File System Protocol Specification (V2)
+USAGE   :
+    The NFS protocol was intended to be as stateless as possible.make operations as "idempotent" as possible.而且带了MNT协议:(MOUNT PROTOCOL DEFINITION)
+    1. nfs的通过rpc的认证传递用户id，使用auth_unix传递uid/gid，使用auth_des传递用户名称.不用auth_null?auth_krb5呢？
+    The NFS server checks permissions by taking the credentials from the RPC authentication information in each remote request. For example, using the AUTH_UNIX flavor of authentication, the server gets the user's effective user ID, effective group ID and groups on each call, and uses them to check access.
+    2.The general practice with the NFS version 2 protocol was to implement a time-based client-server cache consistency mechanism
+LINK    :
+    http://www.ietf.org/rfc/rfc1094.txt
+REFER:
+    
+========
+NO      :
+    1813        
+NAME    :
+    NFS Version 3 Protocol Specification
+USAGE    : 
+    介绍NFSV3,包括了mnt协议和nlm3/4. 需要看一下verifier和cookie的定义。
+    1. The NFS service uses AUTH_NONE in the NULL procedure. AUTH_UNIX, AUTH_DES, or AUTH_KERB are used for all other procedures.
+    2. verf (write/commit)只是用来测试nfs服务器是否意外重启.
+    3. 增加了许多attr的操作，还有wcc。
+REFER:
+
+========
+NO      :
+    5531(1831)
+NAME    :
+    RPC: Remote Procedure Call Protocol Specification Version 2
+USAGE   :
+    定义了RPC数据包的格式。
+REFER   :
+
+========
+NO      :
+    4506(1832)
+NAME    :
+    XDR: External Data Representation Standard
+USAGE   :
+    定义了xdr组装数据结构的方式
+REFER   :
+
+========
+NO      :
+    1833
+NAME    :
+    Binding Protocols for ONC RPC Version 2
+USAGE   :
+    在RPC2应用中，server安装应用时，分配传输地址，把应用(program)注册到这个地址上。传输地址包括网络地址(network address)和动态地址(selector address)，对应tcp/ip来说，网络地址就是server的ip地址，动态地址就是tcp端口号(socket)，而socket是变化的。所以server还提供lookup service，而且这个服务使用固定的传输地址，客户端可通过它来获取其他应用的传输地址，或server提供的服务等。这个lookup service使用的socket地址是111，程序号（program)是100000。这种服务通过binding protocol实现，第3/4版叫做rpcbind,第2版叫portmap.portmap是针对tcp/udp来说的，所以传输地址是固定的。而rpcbind使用传输层无关，传输地址使用字符串表示。当然这是对用户层来说的，底层还是根据实现来，如果利用tcp/ip，这个字符串就是ip地址和tcp地址格式化而成。后面还定义binding protocol支持的应用.
+REFER   :
+
+========
+NO      :
+    4121(1964)
+NAME    : 
+    The Kerberos Version 5 GSS-API Mechanism
+USAGE   :
+REFER   :
+
+========
+NO      :
+    2054
+NAME    : 
+    WebNFS Client Specification
+USAGE   :
+REFER   :
+
+========
+NO      :
+    2055
+NAME    : 
+    WebNFS Server Specification
+USAGE   :
+REFER   :
+
+========
+NO      :
+    2224
+NAME    : 
+    NFS URL Scheme
+USAGE   :
+    定义public filehandle, 在nfs4中同样也定义此概念。The public filehandle is a zero filehandle.
+REFER   :
+
+========
+NO      :
+    2743(2078)
+NAME    :
+    Generic Security Service Application Program Interface, Version 2
+USAGE   :
+    GSSAPI v2
+REFER   :
+
+========
+NO      :
+    5403(2203)
+NAME    :
+    RPCSEC_GSS Protocol Specification
+USAGE   :
+    在rfc1831的基础上，扩充了rpc_sec_gss，详细说明包结构，需要结合1831了解.
+REFER   :
+
+========
+NO      : 
+    2623
+NAME    :
+    NFS Version 2 and Version 3 Security Issues and the NFS Protocol's Use of RPCSEC_GSS and Kerberos V5 
+USAGE   :
+    讨论nfs的安全问题，其实就是利用RPC层的安全功能(auth_null/auth_sys/rpcsec_gss等).但详细介绍了mnt等协议的安全问题。还有详细介绍了rpcsec_gss实现krb5,其他rpc相关协议中不一定介绍
+REFER   :
+
+========
+NO      : 
+    3530(3010)
+NAME    :
+    Network File System (NFS) version 4 Protocol
+USAGE   :
+    NFS4. compound过程（procedure)是自定义的，它包装了其他nfs的procedure.
+    clientid4(uint64_t);seqid4(uint32_t);verifier4(字符测);fsid4(两个uint64_t);
+    clientaddr(netid;uaddr); stateid4(uint32_t;opaque[])    
+    1. filehandler: ROOT filehandler / Public Filehandler  
+    2. 文件属性又增加了许多
+    3. NFS4state注视：
+        * 能检测状态不一致
+        * 状态恢复机制
+    4. share reservation: 文件的使用状态
+REFER   :
+
+========
+NO      :
+    5661
+NAME    :
+    Network File System (NFS) Version 4 Minor Version 1 Protocol
+USAGE   :
+    详细介绍了nfs4.1中的功能.
+REFER   :
+
+========
+NO      :
+    5662
+NAME    :
+    Network File System (NFS) Version 4 Minor Version 1 External Data Representation Standard (XDR) Description
+USAGE   :
+    详细介绍了nfs4.1中使用的数据包的数据结构。需要看session的使用。
+    file locking and share reservation:
+    共享池？这需要提供atomic open/create. win平台的createfile有参数表示share,意思是对一个文件的访问是否可以share. 在linux中，只有lock实现共享互斥的访问（主要保护read/write),但这里添加共享的范围，对整个访问过程(open/lookup/io/close)实现保护.要在open等操作上添加保护，需要实现atomic操作,这样才能在操作中检查互斥和共享。如果对整个文件的访问过程增加了互斥，可以更大范围对数据共享做优化。     
+    因此这里区分了open和lock，lock是一种heavyweight的互斥机制，它实现了一个更精确(byte-range-lock，锁主人是task等), open是一种lightweight的互斥机制，它锁的精度很粗糙，只检查文件的访问(open)是否有冲突，锁的主人也是client等。
+
+    这里讨论的目的是实现数据的完全一致。NFS是文件access protocol, 如果说client每次write/read操作，都直接调用write/read procedure，那就不会有不一致的现象. 当然lock还是少不了的。但这里需要优化的是，文件的普通访问(read)不要添加锁，lock操作是非常耗费资源的。而且nfs client实现的，不是每次read都能够映射到read procedure, 不能每执行一个访问数据的指令,就执行read/write的操作！所以这些全是为了优化系统而实现的.
+    上面讨论的不正确，因为rfc中说的lock_owner和open_owner是相似的，都对应client-id和task-id，而且delegation和layout的owner对应client-id.
+    READ,WRITE,SETATTR需要stateid,这个stateid可以是byte-range lock或share reservation,或special stateid. share reservation使用OPEN创建. OPEN和mandatory lock会阻挡READ/WRITE操作,advisory lock不会阻挡READ/WRITE操作。
+
+REFER   :
+
+========
+NO      :
+    5663
+NAME    :
+    Parallel NFS (pNFS) Block/Volume Layout
+USAGE   :
+    基于block的pnfs。
+REFER   :
+
+========
+NO      :
+    5664
+NAME    :
+    Object-Based Parallel NFS (pNFS) Operations
+USAGE   :
+    介绍object-based pnfs. 自带xdr描述。
+REFER   :
+
+========
+NO      :
+    5665
+NAME    :
+    IANA Considerations for Remote Procedure Call (RPC) Network Identifiers and Universal Address Formats
+USAGE   :
+    介绍RPC中使用的网络ID和地址格式。网络id(Network Identifier)是tcp6/tcp之类的东西。
+REFER   :
+
+========
+NO      :
+    5666
+NAME    :
+    Remote Direct Memory Access Transport for Remote Procedure Call
+USAGE   :
+    RDMA NFS
+REFER   :
+
+========
+NO      :
+    5667
+NAME    :
+    Network File System (NFS) Direct Data Placement
+USAGE   :
+REFER   :

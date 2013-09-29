@@ -1,0 +1,1005 @@
+* disk-io.c
+  - 这里把btree中节点使用extent叫做tree block,把普通文件的数据extent叫做extent data
+
+** extent_io_ops
+   #+begin_src C++
+       //这个结构在extent_io_tree中,extent_state/extent_buffer的操作使用它
+       //前面4个是write使用的
+       //处理delalloc
+       fill_delalloc(inode, page, start, end, page_started, nr_written)
+       //writepage
+       writepage_start_hook(page, start, end)
+       writepage_io_hook(page, start, end)
+       // 提交bio..
+       extent_submit_bio_hook_t submit_bio_hook
+       // 合并bio
+       merge_bio_hook(page, offset, size, bio, bio_flags)
+       //read使用
+       readpage_io_hook(page, start, end)
+       readpage_io_failed_hook(page, failed_mirror)
+       readpage_end_io_hook(page, start, end)
+       //在writepage完成后使用
+       writepage_end_io_hook(page, start, end, extent_state, uptodate)
+       //操作extent_state时使用
+       set_bit_hook(inode, extent_state, bits)
+       clear_bit_hook(inode, extent_state, bits)
+       //合并extent_state使用
+       merge_extent_hook(inode, extent_state, extent_state)
+       //分裂extent_state
+       split_extent_hook(inode, extent_state)
+   #+end_src
+
+** btrfs_worker_thread
+   #+begin_src C++
+       btrfs_workers workers
+       list_head pending
+       list_head prio_pending
+     
+       list_head worker_list
+       task_struct  task  #kthread
+       atomic_t num_pending, refs
+       unsigned long sequence
+       spinlock_t lock
+       int working, idle
+   #+end_src
+     
+** btrfs_work
+   #+begin_src C++
+       void func(btrfs_work)   //任务的回调函数
+       void ordered_func(btrfs_work) //ordered work queue
+       void ordered_free(btrfs_work) //
+       flags
+       btrfs_worker_thread
+       list_head list, order_list
+   #+end_src
+     
+** btrfs_workers
+   #+begin_src C++
+       int num_workers
+       int num_workers_starting
+       int max_workers, idle_thresh
+       int ordered     //在btrfs_work->func完成之后,有序的执行ordered_func任务
+       int atomic_start_pending
+       btrfs_workers atomic_worker_start  //用于创建任务的btrfs_workers
+       list_head worker_list
+       list_head idle_list
+       list_head order_list    //等待完成的work
+       list_head prio_order_list
+       spinlock_t lock, order_lock
+       char *name..
+   #+end_src
+     
+** btree_get_extent(inode, page, pg_offset, start, len, create)
+   - btrfs_fs_info->inode使用的extent_map,这个文件使用整个逻辑磁盘空间.
+   - extent_map管理文件偏移和磁盘逻辑偏移的映射关系,对于这个文件没有映射关系.
+   - btrfs_fs_info->extent_map_tree,它管理磁盘逻辑偏移和物理偏移的映射,所以这个extent_io_tree没什么用.
+   - 这里查找针没有使用page,使用(start,len)
+   > lookup_extent_mapping(inode=>btrfs_inode->extent_map_tree, start, len)
+   - 如果找不到创建一个,创建了使用(0, -1),所以这个extent_map_tree中就只有一个extent_map
+   - 设置extent_map->block_dev为inode=>btrfs_inode=>btrfs_root=>btrfs_fs_info=>btrfs_fs_devices->latest_bdev. extent_map这里不是管理map_lookup??
+   > alloc_extent_map()
+   > add_extent_mapping(extent_map_tree, extent_map)
+
+** csum_tree_block(btrfs_root, extent_buffer, verify)
+   - 对于tree block, 头部是btrfs_header,btrfs_header->csum存放对整个extent计算的checksum
+   - 对extent_buffer计算checksum,如果verify是1,和btrfs_header->csum做比较,否则把checksum写到btrfs_header->csum中
+   - 以32字节单位,计算checksum..  extent_buffer->start应该是页对齐的.建立page映射,访问数据
+   > map_private_extent_buffer(extent_buffer, off, 32, kaddr, map_start, map_len)
+   - 计算checksum
+   > btrfs_csum_data(btrfs_root, kaddr, ...)
+   > btrfs_csum_final(crc, result)
+   - 比较checksum, verify=1, 操作的是头csum_size数据..
+   > memcpy_extent_buffer(extent_buffer, result, 0, csum_size)
+   - 保存checksum. 估计这个extent是btree中的节点..
+   > write_extent_buffer(extent_buffer, result, 0, csum_size)
+
+** verify_parent_transid(extent_io_tree, extent_buffer, parent_transid, atomic)
+   - 对于btrfs_node, 里面是btrfs_key_ptr, parent_transid是btrfs_key_ptr->generation
+   - tree block的头部是btrfs_header. 比较btrfs_header->generation和parent_transid.
+   - 如果相同返回0,如果不是,可能READ IO没有完成,锁extent,等待完成后检查.
+   - 如果atomic!=0, 不等待返回-EAGAIN
+   > lock_extent_bits(extent_io_tree, extent_buffer->start, ...)
+   - 检查EXTENT_BUFFER_UPTODATE, 重新比较generation和parent_transid
+   > btrfs_header_generation(extent_buffer)
+   - 如果generation不一致,清除extent_buffer的EXTENT_BUFFER_UPTODATE,还有PG_uptodate, IO有问题.
+   > clear_extent_buffer_dirty(extent_buffer)
+   > unlock_extent_cached(extent_io_tree, ...)
+
+** btree_read_extent_buffer_pages(btrfs_root, extent_buffer, start, parent_transid)
+   - 读一个extent_buffer的磁盘数据,检查数据的checksum/generation,如果不正确,读其他mirror. 
+   - parent_transid是从btrfs_node中btrfs_key_ptr中获取的. start是文件偏移,也就是磁盘逻辑偏移,这里一直是0,下面调用的函数会使用它.
+   > read_extent_buffer_pages(btrfs_io_tree, extent_buffer, start, WAIT_COMPLETE, btree_get_extent, mirror_num)
+   - 这个函数是extent_io.c中实现的, 非常负责的一个readpages..
+   > verify_parent_transid(btrfs_io_tree, extent_buffer, parent_transid, 0)
+   - 检查parent_transid,如果没问题读回结束. 
+   - 如果有错误,而且有EXTENT_BUFFER_CORRUPT标志, 结束读,退出
+   - 尝试其他的mirrors, 检查镜像个数,如果为1,直接退出
+   > btrfs_num_copies(btrfs_root->btrfs_fs_info, extent_buffer->start, extent_buffer->len)
+   - 这里循环读取多个mirrors,从0开始读,只有第一次失败了才去尝试别的mirror.这里保存结果什么的有点弱! 
+   - 在submit_io中使用extent_buffer->read_mirror记录失败的mirror,在btree的readpage_io_failed_hook(btree_io_failed_hook)中设置.
+   - 最后循环完成,如果有失败mirror,而且其他mirror成功,修复失败的mirror
+   > repair_eb_io_failure(btrfs_root, extent_buffer, failed_mirror)
+
+*** 总结
+   - 从新整理一下读取数据过程, 里面就是lock/uptodate两个标志.
+   - extent_buffer->flags的EXTENT_BUFFER_UPTODATE总是能保证PG_uptodate, 所以检查和设置的顺序都是先extent_buffer, 然后是page  (btree_readpage_end_io_hook->set_extent_buffer_uptodate
+   - 先锁PG_locked, 然后是extent_state, 因为extent_state范围也是page. 释放锁也是先考虑extent_state, 然后是PG_locked. 先设置PG_uptodate, 再释放PG_locked..
+
+** csum_dirty_buffer(btrfs_root, page)
+   - 使用上面的函数计算并填充btrfs_header->csum. 
+   - page->private是extent_buffer. 先检查page->index和extent_buffer中btrfs_header->bytenr是否一直.
+   > btrfs_header_bytenr(extent_buffer)
+   - 计算之间保证PG_uptodate
+   > csum_tree_block(btrfs_root, extent_buffer, 0)
+
+** check_tree_block_fsid(btrfs_root, extent_buffer)
+   - 检查extent_buffer表示的tree block属于这个fs
+   - btrfs_root=>btrfs_fs_info->btrfs_fs_device->fsid和btrfs_header->fsid比较
+   > btrfs_header_fsid(extent_buffer)
+   - 读取btrfs_header->fsid
+   > read_extent_buffer(extent_buffer, btrfs_fs_devices, start, len)
+   > memcmp(fsid, btrfs_root->btrfs_fs_info->btrfs_devices->fsid, BTRFS_FSID_SIZE)
+   - fsid是char[8]的数据, 如果不一样,尝试其他device, btrfs_fs_devices->seed.
+   - 可能这个fs是从seed的fs开始创建的
+
+** check_leaf(btrfs_root, extent_buffer)
+   - extent_buffer是btrfs_leaf,这里检查它的数据有效性
+   - 节点中的item个数, 如果为0,就退出..
+   > btrfs_header_nritems(btrfs_key)
+   - 检查每个节点
+   > btrfs_item_offset_nr(btrfs_key, 0)
+   > btrfs_item_size_nr(btrfs_key, 0)
+   > BTRFS_LEAF_DATA_SIZE(btrfs_root)
+   - 第一个节点的data在extent最后..两者相加是btrfs_leaf的大小/tree block大小
+   > btrfs_item_key_to_cpu(extent_buffer, btrfs_key, slot)
+   - 获取btrfs_leaf中连续的两个key,检查是否有序,先比较objectid/type/offset
+   > btrfs_comp_cpu_keys(key1, key2)
+   - 检查两个挨着的data,位置是否正确
+   > btrfs_item_offset_nr(extent_buffer, slot)
+   > btrfs_item_end_nr(extent_buffer, slot+1)
+
+** find_eb_for_page(extent_io_tree, page, int max_walk)
+   - 找extent_buffer,它的范围函盖page
+   - btrfs_io_tree使用radix tree管理extent_buffer,使用文件偏移索引
+   - page是pagecache中的,从它获取文件偏移
+   > page_offset(page)
+   > find_extent_buffer(extent_io_tree, start, 0)
+   - 如果找不到会减小查找地址start,直到找到一个extent_buffer
+   - 检查extent_buffer->start/len,包含page的位置才有效,否则返回NULL
+
+** btrfs_readpage_end_io_hook(page, start, end, extent_state, mirror)
+   - 这是readpage完成后的回调函数, page->private是extent_buffer, page可以找到btrfs_inode, btrfs_root, btrfs_io_tree. 
+   - 虽然这里是page,但操作的单位是extent,这个extent的page都完成时,才进行检查
+   - page对应的extent是page->private.
+   - 完成一个page的read, 记录到extent_buffer, 如果extent没有完成,就直接退出.
+   > atomic_dec_and_test(extent_buffer->io_pages)
+   - 下面开始检查extent_buffer数据的有效性.
+   - btrfs_header->bytenr和extent_buffer->start比较
+   > btrfs_header_bytenr(extent_buffer)
+   - fsid, tree block属于这个fs
+   > check_tree_block_fsid(btrfs_root, extent_buffer)
+   - tree block的checksum
+   > btrfs_header_level(extent_buffer)
+   > csum_tree_block(btrfs_root, extent_buffer, 1)
+   - 如果上面得出的level为0,检查叶子有效性..
+   > check_leaf(btrfs_root, extent_buffer)
+   - 如果extent读取完毕,设置extent/page的uptodate标志
+   > set_extent_buffer_uptodate(extent_buffer)
+   - 如果是readahead,回调函数
+   > btrfs_readahead_hook(btrfs_root, extent_buffer, start, ret)
+
+** btree_io_failed_hook(page, failed_mirror)
+   - bio失败的回调函数
+   - 设置extent_buffer->bflags的EXTENT_BUFFER_IOERROR, extent_buffer->read_mirror为failed_mirror
+   - 检查EXTENT_BUFFER_READAHEAD
+   > btree_readahead_hook(btrfs_root, extent_buffer, start, -EIO)
+
+** 总结
+
+** end_io_wq
+   #+begin_src 
+       bio                     //原始的bio
+       bio_end_io_t end_io     //原始的回调
+       void private            //?
+       btrfs_fs_info info      //?
+       int error
+       int metadata            //是否是metadata的io
+       list_head list
+       btrfs_work work         //具体的事情
+       // 用于bio完成之后的数据,对于读就是验证checksums,对于写是操作metadata,
+   #+end_src
+
+** end_workqueue_bio(bio, err)
+   - 这是一个bio回调函数. bio提交之后,再触发别的任务.
+   - end_io_wq在bio->private中, 设置end_io_wq, 回调函数是end_workqueue_fn. 根据IO方向和end_io_wq->metadata把end_io_wq添加到对应的wq中
+   > btrfs_queue_worker(btrfs_fs_info->some_worker, end_io_wq->work)
+   - wirte, metadata=BTRFS_WQ_ENDIO_METADATA   => endio_meta_write_workers
+   - write, metadata=BTRFS_WQ_ENDIO_FREE_SPACE => endio_freespace_worker
+   - write, metadata=BTRFS_WQ_ENDIO_RAID56     => endio_raid56_workers
+   - write                                     => endio_write_workers
+   - metadata = BTRFS_WQ_ENDIO_RAID56          => endio_raid56_workers
+   - metadata > 0                              => endio_meta_workers
+   - metadata = 0                              => endio_workers
+   - 对于metadata还有什么后续工作?!
+
+** btrfs_bio_wq_end_io(btrfs_fs_info, bio, metadata)
+   - 处理bio, 使用的end_io_wq保存bio->private/end_io
+   - 替换bio->bi_end_io使用end_workqueue_bio, bio->bi_private为end_io_wq
+
+** btrfs_async_submit_limit(btrfs_fs_info)
+   - 计算界限值  256*btrfs_fs_info->workers.max_workers
+   - 这里开始处理一种btrfs_workers
+
+** async_submit_bio
+   #+begin_src 
+       inode,
+       bio
+       list_head list
+       extent_submit_bio_hook_t submit_bio_start   //发射bio的函数
+       extent_submit_bio_hook_t sbumit_bio_done    //bio完成后的操作,不仅是bio的回调
+       int rw, mirror_num
+       long bio_flags
+       bio_offset
+       btrfs_work work
+       int error
+   #+end_src
+   
+** run_one_async_start(btrfs_work)
+   - 处理async_submit_bio的工作, 提交bio
+   > async_submit_bio->submit_bio_start(async_submit_bio->inode, async_submit_bio->rw, async_submit_bio->bio, async_submit_bio->mirror_num, async_submit_bio->bio_flags, async_submit_bio-> bio_offset)
+
+** run_one_async_done(btrfs_work)
+   - 根据一个特殊的btrfs_fs_info->workers计算阀值??
+   - btrfs_fs_info->nr_async_submits--, 如果它计算的阀值,唤醒其他等待的任务
+   > wake_up(btrfs_fs_info->async_submit_wait)
+   - bio完成,如果bio有问题,直接结束bio
+   > bio_endio(async_submit_bio->bio, async_submit_bio->error)
+   - 如果没有错误,处理后续的问题
+   > async_submit_bio->submit_bio_done(async_submit_bio->inode, ...)
+
+** run_one_async_free(btrfs_work)
+   - 释放async_submit_bio
+
+** 总结
+   - 上面三个是async_submit_bio->btrfs_work使用的3个回调函数,它会放到ordered的btrfs_workers中.
+   - btrfs_work会先处理bio,它应该会等待bio完成,提交bio是回调函数
+   - 完成后处理ordered的回调,就是bio完成后的处理,也是回调函数
+   - 最后释放async_submit_bio结构
+
+** btrfs_wq_submit_bio(btrfs_fs_info, inode, rw, bio, mirror_num, bio_flags, bio_offset, extent_submit_bio_hook_t submit_bio_start, submit_bio_done)
+   - 异步提交bio, 创建一个async_submit_bio, 
+   - async_submit_bio的2个回调是submit_bio_start/done, 就是给btrfs_work里面使用的
+   - 构造btrfs_work, btrfs_work->func是run_one_async_start, btrfs_work->ordered_func是run_one_async_done, btrfs_work->ordered_free是run_one_async_free
+   - 增加btrfs_fs_info->nr_async_submits, 如果是同步bio/REQ_SYNC,提高它的优先级, 为何还用异步提交?!
+   > btrfs_set_work_high_prio(async_submit_bio->btrfs_work)
+   - 提交到btrfs_workers
+   - btrfs_queue_worker(btrfs_fs_info->workers, async_submit_bio->btrfs_work)
+   - btrfs_fs_info->async_submit_draining>0 && btrfs_fs_info->nr_async_submits>0. while等待,应该是等待第一个条件
+   > wait_event(btrfs_fs_info->async_submit_wait, btrfs_fs_info->nr_async_submits == 0)
+   - 在启动delalloc的操作中设置这个标志,它几乎停止了异步提交的工作????
+     
+** btree_csum_one_bio(bio)
+   - 对bio数据进行校验,bio_vec的单位是page,循环每个page
+   - 但checksum的计算单位是extent,对每个page,找到对应的extent_buffer,只有page是extent_buffer的第一个page时,才处理.
+   - 这里也没有页内偏移了!!
+   > csum_dirty_buffer(page=>address_space=>inode=>btrfs_inode=>btrfs_root, page)
+
+** __btrfs_submit_bio_start(inode, rw, bio, mirror_num, bio_flgs, offset)
+   > btree_csum_one_bio(bio)
+   - 提交bio之前校验
+
+** __btrfs_submit_bio_done(inode, re, bio, mirror_num, bio_flags, bio_offset)
+   - 映射bio,并提交针对物理设备的bio
+   > btrfs_map_bio(btrfs_inode->btrfs_root, rw, bio, mirror_num, 1)
+   > bio_endio(bio, ret)
+   - 如果上面映射失败,就结束bio..
+
+** check_async_write(inode, bio_flags)
+   - 检查bio_flags的EXTENT_BIO_TREE_LOG. 如果是log,不支持async?!
+   - 如果有xmm4,也是同步,计算的很快!
+
+** btree_submit_bio_hook(inode, re, bio, mirror_num, bio_flags, bio_offset)
+   - btree_extent_io_ops->submit_bio_hook函数,根据不同的bio,使用不同的提交方式处理
+   - 这里的同步异步之分,根据log?!
+   > check_async_write(inode, bio_flags)
+   - 如果是读, 使用end_io_wq包装起来. bio回调函数没有多做什么!把不同的bio回调放到不同的worker里面调用??
+   > btrfs_bio_wq_end_io(btrfs_fs_info, bio, 1)
+   - 这里会把end_io_wq->btrfs_work提价到btrfs_fs_info->endio_meta_workers中,在里面处理原来的bio的回调函数.??
+   - 提交bio
+   > btrfs_map_bio(btrfs_root, rw, bio, mirror_num, 0)
+   - 如果是同步写操作,就先校验..
+   > btree_csum_one_bio(bio)
+   - 再提交
+   > btrfs_map_bio(btrfs_root, rw, bio, mirror_num, 0)
+   > 如果是异步写操作, 包装async_submit_bio,使用上面的2个函数提交,首先计算checksum,然后提交bio
+   > btrfs_wq_submit_bio(btrfs_fs_info, inode, rw, bio, mirror_num, 0, bio_offset, __btree_submit_bio_start, __btree_submit_bio_done)
+   - 如果上面有错误,处理endio
+   > bio_endio(bio, ret)
+
+** 总结
+   - 上面有2个任务,一个是readpage的完成处理,检查结果和处理失败
+   - 二是提交bio,对于写就是先check,再提交bio.
+   - 但这里要看看提交bio时的回调函数. 对于readpage,已经明确,对于读呢?
+
+** btree_writepages(address_space, writeback_control)
+   - address_space_operations的readpages结构
+   - 如果WB_SYNC_NONE,检查是否需要启动io
+   - 如果writeback_control->for_kupdate,不需要?
+   - btrfs_fs_info->dirty_metadata_bytes > BTRFS_DRITY_METADATA_THRESH/32M, 需要启动
+   > btree_write_cache_pages(address_space, writeback_control)
+
+** btree_readpage(file, page)
+   - page->address_space->inode=>btrfs_inode->btrfs_io_tree
+   > extent_read_full_page(extent_io_tree, page, btrfs_get_extent, 0)
+   - 对于btree来说,没有readpages接口..
+
+** btrfs_releasepage(page, gfp_flags)
+   - 如果page在io中, PageWriteback/PageDirty,不能释放.
+   - 只能通过释放extent_buffer,来释放page
+   > try_release_extent_buffer(page, gfp_flags)
+
+** btrfs_invalidatepage(page, offset)
+   - 这个函数只有一个地方使用,就是writepage中,发现写的地址已经超过文件大小,需要无效掉相映的数据.
+   - 锁住extent,等待PG_writeback, 最后释放extent_state的状态
+   > extent_invalidatepage(extent_io_tree, page, offset)
+   - 最后释放它.
+   > btrfs_releasepage(page, ..)
+
+** btrfs_set_page_dirty(page)
+   - 就是设置pagecache的标志
+   > __set_page_dirty_nobuffers(page)
+
+** btree_aops
+   readpage => btree_readpage
+   writepages => btree_writepages
+   releasepage => btree_releasepage
+   invalidatepage => btree_invalidatepage
+   set_page_dirty => btree_set_page_dirty
+
+** readahead_tree_block(btrfs_root, bytenr, blocksize, parent_transid)
+   > btrfs_find_create_tree_block(btrfs_root, bytenr, blocksize)
+   - 这里找的extent_buffer是属于某个inode??  btrfs_fs_info应该是某个super_block?? btrfs的subvolumn管理使用了inode??  创建extent_buffer, 分配page
+   > read_extent_buffer_pages(btrfs_inode->extent_io_tree, extent_buffer, 0, WAIT_NONE, btree_get_extent, 0)
+   - 读取数据到对应的page中
+   > free_extent_buffer(extent_buffer)
+   - 释放extent_buffer, 但数据在page中不会立刻释放
+
+** reada_tree_block_flagged(btrfs_root, bytenr, blocksize, mirror_num, extent_buffer)
+   - 和上面的预读类似,但如果操作没有错误,这里会返回extent_buffer
+   > btrfs_find_create_tree_block(btrfs_root, bytenr, blocksize)
+   > read_extent_buffer_page(...)
+   > extent_buffer_uptodate(extent_buffer)
+   - 检查uptodate标志,没有问题才返回. 并且设置EXTENT_BUFFER_READAHEAD
+
+**** readahead的接口..
+
+** btrfs_find_tree_block(btrfs_root, bytenr, blocksize)
+   - 所有的tree block使用的extent_buffer都在btrfs_fs_info->btrfs_inode的extent_io_tree中,使用radix管理
+   > find_extent_buffer(...)
+
+** btrfs_find_create_tree_block(btrfs_root,  bytenr, blocksize)
+   - 创建extent_buffer, 还要关联page.磁盘的数据使用btree inode的pagecache缓存.
+   > alloc_extent_buffer(...)
+   - 应该算一个总结,说明page/extent的关系
+   - 从pagecache中获取/创建page, 同时绑定两者关系, 第一个page设定了,其他的没有PG_checked
+
+** btrfs_write_tree_block(extent_buffer)
+   - 直接使用pagecache的操作
+   > filemap_fdatawrite_range(extent_buffer=>page=>address_space, start, end)
+
+** btrfs_wait_tree_block_writeback(extent_buffer)
+   > filemap_fdatawait_range(...)
+
+** read_tree_block(btrfs_root, bytenr, blocksize, parent_transid)
+   - 这里包装extent-io.c的函数, 给上层操作btree使用,读取磁盘数据.
+   > btrfs_find_create_tree_block(...)
+   > btree_read_extent_buffer_pages(btrfs_root, extent_buffer, 0, parent_transid)
+
+** clean_tree_block(btrfs_trans_handle, btrfs_root, extent_buffer)
+   - 清除EXTENT_BUFFER_DIRTY标志,不清楚哪里使用它
+   - btrfs_header->generation == btrfs_root=>btrfs_fs_info=>running_transaction=>transid 才处理
+   - 获取extent_buffer的blocking write lock
+   - 清除EXTENT_BUFFER_DIRTY标志, 如果原来有,修改统计数
+   - btrfs_fs_info->dirty_metadata_bytes -=  extent_buffer->len
+   > btrfs_set_lock_blocking(extent_buffer)
+   > clear_extent_buffer_dirty(extent_buffer)
+   - 这里不明白要做什么? 因为要释放extent,而不需要把它写回吗?
+
+** 总结
+   - 这里都tree block的辅助函数,但大都是log使用的?!
+
+** __setup_root(nodesize, leafsize, sectorsize, stripesize, btrfs_root, btrfs_fs_info, objectid)
+   - 填充btrfs_root, 大部分是一些初始化. 
+   > extent_io_tree_init(btrfs_root->dirty_log_pages, btrfs_fs_info->btrfs_inode->i_mapping)
+
+** find_and_setup_root(btrfs_root tree_root, btrfs_fs_info, objectid, btrfs_root)
+   - 从磁盘中读取出来一个树的信息,放到参数btrfs_root中
+   - 初始化普通的btrfs_root,在tree_root中取出一些参数使用nodesize/leafsize/sectorsize/stripesize
+   > __setup_root(..)
+   - 想去tree root中查找对应的btrfs_key/btrfs_root_item
+   > btrfs_find_last_root(btrfs_root, objectid, btrfs_root->btrfs_root_item, btrfs_root->root_key)
+   - 获取btrfs_root_item->generation,用它检查btrfs_root树根节点tree block的有效性
+   > btrfs_root_generation(btrfs_root_item)
+   > btrfs_level_size(btrfs_root, btrfs_root_item->level)
+   - 读取出来树的根节点..
+   > read_tree_block(btrfs_root, btrfs_root_bytenr(btrfs_root_item), blocksize, generation)
+   - 重复验证了? ??
+   > btrfs_buffer_uptodate(..)
+   - btrfs_root->commit_root是在transaction用的?? 保存指针.
+   > btrfs_root_node(btrfs_root)
+
+** btrfs_alloc_root(btrfs_fs_info)
+   - kzalloc(sizeof(btrfs_root)..)
+
+** btrfs_create_tree(btrfs_trans_handle, btrfs_fs_info, objectid)
+   - btrfs_fs_info->tree_root是树根树,从里面取出objectid对应的item,它是一颗树的root,构造另一颗树.
+   > btrfs_alloc_root(btrfs_fs_info)
+   - 使用btrfs_fs_info做简单的初始化
+   > __setup_root(btrfs_root->btrfs_root->nodesize, leafsize, sectorsize, stripesize, btrfs_root, btrfs_fs_info, objectid)
+   - 设置btrfs_root->btrfs_key=(objectid/BTRFS_ROOT_ITEM_KEY,0)
+   - 从磁盘btree中创建一个extent_buffer,作为btrfs_leaf, 新的btree只有一个节点,就是叶子节点..初始化btrfs_header.. 它实际上需要分配extent, 使用了delay的操作.
+   > btrfs_alloc_free_block(btrfs_trans_handle, btrfs_root, leafsize, 0, objectid, NULL, 0, 0, 0)
+   > btrfs_set_header_bytenr(...)
+   - 这里设置了btrfs_header->genration是btrfs_trans_handle->transid, 那么tree_root中对应的btrfs_root_item呢??
+   > btrfs_set_header_generation(...）
+   > btrfs_set_header_backref_rev(btrfs_leaf, BTRFS_MIXED_BACKREF_REV)
+   - 设置btrfs_header->flags的BTRFS_BACKREF_REV_SHIFT, 反向索引个数??  还有own,也就是root. 把这个extent_buf给btrfs_root->node
+   > btrfs_set_header_owner(btrfs_leaf, objectid)
+   > write_extent_buffer(extent_buffer, btrfs_fs_info->fsid, btrfs_header_fsid(leaf), BTRFS_FSID_SIZE)
+   - 处理fsid, 还是在初始化这个叶子节点, 还有uuid.. btrfs_fs_info->fsid/chunk_tree_uuid
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - 刚创建的就是脏的,不仅extent_buffer->bflags的EXTENT_BUFFER_DIRTY,还有PageDirty.
+   - 下面是初始化btrfs_root->btrfs_root_item, 插入到tree_root中的item..
+   > btrfs_set_root_bytenr(...)
+   - 最后把btrfs_key/btrfs_root_item插入到tree_root中..
+   > btrfs_insert_root(btrfs_trans_handle, btrfs_root tree_root, key, btrfs_root->btrfs_root_item)
+   > btrfs_tree_unlock(extent_buffer)
+   - 这里竟然用到了extent_buffer的释放blocking write lock..在刚创建时,设置了锁..
+
+** alloc_log_tree(btrfs_trans_handle, btrfs_fs_info)
+   - log机制为每个subvol创建一个log tree, 里面记录文件系统的变化. 这里建立的tree也是给btrfs_fs_info使用的? 它里面是什么??
+   - 创建一个log树,它的在tree_root中的节点是(BTRFS_TREE_LOG_OBJECTID,BTRFS_ROOT_ITEM_KEY, BTRFS_TREE_LOG_OBJECTID). 使用btrfs_fs_info创建并初始化btrfs_root
+   > btrfs_alloc_root(btrfs_fs_info)
+   > __setup_root(tree_root->nodesize, ..., BTRFS_TREE_LOG_OBJECTID)
+   - 分配log tree根节点extent
+   > btrfs_alloc_free_block(btrfs_trans_handle, btrfs_root, btrfs_root->leafsize, 0, BTRFS_TREE_LOG_OJBECTID, ...)
+   - 初始化extent_buffer中的btrfs_header
+   > write_extent_buffer(fsid)
+   > btrfs_mark_buffer_dirty(btrfs_root->node)
+   > btrfs_tree_unlock(btrfs_root->extent_buffer)
+   - 这里并没有把新创建的btrfs_root的btrfs_key/btrfs_item放到tree_root中?? 都没有初始化这些..
+
+** btrfs_init_log_tree_root(btrfs_trans_handle, btrfs_fs_info)
+   - 创建btrfs_fs_info->log_tree_root...  估计不久就可以看到btrfs_fs_info的创建了..
+   > alloc_log_tree(btrfs_trans_handle, btrfs_fs_info)
+
+** btrfs_add_log_tree(btrfs_trans_handle, btrfs_root)
+   - 创建btrfs_root作为log tree, 设置log_tree->last_trans = btrfs_trans_handle->transid.. 为何不设置btree的generation? 
+   > alloc_log_tree(btrfs_trans_handle, btrfs_root->btrfs_fs_info)
+   - log_root->btrfs_key.offset = btrfs_root->btrfs_key.objectid, 在btree中建立联系.
+   - btrfs_root_item里面有btrfs_inode_item, 初始化btrfs_root->btrfs_root_item->btrfs_inode_item, 然后是btrfs_root_item的其他部分..
+   - 从extent_buffer中获取信息,给btrfs_root_item
+   > btrfs_set_root_node(log_root->btrfs_root_item, log_root->extent_buffer)
+   - 把这个log_root给btrfs_root->log_root
+
+** btrfs_read_fs_root_no_radix(btrfs_root, btrfs_key)
+   - 应该是从树之树中读取一个subvolume对应的btrfs_root. 
+   - 在内存中所有的btrfs_root使用radix管理,索引是btrfs_key 这里是直接创建btrfs_root, 从btree中获取信息..
+   - 创建btrfs_root.
+   > btrfs_alloc_root(btrfs_fs_info)
+   - 如果btrfs_key->offset=-1，offset应该是generation/transid, 找btree中创建,直接退出
+   > find_and_setup_root(btrfs_root tree_root, btrfs_fs_info, btrfs_key.objectid, btrfs_root)
+   - 否则读取特定的btrfs_root_item,创建btrfs_root
+   > __setup_root(btrfs_root->nodesize, ...)
+   - 读取btrfs_root_item
+   > btrfs_alloc_path()
+   > btrfs_search_slot(NULL, btrfs_root, location, path, 0,0)
+   > btrfs_read_root_item(btree_root, extent_buffer, slot, btrfs_root->btrfs_root_item..)
+   > btrfs_free_path(btrfs_path)
+   - 读取根节点extent_buffer
+   > btrfs_level_size(btrfs_root, level)
+   - nodesize / leafsize, 使用generation去验证下面读的结构,挑一个好的mirror..
+   > btrfs_root_generation(btrfs_root->btrfs_root_item)
+   > btrfs_root_bytenr(btrfs_root_item)
+   > read_tree_block(btrfs_root, btrfs_root_bytenr(...), blocksize, generation)
+   - 对于非log的btree_root, 设置btrfs_root->ref_cows=1.. log自然不需要cow.
+   > btrfs_check_and_init_root_item(btrfs_root->btrfs_root_item)
+   - 设置btrfs_root_item->btrfs_inode_item->flags的BTRFS_INODE_ROOT_ITEM_INIT, 这不是一个普通的btrfs_inode_item. 它有用吗?!
+
+** btrfs_read_fs_root_no_name(btrfs_fs_info, btrfs_key)
+   - 根据btrfs_key从btrfs_fs_info中找btrfs_root..
+   - 先处理特殊的树, btrfs_key->objectid= BTRFS_TREE_ROOT_OBJECTID/BTRFS_ENTENT_TREE_OBJECT/BTRFS_CHUNK_TREE_OBJECTID/BTRFS_DEV_TREE_OBJECTID/BTRFS_CSUM_TREE_OBJECTID/BTRFS_QUOTA_TREE_OBJECTID.. 这些都在btrfs_fs_info->**_root, 在创建btrfs_fs_info时都创建好了. 
+   - 去radix tree中查找
+   > radix_tree_lookup(btrfs_fs_info->fs_roots_radix, btrfs_key->objectid)
+   - 如果没找到,再去磁盘中找..
+   > btrfs_read_fs_root_no_radix(btrfs_fs_info->btrfs_root, btrfs_key)
+   - 然后创建free_ino_ctl/free_ino_pinned
+   > btrfs_init_free_ino_ctl(btrfs_root)
+   - cache wait是什么??
+   > init_waitqueue_head(btrfs_root->cache_wait)
+   - 这是dev_t, 申请一个空闲的dev_t
+   > get_anon_bdev(btrfs_root->anon_dev)
+   - 如果有orphan item, 设置btrfs_root->orphan_item_inserted = 1
+   > btrfs_find_orphan_item(btrfs_fs_info->tree_root, btrfs_key->objectid)
+   - 把btrfs_root放到radix tree..
+   > radix_tree_insert(btrfs_fs_info->fs_roots_radix, btrfs_root->btrfs_key->objectid, btrfs_root)
+   - 检查有没有死节点,也就是btrfs_root_item->refs为0的,把它放到btrfs_fs_info的一个队列中
+   > btrfs_find_dead_roots(btrfs_fs_info->tree_root, btrfs_key->btrfs_key->objectid)
+
+** btrfs_congested_fn(contested_data, bdi_bits)
+   - congested_data是btrfs_fs_info. 
+   - 遍历btrfs_fs_info->btrfs_fs_devices->devices,里面是btrfs_device.
+   > blk_get_backing_dev_info(btrfs_device->block_device)
+   - backing_dev_info在2个地方使用,一个是request_queue,一个是fs
+   > bdi_congested(backing_dev_info, bdi_bits)
+   - 如果有一个阻塞,就返回1
+
+** setup_bdi(btrfs_info, backing_dev_info)
+   > bdi_setup_and_register(bdi, "btrfs", BDI_CAP_MAP_COPY)
+   - 创建bdi内存刷新线程, 设置bdi->congested_fn回调函数btrfs_congested_fn.
+   - 这个文件系统还是很负责的,它处理设备的阻塞情况?!
+
+** 总结
+   - 上面的工作是创建btrfs_root
+
+** end_workqueue_fn(btrfs_work)
+   - end_io_wq->btrfs_work的工作,怎么不放到上面! 完成bio. 它的回调函数应该会做checksum校验
+   > bio_endio(bio, error)
+   - 这里使用btrfs_workers的目标是使用单独的线程计算checksum!
+
+** cleaner_kthread(void)
+   - 这个是btrfs_fs_info->cleaner_kthread使用的函数
+   - void是btrfs_root, 应该是tree_root
+   - 它的inode应该是btrfs_block_group_cache的free space inode,需要它处理吗?
+   > btrfs_run_delayed_iput(btrfs_root)
+   - 处理没有用的snapshot
+   > btrfs_clean_old_snapshots(btrfs_root)
+   - 还有碎片整理的东西
+   > btrfs_run_defrag_inodes(btrfs_root->btrfs_fs_info)
+   - transaction会唤醒它
+   > __set_current_state(TASK_RUNNING)
+   - 使用btrfs_fs_info->cleanr_mutex锁住,和transaction通信
+
+** transaction_kthread(void)
+   - btrfs_fs_info->running_transaction的工作,周期的检查btrfs_fs_info->running_transaction, 及时的提交它们. transaction会唤醒这个工作,难道是异步提交?!
+   - 如果btrfs_transaction->blocked, 直接提交
+   - now - btrfs_transaction->start_time > 30 也可以提交
+   - 首先获取btrfs_trans_handle
+   > btrfs_attach_transaction(btrfs_root)
+   - 如果btrfs_transaction->transid和btrfs_trans_handle->transid相同,就是提交
+   > btrfs_commit_transaction(btrfs_transaction, btrfs_root)
+   - 否则就是结束?!
+   > btrfs_end_transaction(btrfs_transaction, btrfs_root)
+   - 唤醒cleaner_kthread, 就是上面的btrfs_work..
+   - 睡眠一段时间,继续工作..
+   > wait_up_process(btrfs_root->btrfs_fs_info->cleaner_kthread)
+
+** find_newest_super_backup(btrfs_fs_info, newest_gen)
+   - BTRFS_NUM_BACKUP_ROOTS是btrfs_fs_info->btrfs_super_block->btrfs_root_backup的个数,里面是一些重要的备份信息.
+   - 遍历这些btrfs_root_backup,找一个btrfs_root_backup->tree_root->gen和newest_gen相同的
+   > btrfs_backup_tree_root_gen(btrfs_root_backup)
+
+** find_oldest_super_backup(btrfs_fs_info, newest_gen)
+   - 找最老的备份给btrfs_fs_info->backup_root_index, 保存新的备份
+   > find_newest_super_backup(btrfs_fs_info, newest_gen)
+   - 如果找到-1, 就是没有找到,就使用第一个
+
+** backup_super_roots(btrfs_fs_info)
+   - 把重要信息备份到btrfs_root_backup中,逻辑地址和generation
+   > btrfs_set_backup_tree_root(btrfs_root_backup, ...)
+   - 获取btrfs_fs_info中的各种btrfs_root, 获取每个extent_buffer中的btrfs_header中的bytenr/generation
+
+** next_root_backup(btrfs_fs_info, btrfs_super_block, num_backups_tried, backup_index)
+   - 从btrfs_root_backup中取出来一些信息给btrfs_super_block. 
+   - tree_root的bytenr/level/generation
+   - 根据btrfs_super_block->generation找一个对应的btrfs_root_backup
+
+** free_root_pointers(btrfs_fs_info, chunk_root)
+   - 释放各种btrfs_fs_info->*root->node)
+   > free_extent_buffer(btrfs_fs_info->tree_root->node)
+   - 还有chunk_root的.
+
+** open_ctree(super_block, btrfs_fs_devices, options)
+   - 初始化btrfs_fs_info, 创建一系列的btrfs_root
+   > btrfs_alloc_root(btrfs_fs_info)
+   > init_srcu_struct(btrfs_fs_info->subvol_srcu)
+   > setup_bdi(btrfs_fs_info)
+   - 创建bdi, 给btrfs_fs_info->bdi. 
+   - 创建之后,文件系统应该不会再管理bdi任务,而是交给flush线程处理. 当flush线程发现某个bdi任务很重时,自动创建对应的线程. 它处理的是bd_writeback, 一般是sync,回收内存使用的那些任务.
+   > new_inode(super_block)
+   - 创建btrfs_inode给btrfs_fs_info->btree_inode,貌似没有特别的
+   - 初始化各种表头,
+   - fs_roots_radix管理所有的btrfs_root
+   - trans_list应该是btrfs_transaction队列
+   - dead_roots是该删除的btrfs_root
+   - delayed_iputs是该释放的inode
+   - delalloc_inodes该出发delalloc的inode
+   - caching_block_groups是所有的btrfs_block_group_cache
+   - 各种lock/mutex,应该保护对应的list/tree
+   - space_info是btrfs_space_info
+   - dirty_cowonly_roots是什么??
+   - tree_mod_seq_list是什么?? btrfs_delayed_ref_node好像用到?!
+   - btrfs_mapping_tree是volume.c里面的,它包装了extent_map_tree.管理逻辑空间到物理空间的映射
+   > btrfs_mapping_init(btrfs_fs_info->btrfs_mapping_tree)
+   - global/delalloc/trans/chunk等btrfs_block_rsv
+   - delayed_root是btrfs_delayed_root
+   - 初始化super_block, s_block_size为4096
+   - 初始化btrfs_fs_info->btree_inode, inode->i_ino是BTRFS_BTREE_INODE_OBJECTID,最特殊的,一般inode->i_ino>=256
+   - inode->i_size是OFFSET_MAX, aops是上面定义的, address_space->backing_dev_info
+   - 初始化extent_io_tree, btrfs_inode->extent_io_tree->ops = btrfs_extent_io_ops.  
+   > extent_io_tree_init(btrfs_fs_info->btrfs_inode=>extent_io_tree, address_sapce
+   - 这个还有什么用吗?
+   > extent_map_tree_init(btrfs_inode->extent_tree)
+   - 设置btrfs_fs_info->btree_inode->runtime_flags的BTRFS_INODE_DUMMY标志
+   > __insert_node_hash(btrfs_fs_info->btrfs_inode)
+   - 竟然还放到inode hash中管理..
+   - freed_extents管理的空间是什么用?
+   > extent_io_tree_init(btrfs_fs_info->freed_extents[], btrfs_fs_info->btree_inode->i_mapping)
+   - btrfs_block_cluster   meta/data各一个
+   > btrfs_init_free_cluster(btrfs_fs_info->meta_alloc_cluster)
+   - ??? raid56..
+   > btrfs_alloc_stripe_hash_table(btrfs_fs_info)
+   - 创建btrfs_fs_info的tree_root
+   > __setup_root(4096, ... , btrfs_fs_info, BTRFS_TREE_ROOT_OBJECTID)
+   > invalidate_bdev(btrfs_fs_devices->latest_bdev)
+   - 读取btrfs_super_block
+   > btrfs_read_dev_super(btrfs_fs_devices->latest_bdev)
+   - 检查btrfs_super_block的有效性
+   > btrfs_check_super_valid(btrfs_fs_info, ...)
+   > btrfs_super_generation(btrfs_super_block)
+   - 找一个btrfs_root_backup
+   > find_oldest_super_backup(btrfs_fs_info, generation)
+   - 解析mount option
+   > btrfs_parse_options(btrfs_root, options)
+   - 初始化一系列的工作，只是创建btrfs_worker,这里还有辅助线程..
+   > btrfs_init_workers(btrfs_fs_info->generic_worker, ...)
+   > btrfs_start_workers(...)
+   - 构造chunk root
+   > __setup_root(nodesize, leafsize, sectorsize, stripesize, chunk_root, btrfs_fs_info, BTRFS_CHUNK_TREE_OBJECTID)
+   > read_tree_block(chunk_root, btrfs_super_block->chunk_root, block_size...)
+   - 读回extent_buffer给btrfs_root.. 还有里面的chunk_tree_uuid给btrfs_fs_info->chunk_tree_uuid
+   - 读取chunk_root中的设备信息和地址映射信息extent_map/map_lookup
+   > btrfs_read_chunk_tree(chunk_root)
+   - 读回tree root
+   > read_tree_block(btrfs_root, btrfs_super_block->root_block)
+   - 读回root磁盘的extent_buffer根节点..
+   > find_and_setup_root(btrfs_root, btrfs_fs_info, BTRFS_EXTENT_TREE_OBJECTID, extent_root)
+   - 从根树tree_root找最新的文件系统的跟节点..
+   > find_and_setup_root(btrfs_root, btrfs_fs_info, BTRFS_DEV_TREE_OBJECTID, dev_root)
+   - 还有其他的跟csum, quota,
+   > btrfs_recover_balance(btrfs_fs_info)
+   - volume.c中相关操作
+   > btrfs_init_dev_stats(btrfs_fs_info)
+   > btrfs_init_dev_replace(btrfs_fs_info)
+   > btrfs_init_space_info(btrfs_fs_info)
+   - 创建所有的btrfs_block_group_cache
+   > btrfs_read_block_groups(extent_root)
+   - 启动cleaner线程，还有transaction线程.
+   > kthread_run(clearn_kthread, ...)
+   > btrfs_super_log_root(btrfs_fs_info)
+   - log信息恢复..创建log tree..
+   > btrfs_recover_log_trees(log_tree_root)
+   - orphan root.. 如果又就又问题???
+   > btrfs_find_orphan_roots(tree_root)
+   > btrfs_cleanup_fs_roots(btrfs_fs_info)
+   - 构造btrfs_key(BTRFS_FS_TREE_OBJECTID, BTRFS_ROOT_ITEM_KEY, -1), 应该是default subvolume
+   - btrfs_read_fs_root_no_name(btrfs_fs_info,btrfs_key)
+   > btrfs_resume_balance_async(btrfs_fs_info)
+   > btrfs_resume_dev_replace_async(btrfs_fs_info)
+
+** btrfs_end_buffer_write_sync(buffer_head, uptodate)
+   - buffer_head应该是一个page的数据. 如果uptodate有效,更新buffer_head, 否则统计WRITE_ERRS, buffer_head->b_private就是btrfs_device.. 这个是哪里的回调??
+   > set_buffer_uptodate(buffer_head)
+   > btrfs_dev_stat_inc_and_print(btrfs_device, BTRFS_DEV_STAT_WRITE_ERRS)
+
+** btrfs_read_dev_super(block_device)
+   - block_device对应一个block系统的块文件, 这个是上面使用的函数，读取磁盘的super_block..
+   > i_size_read(block_device->bd_inode)
+   > btrfs_sb_offset(i)
+   - 先读取super_block的块数据, 这里是一个循环, 获取第i个super_block的位置..16k <<(12*mirror)
+   > __bread(block_device, bytenr/4096, 4096)
+   - 这个4096是是btrfs_super_block. 读取的数据在buffer_head->b_data中
+   > brelse(buffer_head)
+   - 这个buffer_head好用阿, 直接读取块设备文件数据
+   - 仅仅检查btrfs_super_block->magic和BTRFS_MAGIC..但这里会读取多个btrfs_super_block, 获取btrfs_super_block->generation最大的..
+
+** write_dev_supers(btrfs_device, btrfs_super_block, do_barriers, wait, max_mirrors)
+   - 每个设备在特定的物理偏移都写上对应的btrfs_super_block.
+   - 这个函数会调用2次,第一次写回,第2次等待
+   > btrfs_sb_offset(i)
+   - 如果等待的话,先找到buffer_head
+   > __find_get_block(btrfs_device->bdev, bytenr/4096, BTRFS_SUPER_INFO_SIZE)
+   - 等待buffer_head完成
+   > wait_on_buffer(buffer_head)
+   - 如果是写回,构造一个buffer_head,提交任务
+   - 首先改造btrfs_super_block->bytenr, 那这是一个物理地址
+   > btrfs_set_super_bytenr(super_block, bytenr)
+   - 计算checksum
+   > btrfs_csum_data(NULL, ...)
+   - 获取buffer_head
+   > __getblk(btrfs_device->bdev, bytenr/4096, BTRFS_SUPER_INFO_SIZE)
+   - 把btrfs_super_block写到buffer_head中
+   > get_bh(buffer_head)
+   > bh_b_end_io = btrfs_end_buffer_write_sync
+   - 构造一个buffer_head, 回调函数会设置buffer_head的uptodate. buffer_head也有回调函数?!
+   > btrfsic_submit_bh(WRITE_FUA, buffer_head)
+   - 这种使用buffer_head的方式,它还是需要block inode的address_space支持, 在pagecache里面多缓冲一次, 然后把数据给btrfs_super_block
+
+** btrfs_end_empty_barrier(bio, err)
+   - bio完成后的回调函数,bio->bi_private是completion,也是btrfs_device->flush_wait,唤醒等待的..
+
+** write_dev_flush(btrfs_device, wait)
+   - 给设备发送flush命令. 如果wait,说明已经提交bio,就是btrfs_device->flush_bio.. 没想到还有一个专门的bio, 去做flash工作..
+   - 这个函数和上面一样,也是需要2遍,根据wait决定要等待flush操作完成,还是提交btrfs_device->flush_bio
+   > wait_for_completion(btrfs_device->flush_wait)
+   > bio_put(bio)
+   - 如果wait为0,则构造一个bio,放到btrfs_device->flush_bio,提交请求,这个新的bio只需要bi_bdev/bi_private, bi_private果然指向btrfs_device->flash_wait..., 回调函数是上面btrfs_end_empty_barrier
+   > bio_alloc(GFP_NOFS, 0)
+   > btrfs_submit_bio(WRITE_FLUSH, bio)
+
+** barrier_all_devices(btrfs_fs_info)
+   - 刷新所有的btrfs_fs_info的设备, btrfs_fs_info->fs_devices->devices
+   > write_dev_flush(btrfs_device, 0)
+   - 遍历btrfs_fs_info->btrfs_fs_devices->devices这个队列, 调用2边,第一遍wait=0, 第二遍是wait=1..
+   - 遍历时检查btrfs_device->in_fs_metadata, 只处理metadata设备..
+   - 这个函数是在transaction commit时使用..
+
+** block group的种类
+    BTRFS_BLOCK_GROUP_DATA
+    BTRFS_BLOCK_GROUP_SYSTEM
+    BTRFS_BLOCK_GROUP_METADATA
+    BTRFS_BLOCK_GROUP_RAID0
+    BTRFS_BLOCK_GROUP_RAID1
+    BTRFS_BLOCK_GROUP_DUP
+    BTRFS_BLOCK_GROUP_RAID10
+    BTRFS_BLOCK_GROUP_RESERVED
+    BTRFS_NR_READ_TYPES 5
+
+    BTRFS_BLOCK_GROUP_PROFILE_MASK  RAID0|RAID1|DUP|RAID10
+    BTRFS_BLOCK_GROUP_TYPE_MASK    DATA|SYSTEM|METADATA
+    
+** btrfs_calc_num_tolerated_disk_barrier_failures(btrfs_fs_info)
+   - 计算什么东西?? btrfs_fs_info->space_info/btrfs_space_info.  能容忍barrier失败的磁盘数量?! 参考btrfs_fs_info->fs_devices->num_devices. 
+   - 遍历几种块组模型,DATA/SYSTEM/METADATA/DATA|METADATA. 
+   - btrfs_fs_info->space_info链表是btrfs_space_info队列,应该时当前系统使用的?!  btrfs_fs_info->flags对应某种类型. 这里只取一种BTRFS_BLOCK_BLOCK_*..  btrfs_space_info->block_groups[]是队列,里面应该是btrfs_block_group_cache, 
+   > btrfs_get_block_group_info(list, btrfs_ioctl_space_info)
+   - 从btrfs_block_group_cache队列中获取统计信息,放到btrfs_ioctl_space_info, 主要是使用btrfs_ioctl_space_info->flags, 按照条件返回0,1,2.  
+   - 针对每种数据block group, 统计它的btrfs_block_group_cache信息, 检查他们使用的raid类型..计算能容忍的failure??
+
+** write_all_supers(btrfs_root, max_mirrors)
+   - 写回super_block??  获取文件系统使用的设备数, btrfs_super_block->num_devices - 1 是最大容忍的失败io次数..
+   > btrfs_super_num_devices(btrfs_root->btrfs_fs_info->super_copy)
+   - 把各种tree的信息写回btrfs_root_backup, 准备写btrfs_super_block..
+   > backup_super_roots(btrfs_root->btrfs_fs_info)
+   > btrfs_test_opt(btrfs_root, NOBARRIER)
+   > barrier_all_devices(btrfs_root->btrfs_fs_info)
+   - 刷新磁盘io, flush操作
+   > btrfs_set_stack_device_...(btrfs_device..)
+   - 写btrfs_fs_devices->devices队列, 里面是btrfs_device, 这里还利用btrfs_fs_info->btrfs_dev_item, 先把设备信息放到这个btrfs_dev_item里面..
+   > write_dev_supers(btrfs_device, suepr_block, do_barriers, 0, max_mirrors)
+   - 把btrfs_super_block写到磁盘中, 之前会检查btrfs_device->in_fs_metadata..这里的意思是针对每个有metadata的磁盘,都会写一个btrfs_super_block, 当然它里面有一个btrfs_dev_item,针对不同的磁盘,写对应的信息..
+
+** write_ctree_super(btrfs_trans_handle, btrfs_root, max_mirrors)
+   - 包装起来.
+   > write_all_supers(btrfs_root, max_mirrors)
+   - 这个函数至少在transaction commit中使用, 这样是不是太频繁??!!
+
+** 总结
+   - 上面包含了btree的启动初始化所有的子模块
+
+** btrfs_free_fs_root(btrfs_fs_info, btrfs_root)
+   - 释放btrfs_root, 系统中可以有多个btrfs_root...先从radix tree中释放..
+   > radix_tree_delete(btrfs_fs_info->fs_roots_radix, btrfs_root->root_key.objectid)
+   - 如果btrfs_fs_info->fs_state有BTRFS_FS_STATE_ERROR, 有错误, 做log处理?!
+   > btrfs_free_log(NULL, btrfs_root)
+   > __btrfs_remove_free_space_cache(btrfs_root->free_ino_ctl)	
+   - 最后是inode和内存
+   > free_fs_root(btrfs_root)
+
+** free_fs_root(btrfs_root)
+   - 释放btrfs_root, cache是处理ino
+   - iput(btrfs_root->cache_inode)
+   - 释放extent_buffer, 它是根节点使用的
+   > free_extent_buffer(btrfs_root->node/commit_root)
+   - 对于btrfs_root的释放工作包括: radix tree关系, btrfs_free_space_ctl, 还有extent_buffer.
+
+** del_fs_roots(btrfs_fs_info)
+   - 处理btrfs_fs_info管理的btrfs_root, 包括btrfs_fs_info->dead_roots和btrfs_fs_info->fs_roots_radix...
+   - btrfs_root->in_radix表示是否在radix tree.. 先处理btrfs_fs_info->dead_roots队列上的btrfs_root. 如果在radix tree上面
+   > btrfs_free_fs_root(btrfs_fs_info, btrfs_root)
+   - 如果不在, 也不处理btrfs_free_space_ctl??
+   > free_extent_buffer(btrfs_root->extent_buffer)
+   - 然后删除radix tree中的btrfs_root,先找到一些..
+   > radix_tree_gang_lookup(btrfs_fs_info->fs_roots_radix, ..)
+   > btrfs_free_fs_root(btrfs_fs_info, btrfs_root)
+
+** btrfs_cleanup_fs_roots(btrfs_fs_info)
+   - 这里清除btrfs_root对应的orphan节点..
+   > radix_tree_gang_lookup(btrfs_fs_info->fs_roots_radix, btrfs_root, objectid, 8)
+   - 先获取btrfs_root指针数组.. 然后遍历这些指针.. 使用他们的btrfs_root->btrfs_key->objectid
+   > btrfs_orphan_cleanup(btrfs_root)
+
+** btrfs_commit_super(btrfs_root)
+   - 综合上面的功能释放btrfs_root.. 应该是在transaction提交时使用..
+   > btrfs_run_delayed_iputs(btrfs_root)
+   - inode.c
+   > btrfs_clean_old_snapshots(btrfs_root)
+   - snapshot 在transaction.c里面
+   > btrfs_join_transaction(btrfs_root)
+   - 创建一个btrfs_trans_handle??  commit还是需要它,而btrfs_transaction自己不够!
+   > btrfs_commit_transaction(btrfs_transaction, btrfs_root)
+   > btrfs_write_and_wait_transaction(NULL, btrfs_root)
+   - 忘记了.. 为何提交事务之后写super_block??
+   > write_ctree_super(NULL, btrfs_root, 0)
+   - 虽然参数是btrfs_root, 但后面写的是btrfs_super_block
+
+** close_ctree(btrfs_root)
+   - 在卸载时使用,参数btrfs_root一般时tree_root
+   - 关闭balance, 下次开机会启动..
+   > btrfs_pause_balance(btrfs_fs_info)
+   - 设备replace..
+   > btrfs_dev_replace_suspend_for_unmounts(btrfs_fs_info)
+   - scrub ??
+   > btrfs_scrub_cancel(btrfs_fs_info)
+   - 等待defraggers..
+   > wait_event(btrfs_fs_info->transaction_wait, btrfs_fs_info->defrag_running==0)
+   > btrfs_cleanup_defrag_inodes(btrfs_fs_info)
+   - 关闭事务等任务,写回btrfs_super_block
+   > btrfs_commit_super(btrfs_root)
+   - 写回错误的btrfs_super_block, 如果有错误,只会完成一部分工作,cleanup..
+   > btrfs_error_commit_super(btrfs_root)
+   - 块组资源
+   > btrfs_put_block_group_cache(btrfs_fs_info)
+   - 然后是btrfs_fs_info->transaction_kthread/cleaner_kthread线程
+   > kthread_stop(btrfs_fs_info->transaction_kthread)
+   - 设置btrfs_fs_info->closing = 2..   quota..
+   > btrfs_free_qgroup_config(btrfs_fs_info)
+   - 然后是btrfs_fs_info->**_root各种extent_buffer, 然后是各种workers.  这里为不使用参数btrfs_fs_info??
+   > free_extent_buffer(btrfs_fs_info->*_root->node)
+   - block groups??
+   > btrfs_free_block_groups(btrfs_fs_info)
+   - 删除它管理的btrfs_root
+   > del_fs_roots(btrfs_fs_info)
+   > iput(btrfs_fs_info->btree_inode)
+   - 删除btrfs_workers..
+   > btrfs_stop_workers(btrfs_fs_info->*workers)
+   - 关闭设备..
+   > btrfs_close_devices(btrfs_fs_info->fs_devices)
+   - btrfs_fs_info使用的btrfs_mapping_tree..
+   > btrfs_mapping_tree_free(btrfs_fs_info->btrfs_mapping_tree)
+   > cleanup_srcu_struct(btrfs_fs_info->subvol_srcu)
+   - raid56.. 
+   > btrfs_free_stripe_hash_table(btrfs_fs_info)
+
+**** btree的释放..
+
+** btrfs_buffer_uptodate(extent_buffer, parent_transid, atomic)
+   - 检查extent_buffer是有有效, 先是extent_buffer->bflags的EXTENT_BUFFER_UPTODATE
+   > extent_buffer_uptodate(extent_buffer)
+   - 比较transid, 和extent_buffer中的btrfs_header比较.
+   > verify_parent_transid(btrfs_inode->btrfs_io_tree, extent_buffer, parent_transid, atomic)
+
+** btrfs_mark_buffer_dirty(extent_buffer)
+   - 检查extent_buffer的generation,也就是transid, 和btrfs_root->btrfs_fs_info->generation比较. 这些extent_buffer应该也是system或metadata数据..
+   > set_extent_buffer_dirty(extent_buffer)
+   - 设置EXTENT_BUFFER_DIRTY/PG_dirty
+
+** __btrfs_btree_balance_dirty(btrfs_root, flush_delayed)
+   - 整理缓存的信息 delayed inode和内存?!
+   > btrfs_balance_delayed_items(btrfs_root)
+   - btrfs_fs_info->dirty_metadata_bytes表示脏的metadata,当它超过32M时,应该刷回磁盘.这里通过inode->address_space的实现的机制
+   > balance_dirty_pages_ratelimited(address_space)
+   - 内存更导致pagecache的操作
+
+** btrfs_btree_balance_dirty(btrfs_root) / btrfs_btree_balance_dirty_nodelay(btrfs_root)
+   > __btrfs_btree_balance_dirty(btrfs_root, 0/1)
+
+** btrfs_read_buffer(extent_buffer, parent_transid)
+   - 读取extent_buffer数据..需要btrfs_root参数,它是btrfs_inode->btrfs_root..
+   > btree_read_extent_buffer_pages(btrfs_root, extent_buffer, 0, parent_transid)
+   - 如果一个mirror有错误,会尝试其他mirror
+
+** btrfs_check_super_valid(btrfs_fs_info)
+   - 都是包装,获取btrfs_super_block->csum_type, 是否在btrfs_csum_sizes范围内..
+   > btrfs_super_csum_type(btrfs_fs_info->super_copy)
+
+** btrfs_error_commit_super(btrfs_root)
+   - 如果磁盘有错误,仅完成部分工作,不会向磁盘写数据
+   > btrfs_run_delayed_iputs(btrfs_root)
+   > btrfs_cleanup_transaction(btrfs_root)
+   - 这个是在close_ctree中使用的, 当btrfs_fs_info状态有问题时使用..
+
+** btrfs_destroy_ordered_operations(btrfs_transaction, btrfs_root)
+   - 处理btrfs_transaction->ordered_operations队列中的btrfs_inode
+   > btrfs_invalidate_inodes(btrfs_inode->btrfs_root)
+   - 竟然间接处理btrfs_root,释放它的所有inode?? 在rename时好像才主动添加btrfs_inode到这个队列中??
+   
+** btrfs_destroy_ordered_extents(btrfs_root)
+   - 处理btrfs_root->btrfs_fs_info->ordered_extents, btrfs_ordered_extent, 设置btrfs_ordered_extent->flags的BTRFS_ORDERED_IOERR..???? 在普通inode的IO中使用btrfs_ordered_extent时,检查这个标志, 立即返回-EIO..
+
+** btrfs_destroy_delayed_refs(btrfs_transaction, btrfs_root)
+   - 释放btrfs_transaction->btrfs_ref_root上的btrfs_delayed_ref_node, 没有把缓存的信息写给btree
+   > btrfs_delayed_node_to_head(btrfs_delayed_ref_node)
+   - 对于btrfs_delayed_ref_head释放btrfs_delayed_extent_op
+   > btrfs_free_delayed_extent_op(btrfs_delayed_ref_head->extent_op)
+   - 释放btrfs_delayed_ref_node, 它和btrfs_delayed_ref_root的关系.
+   > btrfs_put_delayed_ref(btrfs_delayed_ref_node)
+
+** btrfs_evict_pending_snapshots(btrfs_transaction)
+   - 遍历btrfs_transaction->pending_snapshots队列.
+   - 设置btrfs_pending_snapshot->error为-ECANCELED..
+     
+** btrfs_destroy_delalloc_inodes(btrfs_root)
+   - 处理btrfs_root->btrfs_fs_info->delalloc_inodes. 
+   - 清除btrfs_inode->runtime_flags的BTRFS_INODE_IN_DELALLOC_LIST标志.
+   > btrfs_invalidate_inodes(btrfs_inode->btrfs_root)
+   - 同样释放btrfs_root的所有inode.
+
+** btrfs_destroy_marked_extents(btrfs_root, extent_io_tree, mark)
+   - 这里也是transaction的操作, extent_io_tree就是btrfs_transaction->dirty_pages..它关联的address_space应该是btrfs_fs_info->inode使用的.
+   - 和tree-io.c中的操作有关系. 在extent_io_tree中查找带有mark标志的范围..使用extent_state, 
+   > find_first_extent_bit(extent_io_tree, start, start, end, mark, NULL)
+   - 找到某些标志的范围, 同时清除这些mark..根据start,end操作btrfs_inode->address_space的page,
+   > clear_extent_bits(extent_io_tree, start, end, mark..)
+   > find_get_page(btrfs_inode->address_space, index)
+   - 根据page找到extent_buffer, 清除EXTENT_BUFFER_DIRTY标志.
+   > radix_tree_lookup(page=>address_space=>inode=>btrfs_inode=>extent_io_tree->buffer, offset/PAGE_CACHE_SIZE)
+   - 去掉writeback标志,释放page
+   > end_page_writeback(page)
+   - 操作这里时先锁住page  PG_locked
+   > clear_page_dirty_for_io(page)
+   > radix_tree_tag_clear(radix_tree, page_index(page), PAGECACHE_TAG_DIRTY)
+   - 清除address_space上的标志... 
+
+** btrfs_destroy_pinned_extent(btrfs_root, extent_io_tree)
+   - 同样是transaction中使用, 处理EXTENT_DIRTY的extent, extent_io_tree是btrfs_fs_info->freed_extents[]..
+   - 操作extent_state的标志..  找带有EXTENT_DIRTY标志的空间..
+   > find_first_extent_bit(extent_io_tree, 0, start, end, EXTENT_DIRTY, NULL)
+   > btrfs_error_discard_extent(btrfs_root, start, len, NULL)
+   - mount option的DISCARD什么东西??  应该就是磁盘的trim/discard支持,为何是pinned的空间??或者dirty??
+   > clear_extent_dirty(extent_io_tree, start, end, GFP_NOFS)
+   - 这里好像是空间管理????
+   > btrfs_error_unpin_extent_range(extent_root, start, end)
+
+** btrfs_cleanup_one_transaction(btrfs_transaction, btrfs_root)
+   - 在删除btrfs_transaction时使用..
+   - extent delayed refs  
+   > btrfs_destroy_delayed_refs(btrfs_transaction, btrfs_root)
+   - 释放block reserve..
+   > btrfs_block_rsv_release(btrfs_root, ...)
+   - 设置btrfs_transaction->in_commit/blocked, 这里应该是transaction过程中设置的..
+   > wake_up(btrfs_fs_info->transaction_blocked_wait)
+   - snapshots...
+   > btrfs_evict_pending_snapshots(btrfs_transaction)
+   - 再改动btrfs_transaction->blocked=0 ?? 折腾??
+   > wake_up(btrfs_fs_info->transaction_wait)
+   - 设置btrfs_transaction->commit_done, 唤醒
+   > wake_up(btrfs_transaction->commit_wait)
+   - delayed inode
+   > btrfs_destroy_delayed_inodes(btrfs_root)
+   - 3个extent_io_tree..
+   > btrfs_destroy_marked_extents(btrfs_root, ...)
+
+** btrfs_cleanup_transaction(btrfs_root)
+   - 处理btrfs_fs_info->trans_list队列上的btrfs_transaction.. 在btrfs_fs_info出现错误时处理!!
+   > btrfs_destroy_ordered_operations(btrfs_root)
+   > btrfs_destroy_ordered_extents(btrfs_root)
+   > btrfs_destroy_delayed_refs(btrfs_transaction, btrfs_root)
+   > btrfs_block_rsv_release(btrfs_root, ...)
+   - ..snip.. 和上面类似..
+
+**** 后面这些是为btrfs_transaction服务..
+
+** extent_io_ops  btree_extent_io_ops
+   #+begin_src 
+   * readpage_end_io_hook
+   * readpage_io_failed_hook
+   * submit_bio_hook
+   * merge_bio_hook
+   #+end_src
+
+** 总结
+   - 在btrfs中,数据包括metedata和data, metadata就是使用btree, btree的操作在上层就是修改整个系统的btree, 其和底层的数据通信在这里,它还是使用了inode/pagecache;
+   - 在文件系统挂载和卸载时,涉及到所有模块; 尤其是系统的metadata操作,比如操作btrfs_root/btrfs_work等等.. 如何开始从磁盘读取super_block, 如何写回去等等..
+   - 这里还有transaction的支持,在transaction提交时,它必须保证文件系统的数据是一致的..所以这里的操作是综合的..
+

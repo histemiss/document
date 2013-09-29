@@ -1,0 +1,229 @@
+* user.c
+  - 给userspace提供接口,和dlm模块交互. 
+  - dlm-monitor, 用来监控dlm_monitor_opened计数, 还不清楚用户层怎么用它. 打开和关闭这个文件会增加或减小计数,如果计数变为0,关闭lockspace
+  - dlm-control, 用于创建新的lockspace的misc文件
+  - dlm-control_'lockspace name' 这个文件通过操作dlm-control创建
+  - 后面2个文件使用相同的read/write函数, 当然使用的功能不一样
+
+** dlm_user_proc
+   #+begin_src 
+	dlm_lockspace_t		*lockspace;
+	unsigned long		flags; /* DLM_PROC_FLAGS */
+	struct list_head	asts; //队列中是dlm_lkb->lkb_cb_list
+	spinlock_t		asts_spin;
+	struct list_head	locks;  //队列中是dlm_lkb->lkb_ownqueue
+	spinlock_t		locks_spin;
+	struct list_head	unlocking;  //队列中是dlm_lkb->lkb_ownqueue, in-progress unlock
+	wait_queue_head_t	wait;   
+   #+end_src
+   
+
+** device_open(inode, file)
+   - 打开dlm-control_ls文件使用, 创建dlm_user_proc. 
+   - 使用minor dev区分文件,每个文件还有对应的dlm_ls?
+   > dlm_find_lockspace_device(inode->i_dev minor)
+   - 构造dlm_user_proc, 给file->private_data
+
+** device_close(inode, inode)
+   - 和上面对应
+   - 设置dlm_user_proc->flags的DLM_PROC_FLAGS_CLOSING标志
+   - 释放关联的锁
+   > dlm_clear_proc_locks(dlm_ls, dlm_user_proc->flags)
+   - 释放它自己
+   > dlm_put_lockspace(dlm_ls)
+
+** dlm_write_request
+   #+begin_src 
+	__u32 version[3];   //dlm的版本?  没用!
+	__u8 cmd;  //宏,DLM_USER_*, device_write根据它处理后面的数据
+	__u8 is64bit;  //是否是压缩的, 32bit
+	__u8 unused[2];
+
+	union  {
+		struct dlm_lock_params   lock;
+		struct dlm_lspace_params lspace;
+		struct dlm_purge_params  purge;
+	} i;   
+   #+end_src
+
+** dlm_lock_params 
+   - 锁操作使用的参数
+   #+begin_src 
+	__u8 mode;
+	__u8 namelen;
+	__u16 unused;
+	__u32 flags;
+	__u32 lkid;
+	__u32 parent;
+	__u64 xid;
+	__u64 timeout;
+	void __user *castparam;
+	void __user *castaddr;
+	void __user *bastparam;
+	void __user *bastaddr;
+	struct dlm_lksb __user *lksb;
+	char lvb[DLM_USER_LVB_LEN];
+	char name[0];   
+   #+end_src
+
+** dlm_lspace_params
+   #+begin_src 
+	__u32 flags;
+	__u32 minor;
+	char name[0];   
+   #+end_src
+
+** dlm_purge_params
+   - purge操作??
+   #+begin_src 
+	__u32 nodeid;
+	__u32 pid;   
+   #+end_src
+
+** device_write
+   - 向dlm内核发送数据, dlm_write_request
+   - DLM_USER_CREATE_LOCKSPACE 创建lock space
+   > device_create_lockspace(dlm_lspace_params)
+   - DLM_USER_REMOVE_LOCKSPACE 删除lock space
+   > device_remove_lockspace(dlm_lspace_params)
+   - DLM_USER_LOCK 创建或修改锁  request/convert
+   > device_user_lock(dlm_user_proc, dlm_lock_params)
+   - DLM_USER_UNLOCK  释放锁
+   > device_user_unlock(dlm_user_proc, dlm_lock_params)
+   - DLM_USER_QUERY 不处理!!
+   - DLM_USER_PURGE
+   > device_user_purge(dlm_user_proc, dlm_purge_params)
+   - DLM_USER_DEADLOCK 检查死锁
+   > device_user_deadlock(dlm_user_proc, dlm_lock_params)
+
+** device_read 
+   - 操作ast?? 应该是dlm_lbk给userspace的回调数据  dlm_callback
+   - 首先检查dlm_user_proc->flags的DLM_PROC_FLAGS_CLOSING
+   - 检查dlm_user_proc->asts队列, 里面是dlm_lkb. 
+   - 如果队列为空,没有锁可操作. 
+   - 如果文件是O_NONBLOCK打开,直接返回; 否则等待  dlm_user_proc->wait
+   - 从dlm_user_proc->asts队列上取dlm_lkb, 把它队列上的dlm_callback取出来
+   > dlm_rem_lkb_callback(dlm_ls, dlm_lkb, dlm_callback, resid)
+   - 如果dlm_callback->flags有DLM_CB_SKIP(什么意思), 重新找一个
+   - copy_lvb是什么??
+   - 把dlm_callback给userspace
+   > copy_result_to_user(dlm_lkb->lkb_ua / dlm_user_args, dlm_user_proc->flags & DLM_PROC_FLGS_COMPAT, dlm_callback->flags, dlm_callback->mode, copy_lvb, buf, count)
+
+** lkb_is_endoflife(mode, status)
+   - 这是处理DLM_CB_CAST时使用, 检查lock是否该释放?
+   - status是哪里的返回结果??
+
+** dlm_user_add_ast(dlm_lkb, flags, mode, status, sbflags, seq)
+   - 创建dlm_calback时使用
+   - 检查dlm_lkb的状态,  dlm_lkb->lkb_flags & (DLM_IFL_ORPHAN | DLM_IFL_DEAD), 它不能使用
+   - dlm_user_args->bastaddr是什么??
+   - 检查DLM_IFL_ENDOFLIFE
+   > lkb_is_endoflife(mode, status)
+   - 把dlm_callback给dlm_lkb
+   > dlm_add_lkb_callback(dlm_lkb, flags, mode, status, sbflags, seq)
+   - 把dlm_lkb->cb_list放到dlm_user_proc->asts队列
+   - 而且唤醒等待这个dlm_user_proc的任务
+   > wake_up_interruptible(dlm_user_proc->wait)
+   - 如果dlm_lkb->lkb_flags & DLM_IFL_ENDOFLIFE !=0, 释放dlm_lkb??
+   - 释放dlm_lbk->lkb_ownqueue队列关系. 它在dlm_user_proc的队列中.
+
+** device_user_lock(dlm_user_proc, dlm_lock_params)
+   - 找到dlm_ls, dlm_lockspace_t是一个指针.. dlm_ls->ls_local_handle
+   > dlm_find_lockspace_local(dlm_user_proc->dlm_lockspace_t)
+   - 构造dlm_user_args, 保存castparam/castaddr, 这些都是userspace的信息, 这里只是保存起来,不会使用.
+   - 如果dlm_lock_params->flags & DLM_LKF_CONVERT !=0, 这是convert操作
+   > dlm_user_convert(dlm_ls, dlm_user_args, dlm_user_params->mode,  flags, lkid, lvb, timeout)
+   - lvb是锁保护的数据??
+   - 否则是request lock操作
+   > dlm_user_request(dlm_ls, dlm_user_args, mode, flags, name, namelen, timeout)
+
+** device_user_unlock(dlm_user_proc, dlm_lock_params)
+   - 2种情况,一种是cancel之前的等待动作, 一种是释放锁, 同样释放时可以设置锁的值
+
+** device_user_deadlock(dlm_user_proc, dlm_lock_params)
+   - 检查deadlock
+   > dlm_user_deadlock(dlm_ls,  dlm_lock_params->flags, lkid)
+
+** dlm_device_register(dlm_ls, char)
+   - 给dlm_ls创建ls_device, 并注册misc文件
+   > misc_register(dlm_ls->ls_device)
+
+** dlm_device_deregister(dlm_ls)
+   - 和上面相反
+
+** device_user_purge(dlm_user_proc, dlm_purge_params)
+   - 释放那些锁??
+   > dlm_user_purge(dlm_ls, dlm_user_proc, nodeid, pid)
+
+** device_create_lockspace(dlm_lspace_params)
+   - 创建新的dlm_ls, 还有相关的lock value block
+   > dlm_new_lockspace(dlm_user_params->name, NULL, flags, DLM_USER_LVB_LEN, NULL, ...)
+   - 然后是ls_device
+   > dlm_device_register(dlm_ls, name)
+
+** device_remove_lockspace(dlm_lspace_params)
+   - dlm_release_lockspace(dlm_lockspace_t, force)
+
+* ast.c
+  - ast是kernel向userspace发的通知.锁的操作一般都是异步,userspace会poll这些结果,调用申请锁时注册的回调函数.
+  - 在dlm_lkb->lkb_callbacks数组中保存dlm_callback,每个锁最多6个?? 不是只应该有1个??
+  - 回调有2中,一种是通知操作结果,还有一种是别人请求它释放这个锁,因为别人要用,被当前任务block
+  - DLM_CB_BAST / DLM_CB_CAST / DLM_CB_SKIP
+
+** dlm_callback
+   #+begin_src 
+	uint64_t		seq;
+	uint32_t		flags;		/* DLM_CBF_ */
+	int			sb_status;	/* copy to lksb status */
+	uint8_t			sb_flags;	/* copy to lksb flags */
+	int8_t			mode; /* rq mode of bast, gr mode of cast */   
+   #+end_src
+
+** dlm_add_lkb_callback(dlm_lkb, flags, mode, status, sbflags, seq)
+   - 向dlm_lkb->lkb_callbacks数组中添加一个dlm_callback
+
+** dlm_rem_lkb_callback(dlm_ls, dlm_lkb, dlm_callback, resid)
+   - 从数组中取出一个dlm_callback
+   - resid表示数组长度?? 
+   - 如果dlm_callback是DLM_CB_BAST, 而且和前一个普通的callback不互斥,也就是现在的锁和要求释放的锁相容,这个block callback就没有必要,设置DLM_CB_SKIP
+   - 最后如果dlm_callback没有DLM_CB_SKIP,它是有效的,更新dlm_lkb->lkb_last_case或dlm_lkb->lkb_last_bast
+
+** dlm_add_cb(dlm_lkb, flags, mode, status, sbflags)
+   - dlm_callback->seq是全局的序号
+   - 如果dlm_lkb->lkb_flags & DLM_IFL_USER, 使用user实现,唤醒等待的任务
+   > dlm_user_add_ast(dlm_lkb, flags, mode, status, sbflags, new_seq)
+   - 否则就是kernel的锁?
+   > dlm_add_lkb_callback(dlm_lkb, flags, mode, status, sbflags, new_seq)
+   - 如果这是第一个dlm_callback, 出发它的callback work_struct, dlm_lkb->lkb_cb_work
+   - 如果dlm_ls->ls_flags & LSFL_CB_DELAY 有效, 放到dlm_ls->ls_cb_delayed队列中
+   - 否则提交work_struct , dlm_callback_work
+   > queue_work(dlm_ls->ls_callback_wq, dlm_lkb->lkb_cb_work)
+
+** dlm_callback_work(work_struct)
+   - 处理dlm_lkb->lkb_callbacks数组
+   - 把所有的dlm_callback复制到本地数组
+   > dlm_rem_lkb_callback(dlm_ls, dlm_lkb, dlm_callbacks, resid)
+   - 遍历这个数组
+   - 如果dlm_callback->seq ==0 停止,这是最后一个
+   - 如果dlm_callback->flags & DLM_CB_SKIP !=0, 跳过
+   - 如果是DLM_CB_BAST, 调用
+   > dlm_lkb->lkb_bastfn(dlm_lkb->lkb_astparam, dlm_callback->mode)
+   - 如果是DLM_CB_CAST, 需要更新dlm_lkb->lkb_lksb / dlm_lksb
+   > dlm_lkb->lkb_astfn(dlm_lkb->lkb_astparam)
+
+** dlm_callback_start(dlm_ls)
+   - 启动dlm_ls->ls_callback_wq, 这是简单的work_queue
+
+** dlm_callback_stop(dlm_ls)
+   - 销毁队列
+   > destroy_workqueue(dlm_ls->ls_callback_wq)
+
+** dlm_callback_suspend(dlm_ls)
+   - 刷新队列
+   - 在recover中使用它
+
+** dlm_callback_resume(dlm_ls)
+   - 遍历dlm_ls->ls_cb_delay队列, 启动dlm_lkb的延时调用
+   > qeueu_work(dlm_ls->ls_callback_wq, dlm_lkb->lkb_cb_work)
+
+

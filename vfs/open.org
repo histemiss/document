@@ -1,0 +1,220 @@
+* target
+  - 介绍open系统调用,以nfs为例,主要介绍设计的源代码和数据结构,和主要的函数
+
+* syscall
+  - open相关的系统调用有两个:
+    - open(char *filename, flags, mode)
+    - openat(int dfd, char *filename, flags, mode)
+  - open在linux有两个作用,一个是创建文件,另一个是打开文件.filename是路经名,可能是相对路径,可能是绝对路径(以'/'开头), flags表示访问方式,同异步,buffered/direct,读/写,等. mode表示新如果创建文件的属性. 具体的查看manual..
+  - 介绍dfd, 根据manual,它有3种解释
+    - filename是绝对路径('/'开头),忽略它
+    - filename是相对路径, dfd是AT_FDCWD, filename的路径查找时从当前任务的cwd开始
+    - filename时相对路径, dfd时一个目录文件的fd, filename的查找就从这个目录开始..
+  - 看一下open调用(3.9-rc8: fs/open.c:984)
+    #+begin_src 
+      open(...) {
+        //相当于第二种openat
+        do_sys_open(AT_FDCWD, filename, flags, mod)
+      }
+
+      openat(...) {
+        do_sys_open(dfd, filename, ...)
+      }
+    #+end_src
+  
+* 代码模块
+** files_struct
+    - 数据结构
+    #+begin_src 
+    files_struct {
+	struct fdtable fdtab;   // 主要的管理指针数组...
+        ** snip **
+	int next_fd;
+        ** snip **
+	struct file __rcu * fd_array[NR_OPEN_DEFAULT];
+    }
+
+    fdtable {
+	unsigned int max_fds;
+	struct file __rcu **fd;      /* current fd array */
+	unsigned long *close_on_exec;   //这些是文件的访问属性,exec/fork会复制
+	unsigned long *open_fds;      //文件指针,所以是否关闭它,不让新创建
+	struct rcu_head rcu;     //的线程访问它..
+	struct fdtable *next;
+    }
+    #+end_src
+    - 这个数据结构是管理file的指针数组,但是这个数据的管理是可伸缩的, task_struct->files 指向这个数据结构,表示一个进程打开的所有文件. 随着进程使用的文件数量,这个数组会变化(动态的重新分配内存,复制)
+    - 主要的函数在file.c中
+    #+begin_src 
+      get_unused_fd_flags(flags)
+      > __alloc_fd(current->files, 0, ...)
+        > files_fdtable(files_struct)
+        > expand_files(files_struct, fd)
+          > expand_fdtable(files, nr)
+          //增加数组长度..
+    #+end_src
+
+** fs_struct
+    - 代码
+    #+begin_src 
+    fs_struct {
+	int users;
+	spinlock_t lock;
+	seqcount_t seq;
+	int umask;
+	int in_exec;
+	struct path root, pwd;
+    } 
+    //这个数据结构中pwd表示任务的当前路径,和路径的查找有关,然后是root,估计和chroot有关系..
+    #+end_src
+    - 代码在fs/fs_struct.c 比较简单,就是操作这个数据结构..
+
+** nameidata
+   - 代码
+   #+begin_src 
+	struct path	path;   //当前的遍历路径节点
+	struct qstr	last;  
+	struct path	root;   //绝对路径开始的目录
+	struct inode	*inode; /* path.dentry.d_inode */
+	unsigned int	flags; 
+	unsigned	seq;
+	int		last_type;
+	unsigned	depth;
+	char *saved_names[MAX_NESTED_LINKS + 1];
+   #+end_src
+   - 这个数据结构是在遍历过程中的索引功能,它指向遍历时的一个文件(夹)..
+   - 代码path_init就是为处理路径的做准备,它处理openat dfd的各种情况,代码在(fs/namei.c:1883), 基本上使用上面fs_struct.c的代码,使用fs_struct的root/pwd初始化nameidata的path/root.. 如果dfd是一个目录的fd时,nameidata的path就是这个fd指向的path..
+
+** 遍历的递归过程
+   - 代码是link_path_walk(name, nameidata)... 这时open的参数flags已经到了nameidata->flags中, nameidata的path和root也根据dfd初始化好..
+   - nameidata的last表示每次递归处理的目录名,如果最后一个,可能是文件名.. 这里不处理符号链接的情况,符号链接就是再加一层的递归,那里面会检查死循环之类的,有兴趣的可以看看..  follow_link ...
+   - 代码解析
+     #+begin_src 
+     link_path_walk(filename, nameidata)  {
+         //首先是for循环,直到filename处理完成
+         for(;;)  {
+             hash_name(name, qstr)
+             //路径的查找肯定是根据denry进行的,dentry的hash是根据(parent, name)计算,这里的处理中处理了'/',也就是自动把它切开..
+             //**snip** 略过  '.'和'..'的情况
+             walk_component(nameidata, path, LOOKUP_FOLLOW)
+             //nameidata中有一切东西, component也在nameidata的last中
+     #+end_src
+
+** 查找子文件(夹)
+   - 代码: 就是接着上面的介绍,开始找一个子文件(夹)
+   - 在dentry的树的遍历时有两种方法,在我介绍dcache的代码中有. 因为dentry是要处理想当过并发任务的,随意对它的锁肯定是很频繁的事情. 一种锁是rcu, 另一种是seq读写锁,所以这里会先进行rcw锁的遍历,如果出问题(问题下面说一下),切换到seq-rw锁.. rcu也叫lazy方法, seq-rw就是unlazy...
+   - 应该想一下在遍历的时候会碰到什么问题,也就是每一个阶段/找一个子文件(夹)会碰到什么问题: symlink, mount point, auto-mount, 路径删除/修改.. (删除和修改没办法,只能使用锁处理,或返回错误)
+   - lazy vs unlazy, 代码unlazy_walk(nameidata, dentry), 从lazy方式切换到unlzay方式, 去掉nameidata->flags的LOOKUP_RCU, 但是seq-rw锁还需要使用dentry的计数, dentry->refs??? 防止dentry被释放掉..
+   - 代码解析
+     #+begin_src 
+     lookup_fast(nameidata, path, inode)  {
+         //为何名字还是fast??
+         //检查nameidata->flags的LOOKUP_RCU,是lazy方式还是unlazy方式
+         //lazy方式: 通过参数,可看出遍历的进程,第一个参数是父目录,第二个参数是子文件夹名字, 为何这里还使用inode???
+         __d_lookup_rcu(nameidata->path.dentry, nameidata->last, seq, nameidata->inode)
+         //找到dentry,检查是否有效
+         d_revalidate(dentry, nameidata->flags)
+         //是否要跨越mount point..
+         __follow_mount_rcu(nameidata, path, inode)
+         //总结一下什么情况会变为unlazy: 
+            // revalidate有问题..
+            // manage dentry, 也就是auto mount(autofs)之类的操作
+         //unlazy方式: 具体的操作和unlazy都一样,不过它需要处理所有的情况..
+         __d_lookup(parent, qstr)
+         // 这个函数和__d_lookup_rcu的区别好像是加锁不一样...
+         follow_managed(path, ...)
+     } 
+
+
+     lookup_slow(nameidata, path)  {
+         //有了fast,就会有slow.. 两边的区别应该是夹锁粒度不一样,所以互斥的等待也不一样..
+         //遍历时还会碰到一种情况,目录信息还没有在底层文件系统中获取出来..
+         __lookup_hash(qstr, dentry, flags)
+         follow_managed(path, flags)
+     }
+
+     //看看嵌套的函数 
+     __lookup_hash
+     > lookup_dcache
+       //先到dcache中找,如果找不到就创建一个dentry
+       > d_lookup 
+         > __d_lookup(..)
+       // 针对上面创建的构造dentry..
+     > lookup_real(..)
+       > dentry->inode_operations->lookup(dentry/parent, dentry/child, flags)
+
+     #+end_src
+    
+** 结束遍历
+   - 遍历完成之后,就可以去打开文件或者创建文件
+   - 代码解析   do_last(nameidata, path, file, ...)  (fs/namei.c:2691)
+     #+begin_src 
+     do_last(nameidata, path, file, ...)
+        //还得查找? 如果不是创建文件.. 这里先不考虑创建文件的情况..  
+        lookup_fast
+        // ** snip ** 经过大量的检查..
+        //打开文件操作
+        finish_open(file, dentry, NULL, .)
+     }
+
+     finish_open(file, dentry, NULL, ..)
+     > do_dentry_open(file, open, cred)
+       
+     do_dentry_open(file, open, cred) {
+         //之前说过file主要是一些动态信息,它只要建立起来各种回调函数指针,能够让进程访问到文件皆可以.. 这里主要是建立指针的联系..
+         // 参数open是一个函数指针,如果没有指定,就需要使用inode->file_operations中的函数..
+         open(..)  
+     } 
+     #+end_src
+
+** 综合介绍
+   - 综合上面的名点,其实上面已经有一些嵌套关系,所以不好介绍..
+   - 代码解析:   
+     #+begin_src 
+     do_sys_open {
+        //找一个没有使用的fd...参考上面的files_struct管理
+        get_unused_fd_flags(flags)
+        do_filp_open(dfd, ...)
+     }
+
+     do_filp_open(dfd, filename, open_flags, lookup) {
+         path_openat(dfd, pathname, ...) 
+     }
+
+     path_openat(dfd, pathname, open_flags, flags) {
+        //初始化nameidata, 参考上面的介绍
+        path_init(dfd, ...)
+        //遍历路径
+        link_path_walk(name, nameidata) 
+        // 最后处理 打开文件..
+        do_last(..)
+        //符号链接处理..
+        follow_link(...)
+
+     #+end_src
+
+
+* nfs 的相关实现
+** dentry_operations 
+   - 代码: fs/nfs/dir.c:1324
+   - d_automount : 处理managed的dentry, 比较重要, 再以后学习mount时介绍
+   - d_revalidate : 做了一些检查, 没有什么东西..
+
+** file_operations
+   - 代码: fs/nfs/nfs4file.c:121
+   - nfs4_file_open: 
+     - 奇怪,这里之前看rhel6的时候,不能在这里打开文件,应该在遍历的时候打开,但现在手上没有rhel6, 先介绍这个东西..
+
+   - nfs4_file_open(inode, file) 
+     #+begin_src 
+     nfs4_file_open() {
+         NFS_PROTO(dentry)->open_context(dir/dentry, nfs_open_context, open_flags, attr)
+     //对于nfs4来说,server需要直到client的打开文件的状态,所以这里会发起一个open的rpc call..
+     }
+
+     //上面的函数指针 
+     nfs4_atomic_open (inode, nfs_open_context, open_flags) {
+          nfs4_do_open(...)
+          //打开的东西时state..
+     }
+     #+end_src

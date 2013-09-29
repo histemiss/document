@@ -1,0 +1,1002 @@
+* glock.c
+
+** gfs2_glock_iter
+   #+begin_src 
+	int hash;			/* hash bucket index           */
+	unsigned nhash;			/* Index within current bucket */
+	struct gfs2_sbd *sdp;		/* incore superblock           */
+	struct gfs2_glock *gl;		/* current glock struct        */
+	loff_t last_pos;		/* last position               */   
+   #+end_src
+
+** lm_lockname
+   #+begin_src 
+	u64 ln_number;
+	unsigned int ln_type;   
+   #+end_src
+
+** gfs2_holder
+   #+begin_src 
+	struct list_head gh_list;
+
+	struct gfs2_glock *gh_gl;
+	struct pid *gh_owner_pid;
+	unsigned int gh_state;
+	unsigned gh_flags;
+
+	int gh_error;
+	unsigned long gh_iflags; /* HIF_... */
+	unsigned long gh_ip;   
+   #+end_src
+
+** gfs2_glock_operations
+   #+begin_src 
+	void (*go_sync) (struct gfs2_glock *gl);
+	int (*go_xmote_bh) (struct gfs2_glock *gl, struct gfs2_holder *gh);
+	void (*go_inval) (struct gfs2_glock *gl, int flags);
+	int (*go_demote_ok) (const struct gfs2_glock *gl);
+	int (*go_lock) (struct gfs2_holder *gh);
+	void (*go_unlock) (struct gfs2_holder *gh);
+	int (*go_dump)(struct seq_file *seq, const struct gfs2_glock *gl);
+	void (*go_callback)(struct gfs2_glock *gl, bool remote);
+	const int go_type;
+	const unsigned long go_flags;
+#define GLOF_ASPACE 1
+#define GLOF_LVB    2   
+   #+end_src
+
+** gfs2_glock
+   #+begin_src 
+	struct hlist_bl_node gl_list;
+	struct gfs2_sbd *gl_sbd;
+	unsigned long gl_flags;		/* GLF_... */
+	struct lm_lockname gl_name;
+	atomic_t gl_ref;
+
+	spinlock_t gl_spin;
+
+	/* State fields protected by gl_spin */
+	unsigned int gl_state:2,	/* Current state */
+		     gl_target:2,	/* Target state */
+		     gl_demote_state:2,	/* State requested by remote node */
+		     gl_req:2,		/* State in last dlm request */
+		     gl_reply:8;	/* Last reply from the dlm */
+
+	unsigned int gl_hash;
+	unsigned long gl_demote_time; /* time of first demote request */
+	long gl_hold_time;
+	struct list_head gl_holders;
+
+	const struct gfs2_glock_operations *gl_ops;
+	ktime_t gl_dstamp;
+	struct gfs2_lkstats gl_stats;
+	struct dlm_lksb gl_lksb;
+	unsigned long gl_tchange;
+	void *gl_object;
+
+	struct list_head gl_lru;
+	struct list_head gl_ail_list;
+	atomic_t gl_ail_count;
+	atomic_t gl_revokes;
+	struct delayed_work gl_work;
+	struct work_struct gl_delete;
+	struct rcu_head gl_rcu;   
+   #+end_src
+
+** gl_hash(gfs2_sbd, lm_lockname)
+   - 根据lm_lockname计算hash值
+   > jhash(&gfs2_sbd, h)
+   - 这个函数传递地址, 这里当然不是使用栈参数的地址!
+
+** gfs2_glock_dealloc(rcu_head)
+   - 异步释放gfs2_glock. 有2种lock, 带GLOF_ASPACE的来自gfs2_glock_aspace_cache
+   - 其他的来自于gfs2_glock_cachep, 他使用dlm_skb
+   > kfree(gfs2_glock->gl_lksb->sb_lvbptr)
+
+** gfs2_glock_free(gfs2_glock)
+   - 释放gfs2_glock, 这里计数应该是0了.
+   > call_rcu(gfs2_glock->gl_rcu, gfs2_glock_dealloc)
+   - 减小gfs2_sbd->sd_glock_disposal, 如果减为0, 唤醒队列?? 
+   > wake_up(gfs2_sbd->sd_glock_wait)
+
+** gfs2_glock_hold(gfs2_glock)
+   - 增加gfs2_glock->gl_ref
+
+** demote_ok(gfs2_glock)
+   - 检查gfs2_glock是否能升级
+   - 如果gfs2_glock->gl_state == LM_ST_UNLOCKED, 不可以??
+   - 如果gfs2_glock->gl_holders链表不是空,也不行. 还有使用这个锁?? 
+   - gfs2_glock->go_demote_ok(gfs2_glock)
+
+** gfs2_glock_add_to_lru(gfs2_glock)
+   - 把放到gfs2_glock->gl_lru放到lru_list链表中. 这是全局队列
+   - 设置gfs2_glock->gl_flags的GFL_LRU标志
+
+** __gfs2_glock_remove_from_lru(gfs2_glock)
+   - 从lru_list队列中取出来
+
+** gfs2_glock_remove_from_lru(gfs2_lock)
+   - 使用全局lru_lock保护
+   > __gfs2_glock_remove_from_lru(gfs2_lock)
+
+** gfs2_glock_put_nolock(gfs2_glock)
+   - 释放使用计数, gfs2_glock->gl_ref --
+
+** gfs2_glock_put(gfs2_glock)
+   - 减小gfs2_glock->gl_ref, 如果减为0,开始释放
+   - 从全局hash表中释放
+   > hlist_bl_del_rcu(gfs2_glock->gl_hash)
+   - gfs2_glock->gfs2_glock_operations->go_flags & GLOF_ASPACE, 是特殊的锁,他负责inode的数据?? 他和address_space关联一起
+   - 检查address_space中是否还有数据 address_space->nrpages
+   > gfs2_glock2aspace(gfs2_glock)
+   > gfs2_glock_operations->lm_put_lock(gfs2_glock)
+
+** search_bucket(hash, gfs2_sbd)
+   - gl_hash_table hash表用来保存所有gfs2_glock, 遍历列表,比较gfs2_glock->gl_name 
+   > lm_name_equal(lm_lockname, lm_lockname)
+   - 比较gfs2_glock->gfs2_gsb和参数
+
+** may_grant(gfs2_glock, gfs2_holder)
+   - 检查gfs2_holder能否获取锁gfs2_glock
+   - gfs2_glock->gl_holders链表中是gfs2_glock,取出第一个gfs2_holder 
+   - gfs2_gholder->gh_state表示当前锁的状态
+   - 如果它和参数gfs2_holder都是LM_ST_EXCLUSIVE, 而且不相同,返回0
+   - 否则,至少gfs2_holder不冲突, 如果gfs2_glock->gl_state == gfs2_holder->gh_state, 可以获取锁??
+   - 否则需要等待?
+   - 如果gfs2_holder->gh_flags & GL_EXACT !=0, 返回0??
+   - 如果gfs2_glock->gl_state == LM_ST_EXCLUSIVE
+   - 如果2个gfs2_holder->gh_state == LM_ST_SHARED, 或都是LM_ST_DERFERRED, 可以接受?? 
+   - 如果gfs2_glock->gl_state != LM_ST_UNLOCKED, 而且gfs2_holder->gh_flags & LM_FLAG_ANY, 也可以接受??
+   - 其他都拒绝
+
+** gfs2_holder_wake(gfs2_holder)
+   - 唤醒等待gfs2_holder->gh_iflags的HIF_WAIT标志的任务
+   > wake_up_bit(gfs2_holder->gh_iflags, HIF_WAIT)
+
+** do_error(gfs2_glock, ret)
+   - 遍历gfs2_glock->gl_holders队列的gfs2_holder, 根据ret设置gfs2_holder->gh_error
+   - 如果gfs2_holder->gh_iflags & HIF_HOLDER !=0, 表示这个gfs2_holder无效?  不处理
+   - 当ret & LM_OUT_ERROR时设置为EIO
+   - 否则gfs2_holder->gh_flags & LM_FLAG_TRY|LM_FLAG_TRY_1CB, 设置GLR_TRYFALIED
+   - 其他情况不处理?
+   - 如果设置gfs2_holder->gh_error, 唤醒等待任务
+   > gfs2_holder_wake(gfs2_holder)
+
+** do_promote(gfs2_glock)
+   - 遍历gfs2_holder, 检查锁的条件是否满足. 并不是直接的遍历,不可能第一个锁没有满足,就处理第二个锁
+   - 掉过设置HIF_HOLDER的gfs2_holder
+   - 首先和链表上的第一个gfs2_holder比较, 不管是不是holder的..
+   > may_grant(gfs2_glock, gfs2_holder)
+   - 如果他可以, 而且是第一个锁, 发送请求. 
+   - 开始遍历时会掉过HIF_HOLDER的gfs2_holder, 所以这个条件不好满足
+   > gfs2_glock->gfs2_glock_operations->go_lock(gfs2_holder)
+   - 好像是如果锁被接受,设置gfs2_holder->gh_iflags的HIF_HOLDER标志?
+   - 然后唤醒等待HIF_WAIT的任务, 然后重新循环
+   > gfs2_holder_wake(gfs2_holder)
+   - 如果不是第一个gfs2_holder,不会调用gfs2_glock_operations操作, 但会设置HIF_HOLDER,唤醒等待者
+   - 如果不能满足, 而且是第一个锁?? 和谁冲突? 返回1
+   - 否则就错误了? 
+   > do_error(gfs2_glock, 0)
+
+** find_first_waiter(gfs2_glock)
+   - 遍历gfs2_glock->gl_holders队列, 查找没有带HIF_HOLDER标志的gfs2_holder
+
+** state_change(gfs2_glock, new_state)
+   - 改变gfs2_glock->gl_state
+   - 首先检查是要申请锁还是释放锁, gfs2_glock->gl_state, new_state != LM_ST_UNLOCK
+   - 如果变为非LM_ST_UNLOCK, 释放锁
+   > gfs2_glock_hold(gfs2_glock) 
+   - 如果变为LM_ST_UNLOCK, 释放锁
+   > gfs2_glock_put_nolock(gfs2_glock)
+   - 更新gfs2_glock->gl_hold_time
+   - 设置gfs2_glock->gl_state = new_state, gl_tchange = jiffies
+
+** gfs2_demote_wake(gfs2_glock)
+   - 降级所 
+   - 设置gfs2_glock->gl_demote_state = LM_ST_EXCLUSIVE
+   - 去掉gfs2_glock->gl_flags的GLF_DEMOTE, 唤醒等待GFL_DEMOTE的任务
+   > wake_up_bit(gfs2_glock->gl_flags, GLF_DEMOTE)
+
+** finish_xmote(gfs2_glock, ret)
+   - 处理回调消息?
+   - 更新gfs2_glock->gl_state , ret是新的状态
+   > state_change(gfs2_glock, state)
+   - 找到等待的任务? 
+   > find_first_waiter(gfs2_glock)
+   - 如果state != gfs2_glock->gl_target, 表示锁请求有错误
+   - 这里gfs2_glock->gl_flags的GLF_DEMOTE_IN_PROGRESS有很大干扰力
+   - 如果返回LM_OUT_CANCELLED, 这是cancel操作? 
+   - 换一个gfs2_holder继续检查??
+   - 如果返回LM_OUT_ERROR, 设置gfs2_glock->gl_target = gl_state 
+   > do_error(gfs2_glock, ret)
+   - 如果不是cancel/error, 处理state 
+   - 如果是LM_ST_UNLOCKED, 降级处理
+   > do_xmode(gfs2_glock, gfs2_holder, gfs2_glock->gl_target)
+   - 如果是LM_ST_SHARED/LM_ST_FEFERRED, 就是升级? 
+   > do_xmode(gfs2_glock, gfs2_holder, LM_ST_UNLOCKED)
+   - 如果ret和gfs2_glock->gl_target相同, 清除GLF_DEMOTE_IN_PROGRESS
+   > gfs2_demote_wake(gfs2_glock)
+   - 如果state != LM_ST_UNLOCKED, 需要升级锁? 
+   > do_promote(gfs2_glock)
+
+** do_xmote(gfs2_glock, gfs2_holder, target)
+   - 调用dlm改变锁的状态??
+   - 如果target是LM_ST_UNLOCKED,LM_ST_DEFERRED, 而且gfs2_glock_operations->go_inval有效, 设置gfs2_glock->gl_flags的GLF_INVALIDATE_IN_PROGRESS标志
+   > do_error(gfs2_glock, 0)
+   - 设置gfs2_glock->gl_req = target 
+   > gfs2_glock_operations->go_sync(gfs2_glock)
+   - 对应上面的GLF_INVALIDATE_IN_PROGRESS
+   > gfs2_glock_operations->go_inval(gfs2_glock, target == LM_ST_DEFERRED?0:DIO_METADATA)
+   - 清除GLF_INVALIDATE_IN_PROGRESS标志
+   > gfs2_glock_hold(gfs2_glock)
+   - 然后调用dlm 
+   > gfs2_sbd->sd_lockstruct->ls_ops->lm_lock(gfs2_glock, target, lck_flags)
+
+** find_first_holder(gfs2_glock)
+   - 获取第一个带有HIF_HOLDER标志的gfs2_glock
+
+** run_queue(gfs2_glock, nonblock)
+   - 处理等待的锁请求??
+   - 设置gfs2_glock->gl_flags的GLF_LOCK, 防止和其他任务冲突
+   - 这是有DEMOTE,PROMOTE, 什么意思? 
+   - 如果gfs2_glock->gl_flags & GFL_DEMOTE !=0, 而且gl_demote_state != gl_state, 需要处理demote
+   - 必须存在一个HIF_HOLDER的gfs2_holder? 
+   > find_first_holder(gfs2_glock)
+   - 如果nonblock !=0, 不处理demote操作? 跳到后面处理
+   - 否则设置GLF_DEMOTE_IN_PROGRESS, gl_state = gl_demote_state
+   - 如果不需要demote, 而且gfs2_glock->gl_flags & GLF_DEMOTE !=0, 唤醒demote 
+   > gfs2_demote_wake(gfs2_glock)
+   - 操作promote
+   > do_promote(gfs2_glock)
+   - 处理等待的gfs2_holder 
+   > find_first_waiter(gfs2_glock)
+   - 设置gfs2_glock->gl_target = gfs2_holder->gh_state
+   - 操作demote/promote
+   > do_xmote(gfs2_glock, gfs2_holder, gfs2_glock->gl_target)
+   - 如果上面不等带demote
+   - 使用delayed_work释放锁
+   > queue_delayed_work(glock_workqueue, gfs2_glock->gl_work, 0)
+
+** delete_work_func(work_struct)
+   - 异步释放inode?
+   - gfs2_inode和inode没有关系?
+   - 根据gfs2_glock->lm_lockname->ln_number找到inode, 为何不用gfs2_inode->inode?
+   - 如果gfs2_glock->gl_object有效,就是gfs2_inode,说明inode在vfs中
+   > gfs2_ilookup(gfs2_sbd->sd_vfs, no_addr, 1)
+   - 如果怎么查找?
+   > gfs2_lookup_by_inum(gfs2_sbd, no_addr, NULL, GFS2_BLKST_UNLINKED)
+   - 释放dentry 
+   > d_prune_aliases(inode)
+   - 这里不会使用inode?  就为了释放dentry?
+   > iput(inode)
+   - 释放gfs2_glock 
+   > gfs2_glock_put(gfs2_glock)
+
+** glock_work_func(work_struct)
+   - 什么时候调用? 
+   - 如果gfs2_glock->gl_flags & GLF_REPLY_PENDING !=0, 完成xmode? 
+   > finish_xmode(gfs2_glock, gfs2_glock->gl_reply)
+   - 如果是GLF_PENDING_DEMOTE, 而且gl_state != LM_ST_UNLOCK, gl_demote_state != LM_ST_EXCLUSIVE, 处理延时? 
+   - delay = gfs2_glock->gl_hold_time + gl_tchange - now
+   - 如果超时, 去掉GLF_PENDING_DEMOTE, 添加GLF_DEMOTE
+   - 处理gfs2_glock 
+   > run_queue(gfs2_glock, 0)
+   - 释放gfs2_glock, 如果上面delay > 0, 使用delayed_work 
+   > queue_delayed_work(glock_workqueue, gfs2_glock->gl_work, delay)
+   - 否则直接释放
+   > gfs2_glock_put(gfs2_glock)
+
+** gfs2_glock_get(gfs2_sbd, number, gfs2_glock_operations, create, gfs2_glock)
+   - 构造或查找一个gfs2_glock?
+   - lm_lockname是number, gfs2_glock_operations->go_type
+   - 使用lm_lockname查找
+   > search_bucket(hash, gfs2_sbd, lm_lockname)
+   - 如果没找到,创建一个
+   - 根据gfs2_glock_operations->go_flags分配, 如果go_flags & GLOF_LVB, 创建gfs2_glock->gl_lksb
+   - 对于GLOF_ASPACE的gfs2_glock, 他和address_space放一块?
+   - 设置address_space->a_ops = gfs2_meta_aops
+   - address_space->host = super_block->s_bdev->bd_inode, 他管理整个磁盘设备?
+   
+** gfs2_holder_init(gfs2_glock, state, flags, gfs2_holder)
+   - 初始化gfs2_holder
+     
+** gfs2_holder_reinit(state, flags, gfs2_holder)
+   - 设置gfs2_holder->state, flags
+   > gfs2_holder->gh_ip = __builtin_return_address(0)
+   - 这个是栈地址? 还是函数地址?
+
+** gfs2_holder_uninit(gfs2_holder)
+   - 释放pid
+   > put_pid(gfs2_holder->gh_owner_pid)
+
+** gfs2_glock_holder_wait(void *)
+   - schedule();
+
+** gfs2_glock_wait(gfs2_holder)
+   - 等待gfs2_holder->gh_iflags的HIF_WAIT标志
+
+** handle_callback(gfs2_glock, stte, delay, remote)
+   - 处理demote请求? 
+   - 设置gfs2_glock->gl_flags的GLF_DEMOTE, 如果delay !=0, 设置GLF_PENDING_DEMOTE
+   - 如果gfs2_glock->gl_demote_state == LM_ST_EXCLUSIVE, 改为state?
+   - 否则改为LM_ST_UNLOCKED
+   > gfs2_glock->gfs2_glock_operations->go_callback(gfs2_glock, remote)
+
+** gfs2_print_dbg(seq_file, char *fmt, ...)
+
+** add_to_queue(gfs2_holder)
+   - 把gfs2_holder放到等地队列中
+   - 设置gfs2_holder->gh_iflags的HIF_WAIT
+   - 检查gfs2_holder->gh_flags的LM_FLAG_TRY|LM_FLAG_1CB
+   - 如果有GLF_LOCK, 说明gfs2_holder被别人使用? 
+   > may_grant(gfs2_glock, gfs2_holder)
+   - 如果gfs2_glock->gl_flags & GLF_INVALIDATE_IN_PROGRESS, gfs2_glock有错误? 跳到错误处理
+   - 遍历gfs2_glock->gl_holder的gfs2_holder, 检查是否有重复的gfs2_holder? 
+   - gfs2_holder->gh_owner_pid重复, 就有问题?
+   - 最后把gfs2_holder放到链表中,如果gfs2_holder->gl_flgs & LM_FLAG_PRIORITY !=0, 把它放到非HIF_HOLDER的gfs2_holder的前面,否则放到最后
+   - 设置gfs2_holder->gh_flags的GFL_QUEUE标志
+   - 如果如果gfs2_glock的第一个gfs2_holder不是LM_FLAG_PRIORITY, 调用cancel处理
+   > dlm_lockspace_ops->lm_cancel(gfs2_glock)
+
+** gfs2_glock_nq(gfs2_holder)
+   - nq是什么意思? 
+   - 如果gfs2_glock->gl_flags & GLF_LRU !=0, 把它从lru队列中取出来
+   > gfs2_glock_remove_from_lru(gfs2_glock)
+   - 处理gfs2_holder 
+   > add_to_queue(gfs2_holder)
+   - 处理gfs2_glock的所有请求? 
+   > run_queue(gfs2_glock, 1)
+   - 如果gfs2_holder->gh_flags & GL_ASYNC, 同步等待
+   > gfs2_glock_wait(gfs2_holder)
+
+** gfs2_glock_poll(gfs2_holder)
+   - 检查gfs2_holder->gh_iflags的HIF_WAIT
+
+** gfs2_glock_dq(gfs2_holder)
+   - 从等待队列中取出来?
+   - 如果gfs2_holder->gh_flags & GL_NOCACHE !=0? 
+   > handle_callback(gfs2_glock, LM_ST_UNLOCKED, 0, false)
+   - 如果没有HIF_HOLDER的gfs2_holder
+   - find_first_holder(gfs2_holder)
+   - 发送unlock请求??
+   > gfs2_glock_operations->go_unlock(gfs2_holder)
+   - 检查demote操作
+   > demote_ok(gfs2_glock)
+   - 把它放到lru队列, 它已经没有用?
+   > gfs2_glock_add_to_lru(gfs2_glock)
+   - 最后如果gfs2_glock->gl_flags没有GLF_PENDING_DEMOTE|GLF_DEMOTE, 直接返回
+   - 释放gfs2_glock 
+   > queue_delayed_work(glock_workqueue, gfs2_glock->gl_work, delay)
+   > gfs2_glock_put(gfs2_glock)
+
+** gfs2_glock_dq_wait(gfs2_holder)
+   - 出队列也要等待
+   > gfs2_glock_dq(gfs2_holder)
+   - 等待gfs2_glock->gl_flags的GLF_DEMOTE
+
+** gfs2_glock_dq_uninit(gfs2_holder)
+   - dequeue
+   > gfs2_glock_dq(gfs2_holder)
+   - 释放资源, pid, gfs2_glock
+   > gfs2_holder_uninit(gfs2_holder)
+
+** gfs2_glock_nq_num(gfs2_sbd, number, gfs2_glock_operations, state, flags, gfs2_holder)
+   - 根据number构造gfs2_holder
+   > gfs2_glock_get(gfs2_sbd, number, gfs2_glock_operations, CREATE, gfs2_holder)
+   - 放到队列中
+   > gfs2_glock_nq_init(gfs2_glock, state, flags, gfs2_holder)
+   > gfs2_glock_put(gfs2_glock)
+
+** glock_compare(arg_a, arg_b)
+   - 2个参数是gfs2_holder, 已经gfs2_holder->gfs2_glock->lm_lockname
+   - 比较lm_lockname->ln_number
+   - 2者关联的gfs2_glock_operations->go_type必须相同? 
+
+** nq_m_sync(num_gh, gfs2_holder, gfs2_holder)
+   - 同时获取多个gfs2_glock? 参数是指针数组
+   - 根据inum排序
+   > sort(p, num_gh, sizeof(gfs2_holder *), glock_compare, NULL)
+   - 去掉gfs2_holder->gh_flags的LM_FLAG_TRY|GL_ASYNC
+   - 依次获取这些锁
+   > gfs2_glock_nq(gfs2_holder)
+
+** gfs2_glock_nq_m(num_gf, gfs2_holder)
+   - num_gh ==1, 发送一个请求
+   > gfs2_glock_nq(gfs2_holder)
+   - 如果num_gh > 1, 发送多个
+   > nq_m_sync(num_gh, gfs2_holder, gfs2_holder)
+
+** gfs2_glock_dq_m(num_gh, gfs2_holder)
+   - 释放多个gfs2_holder 
+   > gfs2_glock_dq(gfs2_holder)
+
+** gfs2_glock_cb(gfs2_glock, state)
+   - dlm回调函数??
+   - 如果gfs2_holder在队列中,计算超时  gfs2_glock->gl_flags & GLF_QUEUE !=0, 而且是LM_TYPE_INODE
+   - delay = gfs2_glock->gl_tchange + gl_hold_time - jiffies
+   - 如果gfs2_glock->gl_flags & GLF_REPLY_PENDING 有效, delay = gfs2_glock->gl_hold_time
+   - 调用回调
+   > handle_callback(gfs2_glock, state, delay, true)
+   - 释放gfs2_glock 
+   > queue_delayed_work(glock_workqueue, gfs2_glock->gl_work, delay)
+
+** gfs2_should_freeze(gfs2_glock)
+   - gfs2_glock不是freeze的条件是 dlm操作有错误, 或者unlock操作, 或者noexp标志?
+   - gfs2_glock->gl_reply & ~LM_OUT_ST_MASK, 不会freeze, 返回0
+   - gfs2_glock->gl_target == LM_ST_UNLOCKED, 不会freeze
+   - 遍历gfs2_glock的gfs2_holder, 检查没有HIF_HOLDER的, 存在gfs2_holder->gh_flags的LM_FLAG_NOEXP, 也不会freeze
+
+** gfs2_glock_complete(gfs2_glock, ret)
+   - 设置gfs2_glock->gl_reply = ret
+   - lm_lockstruct->ls_recover_flags的DFL_BLOCK_LOCKS表示什么?锁有问题?
+   - 检查dlm是否应该等待recover
+   > gfs2_should_freeze(gfs2_glock)
+   - 设置gfs2_glock->gl_flags的GLF_FREEZE, 返回0
+   - 否则继续
+   - 设置gfs2_glock->gl_flags的GLF_REPLY_PENDING
+   > gfs2_glock_hold(gfs2_glock)
+   - 异步释放
+   > queue_delayed_work(glock_workqueue, gfs2_glock->gl_work, 0)
+
+** glock_cmp(priv, list_head a, list_head b)
+   - 参数的2个链表是gfs2_holder->gl_lru
+   - 比较gfs2_glock->lm_lockname->ln_number
+
+** gfs2_dispose_glock_lru(list_head)
+   - 释放gfs2_glock, 参数list_head是lru链表
+   - 对list_head排序
+   > list_sort(NULL, list, glock_cmp)
+   - 遍历这些gfs2_glock
+   - 释放lru队列
+   - demote 
+   > demote_ok(gfs2_glock)
+   - 这是有callback操作? 
+   > handle_callback(gfs2_glock, LM_ST_UNLOCKED, 0, false)
+   - 使用delayed_work释放 
+   > queue_delayed_work(glock_workqueue, gfs2_glock->gl_work, 0)
+
+** gfs2_scan_glock_lru(nr)
+   - 扫描lru队列,把没有GLF_LOCK的gfs2_glock, 放到一个队列中
+   > test_and_set_bit(GLF_LOCK, gfs2_glock->gl_flags)
+   - 一块释放它们
+   > gfs2_dispose_glock_lru(list)
+
+** gfs2_shrink_glock_memory(shrinker, shrink_control)
+   - 回收内存使用
+   - 遍历lru队列实现
+   > gfs2_scan_glock_lru(nr)
+
+** examine_bucket(glock_examiner, gfs2_sbd, hash)
+   - glock_examiner是回调函数??
+   - 遍历gl_hash_table[hash]中的gfs2_glock
+   - 如果gfs2_glock->gl_sbd == gfs2_sbd, 触发glock_examiner操作
+
+** glock_hash_walk(glock_examiner, gfs2_sbd)
+   - 遍历hash表,回调examiner 
+   > examine_bucket(glock_examiner, gfs2_sbd, x)
+
+** thaw_glock(gfs2_glock)
+   - 解冻gfs2_glock, freeze逆操作, 首先要有GLF_FROZEN
+   > test_and_clear_bit(GLF_FORZEN, gfs2_glock->gl_flags)
+   - 设置gfs2_glock->gl_flags的GLF_REPLY_PENDING
+   - 释放它?? 
+   > queue_delayed_work(glock_workqueue, gfs2_glock->gl_work, 0)
+
+** clear_glock(gfs2_glock)
+   - 检查gfs2_glock是否可以释放? 
+   - 释放lru
+   - gfs2_glock_remove_from_lru(gfs2_glock)
+   - 如果gfs2_glock->gl_state != LM_ST_UNLOCKED, 调用callback 
+   > handle_callback(gfs2_glock, LM_ST_UNLOCKED, 0, false)
+   - 提交work_struct是什么任务? 
+   > queue_delayed_work(glock_workqueue, gfs2_glock->gl_work, 0)
+
+** gfs2_glock_thaw(gfs2_sbd)
+   - 解冻所有的gfs2_glock
+   - glock_hash_walk(thaw_glock, gfs2_sbd)
+
+** dump_glock(seq_file, gfs2_glock)
+   - 要打印gfs2_glock信息??
+
+** dump_glock_func(gfs2_glock)
+   > dump_glock(NULL, gfs2_glock)
+
+** gfs2_gl_hash_clear(gfs2_sbd)
+   - 要删除所有的gfs2_glock
+   - 设置gfs2_sbd->sd_flags的SDF_SKIP_DLM_UNLOCK
+   - 刷新glock_workqueue 
+   > flush_workqueue(glock_workqueue)
+   - 清除所有的gfs2_glock
+   > glock_hash_walk(clear_glock, gfs2_sbd)
+   - 再刷新一遍?
+   > flush_workqueue(glock_workqueue)
+   - 等待gfs2_sbd->sd_glock_disposal == 0
+   - 打印信息
+   > glock_hash_walk(dump_glock_func, gfs2_sbd)
+
+** gfs2_glock_finish_truncate(gfs2_inode)
+   - truncate操作使用? 
+   > gfs2_truncatei_resume(gfs2_inode)
+   - 清除gfs2_glock->gl_flags的GLF_LOCK
+   > run_queue(gfs2_glock, 1)
+
+** hflags2str(buf, flags, iflags)
+   - 肯定是打印操作,把flags和iflags的标志格式化
+
+** dump_holder(seq_file, gfs2_holder)
+   - 打印gfs2_holder信息
+
+** gflags2str(buf, gfs2_glock)
+   - 处理gfs2_glock->gl_flags
+
+** gfs2_dump_glock(seq_file, gfs2_glock)
+   - 打印的信息包括state, type, lm_lockname, flags, target ..
+
+
+** gfs2_glstate_seq_show(seq_file, iter_ptr)
+   - 遍历所有的gfs2_glock
+
+** gfs2_glock_init()
+   - 构造work_queue, glock_workqueue, delete_workqueue
+
+** glock_hash_china(hash)
+   - 获取gl_hash_table[hash]链表的第一个gfs2_glock
+
+** glock_hash_next(gfs2_glock)
+   - 获取gfs2_glock的下一个hash表的gfs2_glock
+
+** gfs2_glock_iter_next(gfs2_glock_iter)
+   - 使用上面2个辅助函数遍历gl_hash_table 
+   > glock_hash_next(gfs2_glock)
+   > glock_hash_chain(gfs2_glock_iter->hash)
+
+** gfs2_glock_seq_start(seq_file, loff_t)
+   
+** debugfs
+   - 在gfs2_sbd->debugfs_dir下面有3个文件, glocks, glstats, sbstats.
+
+
+* lock_dlm.c
+
+** gdlm_ast(void *)
+   - 参数是gfs2_glock
+   - 更新统计数 
+   > gfs2_update_reply_times(gfs2_glock)
+   - 如果gfs2_glock->dlm_lksb->sb_flags保护DLM_SBF_VALNOTVALID, 清除lksb数据
+   - 检查dlm_lksb->sb_status
+   - 如果是DLM_EUNLOCK, 释放gfs2_glock, 不会向glock传递?
+   > gfs2_glock_free(gfs2_glock)
+   - 如果是DLM_ECANCEL, 设置ret |= LM_OUT_CANCELLED
+   - 如果是DLM_ETIMEOUT, 设置ret |= LM_OUT_ERROR
+   - 如果dlm_lksb->sb_flags & DLM_SBF_ALTMODE, 锁被改变? 
+   - 如果gfs2_glock->gl_req == LM_ST_SHARED, 改为LM_ST_DEFERRED
+   - 如果是LM_ST_DEFERRED, 改为LM_ST_SHARED, 怎么互相该??
+   - 设置gfs2_glock->gl_flags的GLF_INITIAL, 调用gfs2_glock 
+   > gfs2_glock_complete(gfs2_glock, ret)
+
+** gdlm_bast(arg, mode)
+   - 根据mode, 调用glock处理
+   - 如果mode == DLM_LOCK_EX, glock使用的参数不一样
+   > gfs2_glock_cb(gfs2_glock, LM_ST_UNLOCKED)
+   - 如果mode == DLM_LOCK_CW
+   > gfs2_glock_cb(gfs2_glock, LM_ST_DEFERRED)
+   - 如果mode == DLM_LOCK_PR
+   > gfs2_glock_cb(gfs2_glock, LM_ST_SHARED)
+
+** make_mode(lmstate)
+   - 把glock换为dlm的锁
+   - LM_ST_UNLOCKED对应DLM_LOCK_NL
+   - LM_ST_EXCLUSIVE对应DLM_LOCK_EX
+   - LM_ST_DEFERRED对应DLM_LOCK_CW
+   - LM_ST_SHARED对应DLM_LOCK_PR
+
+** make_flags(gfs2_glock, gfs_flags, req)
+   - 根据gfs2_glock->dlm_lksb, gfs_flags设置flag, 给dlm使用
+   - gfs2_glock->dlm_lksb->sb_lvbptr有效,设置DLM_LKF_VALBLK
+   - 如果gfs_flags有LM_FLAG_TRY, 设置DLM_LKF_NOQUEUE
+   - 如果gfs_flags有LM_FLAG_TRY_1CB, 设置DLM_LKF_NOQUEUE,DLM_LKF_NOQUEUEBAST
+   - 如果LM_FLAG_PRIORITY, 设置DLM_LKF_NOORDER, DLM_LKF_HEADQUE
+   - 如果有LM_FLAG_ANY, 而且req = DLM_LOCK_PR, 设置DLM_LKF_ALTCW,可以改为cw
+   - 如果req = DLM_LOCK_CW, 设置DLM_LKF_ALTPR, cw和pr可以互相转化
+   - 如果dlm_lksb->sb_lkid !=0, 设置DLM_LKF_CONVERT?? 没有unlock? 
+   - 如果gfs2_glock->gl_flags有GLF_BLOCKING, 设置DLM_LKF_QUECVT
+
+** gdlm_lock(gfs2_glock, req_state, flags)
+   - 映射request mode 
+   > make_mode(req_state)
+   - 构造flag 
+   > make_flags(gfs2_glock, flags, req)
+   - 统计数
+   > gfs2_glstats_inc(gfs2_glock, GFS2_LKS_DCOUNT)
+   - 如果gfs2_glock->dlm_lksb->sb_lkid !=0, 更新他的请求时间? gfs2_glock->gl_dstamp
+   > gfs2_update_request_times(gfs2_glock)
+   - 否则构造dlm的锁name
+   - 发送dlm 
+   > dlm_lock(gfs2_glock->ls_dlm, req, gfs2_glock->dlm_lksb, lkf, strname, namelen, 0, gdlm_ast, gfs2_glock, gdlm_bast)
+
+** gdlm_put_lock(gfs2_glock)
+   - 是否gfs2_glock
+   - 如果gfs2_glock->dlm_lksb->sb_lkid ==0, 直接释放锁
+   > gfs2_glock_free(gfs2_glock)
+   - 否则需要dlm资源? 
+   > 清除gfs2_glock->gl_flags的GLF_BLOCKING
+   - 更新时间
+   > gfs2_update_request_times(gfs2_glock)
+   - 如果gfs2_glock锁是LM_ST_EXCLUSIVE, 而且他的lvb有效,需要使用unlock,写回lvb
+   - 如果不需要写回,而且gfs2_sbd->sd_flags 有SDF_SKIP_DLM_UNLOCK, 不需要操作dlm
+   - 发送unlock请求
+   > dlm_unlock(gfs2_glock->sd_lockstruct->ls_dlm, gfs2_glock->dlm_lksb->sd_lkid, DLM_LKF_VALBLK, NULL, gfs2_glock)
+
+** gdlm_cancel(gfs2_glock)
+   - 发送cancel请求
+   > dlm_unlock(lm_lockstruct->dlm_ls, lkid, DLM_LKF_CANCEL, NULL, gfs2_glock)
+
+** dlm_controld
+   - dlm_controld应该是dlm用户态的线程,监视集群状态, members change
+   - dlm_controld会停止dlm的活动
+   - dlm内核任务会通知gfs2?  recover_prep
+   - dlm_controld启动内核的dlm_recoverd, 恢复内核的dlm信息
+   - dlm_recoverd通知gfs2,那些节点失败
+   - gfs2_control更新control_lock lvb?
+   - gfs2_control控制journal
+   - gfs2_recover处理失败节点的journal, 已经写回磁盘的journal
+   - gfs2_recover给gfs2_control recovery的信息
+   - gfs2_control会阻止lock的请求
+   
+   - parallel recovery, 并行恢复动作, 所有节点尝试更新control_lock lvb, generation number, jid, 当第一个获取锁的node去做这些事情
+
+   
+** control_lvb_read(lm_lockstruct, lvb_gen, lvb_bits)
+   - 从lm_lockstruct->ls_control_lvb中去读lvb_gen, 类型是uint32, 还有lvb_bits,长度是GDLM_LVB_SIZE
+
+** control_lvb_write(lm_lockstruct, lvb_gen, lvb_bits)
+   - 把gen/bits写道lm_lockstruct->ls_control_lvb中
+
+** all_jid_bits_clear(lvb)
+   - 检查lvb的(JID_BITMAP_OFFSET, GDLM_LVB_SIZE)中间全是0
+
+** sync_wait_cb(arg)
+   - arg是lm_lockstruct, 唤醒等待的任务
+   > complete(lm_lockstruct->ls_sync_wait)
+
+** sync_unlock(gfs2_sbd, dlm_lksb, name)
+   - 同步unlock请求?
+   > dlm_unlock(lm_lockstruct->ls_dlm, dlm_lksb->sb_lkid, 0, dlm_lksb, dlm_ls)
+   - 等待lm_lockstruct->ls_sync_wait
+   > wait_for_completion(lm_lockstruct->ls_sync_wait)
+   - 哪里调用sync_wait_cb?
+
+** sync_lock(gfs2_sbd, mode, flags, num, dlm_lksb, name)
+   - 构造锁名字, LM_TYPE_NONDISK和name一块, 这是专有的锁请求?
+   - 发送请求
+   > dlm_lock(lm_lockstruct->dlm_ls, mode, dlm_lksb, flags, strname, namelen, 0, sync_wait_cb, dlm_ls, NULL)
+   - 等待回调
+   > wait_for_completion(lm_lockstruct->ls_sync_wait)
+   - 结果是dlm_lksb->sb_status 
+
+** mounted_unlock(gfs2_sbd)
+   - 原来是mounted_lock 
+   > sync_unlock(gfs2_sbd, lm_lockstruct->ls_mounted_lksb, "mounted_lock")
+
+** mounted_lock(gfs2_sbd, mode, flags)
+   > sync_lock(gfs2_sbd, mode, flags, GFS2_MOUNTED_LOCK, lm_lockstruct->ls_mounted_lksb, "mounted_lock"
+
+** control_unlock(gfs2_sbd) / control_lock
+   - 这里是control_lock 
+
+** gfs2_control_func(work_struct)
+   - 参数work_struct是gfs2_sbd->sd_control_work->work_struct
+   - 这是什么操作?
+   - 首先检查lm_lockstruct->ls_recover_flags
+   - 如果没有DFL_MOUNT_DONE, 或者有DFL_FIRST_MOUNT, 说明mount操作没有完成, 直接退出?
+   - lm_lockstruct->ls_recover_block和ls_recover_start表示什么?
+   - 锁住control?? 
+   > control_lock(gfs2_sbd, DLM_LOCK_EX, DLM_LKF_CONVERT|DLM_LKF_VALBLK)
+   - 获取lvb
+   > control_lvb_read(lm_lockstruct, lvb_gen, lm_lockstruct->ls_lvb_bits)
+   - lm_lockstruct->ls_recover_block / ls_recover_start 和lvbgen是什么数据?
+   - 如果lvb_gen <= start_gen, 表示有些recover工作已经完成? 
+   - 根据lm_lockstruct->ls_recover_result, 设置lm_lockstruct->ls_lvb_bits
+   - 如果ls_recover_result[i] == LM_RD_SUCCESS, 把ls_lvb_bits的位设为0
+   - 然后根据需要把ls_lvb_bits数据写回到lvb中,并释放锁
+   > control_lvb_write(lm_lockstruct, start_gen, lm_lockstruct->ls_lvb_bits)
+   > control_lock(gfs2_sbd, DLM_LOCK_NL, flags)
+   - 然后根据lm_lockstruct->ls_lvb_bits去做恢复工作? 
+   > gfs2_recover_set(gfs2_sbd, i)
+   - 如果block_gen / start_gen 还是和lm_lockstruct->ls_recover_block/start一样, recover工作完成
+   - 去掉lm_lockstruct->ls_recover_flags的DFL_BLOCK_LOCKS, 恢复所有的gfs2_glock 
+   > gfs2_glock_thaw(gfs2_sbd)
+
+** control_mount(gfs2_sbd)
+   - 在mount时的操作, 和其他node同步?
+   - 初始化lm_lockstruct->ls_mounted_lksb, ls_control_lksb
+   - ls_control_lksb->sb_lvbptr = ls_control_lvb
+   - 设置lm_lockstruct->ls_recover_flags的DFL_BLOCK_LOCKS
+   - 获取control lock , 读取lvb
+   > control_lock(gfs2_sbd, DLM_LOCK_NL, DLM_LKF_VALBLK)
+   - 获取mount lock 
+   > mounted_lock(gfs2_sbd, DLM_LOCK_NL, 0)
+   - 提升control lock
+   > control_lock(gfs2_sbd, DLM_LOCK_EX, DLM_LKF_CONVERT|DLM_LKF_NOQUEUE|DLM_LKF_VALBLK)
+   - 提升mount lock , 首先是ex锁
+   > mounted_lock(gfs2_sbd, DLM_LOCK_EX, DLM_LKF_CONVERT|DLM_LKF_NOQUEUE)
+   - 读取control lvb 
+   > control_lvb_read(lm_lockstruct, lvb_gen, lm_lockstruct->ls_lvb_bits)
+   - 如果上面获取mount ex锁成功, 清除lm_lockstruct->ls_recover_flags的DFL_BLOCK_LOCKS, 设置DFL_MOUNT_DONE, DFL_FIRST_MOUNT, 返回
+   - 如果ex锁获取不到,尝试pr
+   > mounted_lock(gfs2_sbd, DLM_LOCK_PR, DLM_LKF_CONVERT|DLM_LKF_NOQUEUE)
+   - 然后读取lvb_gen, lv_lvb_bits
+   - 然后释放control lock 
+   > control_lock(gfs2_sbd, DLM_LOCK_NL, DLM_LKF_CONVERT)
+   - 如果lm_lockstruct->ls_lvb_bits不是全0, 说明有别人在mount?? 重新获取control/mount的锁
+   - 如果lm_lockstruct->ls_recover_mount > lvb_gen, 也要重新获取锁?? gen代表什么?
+   - lvb_gen != ls_recover_start 或ls_recvoer_block | ls_recover_start, 都需要重新获取锁
+   - 否则,可以继续自己的mount
+
+** dlm_recover_wait(void *)
+   > schedule
+
+** control_first_done(gfs2_sbd)
+   - 应该是第一个mount操作完成后的动作, 唤醒其他等待的node
+   - 检查lm_lockstruct, 如果ls_recover_flags包括DFL_BLOCK_LOCKS, 不包括DFL_MOUNT_DONE,DFL_FIRST_MOUNT, 返回错误
+   - 如果ls_recover_start == ls_recover_block, 等待recover完成
+   > wait_on_bit(lm_lockstruct->ls_recover_flags, DFL_DLM_RECOVERY, dlm_recovery_wait, TASK_UNINTERRUPTIBLE)
+   - 清除ls_recover_flags的DFL_FIRST_MOUNT, 设置DFL_FIRST_MOUNT_DONE
+   - 清除lm_lockstruct->ls_recover_submit, ls_recover_result
+   - 清除lm_lockname->ls_lvb_bits
+   - 写control lvb, 需要通知其他人
+   - 首先获取PR锁
+   > mounted_lock(gfs2_sbd, DLM_LOCK_PR, DLM_LKF_CONVERT)
+   - 然后通过convert, 写回lvb 
+   > mounted_lock(DLM_LOCK_NL, DLM_LKF_CONVERT|DLM_LKF_VALBLK)
+
+** set_recover_size(gfs2_sbd, dlm_slot, num_slots)
+   - dlm_slot表示node个数?? 这里使用他决定journal的个数?
+   - 遍历dlm_slot, 选择最大的dlm_slot->slot, 作为max_jid
+   - 如果lm_lockstruct->ls_recover_size < max_jid, 需要重新创建lm_lockstruct->ls_recover_submit, ls_recover_result
+   - ls_lockstruct->ls_recover_size += RECOVER_SIZE_INC
+
+** gdlm_recover_prep(void *)
+   - 在dlm recover之前调用,参数是gfs2_sbd
+   - lm_lockstruct->ls_recover_block = ls_recover_start
+   - 设置lm_lockstruct->ls_recover_flags的DFL_DLM_RECOVERY
+   - 如果ls_recover_flags有DLM_MOUNT_DONE而且没有DFL_FIRST_MOUNT, 设置DFL_BLOCK_LOCKS
+
+** gdlm_recover_slot(arg, dlm_slot)
+   - 在recover_prep完成只会调用,这是lockspace member已经recover, 确定failed members
+   - 设置lm_lockstruct->ls_recover_submit[jid] = lm_lockstruct->ls_recover_block
+
+** gdlm_recover_done(arg, dlm_slot, num_slot, our_slot, generation)
+   - 在lock recovery调用?
+   - 设置recover size ? 
+   > set_recover_size(gfs2_sbd, dlm_slot, num_slots)
+   - 设置lm_lockstruct->ls_recover_start = generation, 这里设置start
+   - 如果lm_lockstruct->ls_recover_mount ==0, 设置为generation
+   - 提交control work 
+   > queue_delayed_work(gfs2_control_wq, gfs2_sbd->sd_control_work, 0)
+   - recovery完成? 
+   - 去掉lm_lockstruct->ls_recover_flags的DFL_DLM_RECOVERY
+   - 唤醒等待的任务
+   > wake_up_bit(lm_lockstruct->ls_recover_flags, DFL_DLM_RECOVERY)
+
+** gdlm_recovery_result(gfs2_sbd, jid, result)
+   - 如果jid == lm_lockstruct->ls_jid, 不处理自己的journal? 直接返回
+   - 如果lm_lockstruct->ls_recover_flags 有DFL_FIRST_MOUNT, 直接返回??
+   - 如果jid + 1 > lm_lockstruct->ls_recover_size, 返回.. jid太大??
+   - 设置lm_lockstruct->ls_recover_result[jid] = result
+   - resule表示处理jid代表的journal的结果?
+   - 提交control work , 如果result==LM_RD_GAVEUP, 等待1s
+   > queue_delayed_work(gfs2_control_wq, gfs2_sbd->sd_control->work, HZ/0)
+
+** dlm_lockspace_ops gdlm_lockspace_ops
+   - 上面三个函数构成这一个gdlm_lockspace_ops
+
+** gdlm_mount(gfs2_sbd, char *table)
+   - 初始化gfs2_sbd->lm_lockstruct
+   - gfs2_sbd->sd_control_work使用的函数是gfs2_control_func, 他去和别的node交互,恢复fail member的journal
+   - 设置recover size 
+   > set_recover_size(gfs2_sbd, NULL, 0)
+   - 根据table构造dlm_ls 
+   > dlm_new_lockspace(fsname, cluster, flags, GDLM_LVB_SIZE, gdlm_lockspace_ops, gfs2_sbd, ops_result, lm_lockstruct->dlm_ls)
+   - 启动control mount dlm操作? 
+   > control_mount(gfs2_sbd)
+   - 设置lm_lockstruct->ls_first = lm_lockstruct->ls_recover_flags & DFL_FIRST_MOUNT
+   - 清除dlm_sbd->sd_flags的SDF_NOJOURNALID
+   > wake_up_bit(gfs2_sbd->sd_flags, SDF_NOJOURNALID)
+
+** gdlm_first_done(gfs2_sbd)
+   - 调用dlm的操作??
+   > control_first_done(gfs2_sbd)
+
+** gdlm_unmount(gfs2_sbd)
+   - 设置lm_lockstruct->ls_recover_flags的DFL_UMOUNT
+   > flush_delayed_work(gfs2_sbd->sd_control_work)
+
+** lm_lockops gfs2_dlm_ops
+   - 这个文件构造了gfs2_dlm_ops
+
+* glops.c
+  - 这里是gfs2_glock_operations操作, 目前一共有9种gfs2_glock
+
+
+** gfs2_bufdata
+   #+begin_src 
+	struct buffer_head *bd_bh;
+	struct gfs2_glock *bd_gl;
+	u64 bd_blkno;
+
+	struct list_head bd_list;    //gfs2_sbd->sd_log_le_revoke链表
+	const struct gfs2_log_operations *bd_ops;
+
+	struct gfs2_trans *bd_tr;
+	struct list_head bd_ail_st_list;
+	struct list_head bd_ail_gl_list;   //gfs2_glock->gl_ail_list链表
+   #+end_src
+
+** __gfs2_ail_flush(gfs2_glock, fsync)
+   - gfs2_glock->gl_ail_list里面是gfs2_bufdata, 遍历gfs2_bufdata,  
+   - 检查gfs2_bufdata->buffer_head->b_state, 如果包含BH_Dirty|BH_Pinned|BH_Lock, 不能处理??
+   - 把gfs2_bufdata放到专门的log链表中?
+   > gfs2_trans_add_revoke(gfs2_sbd, gfs2_bufdata)
+
+** gfs2_trans
+   #+begin_src 
+	unsigned long tr_ip;
+
+	unsigned int tr_blocks;
+	unsigned int tr_revokes;
+	unsigned int tr_reserved;
+
+	struct gfs2_holder tr_t_gh;
+
+	int tr_touched;
+	int tr_attached;
+
+	unsigned int tr_num_buf_new;
+	unsigned int tr_num_databuf_new;
+	unsigned int tr_num_buf_rm;
+	unsigned int tr_num_databuf_rm;
+	unsigned int tr_num_revoke;
+	unsigned int tr_num_revoke_rm;
+
+	struct list_head tr_list;
+
+	unsigned int tr_first;
+	struct list_head tr_ail1_list;
+	struct list_head tr_ail2_list;   
+   #+end_src
+
+** gfs2_ail_empty_gl(gfs2_glock)
+   - 构造gfs2_trans, 把ail写回磁盘?? 
+   - gfs2_trans->tr_revokes = gfs2_glock->gl_ail_count, 计算gfs2_trans使用的空间 gfs2_trans->tr_reserved
+   > gfs2_strunct2blk(gfs2_sbd, gfs2_trans->tr_revokes, sizeof(u64))
+   - 预留空间
+   > gfs2_log_reserve(gfs2_sbd, gfs2_trans->tr_revokes)
+   - 处理ail 
+   > __gfs2_ail_flush(gfs2_glock, 0)
+   - flush 
+   > gfs2_log_flush(gfs2_sbd, 0)
+
+** gfs2_ail_flush(gfs2_glock, fsync)
+   - 先检查gfs2_glock->gl_ail_count, 如果为0, 不用flush
+   - 使用trans, 而且要获取gfs2_glock 
+   > gfs2_trans_begin(gfs2_sbd, 0, revokes)
+   - 处理block 
+   > __gfs2_ail_flush(gfs2_glock, fsync)
+   - 结束trans 
+   > gfs2_trans_end(gfs2_sbd)
+   - flush 
+   > gfs2_log_flush(gfs2_sbd, NULL)
+
+** rqrp_go_sync(gfs2_glock)
+   - 写回gfs2_glock使用的metadata, 在demote或释放EX锁时调用.
+   - 检查gfs2_glock->gl_flags的GFL_DIRTY, 如果没有脏数据,不再处理
+   - gfs2_glock->gl_state 必须是LM_ST_EXCLUSIVE
+   - flush 数据
+   > gfs2_log_flush(gfs2_glock->gl_sbd, gfs2_glock)
+   - 写回address_space?  用来保存metadata?  
+   > filemap_fdatawrite(address_space)
+   - 等待写完
+   > filemap_fdatawait(address_space)
+   - 清空的的buffer_head和上面不一样? 
+   > gfs2_ail_empty_gl(gfs2_glock)
+   - gfs2_glock->gl_object是gfs2_rgrpd, 释放资源
+   > gfs2_free_clones(gfs2_rgrqd)
+
+** rgrq_go_inval(gfs2_glock, flags)
+   - resource group应该是metadata, address_space应该是block inode使用的
+   - 清除他的page? 
+   > truncate_inode_pages(address_space, 0)
+   - 去掉gfs2_rgrpd->rd_flags的GFS2_RDF_UPTODATE
+
+** inode_go_sync(gfs2_glock)
+   - gfs2_glock关联gfs2_inode, 写回metadata, data
+   - 如果gfs2_inode->i_flags有GIF_SW_PAGED, 释放mapping? 
+   > unmap_shared_mapping_range(inode->address_space, 0, 0)
+   - 检查gfs2_glock->gl_flags的GFL_DIRTY, 如果没有脏数据,不再处理
+   - 写回log? 
+   > gfs2_log_flush(gfs2_glock->gfs2_sbd, gfs2_glock)
+   - 下面操作2个address_space , 一个是gfs2_glock使用的
+   > filemap_fdatawrite(address_space)
+   - 还有gfs2_inode->inode->i_mapping
+   > filemap_fdatawait(address_space)
+   - 写回ail 
+   > gfs2_ail_empty_gl(gfs2_glock)
+
+** inode_go_inval(gfs2_glock, flags)
+   - 准备释放inode glock
+   - 处理dio ?  flags & DIO_METADATA
+   - 获取gfs2_glock的address_space 
+   > gfs2_glock2aspace(gfs2_glock)
+   - 释放他的page 
+   > truncate_inode_pages(address_space, 0)
+   - 设置gfs2_inode->i_flags的GIF_INVALID, 释放acl
+   > gfs2_dir_hash_inval(gfs2_inode)
+   - 如果gfs2_inode是gfs2_sbd->sd_rindex, 这是什么文件?
+   - 写回log? 
+   > gfs2_log_flush(gfs2_glock->gfs2_sbd, NULL)
+   - 释放gfs2_inode的数据
+   > truncate_inode_pages(address_space, 0)
+
+** inode_go_demote_ok(gfs2_glock)
+   - 检查是否可以unlock inode glock
+   - 如果gfs2_glock->gl_object是gfs2_sbd->sd_jindex或者gfs2_sbd->sd_rindex, 不准demote
+   - 而且gfs2_glock->gl_holder的gfs2_holder超过1个, 不准demote
+
+** gfs2_set_nlink(inode, nlink)
+   - nlink是从磁盘中读取的数据,设置inode->i_nlink
+   - 如果nlink == 0 , 增加super_block计数
+   > clear_nlink(inode)
+   > set_nlink(inode, nlink)
+
+** gfs2_dinode_in(gfs2_inode, buf)
+   - buf是gfs2_dinode, inode在磁盘中的格式
+   - 检查gfs2_inode->i_no_addr == gfs2_dinode->gfs2_inum->no_addr, 如果不一致,严重错误.
+   - 设置gfs2_inode->i_no_formal_info , inode->i_mode, i_rdev = 0, i_mode, i_uid, i_gid等
+
+** gfs2_inode_refresh(gfs2_inode)
+   - 根据gfs2_inode->i_no_addr读取buffer_head
+   > gfs2_meta_inode_buf(gfs2_inode, buffer_head)
+   - 然后组装inode 
+   > gfs2_dinode_in(gfs2_inode, buffer_head->b_data)
+   - 释放buffer_head 
+   > brelse(buffer_head)
+   - 清除gfs2_inode->i_flags的GIF_INVALID
+
+** inode_go_lock(gfs2_holder)
+   - 锁住inode之后的处理
+   - 如果gfs2_holder->gfs2_glock->gl_object还没有关联gfs2_inode, 或者gfs2_holder->gh_flags & GL_SKIP, 不处理
+   - 检查gfs2_inode->i_flags的GIF_INVALID, 重新读取数据
+   > gfs2_inode_refresh(gfs2_inode)
+   - 检查truncate??
+   - 如果gfs2_inode->i_diskflags & GFS2_DIF_TRUNC_IN_PROG, 而且gfs2_glock->gl_state == LM_ST_EXCLUSIVE 而且gfs2_holder->gh_state  == LM_ST_EXCLUSIVE, 把gfs2_inode->i_trunc_list放到gfs2_sbd->sd_turnc_list中
+   - 而且唤醒quota??
+
+** inode_go_dump(seq_file, gfs2_glock)
+   - 打印gfs2_glock->gfs2_inode信息
+
+** trans_go_sync(gfs2_glock)
+   - 写回sync信息?
+   - 如果gfs2_glock->gl_state != LM_ST_UNLOCKED, 而且gfs2_sbd->sd_flags & SDF_JOURNAL_LIVE, 才处理
+   > gfs2_meta_syncfs(gfs2_sbd)
+   > gfs2_log_shutdown(gfs2_sbd)
+
+** trans_go_xmote_bh(gfs2_glock, gfs2_holder)
+   - 在promote/demote之后的操作? 
+   - 如果gfs2_sbd->sd_flags包含SDF_JOURNAL_LIVE, 才处理? 
+   > gfs2_glock->gfs2_glock_operations->go_inval(gfs2_glock, DIO_METADATA)
+   - 操作gfs2_log_header_host 
+   > gfs2_find_jhead(gfs2_sbd->sd_jdesc, gfs2_log_header_host)
+   - 设置gfs2_sbd->sd_log_sequence = gfs2_log_header_host->lh_sequence + 1
+   > gfs2_log_pointers_init(gfs2_sbd, gfs2_log_header_host->lh_blkno)
+
+** trans_go_demote_ok(gfs2_glock)
+   - return 0
+
+** iopen_go_callback(gfs2_glock, remote)
+   - 如果remote ==0, 或者readonly, gfs2_sbd->sd_vfs->s_flags & MS_RDONLY, 不处理
+   - 如果gfs2_glock->gl_demote_state == LM_ST_UNLOCKED, 而且gfs2_glock->gl_state == LM_ST_SHARED, 从share降到unlocked, 提交gfs2_glock->gl_delete? 
+   > queue_work(gfs2_delete_workqueue, gfs2_glock->gl_delete)
+
+** gfs2_glocks_list
+   - 这里有8中gfs2_glock, 但只有gfs2_inode_glops, gfs2_rgrq_glops, gfs2_trans_glops, gfs2_iopen_glops有相关回调函数,其他仅有go_type/go_flags??

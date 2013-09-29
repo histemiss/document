@@ -1,0 +1,550 @@
+
+* delayed-inode.c
+
+** btrfs_delayed_root
+   #+begin_src 
+   	spinlock_t lock;
+	struct list_head node_list;
+	/*
+	 * Used for delayed nodes which is waiting to be dealt with by the
+	 * worker. If the delayed node is inserted into the work queue, we
+	 * drop it from this list.
+	 */
+	struct list_head prepare_list;
+	atomic_t items;		/* for delayed items */
+	atomic_t items_seq;	/* for delayed items */
+	int nodes;		/* for delayed nodes */
+	wait_queue_head_t wait;
+
+
+   #+end_src
+** btrfs_delayed_node
+   #+begin_src 
+	u64 inode_id;
+	u64 bytes_reserved;
+	struct btrfs_root *root;
+	/* Used to add the node into the delayed root's node list. */
+	struct list_head n_list;
+	/*
+	 * Used to add the node into the prepare list, the nodes in this list
+	 * is waiting to be dealt with by the async worker.
+	 */
+	struct list_head p_list;
+	struct rb_root ins_root;  //里面是btrfs_delayed_item
+	struct rb_root del_root;
+	struct mutex mutex;
+	struct btrfs_inode_item inode_item;   //这个叶子节点要放到哪个树?
+	atomic_t refs;
+	u64 index_cnt;
+	bool in_list;
+	bool inode_dirty;
+	int count;
+        // btrfs_delayed_node属于某个btrfs_inode, 同时它被btrfs_root->delayed_nodes_tree管理, 使用ino索引radix tree. 它还被btrfs_fs_info->btrfs_delayed_root管理, 使用2个队列
+   #+end_src
+
+** btrfs_delayed_item
+   #+begin_src 
+   	struct rb_node rb_node;
+	struct btrfs_key key;
+	struct list_head tree_list;	/* used for batch insert/delete items */
+	struct list_head readdir_list;	/* used for readdir items */
+	u64 bytes_reserved;
+	struct btrfs_delayed_node *delayed_node;
+	atomic_t refs;
+	int ins_or_del;
+	u32 data_len;
+	char data[0];
+
+   #+end_src
+
+** btrfs_delayed_inode_init()
+   - btrfs_delayed_node的对象使用delayed_node_cache管理..
+
+** btrfs_init_delayed_node(btrfs_delayed_node, btrfs_root, inode_id)
+   - 初始化btrfs_delayed_node, 只设置btrfs_root/inode_id.
+
+** btrfs_is_continuous_delayed_item(btrfs_delayed_item, btrfs_delayed_item)
+   - 两个btrfs_delayed_item是否连续. btrfs_key是否连续, type都是BTRFS_DIR_INDEX_KEY, objectid相同, offset连续.. btrfs_key指向btrfs_dir_item
+
+** btrfs_get_delayed_root(btrfs_root)
+   - 获取btrfs_root->btrfs_fs_info->delayed_root
+
+** btrfs_get_delayed_node(inode)
+   - 获取btrfs_inode->delayed_node, 如果有效,直接返回
+   - 如果还没有关联,在btrfs_root中找一个.
+   > radix_tree_lookup(btrfs_root->delayed_nodes_tree, ino)
+   - 把它和btrfs_inode->delayed_node关联起来..
+
+** btrfs_get_or_create_delayed_node(inode)
+   - 先查找,然后再创建.
+   > btrfs_get_delayed_node(inode)
+   > kmem_cache_alloc(delayed_node_cache, GFP_NOFS)
+   > btrfs_init_delayed_node(btrfs_delayed_node, btrfs_root, ino)
+   > radix_tree_insert(btrfs_root->delayed_nodes_tree, ino, btrfs_delayed_node)
+
+** btrfs_queue_delayed_node(btrfs_delayed_root, btrfs_delayed_node, mod)
+   - btrfs_delayed_node->in_list表示它是否在btrfs_delayed_root管理之下. 
+   - 如果btrfs_delayed_node->in_list有效,btrfs_delayed_node->n_list已经在队列中,修改btrfs_delayed_node->p_list的位置. 如果p_list在队列中,把他移到prepare_list队尾,否则mod为1,添加到btrfs_delayed_root->prepare_list中. mod为0, 而且不在队列中也不处理.
+   - 如果in_list无效,btrfs_delayed_node->n_list放到btrfs_delayed_root->node_list, p_list到prepare_list中. 增加btrfs_delayed_root->nodes, 设置in_list=1
+
+** btrfs_dequeue_delayed_node(btrfs_delayed_root, btrfs_delayed_node)
+   - 释放btrfs_delayed_node和btrfs_delayed_root的关系 
+   - 判断in_list,无效时直接返回.
+   - btrfs_delayed_root->in_list/n_list/p_list, btrfs_delayed_root->nodes减小..
+
+** btrfs_first_delayed_node(btrfs_delayed_root)
+   - 从btrfs_delayed_root->node_list中取出第一个btrfs_delayed_node节点. 
+
+** btrfs_next_delayed_node(btrfs_delayed_node)
+   - 找到btrfs_delayed_node的下一个节点. 如果btrfs_delayed_item->in_list无效,检查btrfs_delayed_root->node_list第一个(n_list)
+   - 如果btrfs_delayed_node->n_list是node_list的最后一个节点,返回NULL
+   - 否则返回n_list下一个节点.
+
+** __btrfs_release_delayed_node(btrfs_delayed_node, mod)
+   - 检查btrfs_delayed_node->count, 如果有效，把他放到btrfs_delayed_root管理下
+   > btrfs_queue_delayed_node(btrfs_delayed_root, btrfs_delayed_node, mod)
+   - 否则释放它和btrfs_delayed_root的关系
+   > btrfs_dequeue_delayed_node(btrfs_delayed_root, btrfs_delayed_node)
+   - 释放它的使用计数 btrfs_delayed_node->refs --, 如果减到0,从radix tree中释放,最后回收内存. 上面也应该是释放关系. 释放它和btrfs_root的关系.
+   > radix_tree_delete(btrfs_delayed_root->delayed_nodes_tree, btrfs_delayed_node->inode_id)
+   
+** btrfs_release_delayed_node(btrfs_delayed_node)
+   - mod是0,btrfs_delayed_node对应的btrfs_inode没有修改?
+   > __btrfs_release_delayed_node(btrfs_delayed_node, 0)
+
+*** 上面处理btrfs_delayed_node和btrfs_delayed_root
+
+** btrfs_alloc_delayed_item(data_len)
+   - 创建btrfs_delayed_item对象, 数据结构后面是数据?什么意义?
+
+** __btrfs_lookup_delayed_item(rb_root, btrfs_key, btrfs_delayed_item prev, btrfs_delayed_item next)
+   - rb_root中是使用btrfs_key索引的btrfs_delayed_item.
+   > btrfs_comp_cpu_keys(btrfs_delayed_item->key)
+   - 参数的2个指针在查询失败时,用于返回2个相邻的btrfs_delayed_item
+
+** __btrfs_lookup_delayed_insertion_item(btrfs_delayed_node, btrfs_key)
+   - rb_tree是btrfs_delayed_node->ins_root
+   -> __btrfs_lookup_delayed_item(btrfs_delayed_node->ins_root)
+
+** __btrfs_lookup_delayed_deletion_item(btrfs_delayed_node, btrfs_key)
+   - 在btrfs_delayed_node->del_root中找btrfs_delayed_item..
+
+** __btrfs_search_delayed_insert_item(btrfs_delayed_node, btrfs_key)
+   > __btrfs_lookup_delayed_item(btrfs_delayed_node->ins_root, btrfs_key, NULL, next)
+   - 如果找不到合适的,就使用next
+
+** __btrfs_search_delayed_deletion_item(btrfs_delayed_node, btrfs_key)
+   - 和上面一样..
+
+** __btrfs_add_delayed_item(btrfs_delayed_node, btrfs_delayed_item, action)
+   - action是BTRFS_DELAYED_INSERTION_ITEM / BTRFS_DELAYED_DELETION_ITEM,它决定操作那个rb_root.
+   - 在btrfs_delayed_node的ins_root/del_root中找对应的btrfs_delayed_item->btrfs_key, 如果找到就返回EEXIST
+   - 如果没找到就把它插到树中.
+   > rb_link_node(rb_node, parent_node, p)
+   > rb_insert_color(rb_node, rb_root)
+   - 如果是BTRFS_DIR_INDEX_KEY / BTRFS_DELAYED_INSERT_ITEM,需要修改btrfs_delayed_node->index_cnt = btrfs_key->offset + 1, 这是目录的index,以后需要用.
+   - 增加btrfs_delayed_node->count, btrfs_delayed_root->items
+
+** __btrfs_add_delayed_insertion_item(btrfs_delayed_node, btrfs_delayed_item)
+   - 记录插入的item
+   > __btrfs_add_delayed_item(btrfs_delayed_node, btrfs_delayed_item, BTRFS_DELAYED_INSERTION_ITEM)
+
+** __btrfs_add_delayed_deletion_item(btrfs_delayed_node, btrfs_delayed_item)
+   - 记录删除的item
+
+** finish_one_item(btrfs_delayed_root)
+   - 在处理了btrfs_delayed_item之后, 判断是否需要唤醒
+   - btrfs_delayed_root->items < BTRFS_DELAYED_BACKGROUND / 128
+   - btrfs_delayed_root->items_seq % BTRFS_DELAYED_BATCH = 0
+   - 唤醒btrfs_delayed_root->wait上等待的任务.
+
+** __btrfs_remove_delayed_item(btrfs_delayed_item)
+   - 从btrfs_delayed_node中释放btrfs_delayed_item
+   > rb_erase(btrfs_delayed_node->ins_root/del_root, btrfs_delayed_item)
+   - 减小btrfs_delayed_node->count, 下面的函数里面会减小btrfs_delayed_root->items
+   > finish_one_item(btrfs_delayed_root)
+
+** btrfs_release_delayed_item(btrfs_delayed_item)
+   > __btrfs_remove_delayed_item(btrfs_delayed_item)
+   - 如果btrfs_delayed_item->refs减为0,就回收内存
+
+** __btrfs_first_delayed_insertion_item(btrfs_delayed_node)
+   - 找到btrfs_delayed_node->ins_root树中的第一个btrfs_delayed_item. rb tree操作.
+
+** __btrfs_first_delayed_deletion_item(btrfs_delayed_node)
+   - 处理del_root树...
+
+** __btrfs_next_delayed_item(btrfs_delayed_item)
+   - 处理rb_tree中的下一个btrfs_delayed_item..
+   > rb_next(btrfs_delayed_item->rb_node)
+
+** btrfs_get_fs_root(btrfs_root, root_id)
+   - 查找btrfs_root, 先检查参数的btrfs_root->objectid和root_id. 
+   - 构造btrfs_key(BTRFS_ROOT_ITEM_KEY, root_id, -1)
+   > btrfs_read_fs_root_no_name(btrfs_root->btrfs_fs_info, btrfs_key)
+
+*** 上面介绍btrfs_delayed_root和btrfs_delayed_item关系
+
+** btrfs_delayed_item_reserve_metadata(btrfs_trans_handle, btrfs_root, btrfs_delayed_item)
+   - btrfs_trans_handle->bytes_reserved表示什么? 应该是btrfs_trans_handle->btrfs_block_rsv使用的空间?
+   - 欲留metadata的空间, 修改btree的操作, 具体是什么?
+   > btrfs_calc_trans_metadata_size(btrfs_root, 1)
+   - 把btrfs_trans_handle的欲留空间给btrfs_fs_info->delayed_block_rsv, 使用btrfs_delayed_item->bytes_reserved记录空间大小.
+   > btrfs_block_rsv_migrate(btrfs_trans_handle->block_rsv, btrfs_fs_info->delayed_block_rsv, num_bytes)
+
+** btrfs_delayed_item_release_metadata(btrfs_root, btrfs_delayed_item)
+   - 释放之前欲留的空间, 给了btrfs_fs_info->global_block_rsv. 奇怪释放reserve空间时减小size, 分配reserve空间是减小reserve,只有填充reserve空间时增加2者.
+   > btrfs_block_rsv_release(btrfs_root, btrfs_block_rsv, btrfs_delayed_item->bytes_reserved)
+
+** btrfs_delayed_inode_reserve_metadata(btrfs_trans_handle, btrfs_root, inode, btrfs_delayed_node)
+   - 需要为delayed操作预留空间,把空间给btrfs_fs_info->delayed_block_rsv. 
+   - 计算空间大小, 还是btree操作?
+   > btrfs_calc_trans_metadata_size(btrfs_root, 1)
+   - 先找从哪里预留, 检查btrfs_trans_handle->block_rsv. 如果它无效,或者btrfs_block_rsv->bytes_reserved为0, 或者btrfs_block_rsv->type不是BTRFS_BLOCK_RSV_DELALLOC, 去btrfs_space_info中分配空间, btrfs_space_info->bytes_may_use.
+   > btrfs_block_rsv_add(btrfs_root, btrfs_block_rsv/delayed_block_rsv, num_bytes, BTRFS_RESERVE_NO_FLUSH)
+   - 如果btrfs_trans_handle->btrfs_block_rsv->type是BTRFS_BLOCK_RSV_DELALLOC,借用吗?
+   - 去掉btrfs_inode->runtime_flags的BTRFS_INODE_DELALLOC_META_RESERVED, 如果原来已经设置,估计transaction有空间.直接去使用transaction的空间.
+   > btrfs_block_rsv_migrate(btrfs_trans_handle->block_rsv, ...)
+   - 否则还是重新分配
+   > btrfs_block_rsv_add(btrfs_root, btrfs_block_rsv/delayed_block_rsv, num_bytes, BTRFS_RESERVED_NO_FLUSH)
+   - 如果空间不够,从transaction中分配
+   > btrfs_block_rsv_migrate(btrfs_trans_handle->block_rsv, btrfs_fs_info->delayed_block_rsv, num_bytes)
+   - 如果transaction也不够,使用global_block_rsv
+   > btrfs_block_rsv_migrate(btrfs_fs_info->global_block_rsv, btrfs_fs_info->delayed_block_rsv, num_bytes)
+   - 对于其他情况,只会考虑btrfs_trans_handle->block_rsv.
+   - 这里的参数是btrfs_delayed_node, 不是btrfs_delayed_item, 使用btrfs_delayed_node->bytes_reserved记录num_bytes
+   - 最后如果原来有BTRFS_INODE_DELALLOC_META_RESERVED标志,释放btrfs_trans_handle->block_rsv的空间??
+   > btrfs_block_rsv_release(btrfs_root, btrfs_trans_handle->btrfs_block_rsv, num_bytes)
+   - 因为分配只是减小了reserved, 没有改变size, 所以这里减小size?
+   - 太乱!!
+
+** btrfs_delayed_inode_release_metadata(btrfs_root, btrfs_delayed_node)
+   - 释放预留的metadata空间, 把delayed_rsv中的预留空间转移到btrfs_fs_info->global_block_rsv..
+   > btrfs_block_rsv_release(btrfs_root, btrfs_fs_info->delayed_block_rsv, btrfs_delayed_node->bytes_reserved)
+   - 上面的4个函数分成2套,分别针对btrfs_delayed_item / btrfs_delayed_node
+
+** btrfs_batch_insert_items(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_delayed_item)
+   - btrfs_delayed_item里面保存了(btrfs_key/btrfs_item), btrfs_item在btrfs_delayed_item->data中. 这里先btrfs_path指向的leaf节点中,插入合适的对值.
+   - 遍历btrfs_delayed_item后续的一系列节点,检查btrfs_leaf能否容纳这些.
+   > btrfs_leaf_free_space(btrfs_root, extent_buffer)
+   - 检查sizeof(btrfs_item) + btrfs_delayed_item->data_len + total_size <= free_space, 而且btrfs_key连续.
+   > __btrfs_next_delayed_item(btrfs_delayed_item)
+   - 这些都是btrfs_dir_item?
+   > btrfs_is_continueous_delayed_item(btrfs_delayed_item, btrfs_delayed_item)
+   - 写锁extent_buffer, 就是为了防止分配内存时修改数据???
+   > btrfs_set_path_blocking(btrfs_path)
+   - 分配内存,把数据都集中在一块.
+   - 先写btrfs_item
+   > setup_items_for_insert(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_keys, data_size, total_data_size, total_size, nitems)
+   - 然后遍历上面的btrfs_delayed_item,把数据写进去.
+   > write_extent_buffer(extent_buffer, btrfs_delayed_item->data, data_ptr, btrfs_delayed_item->data_len)
+   - 同时释放预留空间, 这得多浪费!
+   > btrfs_delayed_item_release_metadata(btrfs_root, btrfs_delayed_item)
+   > btrfs_release_delayed_item(btrfs_delayed_item)
+
+** btrfs_insert_delayed_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_delayed_item)
+   - 直接插入一个btrfs_delayed_item. 上面是尽量写入,这里只处理一个..
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_delayed_item->btrfs_key, btrfs_delayed_item->data_len)
+   > write_extent_buffer(extent_buffer, btrfs_delayed_item->data, ...)
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - 释放预留空间
+   > btrfs_delayed_item_release_metadata(btrfs_root, btrfs_delayed_item)
+
+** btrfs_insert_delayed_items(btrfs_trans_handle, btrfs_path, btrfs_root, btrfs_delayed_node)
+   - 先插入一个btrfs_delayed_item, 然后再看看是否有剩余的,如果有就尝试插入多个. 
+   - 先获取第一个btrfs_delayed_item
+   > __btrfs_first_delayed_insertion_item(btrfs_delayed_node)
+   > btrfs_insert_delayed_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_delayed_item)
+   - 检查后面的btrfs_delayed_item, 如果连续,就尝试插入多个.
+   > __btrfs_next_delayed_item(btrfs_delayed_item)
+   > btrfs_is_continuous_delayed_item(btrfs_delayed_item, btrfs_delayed_item)
+   - 如果还有其他btrfs_delayed_item, 而且连续,继续写入btree
+   > btrfs_batch_insert_items(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_delayed_item)
+   - 第一个的..
+   > btrfs_release_delayed_item(btrfs_delayed_item)
+
+** btrfs_batch_delete_items(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_delayed_item)
+   - 删除和插入好像类似，不仅考虑btrfs_path中的btrfs_item和btrfs_delayed_item,而且检查后面的item,如果btfs_delayed_item连续,而且叶节点中btrfs_item挨着,就删除多个.
+   > btrfs_item_key_to_cpu(extent_buffer, btrfs_key, i)
+   - 循环处理时先比较btrfs_key
+   > btrfs_comp_cpu_keys(btrfs_key, btrfs_key)
+   > __btrfs_next_delayed_item(btrfs_delayed_item)
+   > btrfs_is_continuous_delayed_item(btrfs_delayed_item, ...)
+   > btrfs_del_items(btrfs_trans_handle, btrfs_root, btrfs_path,  btrfs_path->slots[0], nitems)
+   - 释放预留空间,删除btrfs_delayed_item
+   > btrfs_delayed_item_release_metadata(btrfs_root, btrfs_delayed_item)
+   > btrfs_release_delayed_item(btrfs_delayed_item)
+
+** btrfs_delete_delayed_items(btrfs_trans_handle, btrfs_path, btrfs_root, btrfs_delayed_node)
+   - 删除btrfs_delayed_node管理的btrfs_delayed_item, btrfs_delayed_item不一定有对应的btrfs_key.
+   - 先找到第一个btrfs_delayed_item
+   > __btrfs_first_delayed_deletion_item(btrfs_delayed_node)
+   - 查找对应btree中的btrfs_item
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_delayed_item->btrfs_key, btrfs_path, -1, 1)
+   - 如果查找失败,出现大问题,不再删除.如果找到的不一致,说明btrfs_delayed_item有问题,删除这个节点,处理下一个btrfs_delayed_item
+   > __btrfs_next_delayed_item(btrfs_delayed_item)
+   > btrfs_release_delayed_item(btrfs_delayed_item)
+   - 如果找到合适的,就删除一串. 然后重新开始,直到所有的btrfs_delayed_item都删除.
+   > btrfs_batch_delete_items(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_delayed_item)
+
+*** 先btree中提交btrfs_delayed_node / btrfs_delayed_item, 同时释放预留空间
+
+** btrfs_release_delayed_inode(btrfs_delayed_node)
+   - 上面有类似释放btrfs_delayed_item的操作, 这里貌似释放btrfs_delayed_node和btrfs_inode的关系. 只有btrfs_delayed_node->inode_dirty才操作.
+   - 设置btrfs_delayed_node->inode_dirty = 0, 减小btrfs_delayed_node->count
+   - 触发btrfs_delayed_root的等待工作. 说明延时的操作够少的?
+   > finish_one_item(btrfs_delayed_root)
+
+** __btrfs_update_delayed_inode(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_delayed_node)
+   - 这里还是处理btrfs_delayed_node, 它里面竟然有btrfs_inode_item..
+   - 创建btrfs_key(BTRFS_INODE_ITEM_KEY, inode_id, 0), inode_id是btrfs_delayed_inode->inode_id.
+   > btrfs_lookup_inode(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, 1)
+   - 如果找不到合适的,就退出.
+   - 找到btrfs_inode_item, 把btrfs_delayed_node->btrfs_inode_item覆盖它.
+   > write_extent_buffer(extent_buffer, btrfs_delayed_node->btrfs_inode_item, ...)
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   > btrfs_release_path(btrfs_path)
+   - 最后释放预留空间,并清空btrfs_delayed_node->inode_dirty记录
+   > btrfs_delayed_inode_release_metadata(btrfs_root, btrfs_delayed_node)
+   > btrfs_release_delayed_inode(btrfs_delayed_node)
+
+** btrfs_update_delayed_inode(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_delayed_node)
+   - 先检查btrfs_delayed_node->inode_dirty, 如果没有脏数据,就不再操作.
+   > __btrfs_update_delayed_inode(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_delayed_node)
+
+*** 上面是提交btrfs_delayed_node->btrfs_inode_item数据
+
+** __btrfs_commit_inode_delayed_items(btrfs_trans_handle, btrfs_path, btrfs_delayed_node)
+   - 先btree中提交btrfs_delayed_node管理的信息
+   > btrfs_insert_delayed_items(btrfs_trans_handle, btrfs_path, btrfs_delayed_node->btrfs_root, btrfs_delayed_node)
+   > btrfs_delete_delayed_items(btrfs_trans_handle, ...)
+   > btrfs_update_delayed_inode(btrfs_trans_handle, ...)
+
+** __btrfs_run_delayed_items(btrfs_trans_handle, btrfs_root, nr)
+   - 解释说这个函数在commit transaction时使用, 提交inode相关的延时的btree操作
+   - 准备btrfs_path / btrfs_delayed_root / btrfs_block_rsv 
+   > btrfs_alloc_path()
+   - 在创建btrfs_delayed_node/item时,已经分配预留空间,给btrfs_fs_info->delayed_block_rsv, 这里先切换btrfs_trans_handle->block_rsv.
+   - 循环处理btrfs_fs_info->btrfs_delayed_root中的btrfs_delayed_node, 就是系统中所有的.
+   > btrfs_get_delayed_root(btrfs_root)
+   - 开始循环,循环次数受nr影响, 如果nr=0, 处理所有的,否则循环nr次.
+   > btrfs_first_delayed_node(btrfs_delayed_root)
+   > __btrfs_commit_inode_delayed_items(btrfs_trans_handle, btrfs_path, btrfs_delayed_node)
+   > btrfs_next_delayed_node(btrfs_delayed_node)
+   - 可能会完全释放btrfs_delayed_node, 如果没人使用它
+   > btrfs_release_delayed_node(btrfs_delayed_node)
+   
+** btrfs_run_delayed_items(btrfs_trans_handle, btrfs_root)
+   - 提交所有数据  nr=-1
+   > __btrfs_run_delayed_items(btrfs_trans_handle, btrfs_root, -1)
+
+** btrfs_run_delayed_items_nr(btrfs_trans_handle, btrfs_root, nr)
+   - 包装有意义吗?
+
+** btrfs_commit_inode_delayed_items(btrfs_trans_handle, inode)
+   - 提交一个inode,每个btrfs_inode有一个对应的btrfs_delayed_node, 要检查btrfs_delayed_node->count. 如果为0,说明没有delayed的操作,无需提交.
+   > btrfs_get_delayed_node(inode)
+   > btrfs_alloc_path()
+   > __btrfs_commit_inode_delayed_items(btrfs_trans_handle, btrfs_path, btrfs_delayed_node)
+   > btrfs_release_delayed_node(btrfs_delayed_node)
+   - 提交btrfs_delayed_node, 但过程中要把btrfs_trans_handle->btrfs_block_rsv换掉.
+
+** btrfs_commit_inode_delayed_inode(inode)
+   - 提交一个inode,和上面的区别是,这里要自己准备btrfs_trans_handle, 而且这里尽更新btrfs_inode_item
+   > btrfs_get_delayed_node(inode)
+   - 准备btrfs_trans_handle
+   > btrfs_join_transaction(btrfs_delayed_node->btrfs_root)
+   - 检查btrfs_delayed_node->inode_dirty, 有效才更新btrfs_inode_item
+   > __btrfs_update_delayed_inode(btrfs_trans_handle, btrfs_delayed_node->btrfs_root, btrfs_path, btrfs_delayed_node)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 什么东西?
+   > btrfs_btree_balance_dirty(btrfs_delayed_node->btrfs_root)
+   - 对应开始的增加refs
+   > btrfs_release_delayed_node(btrfs_delayed_node)
+
+** btrfs_remove_delayed_node(inode)
+   - 删除btrfs_inode关联的btrfs_delayed_node
+   > btrfs_release_delayed_node(btrfs_delayed_node)
+
+*** transaction中对btrfs_delayed_node的使用.
+
+** btrfs_async_delayed_work
+   #+begin_src 
+   	struct btrfs_delayed_root *delayed_root;
+	int nr;
+	struct btrfs_work work;
+        //应该是异步工作,提交delayed inode...
+   #+end_src
+
+** btrfs_async_run_delayed_root(btrfs_work)
+   - 这个函数应该是delayed inode使用的btrfs_work的回调函数. 处理btrfs_delayed_root的btrfs_delayed_node, 这个不应该是全局的?nr表示处理的数量.
+   > btrfs_alloc_path()
+   - 检查是否需要释放, btrfs_delayed_root->items超过BTRFS_DELAYED_BACKGROUND/2
+   - 这里只处理prepare_list队列的btrfs_delayed_node
+   > btrfs_first_prepared_delayed_node(btrfs_delayed_root)
+   - 启动transaction, 并且切换btrfs_trans_handle->block_rsv
+   > btrfs_join_transaction(btrfs_root)
+   - 提交所有的数据.. insert/delete/metadata
+   > __btrfs_commit_inode_delayed_items(btrfs_trans_handle, btrfs_path, btrfs_delayed_node)
+   - 把btrfs_delayed_node从队列中释放n_list/p_list
+   > btrfs_dequeue_delayed_node(btrfs_root->btrfs_fs_info->btrfs_delayed_root, btrfs_delayed_node)
+   - 提交transaction
+   > btrfs_end_transaction_dmeta(btrfs_trans_handle, btrfs_root)
+   > btrfs_btree_balance_dirty_nodelay(btrfs_root)
+   - 下面如何决定btrfs_delayed_node->count数量?
+   > btrfs_release_prepare_delayed_node(btrfs_delayed_node)
+   - 释放这个btrfs_delayed_node?? 然后继续循环,直到处理了足够的btrfs_async_delayed_work->nr..
+   > wake_up(btrfs_delayed_root->wait)
+
+** btrfs_wq_run_delayed_node(btrfs_delayed_root, btrfs_root, nr)
+   - 是否提交delayed_inode要判断btrfs_delayed_root->items < BTRFS_DELAYED_BACKGROUND(128)
+   - 根据参数构造async work, 把他放到btrfs_fs_info->delayed_workers队列中.
+   > btrfs_queue_worker(btrfs_root->btrfs_fs_info->delayed_workers, btrfs_async_delayed_work->btrfs_work)
+
+** btrfs_assert_delayed_root_empty(btrfs_root)
+   - 确定btrfs_root->btrfs_delayed_root没有btrfs_delayed_node...
+   
+** refs_newer(btrfs_delayed_root, seq, count)
+   - btrfs_delayed_root->items_seq是一个seq lock? 它必须再(seq, seq+count)之间
+
+** btrfs_balance_delayed_items(btrfs_root)
+   > btrfs_get_delayed_root(btrfs_root)
+   - 使用async work, 提交任务处理btrfs_delayed_root.
+   - 先判断btrfs_delayed_root->items < BTRFS_DELAYED_BACKGROUP, 直接退出.
+   - 如果btrfs_delayed_root->items > BTRFS_DELAYED_WRITEBACK(512), 任务很重,等待一段时间
+   > btrfs_wq_run_delayed_node(btrfs_delayed_root, btrfs_root, 0)
+   - 提交任务后等待
+   > prepare_to_wait(btrfs_delayed_root->wait, ...)
+   - 结束条件2个
+   > btrfs_delayed_root->items < BTRFS_DELAYED_BACKGROUND
+   - btrfs_delayed_root->items_seq增长太慢,也就是写的少?所以可以退出等待.
+   > refs_newer(btrfs_delayed_root, seq, BTRFS_DELAYED_BATCH)
+   - 这个items_seq是什么数据? 等待条件有2个,一个是items_seq,一个是items个树小于BTRFS_DELAYED_BACKGROUND
+   - 如果本来就不多,就需要提交16个. 这是btrfs_delayed_node, 上面是btrfs_delayed_item/dirty
+   > btrfs_wq_run_delayed_node(btrfs_delayed_root, btrfs_root, BTRFS_DELAYED_BATCH)
+
+*** 上面是使用处理delayed_inode的async work
+
+** btrfs_insert_delayed_dir_index(btrfs_trans_handle, btrfs_root, char *name, name_len, inode, btrfs_disk_key, type, index)
+   - 创建btrfs_dir_item, 把他添加到父目录的btrfs_delayed_node中.
+   - 准备对应的btrfs_delayed_node
+   > btrfs_get_or_create_delayed_node(inode)
+   - 创建btrfs_delayed_item, 数据是btrfs_dir_item
+   > btrfs_alloc_delayed_item(sizeof(btrfs_delayed_item) + name_len)
+   - 设置btrfs_delayed_item->btrfs_key(inode->btrfs_key->objectid, BTRFS_DIR_INDEX_KEY, index)
+   - 设置里面的btrfs_dir_item, btrfs_key/transid/name_len/type/name
+   - 从btrfs_trans_handle->block_rsv中预留空间给btrfs_fs_info->delayed_block_rsv.
+   > btrfs_delayed_item_reserve_metadata(btrfs_trans_handle, btrfs_root, btrfs_delayed_item)
+   - 预留的空间竟然和name_len没有关系,仅仅是btree内节点的空间.
+   > __btrfs_add_delayed_insertion_item(btrfs_delayed_node, btrfs_delayed_item)
+   - 把btrfs_delayed_item给btrfs_delayed_node->ins_root中.
+   > btrfs_release_delayed_node(btrfs_delayed_node)
+   - 最后这个函数会更新n_list/p_list情况, 如果count>0, n_list肯定会入队,p_list如果原来不在队列中,也不会添加它.
+   
+** btrfs_delete_delayed_insertion_item(btrfs_root, btrfs_delayed_node, btrfs_key)
+   - 根据btrfs_key找一个btrfs_delayed_item, 把它从btrfs_delayed_node->ins_root中释放
+   > __btrfs_lookup_delayed_insertion_item(btrfs_delayed_node, btrfs_key)
+   - 同时释放预留的空间
+   > btrfs_delayed_item_release_metadata(btrfs_root, btrfs_delayed_item)
+   - 释放rb tree关系
+   > btrfs_release_delayed_item(btrfs_delayed_item)
+
+** btrfs_delete_delayed_dir_index(btrfs_trans_handle, btrfs_root, inode, index)
+   - 删除的delayed操作. 同样要准备btrfs_delayed_node, 创建btrfs_delayed_item 
+   > btrfs_get_or_create_delayed_node(inode)
+   - 准备btrfs_delayed_item->btrfs_key是(dir->ino, BTRFS_DIR_INDEX_KEY, index)
+   - 先去btrfs_delayed_node->ins_root中查找,如果有,就直接删除返回,抵消操作.
+   > btrfs_delete_delayed_insertion_item(btrfs_root, btrfs_delayed_node, btrfs_key)
+   - 如果没有,需要创建btrfs_delayed_item, 记录删除操作, 这个btrfs_delayed_item没有数据,只需要记录btrfs_key.
+   > btrfs_alloc_delayed_item(0)
+   - 通言也要预留空间
+   > btrfs_delayed_item_reserve_metadata(btrfs_trans_handle, btrfs_root, btrfs_delayed_item)
+   - 添加到btrfs_delayed_node中.
+   > __btrfs_add_delayed_deletion_item(btrfs_delayed_node, btrfs_delayed_item)
+   - btrfs_release_delayed_node(btrfs_delayed_node)
+   
+** btrfs_inode_delayed_dir_index_count(inode)
+   - 找到对应的btrfs_delayed_node, 使用btrfs_delayed_node->index_cnt更新btrfs_inode->index_cnt..
+   > btrfs_get_delayed_node(inode)
+   - 在新创建子文件时使用.
+   
+** btrfs_get_delayed_items(inode, list_head ins_list, list_head del_list)
+   - 把btrfs_delayed_node的两个rbtree上的btrfs_delayed_item放到参数的两个队列中. 但要增加btrfs_delayed_item的索引..使用btrfs_delayed_item->readdir_list队列. btrfs_delayed_item使用rb tree, 使用btrfs_key索引,有序存放.
+   > btrfs_get_delayed_node(inode)
+   > __btrfs_first_delayed_insertion_item(btrfs_delayed_node)
+   > __btrfs_next_delayed_item(btrfs_delayed_item)
+   > __btrfs_first_delayed_deletion_item(btrfs_delayed_item)
+   > __btrfs_next_delayed_item(...)
+   - 这个函数是readdir使用的?!
+
+** btrfs_put_delayed_items(list_head ins_list, list_head del_list)
+   - 释放两个队列中的btrfs_delayed_item, 这里很简单,只减小btrfs_delayed_item->refs,如果减到0,就回收对应的内存.
+
+** btrfs_should_delete_dir_index(list_head, index)
+   - 队列中的btrfs_delayed_item是有序的, 根据btrfs_key->offset/index 
+   - 对于前部分, offset<=index, 从队列中释放这些.
+   - 删除也就是减小btrfs_delayed_item->refs,如果为0,回收内存..
+
+** btrfs_readdir_delayed_dir_index(file, dirent, filldir_t, list_head ins_list)
+   - 读取delayed tree中的目录.. ins_list应该是从btrfs_delayed_node中获取的队列,这里用完就释放了..
+   - 遍历ins_list, 对于btrfs_delayed_item, offset<file->f_pos, 就直接删除. 对于其他btrfs_delayed_item,就拿出数据给filldir_t, name, ino (btrfs_delayed_item->btrfs_key->objectid). 奇怪,这个ino是父目录的ino..
+
+** fill_stack_inode_item(btrfs_trans_handle, btrfs_inode_item, inode)
+   - 使用inode填充btrfs_inode_item, 包括uid,gid,btrfs_inode->disk_i_size, mode, nlink, nbytes, transid
+   - 这里nbytes是根据inode->block, bytes计算的,是不包括空洞的数据量?
+
+** btrfs_fill_inode(inode, rdev)
+   - 上面的逆过程,根据btrfs_delayed_node->btrfs_inode_item,填充inode..
+   > btrfs_get_delayed_node(inode)
+
+** btrfs_delayed_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   - 准好btrfs_delayed_node/btrfs_inode_item
+   > btrfs_get_or_create_delayed_node(inode)
+   - btrfs_delayed_node->inode_dirty表示已经为修改btrfs_inode_item做好了准备, 直接填充btrfs_inode_item.
+   > fill_stack_inode_item(btrfs_trans_handle, btrfs_inode_item, inode)
+   - 否则先预留空间, 这个比btrfs_delayed_item更加复杂???
+   > btrfs_delayed_inode_reserve_metadata(btrfs_trans_handle, btrfs_root, inode, btrfs_delayed_node)
+   > fill_stack_inode_item(btrfs_trans_handle, btrfs_inode_item, inode)
+   - 设置btrfs_inode->inode_dirty, 增加btrfs_delayed_root->items / btrfs_delayed_node->count
+   > btrfs_release_delayed_node(btrfs_delayed_node)
+
+** __btrfs_kill_delayed_node(btrfs_delayed_node)
+   - 释放btrfs_delayed_node, 还有它关联的btrfs_delayed_item,以及预留的空间..
+   - ins_root / del_root
+   > __btrfs_first_delayed_insertion_item(btrfs_delayed_node)
+   > btrfs_delayed_item_release_metadata(btrfs_root, btrfs_delayed_item)
+   > __btrfs_next_delayed_item(btrfs_delayed_item)
+   > btrfs_release_delayed_item(btrfs_delayed_item)
+   - 但btrfs_inode->inode_dirty有效时,才释放btrfs_inode_item数据
+   > btrfs_delayed_inode_release_metadata(btrfs_root, btrfs_delayed_node)
+   > btrfs_release_delayed_inode(btrfs_delayed_node)
+
+** btrfs_kill_delayed_inode_items(inode)
+   > __btrfs_kill_delayed_node(btrfs_delayed_node)
+
+** btrfs_kill_all_delayed_nodes(btrfs_root)
+   - btrfs_delayed_root使用radix tree管理btrfs_delayed_node, 删除所有关联的btrfs_delayed_node
+   > radix_tree_gang_lookup(...)
+   > __btrfs_kill_delayed_node(btrfs_delayed_node)
+   - 上面Kill时先增加btrfs_delayed_node->refs
+   > btrfs_release_delayed_node(btrfs_delayed_node)
+
+** btrfs_destroy_delayed_inodes(btrfs_root)
+   - 处理btrfs_delayed_root的btrfs_delayed_node,使用node_list管理. 
+   > btrfs_first_delayed_node(btrfs_delayed_root)
+   > __btrfs_kill_delayed_node(btrfs_delayed_node)
+   > btrfs_next_delayed_node(btrfs_delayed_node)
+   > btrfs_release_delayed_node(btrfs_delayed_node)
+
+** 总结
+   - btrfs_delayed_node管理metadata,btrfs_inode_item,还有btrfs_dir_item. 
+   - btrfs_root使用rb_root管理, btrfs_fs_info->btrfs_delayed_root使用node_list/prepare_list管理
+   - btrfs_delayed_node使用rb tree管理btrfs_delayed_item
+   - 处理btree的数据提交,都是在transaction中提交. 处理的是btrfs_delayed_root-node_list上的. 在transaction/log中使用. 每次transaction提交时,要把所有的btrfs_delayed_node都销毁??
+   - 在extent tree的flush space中使用它回收空间,有专门的FLUSH_DELAYED_ITEMS{,_NR},用于回收空间.
+   - 可以为某个btrfs_delayed_node/btrfs_inode提交信息, 可以提交inode所有的metadata,包括btrfs_delayed_item, 也可以只提交btrfs_inode_item. 
+   - 如果btrfs_delayed_root->items太多,可以启动balance操作,写回一部分.在disk-io中包装它,在其他模块大量使用. 具体操作就是提交btrfs_delayed_node的全部数据.
+   - 更新dir/inode信息, 而且为readdir提供缓存的数据.
+   - prepare_list的使用,只有在async提交时,才使用prepare_list.在async work处理时,把它从preapre_list中取下来,其他的的enqueue不会把它放到prepare队列中. 在work完成后,把它放到prepare_list中,这里就是保证在处理时,它不在prepare_list队列中. 因为work是多个任务并且的?
+   - 每个btrfs_delayed_item的处理使用btrfs_delayed_node->mutex保护.
+   - 一般balance会触发btrfs_delayed_node写回,其他应该只有transaction..

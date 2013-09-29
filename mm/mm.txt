@@ -1,0 +1,102 @@
+哇，mm/下面好多文件！ 无从下手了。
+
+a. 数据结构
+page:
+* flags
+* address_page
+    如果最低位为0，它指向inode->address_space, 或者NULL
+    否则:  作为anonymous page,指向anon_vma对象
+* + index 在address_space中的索引
+  + freelist 在slab中，指向第一个free object
+
+* + counters
+  + * + _mapcount  在放入buddy system前，这个值必须为-1，放入后必须为
+      + inuse/objects/frozen        PAGE_BUDDY_MAPCOUNT_VALUE(-128)
+    * _count
+
+* + list_head lru  (active_list)
+  + * page(next, slab)
+    * pages
+    * pobjects
+
+* + private 当PG_private设置时，它指向附加数据
+  + kmem_cache slab
+  + page *first_page compound page
+
+* void *virtual highmem映射建立时的虚拟地址
+太零散了，没法整理
+* address_space/anon_vma
+* slab
+* lru
+* private
+* compound 
+address_space/anon_vma应该和slab互斥
+
+mm_struct
+vm_area_struct    
+anon_vma 管理vm_area_struct
+
+参考Documentation/vm/pagemap.txt;include/linux/page-flags.h看page的标志
+1. page_alloc.c
+系统的内存分级为:node(zonelist),zone,page
+
+zone一般包括DMA,DMA32,NORMAL,HIGHMEM,MOVABLE. 现在应该没有HIGHMEM了，DMA32应该是扩展的dma空间。笔记本上有三个zone，一个node。
+
+a. sysctl_lowmem_reserve_ratio[MAX_NR_ZEONES-1]
+对低级zone的保护，当从高级的zone分配内存失败时，会尝试低级zone，但不能把低级zone的page都给高级zone使用，因为早期highmem名声不大好。所以这个比率参数是控制低级zone的底线，当空余内存低于它时，不再给高级的zone分配内存。
+计算公式为
+  zone[i]->protection[j]
+  = (total sums of present_pages from zone[i+1] to zone[j] on the node)
+    / lowmem_reserve_ratio[i];
+可以从/proc/zoneinfo中看出相关信息
+
+b. bad_page(page)
+  发现page出错时的处理
+  -> PageHWPoison  page不能再使用
+  -> reset_page_mapcount(page), 把mapcount设为-1
+  -> dump_page
+  -> print_modules
+  -> dump_stack
+
+c. free_compound_page(page)
+  释放compound page. 所有compound的page都带标志PG_compound/PG_tail，第一个page叫first page(PG_head),其他page都是tail pages. tail pages ->first_page都是first page. 第一个tail page的->lru.next指向put_page, ->lru.pref指向compound的大小.所有的tail pages的_count为0.
+  -> __free_pages_ok(page, compound_order(page))
+
+d. prep_compound_page(page, order)
+  根据上面的解释设置page的标志
+  
+e. destroy_compound_page(page, order) 
+  清除标志PG_head/PG_tail
+
+f. prep_zero_page(page, order, gfp_t)
+  把page内容都设为0. 这个函数不能在中断中调用
+
+g. set_page_order(page, order)/rmv_page_order(page)
+  这是buddy system使用的，必须之道page在buddy system的那个队列中，order表示它所在队列的页块大小
+  -> set_page_private(page, order)/(page, 0)
+  -> __SetPageBuddy(page) / __ClearPageBuddy(page)  这两个就是设置page->_mapcount
+
+h. __find_buddy_index(page, order)
+  找page对应的buddy页  
+  * B2 = B1 ^ (1<<order)
+  * P  = B & !(1<<order)
+
+i. page_is_buddy(page *page, page *buddy, order)
+  判断page和buddy是否是buddy. 两个使用的zone是一个。
+
+j. __free_one_page(page, zone, order, migratetype)
+   找到它的buddy，如果buddy是free的，则把它从buddy system中取出来，合成一个大的page块，然后继续找。把大的page块放到buddy system中.
+  -> Pagecompound/destroy_compound_page
+  -> bad_page
+  -> __find_buddy_index / page_is_buddy
+  -> rmv_page_order
+  
+k. free_page_mlock
+  减少NR_MLOCK统计数  zone->vm_stat[NR_MLOCK] / vm_stat[]
+
+l. free_pages_check(page)
+  检查page是否free：
+  * page->_mapcount == -1 (为何为-1，是free的呢）
+  * page->mapping == NULL
+  * page->_count为0
+  * page

@@ -1,0 +1,254 @@
+这里是扫描内存，回收系统page.
+
+需要整理一下相关函数的关系和外部调用环境.
+shrink_zones
+shrink_list
+
+1. scan_control 数据结构表示扫描过程中使用的计数和标志
+    * nr_scanned
+    * nr_reclaimed
+    * nr_to_claim
+    * hibernation_mode
+    * gfp_mask
+    * may_writepage
+    * may_unmap   mapped page是否可回收?
+    * may_swap     page是否可以被交换出去?
+    * order ??
+    * reclaim_mode_t 
+        - RECLAIM_MODE_SINGLE  回收order=0的页
+        - RECLAIM_MODE_ASYNC   回收过程不可阻塞
+        - RECLAIM_MODE_SYNC    回收过程可阻塞
+        - RECLAIM_MODE_LUMPYRECLAIM 回收一片page,给大块请求使用
+        - RECLAIM_MODE_COMPACTION 回收许多order=0的页,然后压缩zone
+        set_reclaim_mode(priority, scan_control, sync) 根据scan_control->order/priority/sync决定使用的回收模式. 在order>PAGE_ALLOC_COSTLY_ORDER时,使用compact/lumpy,如果priority<10时,也是如此.在order=0,优先级不高时,使用RECLAIM_MODE_SINGLE|RECLAIM_MODE_ASYNC.
+    * nodemask
+
+2. page 
+    * is_page_cache_freeable(page)
+    检查page是否可以回收? page->_count, 在buddy中为0. 分配后应该变为1, 然后给page cache radix tree, 所以变为2, 如果有private数据关联,又增加1, 如果被isolate操作,又增加1. 即使page有private数据,也可以回收.
+    page_count(page) == page_has_private() + 2
+
+    * page标志
+    PG_lru 只有page在zone的lru队列中时,才设置?!
+    PG_active 只有page在zone的active队列中才设置.
+    PG_unevitable 表示page在unevictable队列中
+
+3. putback to lru
+    这个操作是isolate_lru_page的逆操作
+    putback_lru_page  清除PG_unevictable, 根据page标志返回到各种lru队列中, 在这里会删除PG_active, PG_unevictable, page不带有PG_lru
+    > page_evictable(page, NULL) 如果page是evictable,添加到lru,否则到unevictable
+    > lru_cache_add_lru(page, lru)
+    > add_page_to_unevictable_list(page)
+    > isolate_lru_page   最后会检查是否真的unevictable
+
+    page在什么情况下会放到lru队列中, 这个函数只在migrate/rmap中调用. 在page回收时，从lru队列中拿出page，释放可以回收的,如果取出来之后不能回收,则放回到lru中.
+    lru_cache_add_lru(page, lru_list) 把page添加到lru_add_pvecs的lru_list队列中,需要重新PG_active, PG_unevictable. lru_add_pvecs是percpu的缓存队列
+    > __lru_cache_add 把page加到lru_ad_pvecs这个percpu的队列中
+     > page_cache_get(page)  增加page计数,为何? page在pagevec上面时，需要使用计数避免page被释放.
+     > pagevec_add() 放到pagevec队列中
+     > __pagevec_lru_add(pagevec, lru_list) 如果pagevec满了,就把pvec都释放掉.
+      >  pagevec_lru_move_fn(pagevec, __pagevec_lru_add_fn, lru_list)遍历pagevec上的page,回调__pagevec_lru_add_fn
+      > __pagevec_lru_add_fn(page, lru_list) 设置PG_lru,PG_active
+       > add_page_to_lru_list(zone, page, lru_list) 真正的加入到zone的lru队列
+      > release_pages(page, nr, cold) 减小page的计数，和上面的对应,如果page计数为0,释放它
+       > put_page_testzero / put_compound_page 
+       > free_hot_cold_page_list
+
+    原来lru也有两层,一层是全局的percpu缓存队列,然后才是zone->lruvec. 上面的操作都早swap.c中
+
+4. page reference 参考下面
+    page_check_references(page, ...) 检查page被哪些使用? 结果有以下: 都什么意思？怎么处理?
+        * PAGEREF_RECLAIM
+        * PAGEREF_RECLAIM_CLEAN
+        * PAGEREF_KEEP
+        * PAGEREF_ACTIVATE
+    > 
+
+    刚才扫了一遍vmscan,内容还是相当多的，里面有许多参数，控制各种page的数量,在回收lru队列时，使用isolate把page取出来，然后释放，或放到其他lru队列. 设计到rmap(vma), filemap等. 有两种回收，一种是在page_alloc中间接使用，另一种是kswapd,很久之前说0号线程是kswap,现在呢? kswapd属于pglist_data.
+
+5. page_evictable(page, vm_area_struct)
+    判断page是否可被被放到删除, 根据page->address_space->flags的AS_UNEVICTABLE, 但这个标志只有ramfs和shm中使用, 然后检查page的PG_mlocked标志和vm_area_struct->vm_flags的VM_LOCKED标志. page在vma中时,能带有PG_lru标志. 在这种环境中page已经从lru队列中取出来. 这个函数用来分配page到lru/unevictable队列中.
+
+6. zone reclaim
+    * 回收动作的类型 zone_reclaim_mode
+        RECLAIM_OFF
+        RECLAIM_ZONE    shrink_inactive_list, 回收inactive队列
+        RECLAIM_WRITE   在reclaim时可以写操作 如果不支持,不能回收NR_FILE_DIRTY的page
+        RECLAIM_SWAP    换出page, 如果支持swap,可以换出NR_FILE_PAGES的page,如果不支持只能换出zone_unmapped_file_pages. 为何映射的page必须swap? 应该说有的需要，有的不需要.
+    zone_pagecache_reclaim(zone) 计算zone中可回收的page数量,使用全局变量zone_reclaim_mode. 这个变量就是系统参数zone_reclaim_mode
+    > zone_page_state(zone, NR_FILE_PAGES) 如果使用RECLAIM_SWAP,可回收所有的文件支持的page(和anon对应)
+    > zone_unmapped_file_pages(zone) 否则只能回收没有映射的page
+     > zone_page_state(zone, NR_FILE_MAPPED)
+     > zone_page_state(zone, NR_INACTIVE_FILE) + zone_page_state(zone, NR_ACTIVE_FILE)  两者相减,为何不用上面的NR_FILE_PAGES, page不可能会属于多个radix tree,根据address_space决定.
+     > zone_page_state(zone, NR_FILE_DIRTY) 如果不使用RECLAIM_WRITE,则不能回收脏页. 返回结果就是上面的两个之一减去这个
+
+    zone_reclaim(zone, gfp_t, order) 回收file使用的page和slab page, 只有可回收的page达到一定数量时才回收. 只有当zone属于当前cpu时，才回收. 回收过程使用zone->flags的ZONE_RECLAIM_LOCKED, 回收没有映射的page.  如果下面两个条件满足，不再回收，返回ZONE_RECLAIM_FULL,还有zone->all_unreclaimable, 表示page都被锁定.
+     > zone_pagecache_reclaimable(zone) <= zone->min_unmapped_pages
+     > zone_page_state(NR_SLAB_RECLAIMABLE) <= zone->min_slab_pages
+      > __zone_reclaim(zone, gfp, order)
+       构造scan_control, 回收时需要设置current,不能重复回收.
+        nr_to_reclaim是max(1<<order, SWAP_CLUSTER_MAX)
+        priority = ZONE_RECLAIM_PRIORITY
+       > shrink_zone(priority, zone, scan_control) 直到scan_control->nr_reclaimed > nr_pages
+       > shrink_slab(shrink_control, scan_control.nr_scanned, lru_pages) lru_pages表示可回收的page, 为何给它这个参数? 根据NR_SLAB_RECLAIMABLE的变化，决定回收了多少page
+
+7 page各种统计数
+    * 回收zone的page, 需要计数各种page
+    NR_FILE_MAPPED 映射到pte的文件使用的page数量
+    NR_INACTIVE_FILE / NR_ACTIVE_FILE 文件使用的page
+    zone_unmapped_file_pages    : NR_INACTIVE_FILE + NR_ACTIVE_FILE - NR_FILE_MAPPED
+    NR_FILE_PAGES:  在address_space中的page
+    zone->min_unmapped_pages 根据sysctl_min_unmapped_ratio决定 这个值太大，会阻挡回收工作
+    zone->min_slab_pages 根据sysctl_min_slab_ratio 决定
+    zone_pagecache_reclaimable(zone) 返回可回收的page数量
+    global_reclaimable_pages NR_ACTIVE_FILE/NR_INACTIVE_FILE/NR_ACTIVE_ANON/NR_INACTIVE_ANON统计的page
+    zone_reclaimable_pages 和上面一样
+    zone->inactive_ratio 根据zone的大小计算
+
+8. swap 任务
+    每个node有一个swap, 使用kswapd函数
+    wakeup_kswapd 使用pglist_data->kswapd_wait等待队列.
+    kswapd -> kswapd_try_to_sleep
+           -> balance_pgdat  回收pglist_data
+
+    balance_pgdata是kswapd主要的工作,扫描node的所有zone,直到free page高于high wmark.
+        * 需要遍历priority次
+        * 从highmem开始,扫描所有zone,找一个high water mark 没有满足的zone
+        -> age_active_anon  -> shrink_active_list()
+        -> zone_reclaimable_pages(zone)
+
+        然后再遍历,从DMA到HIGHMEM, 这次遍历还是检查watermark, 如果有不满足的，继续回收. 需要整理一下scan_control的成员变量的功能
+        -> shrink_zone
+        -> shrink_slab
+
+        这里也会压缩zone
+        -> compact_pgdat
+
+9. 直接回收page
+    try_to_free_pages(zonelist, order, gfp_t, nodemask)  在page_alloc中使用, 构造scan_control,  nr_to_reclaim = SWAP_CLUSTER_MAX
+    > do_try_to_free_pages(zonelist, scan_control, shrink_control)  这个函数是主要的回收函数,其他它也是调用shrink_zones/slabs. 返回回收的pages,这里和kswapd过程类似，多次扫面zonelist(DEF_PRORITY)
+     > shrink_zones(prority, zonelist, sc)
+     > shrink_slab(shrink)
+     > wakeup_flusher_threads(0, WB_REASON_TRY_TO_FREE_PAGES) 这个会唤醒所有的bdi任务,是fs/fs-writeback.c中实现的. 只有在回收任务无法完成目标时调用, 扫描的page数量超过要回收的page数量*3/2时,启动写回任务.
+
+10. 收缩zone
+    shrink_zones(priority, zonelist, scan_control) 遍历zonelist中的zone,如果zone可以compact,则不再回收.
+    > shrink_zone 
+     > shrink_cgroup_zone(priority, mem_cgroup_zone, scan_control) 为何把croup放进来?
+      > shrink_lruvec(lruvec, scan_control)先取出lru队列,然后使用这个函数每次扫面SWAP_CLUSTER_MAX个page. 直到INACTIVE_ANON, ACTIVE_FILE, INACTIVE_FILE队列为空,或回收了要求的page.
+       > get_scan_count(lruvec, scan_control, nr) 获取要回收的page数量
+       > shrink_list(lru, nr_to_scan, lruvec, scan_control)  返回回收的页数
+        > shrink_active_list(SWAP_CLUSTER_MAX, mem_cgroup, scan_control, priority, 0)
+        > inactive_list_is_low 比较inactive和active，根据zone->inactive_ratio判断inactive是否太少? 对应file来说, 比较inactive,active. 如果anon,使用zone->inactive_ratio
+         > shrink_active_list
+        > shrink_inactive_list(nr_to_scan, mem_cgroup, scan_control, priority, file)
+
+11. 回收过程中anon和file的比率
+    get_scan_count(mem_cgroup_zone, scan_control, nr, priority) 计算回收中每个lru队列中应该扫描的page数量,anon和file维持相应的相比比率.
+    vm_swappiness全局变量, 内核参数swappiness. 如果这个大的话,先回收anon pages. anon和file的比率和reclaim_stat相关.
+
+12. active 队列
+    shrink_active_list(nr_to_scan, mem_cgroup, scan_control, priority, file)
+    > lru_add_drain 把percpu的队列的page放到lru中.
+    > isolate_lru_pages(nr_to_scan, mz, result_list, .. isolate_mode ..) 根据scan_control构造isolate_mode. 这个函数不会修改NR_lru的计数，而且根据返回结构，统一修改NR_lru和NR_ISOLATE_... 它在遍历lru队列时，取到一个page,如果scan_control->order>0,还会考虑page挨着的scan_control->order范围内的page.
+     > __isolate_lru_pages(page, mode, file) mode是isolate_mode_t,根据scan_control设置. 这个函数给增加page的计数,而且去掉page的PG_lru标志.还有它只处理带PG_lru标志的page.
+    下面遍历拿出来的page 队列
+    > page_evictable(page ..)
+    > putback_lru_page()  如果page不可被踢走,把它放回去.
+    > page_has_private(page)
+    > try_to_release_page() 释放page中的buffer, address_space->a_ops->releasepage
+    > page_referenced(page, 0, mem_cgroup, vmflags) 这个函数可能查看page是否最近使用? 在rmap.c中实现. 根据这个函数page分成两类:active/inactive(不带PG_active标志) 把page看为active需要它包含可执行代码  vm_flags&VM_EXEC, page_is_file_cache
+    > move_active_pages_to_lru(zone, page-list, page-list, lru)
+     > list_move(page, lru) 把page放到lru队列中
+     > put_page_testzero(page) 因为isolate过程增加了page计数,所以这里要减掉,如果发现page没人使用,需要释放.
+     > del_page_from_lru_list，从lru队列中释放,同时去掉PG_active/PG_lru标志.
+    > free_hot_cold_page_list(free_list, 1) 把上面计数为0的page释放
+    这里只是简单的把page从一个队列中放到另一个队列中
+
+13. inactive队列
+    这个函数和上面的区别是它会回收page,当然上面的也会,但这里的更复杂.
+    shrink_inactive_list(nr_to_scan, mem_cgroup, scan_control, priority, file) 返回回收的page数量
+    > too_many_isolated(zone, file, scan_control) 发现系统isolate的page太多,有人在大量回收page,则等待一段时间. 他就是检查inactive是否比isolate的page数量少
+    > lru_add_drain
+    > isolate_lru_pages(..) 和上面差不多啊, 实际上可以把那些page都拿过来,但这里使用isolate_mode_t有所过滤
+       ISOLATE_ACTIVE => scan_control->reclaim_mode & RECLAIM_MODE_LUMPYRECLAIM
+       ISOLATE_UNMAPPED => scan_control->may_unmap  也没发现哪里有unmap操作呢?
+       ISOLATE_CLEAN => scan_control->may_writeback
+    > shrink_page_list(page_list, mem_cgroup, scan_control, priority, nr_dirty, nr_writeback)  这个函数很复杂!! 更复杂的是,这里回收两边,第一次scan_control->reclaim_mode带RECLAIM_MODE_ASYNC，第二个是SYNC
+    > putback_inactive_pages() 把不能释放的返回去？ 重新根据page的属性，选择lru
+     > page_lru(page) page可能变成active的
+     > add_page_to_lru_list
+
+    shrink_page_list(list_head, mem_cgroup_zone, scan_control, priority, nr_dirty, nr_writeback) 这个函数使用8%的代码. 处理list_head上的page, 这些page或者被释放,或者返回,再放到lru队列中. 在inactive_lru中的page如何放到active_lru中呢?
+    -> trylock_page(page) 锁住page,如果锁不住,则不处理它
+    -> page_evictable(page ..) 如果page不能被踢出，则把它放回到lru队列中
+    -> page_mapped(page) 如果page在pte中,而且scan_control->may_unmap=0,此次回收不释放映射,则不处理
+    -> PageWriteback(page) 如果page在写回, 检查scan_control->reclaim_mode,如果同步则等待
+    -> wait_on_page_writeback(page)
+    -> page_check_references(page, mem_cgroup_zone, scan_control) 这个下面考虑
+    -> 如果page是anon,而且没有PG_swap_cache -> add_to_swap(page) 把它放到swap中
+    -> 如果page_mapped,并且带address_space -> try_to_unmap  这里修改pte
+    -> PageDirty(page) 如果是脏页,开始写回数据
+    -> page_is_file_cache(page) current_is_kswapd, priority > 10 这里说明如果page是文件,而且当前不是kswapd回收或优先级不够,则不再回收，设置页标志PG_reclaim.
+    -> 检查各种标志，看是否可以写操作: may_enter_fs(allocflags), scan_control->may_writeback
+    -> pageout(page, address_space, scan_control) 写回操作,使用address_space_ops    
+    -> page_has_private(page) 如果page有附带数据，释放这些
+    -> try_to_release_pag(page)
+    -> __remove_mapping(mapping, page) 从page cache中删除page
+    -> page处理完成，上面有些步骤可能无法满足,因此需要把page回复到lru中, 有些操作使page变为PG_active状态.
+    -> free_hot_cold_page_list
+    主要处理page写回和去除地址映射,写回还是使用page_writeback(address_space->a_ops)
+
+14. page reference
+这个应该结合rmap来看,已经了解了filemap,发现rmap非常的复杂
+    page_check_references(page, mem_cgroup_zone, scan_control)
+    -> page_referenced(page, 1, mem_cgroup_zone, vm_flags) 这个返回pte使用情况
+    -> TestCleanPageReferenced 这个就是一般的reference, 还没发现哪里使用?
+    -> 如果pte reference > 0, page是anon,则不回收? 如果swap支持的话,它应该是file page. 如果是file page,设置PG_referenced, 如果pte reference > 1, 不能回收, 而且下次也不能回收,下次referenced_page > 0
+    
+    page_referenced(page, is_locked, mem_cgroup, vm_flags) 检查page是否被用过,确认page建立映射
+    > page_mapped / page_rmapping
+    > page_referenced_ksm   这个。。
+    > page_referenced_anon(page, mem_cgroup, vm_flags) 通过anon_vma遍历所有关联的vma
+     > page_referenced_one(page, vma, address, mapcount, vm_flags) 通过address获取pte,检查pte的标志
+      > ptep_clear_flush_young_notify(vma, address, pte)
+    > page_referenced_file(page, mem_cgroup, vm_flags) 通过address_space->i_mmap遍历所有的vma
+    > page_test_and_clear_young(pfn)
+    
+
+15. page mapping
+    __remove_mapping, 这个应该是处理page和address_space的关系, 把它从page cache中删除.
+    -> PageDirty, 如果page是脏的，不处理.  
+    -> PageSwapCache 如果page是swap支持的,则把它从swap的address_space中删除
+    -> __delete_from_swap_cache(page)
+    -> swapcache_free 这个不懂
+    -> __delete_from_page_cache 否则从file address_space中删除
+    -> address_space->address_space_operations->freepage
+
+ttu_flags ttu是try to unmap的缩写吗?
+    try_to_unmap(page, ttu_flags)
+    > try_to_unmap_ksm
+    > try_to_unmap_anon(page, flags)
+    > try_to_unmap_file
+     > try_to_unmap_one(page, vma, address, flags)
+      > page_check_address(page, mm, address, pte_t, 0)
+      > set_page_dirty(page) 根据pte_t的脏标志,设置
+       > __set_page_dirty 设置inode的脏标志
+      > page_remove_rmap        这里会修改pte相关,减小page->_mapcount
+      > page_cache_release(page)  put_page
+     还有nonline的vma,的确很麻烦.
+
+16. shrink  slab
+    这个不说了吧
+
+17. page_add_file_rmap(page)
+    把page放到page cache中?  这里只增加page->_mapcount,这个函数在do_fault中使用.
+    page_add_new_anon_rmap(page, vma, address) 设置page的anon_vma, 并把page放到lru队列中. 这个和上面的区别可能是上面是file page,而这个是anon page.
+    > SetPageSwapBacked(page) 为何设置这个?
+    > _page_set_anon_rmap(page, vma, address, 1) 给page的是vma->anon_vma,page->index是vma中address的偏移.
+    > lru_cache_add_lru(page, LRU_ACTIVE_ANON)
+
+这里就看完了,再说一下page回收的过程. 回收动作有两种，一种是唤醒kswapd任务,去回收zone,另一种是在page_alloc中去主动调用zone_reclaim(shrink_zone),两种的回收参数有所不同，回收参数相当多.都是使用shrink_zone实现.
+回收时都是处理zone的lru队列,先处理active队列,把inactive的page放到inactive lru中,同时把没人用的释放,然后处理inactive,对可以回收的page尝试着去释放它关联的各种资源, pte, address_space, dirty/writeback等. 在回收时,先把page放到回收队列中，这个过程是isolate,然后再处理这些page. 
+    
+

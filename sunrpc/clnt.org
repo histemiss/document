@@ -1,0 +1,733 @@
+* 数据结构
+
+** client
+   - rpc_task, rpc_messsge, rpc_rqst, rpc_clnt, rpc_task_setup, rpc_procinfo, rpc_create_srgs, rpc_prgrom, rpc_version, rpc_auth, rpc_cred
+   - transport: rpc_xprt, rpc_buf, rpc_xprt_ops, xprt_create, xprt_class
+
+** server
+   - svc_serv, svc_program, svc_version, svc_procedure, svc_pool, svc_rqst
+   - transport: svc_xprt_ops, svc_xprt_class, svc_xpt_user, svc_xprt, svc_serv, sock_xprt
+
+** 共有
+   - xdr_buf,rpc_fraghdr
+
+** 统计
+   - rpc_stat svc_stat, rpc_iotats
+
+** cache 好像只在server使用
+   - cache_head, cache_detail_procfs, cache_detail_pipefs, cache_detail, cache_req, cache_deferred_req
+
+** 其他
+   - sunrpc_net, 这应该是client一端
+   - rpc_buffer, 简单的数据包装.
+
+** 总结
+   - (request: 表示CLIENT的使用者发起的动作,请求RPC服务)
+   - (connect: 表示socket建立起来，与SERVER建立其连接)
+   - CLIENT从代码构成角度来看它分成几个模块: 各种主要数据结构的创建销毁，FSM，网络的创建/端口
+   - 从功能划分SUNRPC分成rpc_task和rpc_clnt构成的FSM接口,rpc_xprt和sock_xprt实现的FSM中网络传输相关的接口.
+   - rpc_clnt表示RPC的使用者，使用任何RPC服务，都要先创建这个数据类型,它的属性表示这个请求者要使用哪个SERVER的什么服务,它依赖的rpc_xprt,rpc_clnt中的成员变量包括rpc_prog/ver,rpc_procinfo等标志请求的服务,还有SERVER地址等
+   - rpc_task表示/完成一个请求,过程简化为:打包,发送,接受,解包. 但SUNRPC非要把事情搞的复杂化,实现了一个FSM,把战线拉得非常长,所以rpc_task需要经过FSM的一套生产线.rpc_task包括状态函数/回调函数,调用参数/结果,其他都是调度使用的数据结构
+   - rpc_xprt是为FSM服务的,所以它是基础设施，为rpc_task的状态改变服务,或者这里rpc_xprt只是实现了rpc_task的调度,控制生产线的效率/产量. rpc_xprt包括等待队列用来管理rpc_task/rpc_rqst,服务地址,协议,表示connect状态的参数等
+   - sock_xprt为rpc_xprt提供网络传输服务, 使用socket发送和接受数据. sock_xprt还有本地地址,数据传输使用的参数.rpc_rqst包括数据存储信息.
+   - rpc_rqst管理SUNRPC服务传输的数据,他负责数据内存的管理,数据的打包和解包.
+
+* addr.c
+  - 把sockaddr和universal address的互相转换,sockaddr可以是sockaddr_in6或sockaddr_in.
+
+* clnt.c
+
+** rpc_procinfo
+   #+BEGIN_SRC 
+	u32			p_proc;		/* RPC procedure number */
+	kxdreproc_t		p_encode;	/* XDR encode function */
+	kxdrdproc_t		p_decode;	/* XDR decode function */
+	unsigned int		p_arglen;	/* argument hdr length (u32) */ //len需要看一下
+	unsigned int		p_replen;	/* reply hdr length (u32) */
+	unsigned int		p_count;	/* call count */ //在call_start中增加
+	unsigned int		p_timer;	/* Which RTT timer to use */ //rtt中索引使用
+	u32			p_statidx;	/* Which procedure to account */ //索引rpc_clnt->rpc_iostats统计数组, 在关闭rpc_task时统计
+	const char *		p_name;		/* name of procedure */   
+   #+END_SRC
+
+** rpc_message   
+   #+BEGIN_SRC 
+	struct rpc_procinfo *	rpc_proc;	/* Procedure information */ //他指向具体的服务的定义的对象
+	void *			rpc_argp;	/* Arguments */
+	void *			rpc_resp;	/* Result */
+	struct rpc_cred *	rpc_cred;	/* Credentials */
+   #+END_SRC
+
+** rpc_clnt 
+    #+BEGIN_SRC 
+	atomic_t		cl_count;	/* Number of references */
+	struct list_head	cl_clients;	/* Global list of clients */ cl_clients 放到队列sunrpc_net->all_clients
+	struct list_head	cl_tasks;	/* List of tasks */
+	spinlock_t		cl_lock;	/* spinlock */
+	struct rpc_xprt __rcu *	cl_xprt;	/* transport */
+
+	struct rpc_procinfo *	cl_procinfo;	/* procedure info */ //指向数组的开头
+	u32			cl_prog,	/* RPC program number */
+				cl_vers,	/* RPC version number */
+				cl_maxproc;	/* max procedure number */
+
+	const char *		cl_protname;	/* protocol name */
+	struct rpc_auth *	cl_auth;	/* authenticator */
+	struct rpc_stat *	cl_stats;	/* per-program statistics */
+	struct rpc_iostats *	cl_metrics;	/* per-client statistics */
+
+	unsigned int		cl_softrtry : 1,/* soft timeouts */
+				cl_discrtry : 1,/* disconnect before retry */
+				cl_autobind : 1,/* use getport() */
+				cl_chatty   : 1;/* be verbose */
+
+	struct rpc_rtt *	cl_rtt;		/* RTO estimator data */
+	const struct rpc_timeout *cl_timeout;	/* Timeout strategy */
+
+	int			cl_nodelen;	/* nodename length */  //hostname
+	char 			cl_nodename[UNX_MAXNODENAME];
+	struct dentry *		cl_dentry;
+	struct rpc_clnt *	cl_parent;	/* Points to parent of clones */
+	struct rpc_rtt		cl_rtt_default;
+	struct rpc_timeout	cl_timeout_default;
+	const struct rpc_program *cl_program;
+	char			*cl_principal;	/* target to authenticate to */
+    #+END_SRC
+
+** rpc_program
+   #+BEGIN_SRC 
+	const char *		name;		/* protocol name */
+	u32			number;		/* program number */
+	unsigned int		nrvers;		/* number of versions */
+	const struct rpc_version **	version;	/* version array */
+	struct rpc_stat *	stats;		/* statistics */  //他和rpc_clnt->rpc_stat一样??
+	const char *		pipe_dir_name;	/* path to rpc_pipefs dir */  //在rpc_clnt->cl_dentry下面创建文件
+   #+END_SRC
+
+** rpc_version
+   #+BEGIN_SRC 
+	u32			number;		/* version number */
+	unsigned int		nrprocs;	/* number of procs */
+	struct rpc_procinfo *	procs;		/* procedure array */   
+   #+END_SRC
+
+** rpc_create_args
+   #+BEGIN_SRC 
+	//创建rpc_clnt使用的参数
+	struct net		*net;
+	int			protocol;
+	struct sockaddr		*address;     //目标地址
+	size_t			addrsize;
+	struct sockaddr		*saddress;    //本地地址
+	const struct rpc_timeout *timeout;
+	const char		*servername;  //目标地址
+	const struct rpc_program *program;
+	u32			prognumber;	/* overrides program->number */
+	u32			version;
+	rpc_authflavor_t	authflavor;
+	unsigned long		flags;
+	char			*client_name; //本地地址
+	struct svc_xprt		*bc_xprt;	/* NFSv4.1 backchannel */   
+   #+END_SRC
+
+** rpc_timeout 
+   - 如果链接超时时，如果重新发起链接,需要等待的时间.
+   #+BEGIN_SRC 
+	unsigned long		to_initval,		/* initial timeout */
+				to_maxval,		/* max timeout */
+				to_increment;		/* if !exponential */
+	unsigned int		to_retries;		/* max # of retries */
+	unsigned char		to_exponential;     
+   #+END_SRC
+
+** rpc_rtt 
+   #+BEGIN_SRC 
+	unsigned long timeo;	/* default timeout value */
+	unsigned long srtt[5];	/* smoothed round trip time << 3 */
+	unsigned long sdrtt[5];	/* smoothed medium deviation of RTT */
+	int ntimeouts[5];	/* Number of timeouts for the last request */
+	//rpc_procinfo->p_timer索引srtt数组,这个和具体的procedure关联
+   #+END_SRC
+
+** rpc_register_client(rpc_clnt) / rpc_unregister_client
+   - 操作rpc_clnt->cl_clients和sunrpc_net->all_clients队列
+
+** __rpc_clnt_remove_pipedir(rpc_clnt)
+   - 每个rpc_clnt都会在pipefs中有一个目录, 目录中有pipefs文件, 和userspace程序交互. 
+   - 现在gss,idmap会使用它
+   > rpc_clnt->rpc_auth->au_ops->pipes_destroy(rpc_clnt->rpc_auth)
+   > rpc_remove_client_dir(rpc_clnt->cl_dentry)
+    
+** rpc_clnt_remove_pipedir(rpc_clnt)
+  - 对上面函数的封装, rpc_clnt->cl_dentry在pipefs_sb下面
+  > rpc_get_sb_net(rpc_clnt->cl_xprt->xprt_net)
+  > __rpc_clnt_remove_pipedir
+  > rpc_put_sb_net(rpc_clnt>cl_xprt->xprt_net)
+    
+** rpc_setup_pipedir_sb(super_block, rpc_clnt, dirname)
+  - 在pipefs中,dir_name目录表示一种rpc请求的服务
+  - 它包含每个rpc_clnt的一个子目录,目录名字为"clnt"+id, id是全局递增的计数. 
+  - dir_name应该是rpc_program->pipe_dir_name. 在创建rpc_clnt时,检查对应的rpc_program是否在pipefs中注册了目录,如果没有就在这里创建
+  - 先查找是否dirname对应的dentry
+  > rpc_d_lookup_sb(super_block, dir_name)
+  - 创建子文件夹, 默认情况下子文件中有info的文件, 其他服务需要自己添加
+  > rpc_create_client_dir(dentry, qstr, rpc_clnt) 
+
+** rpc_setup_pipedir(rpc_clnt, dirname)
+  - 对上面函数的封装. dir_name是rpc_program->name
+  > rpc_setup_pipedir_sb(pipefs_sb, rpc_clnt, dir_name)
+  - 创建的dentry给clnt->cl_dentry
+
+** rpc_clnt_skip_event(rpc_clnt, event)
+   - 如果是RPC_PIPEFS_MOUNT, rpc_clnt->cl_dentry已经存在,不再创建
+   - 如果是RPC_PIPEFS_UMOUNT, 而且cl_dentry不存在,不会删除
+
+** __rpc_clnt_handle_event(rpc_clnt, event, super_block)
+   - 这应该是一个回调函数，根据event进行不同的操作, 为何这里的参数是rpc_clnt
+   - 如果event = RPC_PIPEFS_MOUNT, 创建rpc_clnt使用的文件夹
+   > rpc_setup_pipedir_sb(super_block, rpc_clnt, rpc_clnt->rpc_program->pipe_dir_name)
+   - 这个应该是gss
+   > rpc_clnt->rpc_auth->au_ops->pipes_create(rpc_clnt->rpc_auth)
+   - 如果是event = RPC_PIPEFS_UMOUNT:
+   > __rpc_clnt_remove_pipedir(rpc_clnt)
+ 
+** __rpc_pipefs_event(rpc_clnt, event, super_block)
+   - 遍历rpc_clnt->cl_parent链表, 对每个rpc_clnt创建他的cl_dentry 
+   > __rpc_clnt_handle_event(rpc_clnt, event, super_block)
+
+** rpc_get_client_for_event(net, event)
+   - 遍历sunrc_net->rpc_client队列中的所有rpc_clnt, 找一个接受event的
+   > rpc_clnt_skip_event(rpc_clnt, event)
+
+** rpc_pipefs_event(notifier_block, event, ptr)
+   - 对上面函数的封装，ptr是super_block，它属于一个sunrpc_net,遍历它的所有rpc_clnt,发送event
+   - 找可用的rpc_clnt
+   > rpc_get_client_for_event(net, event)
+   - 创建rpc_clnt->cl_dentry
+   > __rpc_pipefs_event(rpc_clnt, event, super_block)
+
+** notifier_block rpc_clients_block  
+   - 全局变量，使用notifier
+   #+BEGIN_SRC 
+        .notifier = rpc_pipefs_event
+        .priority = SUNRPC_PIPEFS_RPC_PRIO
+   #+END_SRC
+
+** rpc_clients_notifier_register()
+   - rpc_pipefs_notifier_register(rpc_clients_block)
+    
+** rpc_clients_notifier_unregister()
+   - rpc_pipefs_notifier_unregister(rpc_clients_block)
+
+** 总结
+   - 任何rpc_program都在sunrpc目录下面有一个目录，用户创建rpc_clnt，便会在rpc_program下面建立一个目录("clnt"+NO)
+   - 在挂载pipefs时,发送notifier事件,扫描所有的rpc_clnt, 创建对应的文件夹, 在卸载pipefs, 时删除对应的文件夹
+   - gss使用pipefs, 在上面创建rpc_clnt的对应目录时,调用rpc_clnt->rpc_auth->rpc_authops->pipes_create函数构造对应的文件
+   - idmap使用这个文件,在创建nfs_client时,给nfs_client->rpc_clnt创建, 当然idmap也得监听pipefs的notifier
+
+** rpc_clnt_set_nodename(rpc_clnt, nodename)
+   - 设置rpc_clnt->cl_nodename, 使用netname??
+
+** rpc_client_register(rpc_create_args, rpc_clnt)
+   - 建立pipefs的文件夹
+   - 获取pipefs_sb / super_block
+   > rpc_get_sb_net(net)
+   > rpc_setup_pipedir(rpc_clnt, rpc_clnt->rpc_program->pipe_dir_name, pipefs_sb)
+   - 关联sunrpc_net
+   > rpc_register_client(rpc_clnt)
+   - 构造rpc_auth, rpc_clnt->cl_auth
+   > rpcauth_create(rpc_create_args->authflavor, rpc_clnt)
+
+** rpc_new_client(rpc_create_args, rpc_xprt)
+   - 这里填充数据结构, 只有lockd/nfs/cb使用它
+   - rpciod_up  -> try_module_get 
+   - cl_parent = rpc_clnt  指向自己
+   - cl_server = rpc_create_args->servername  server名称
+   - cl_xprt = rpc_xprt
+   - * 上面传输层使用
+   - cl_procinfo = rpc_create_args->rpc_program->rpc_version->rpc_procinfo
+   - cl_maxproc = rpc_version->nrprocs
+   - cl_protname = rpc_program->name  rpc_program名称
+   - cl_prog = rpc_program->number
+   - cl_vers = rpc_version->number
+   - cl_program = rpc_create_args->rpc_program
+   - * 上面是rpc request 使用
+   - cl_stats = rpc_program->stats , rpc_stats使用的是rpc_program的
+   - cl_metrics = rpc_alloc_iostats(rpc_clnt) rpc_iostats做io统计
+   -  统计
+   - cl_autobind = ! xprt_bound(rpc_clnt->rpc_xprt) rpc_xprt有标志位说明它是否bind, bind操作是查找port
+   - cl_timeout = rpc_xprt->timeout  rpc_timeout
+   - cl_timeout_default = rpc_create_args->timeout  rtt?
+   - cl_timeout = rpc_clnt->cl_timeout_default
+   - cl_rtt = rpc_clnt->cl_rtt_default
+   - * 超时使用
+   - cl_principal = rpc_create_args->client_name
+   - rpc_program->pipe_dir_name目录下面建立子目录.
+   > rpc_setup_pipedir(rpc_clnt, rpc_program->pipe_dir_name) 
+   - rpcauth_create(rpc_create_args->authflavor, rpc_clnt)
+   - rl_nodelen = init_utsname()->nodename 类似hostname的东西
+   - rpc_register_client(rpc_clnt) 
+
+** rpc_create(rpc_create_args)
+   - 先使用xprt_create创建rpc_xprt, 里面全是网络地址
+   - net = rpc_create_args->net
+   - ident = rpc_create_args->protocol 协议
+   - srcaddr = rpc_create_args->saddress 发起链接的本地地址
+   - dstaddr = rpc_create_args->address server的地址
+   - addrlen 对应server地址
+   - bx_xprt = rpc_create_args->bc_xprt svc_xprt已经建好了??
+   - 创建rpc_xprt,它主要给rpc_task服务,只有初始化一些信息类的成员变量: server sockaddr, rpc_wait_queue.
+   > xprt_create_transport(xprt_create) 
+   - rpc_xprt->resvport = rpc_create_args->flags & RPC_CLNT_CREATE_NONPRIVPORT, 是否使用特权socket
+   - 根据rpc_create_args->address初始化rpc_create_args->servername, 给rpc_new_client使用.
+   - 构造rpc_clnt
+   > rpc_new_client(rpc_create_args, rpc_xprt)
+   > rpc_ping(rpc_clnt)  ping server
+   - 初始化其他属性
+   - cl_softrtry = RPC_CLNT_CREATE_HARDRTRY
+   - cl_autobind = RPC_CLNT_CREATE_AUTOBIND
+   - cl_discrtry = RPC_CLNT_CREATE_DISCRTRY
+   - cl_chatty = RPC_CLNT_CREATE_QUIET
+        
+** __rpc_clone_client(rpc_clnt)
+   - 克隆rpc_clnt, 只是复用rpc_xprt
+   - 增加rpc_clnt->rpc_xprt使用计数
+   - 构造rpc_clnt 
+   > rpc_new_client(rpc_create_args, rpc_clnt)
+   - 设置rp_clnt->cl_parent, 使用相同的cl_softtry,cl_discretry, cl_chatty
+
+** rpc_clone_client(rpc_clnt)
+   - 根据rpc_clnt构造一个rpc_create_args, 使用相同的服务, program/version/authflavor, client_name
+   > __rpc_clone_client(rpc_create_args, rpc_clnt)
+
+** rpc_clone_client_set_auth(rpc_clnt, rpc_authflavor_t)
+   - 和上面类似,不过rpc_create_args->authflavor使用函数参数
+   > __rpc_clone_create(rpc_create_args, rpc_clnt)
+
+
+** rpc_killall_tasks(rpc_clnt)
+   - 遍历rpc_clnt->cl_tasks, 关闭所有rpc_task
+   - 如果 !rpc_task->tk_runstate & RPC_TASK_ACTIVE，不用kill
+   - 如果 rpc_task->tk_flags & RPC_TASK_KILLED 不用kill
+   - 关闭rpc_task, 这里并没有注销,结束它的FSM过程
+   > rpc_exit(rpc_task, -EIO) 
+   - 如果rpc_task->tk_runstate & RPC_TASK_QUEUED, 异步方式释放rpc_task,这个队列是SUNRPC使用者提供的
+   > rpc_wake_up_queued_task(rpc_task->tk_waitqueue, rpc_task) 
+
+** rpc_shutdown_client(rpc_clnt)
+   - 这里还是关闭rpc_clnt关联的所有rpc_task,直到rpc_clnt->cl_tasks队列为空. 这是rpc使用者调用的，它最后使用rpc_release_client,释放rpc_clnt.
+   > rpc_killall_tasks(rpc_clnt)
+   - destroy_wait是全局等待队列,在上面等1s的时间，当然会被别人唤醒
+   > wait_event_timeout(destroy_wait, list_empty(rpc_clnt->cl_tasks, 1HZ) 
+   > rpc_release_client(rpc_client)
+
+** rpc_free_client(rpc_clnt)
+   - 做以下销毁动作,还是集中在xprt, pipefs等
+   - 先释放parent?
+   > rpc_release_client(rpc_client->cl_parent) 
+   - 注销sunrpc_net
+   > rpc_ungister_client(rpc_clnt)
+   - pipefs操作
+   > rpc_clnt_remove_pipedir(rpc_clnt)
+   - 释放rpc_iostats
+   > rpc_free_iostats(rpc_clnt->cl_metrics)
+   > kfree(cl_server, cl_principal)
+   > xprt_put(rpc_xprt)
+   > rpciod_down()
+   > kfree(rpc_clnt)
+
+** rpc_free_auth(rpc_clnt)
+   - 经过他释放rpc_clnt, 这个函数只在rpc_release_client中调用,而且rpc_clnt->cl_count保证为0
+   - 如果rpc_clnt->rpc_auth == NULL 调用rpc_free_client直接释放. 没有人使用rpc_clnt
+   - 增加rpc_clnt->cl_count, 来释放rpc_auth 
+   - 为了维持gss的操作, rpc_clnt->cl_count ++, 完成之后再减小
+   > rpcauth_release(rpc_clnt->cl_auth) 
+   - 如果rpc_clnt->cl_count ==0, 释放它. 可能释放过程中还有模块使用它?!
+   > rpc_free_client
+
+** rpc_release_client(rpc_clnt)
+   - 如果rpc_clnt->cl_tasks为空,唤醒destroy_wait
+   - 如果rpc_clnt->cl_count减到0，释放rpc_auth
+   > rpc_free_auth(rpc_clnt). 
+    
+** rpc_bind_new_program(rpc_clnt, rpc_program, vers)
+   - 克隆一个rpc_clnt, 绑定新的rpc_program
+   > rpc_clone_client(rpc_clnt)
+   - 设置rpc_clnt的cl_procinfo, cl_maxproc, cl_protname, cl_prog, cl_vers, cl_stats
+   > rpc_ping(rpc_clnt)
+   - 如果有错误的话, 关闭创建的
+   > rpc_shutdown_client(rpc_clnt) 
+
+** 总结
+   - rpc_clnt是最上层的数据结构,他协调rpc_xprt/rpc_auth/rpc_program. 具体的事情交给rpc_task完成.
+
+** rpc_task 
+   #+BEGIN_SRC 
+	atomic_t		tk_count;	/* Reference count */
+	struct list_head	tk_task;	/* global list of tasks */
+	struct rpc_clnt *	tk_client;	/* RPC client */
+	struct rpc_rqst *	tk_rqstp;	/* RPC request */
+
+	/*
+	 * RPC call state
+	 */
+	struct rpc_message	tk_msg;		/* RPC call info */
+
+	/*
+	 * callback	to be executed after waking up
+	 * action	next procedure for async tasks
+	 * tk_ops	caller callbacks
+	 */
+	void			(*tk_callback)(struct rpc_task *);
+	void			(*tk_action)(struct rpc_task *);
+	const struct rpc_call_ops *tk_ops;
+	void *			tk_calldata;
+
+	unsigned long		tk_timeout;	/* timeout for rpc_sleep() */
+	unsigned long		tk_runstate;	/* Task run status */
+	struct workqueue_struct	*tk_workqueue;	/* Normally rpciod, but could
+						 * be any workqueue
+						 */
+	struct rpc_wait_queue 	*tk_waitqueue;	/* RPC wait queue we're on */
+	union {
+		struct work_struct	tk_work;	/* Async task work queue */
+		struct rpc_wait		tk_wait;	/* RPC wait */
+	} u;
+
+	ktime_t			tk_start;	/* RPC task init timestamp */
+
+	pid_t			tk_owner;	/* Process id for batching tasks */
+	int			tk_status;	/* result of last operation */
+	unsigned short		tk_flags;	/* misc flags */
+	unsigned short		tk_timeouts;	/* maj timeouts */
+
+#ifdef RPC_DEBUG
+	unsigned short		tk_pid;		/* debugging aid */
+#endif
+	unsigned char		tk_priority : 2,/* Task priority */
+				tk_garb_retry : 2,
+				tk_cred_retry : 2,
+				tk_rebind_retry : 2;   
+   #+END_SRC
+
+
+** rpc_task_release_client(rpc_task)    
+   - 释放rpc_task->tk_task链表关系, 应该对应rpc_clnt->cl_tasks
+   - 释放rpc_clnt的使用计数
+   > rpc_release_client(rpc_clnt)
+   
+** rpc_task_set_client(rpc_task, rpc_clnt)
+   - 先释放原来的
+   > rpc_task_release_client(rpc_task)  
+   - 关联rpc_task和rpc_clnt,增加rpc_clnt->cl_count计数
+   - 根据rpc_clnt->cl_softrtry, 设置rpc_task->tk_flags的RPC_TASK_SOFT
+
+** rpc_task_reset_client(rpc_task, rpc_clnt)
+   > rpc_task_release_client()
+   > rpc_task_set_client()
+
+** rpc_task_set_rpc_message(rpc_task, rpc_message)
+   - 拷贝rpc_message的数据给rpc_task->rpc_message.
+
+** rpc_task_setup 
+   - 使用这个数据结构构造rpc_task
+   #+BEGIN_SRC 
+	struct rpc_task *task;  //read/write/layout/commit会重复使用rpc_task,其他都不会
+	struct rpc_clnt *rpc_client;   //通过他关联rpc_xprt等, prog/vers等,在rpc_message没有这些
+	const struct rpc_message *rpc_message;
+	const struct rpc_call_ops *callback_ops;   //在FSM中会使用
+	void *callback_data;   
+	struct workqueue_struct *workqueue;  //用来释放rpc_task, 这里不是rpc_wait_queue
+	unsigned short flags;   //给rpc_task->tk_flags
+	signed char priority;
+   #+END_SRC
+   - 开始时rpc_clnt已经创建rpc_xprt,根据rpc_message和rpc_task_setup建立rpc_task,然后交给FSM,碰到rpc_rqst.
+
+** rpc_run_task(rpc_task_setup)
+   - 在调用rpc_task的地方都要自己准备rpc_task_setup
+   - 构造rpc_task
+   > rpc_new_task(rpc_task_setup)
+   - 关联rpc_clnt
+   > rpc_task_set_client(rpc_task, rpc_task_setup->rpc_clnt)
+   - 接受rpc_message, 当然只是指针操作
+   > rpc_task_set_rpc_message(rpc_task, rpc_task_setup->rpc_message)
+   - 设置默认rpc_task->tk_action = call_start
+   > rpc_call_start(rpc_task)
+   > rpc_task->tk_count ++
+   - 启动FSM
+   > rpc_execute(rpc_task)
+
+** rpc_call_sync(rpc_clnt, rpc_message, flags)
+   - 同步方式使用rpc
+   - 先创建rpc_task_setup, rpc_task_setup->rpc_call_ops = rpc_default_ops, 里面没有实质的操作
+   - 创建一个rpc_task, 调度执行
+   - 同步等待rpc_task的执行完成, 他在rpc_task完成之后才会返回
+   > rpc_run_task(rpc_task_setup) 
+   - 释放rpc_task->tk_count计数
+   > rpc_put_task(rpc_task)
+
+** rpc_call_async(rpc_clnt, rpc_message, flags, rpc_call_ops, data)
+   - 和上面类似，不过指定rpc_task_setup->flags = flags | RPC_TASK_ASYNC.
+   - 这里使用了rpc_call_ops
+   - 构造rpc_task, 调度执行
+   > rpc_run_task(rpc_task_setup)
+   > rpc_put_task(rpc_task) 
+
+** rpc_run_bc_task(rpc_rqst, rpc_call_ops)
+   - bc还不明白如何操作
+   - 构造rpc_task_setup, 他只有rpc_call_ops. 可以看出rpc_task的构造和rpc_clnt没有关系,只有在运行时才有关系.
+   > rpc_new_task(rpc_task_setup)
+   - 关联rpc_task 和 rpc_rqst, rpc_task->tk_action = call_bc_transmit, 
+   - 这和正常的rpc_task的FSM完全不一样, 他只有2个状态,发送完成后退出
+   - rpc_task已经关联rpc_rqst, rpc_xprt, xdr_buf已经准备好
+   - 执行rpc_task 
+   > rpc_execute(rpc_task)
+
+** rpc_call_start(rpc_task)
+   - 设置FSM的开始状态
+   - 它一般在rpc_task->rpc_call_ops->rpc_call_prepare中使用, 设置rpc_task的其实操作, 启动FSM
+   - 在rpc_run_task中,也使用他设置rpc_task->tk_action
+
+** rpc_peeraddr(rpc_clnt, sockaddr, bufsize) / rpc_peeraddr2str(rpc_clnt, rpc_display_format_t)
+   - 从rpc_clnt->rpc_xprt中获取地址,第一个获取rpc_xprt->addr,第二个获取rpc_xprt->address_strings[rp_display_format_t]
+
+** rpc_localaddr(rpc_clnt, sockaddr, buflen)
+   - 获取local的ip地址? 他会创建socket, 然后执行connect, 然后再获取自己的地址?? 这么复杂??
+
+** rpc_setbufsize(rpc_clnt, sndsize, rcvsize)
+   - 这里调用rpc_xprt的回调函数,设置udp的缓存大小
+   - rpc_xprt->rpc_xprt_ops->set_buffer_size(rpc_xprt, sndsize, rcvsize)
+
+** rpc_protocol(rpc_clnt)
+   - xpr_clnt->rpc_xprt->prot
+
+** rpc_net_ns(rpc_clnt)
+   - rpc_clnt->rpc_xprt->xprt_net, 就是net??
+
+** rpc_max_payload(rpc_clnt)
+   - 返回rpc_clnt->rpc_xprt->max_payload, 在设定rsize/wsize时使用
+
+** rpc_force_rebind(rpc_clnt)
+   - 清除rpc_clnt->rpc_xprt->flags的XPRT_BOUND,当然需要rpc_clnt->cl_autobind为真.
+
+** rpc_get_timeout(rpc_clnt)
+   - 获取rpc_clnt->rpc_xprt->rpc_timeout->to_initval, 其他模块可能需要等待
+
+** rpc_restart_call_prepare(rpc_task)
+   - 如果rpc_task是自杀, 不会重启.
+   - 修改rpc_task->tk_action为call_start. 
+   - 如果rpc_task->tk_ops->rpc_call_prepare有效,修改为rpc_task->tk_ops->rpc_call_prepare.他会执行rpc_call_prepare
+
+** rpc_restart_call(rpc_task)
+   - 这个和rpc_call_start一样，但是判断rpc_task是否自杀. rpc_tk_flags&RPC_TASK_KILLED. 
+   - 但不会检查prepare, rpc_task->tk_action = call_start.
+
+** 总结
+   - 下面是FSM的状态函数,主要实现状态转换, 设置rpc_task->tk_action或rpc_task->tk_callback, 因为FSM就是循环的执行这两个函数. 
+   - rpc_task->tk_action应该是下面的这些call_*函数,而rpc_task->tk_callback目前只有rpc_call_ops还有rpc_sleep_on设定的函数. call_*这些函数中当然要干一些实质的工作，那些工作就是xprt_*实现.
+
+** rpc_start(rpc_task)
+   - rpc_task->tk_action = call_reserve 跳到reserve
+
+** call_reserve(rpc_task)
+   - rpc_task->tk_action = call_reserveresult
+   - 分配rpc_rqst
+   > xprt_reserve(task)
+
+** call_reserveresult(rpc_task)
+   - 这里开始FSM的分支，分支根据rpc_task->tk_status,还有其他错误处理
+   - status >= 0 rpc_task->rpc_xprt有效  => call_refresh 成功
+   - status = EAGAIN => call_reserve
+   - status = ENOMEM, 等待1/4s, 然后是call_reserve
+   - 其他 rpc_exit
+
+** rpc_refresh(rpc_task)
+   - rpc_task->tk_action = call_refreshresult
+   - 准备rpc_rqst->rpc_cred, 为数据加密做准备
+   > rpcauth_refreshcred(rpc_task)
+
+** call_refreshresult
+   - status = 0 auth是RPCAUTH_CRED_UPTODATE => call_allocate
+   - status = 0 auth无效，需要重新获取auth信息 => call_refresh
+   - status = ETIMEOUT => call_refresh 重新,而且 rpc_delay(rpc_task, 3HZ)
+   - status = EGAIN rp_task->tk_cred_retry -- > 0 => rpc_refresh
+   - status = EGAIN rpc_task->tk_cred_retry = 0 还有其他status => rpc_exit(rpc_task, EACCESS)
+   - rpc_task->tk_cred_retry都是2..
+
+** call_allocate(rpc_task)
+   - 分配内存,使用rpc_rqst, 首先检查rpc_task->rpc_rqst->rq_buf, 如果不是NULL, 就是已经分配了.
+   - 计算发送的数据量
+   > rpc_rqst->rq_callsize = RPC_CALLHDRSIZE + rpc_cred->rpc_auth->au_cslack * 2 + rpc_procinfo->p_arglen
+   - 接受的数据量
+   > rpc_rqst->rq_rcvsize = RPC_REPHDRSIZE + rpc_auth->au_cslack + rpc_procinfo->p_replen
+   - 2者都要*4, 这么浪费?
+   - 创建rpc_rqst->rpc_buf, 这些空间应该只是encode/decode使用的空间, io的数据不会在这里面.
+   - 这里的空间不算大,在rpc_rqst->rq_buffer中记录地址
+   - rpc_xprt->ops->buf_alloc(rpc_task, size)
+   - 如果分配失败, 需要重新分配
+   - rpc_task->tk_flags & RPC_TASK_ASYNC
+   - 等待1/16s, 这些等待时间为何是固定的??
+   > fatal_signal_pending(current)
+   - 如果同步,而且有signal, 直接退出
+
+** rpc_task_need_encode(rpc_task)
+   - 为何它决定是否需要编码，应该是proc决定.
+   - rpc_task->rpc_xprt->rq_snd_buf_len == 0 
+
+** rpc_task_force_reencode(rpc_task) 
+   - 重新编码,修改两个参数 rpc_snd_buf, rq_bytes_send
+
+** rpc_xdr_buf_init(xdr_buf, char *start, len)
+   - 根据它来初始化rpc_rqst->xdr_buf
+   - 把start都给xdr_buf->head[0], 把xdr_buf->tail[0] 和 xdr_buf->page_len都清空, 还有len = buflen =0
+
+** rpc_encode_header(rpc_task)
+    -> xprt_skip_transport_header
+    -> rpcauth_marshcred(rpc_task ...)
+    -> xdr_adjuest_iovec()
+
+** rpc_xdr_encode(rpc_task)
+   - 这个也不是状态转变函数, 这个在call_transmit中使用
+   - 把call_allocate申请的内存分配给2个xfs_buf
+   > rpc_xdr_buf_init(rpc_rqst->rq_snd_buf, ...)
+   > rpc_xdr_buf_init(rpc_rqst->rq_rcv_buf, ...)
+   - 把rpc header打包
+   > rpc_encode_header(rpc_task)
+   - 这里是什么数据??
+   > rpcauth_wrap_req(rpc_task, encode_xdr_t, rpc_rqst, p, rpc_argp)
+    
+** call_bind(rpc_task)
+   - 这里要执行rpcbind操作
+   - rpc_xprt->state & XPRT_BOUND => call_connect, 不需要bind
+   > rpc_xprt->ops->rebind(rpc_task)
+   - 其他情况 => 执行绑定 call_bind_status, rpc_task->tk_timeout = rpx_xprt->bind_timeout
+   > xprt->ops->rpcbind(rpc_task)
+
+** call_bind_status(rpc_status)
+   - 如果没问题,下一步是call_connect,但这里处理的错误情况比较多,主要的是call_timeout.
+   - status = ENOMEM => rpc_delay(HZ>>2) , call_timeout
+   - status = EACCESS, rpc_task->tk_rebind_retry -- > 0 => rpc_delay(3HZ), call_timeout
+   - status = ETIMETOU => call_timeout
+   - EPROTNOSUPPORT => call_bind
+   - 链接错误,而且rpc_task是hard => rpc_delay(5HZ) rpc_timeout
+   - 其他 rpc_exit(rpc, status)
+
+** call_connect(rpc_task)
+   - 检查rpc_xprt->state & XPRT_CONNECTED
+   - 如果不需要, 直接到call_transmit状态
+   - 否则执行connect操作
+   - 如果rpc_task->tk_status < 0, 返回
+   - 如果rpc_task->tk_flags & RPC_TASK_NOCONNECT, 也返回,不会执行connect操作
+   > xprt_connect(rpc_task) 
+   - 状态变为call_connect_status
+
+** call_connect_status(rpc_task)
+   - status >= 0 或 EAGIN => call_transmit
+   - status = ETIMEOUT => call_timeout
+   - 其他 rpc_exit
+
+** call_transmit
+   - 如果status < 0 => call_status
+   - 预留xprt的空间, 比如sock的发送空间??
+   > xprt_prepare_transmit()
+   - status != 0 => call_status
+   - encode操作
+   > rpc_task_need_encode(rpc_task)
+   > rpc_xdr_encode(rpc_task)
+   - status = EGAIN => rpc_delay(HZ>>4) call_transmit_status
+   - status != 0 => rpc_exit(rpc_task, status)
+   - 发送数据
+   > xprt_transmit(rpc_task)
+   - status < 0 =>rpc_transmit_status
+   - 如果没有问题, 处理结果
+   > call_transmit_status(rpc_task) 
+   - 如果需要接受结果,直接返回, 下面就是call_status, 等待接受数据
+   > rpc_reply_expected(rpc_task) 
+   - 如果不需要,跳转到rpc_exit_task
+   > rpc_wake_up_queued_task(rpc_task->rpc_rqst->rpc_xprt->pending, task)
+   - 这时rpc_task已经到了pending队列上等待
+
+** call_transmit_status(rpc_task)
+   - 数据发送完成,清除socket的资源
+   - status = 0 => xprt_end_transmit(rpc_task), rpc_task_force_reencode(rpc_task)把编码的数据丢掉
+   - 链接层错误,而且是soft 或者其他错误 => xprt_end_transmit(rpc_task), rpc_exit()
+   - 没有链接/重新链接 => rpc_task_force_reencode(rpc_task)
+   
+** call_status
+   - rpc_task在接受到数据,会被唤醒执行,直接跳到这里. 或者call_transmit有错误,也跳到这里
+   - status >= 0 => call_decode 
+   - EHOSTDOWN/ENETUNREAD/ETIMEOUT => rpc_delay(3HZ) call_timeout
+   > xprt_conditional_disconnect(rpc_xprt, cookie) 
+   - ECONNREST/ECONNREFUSED => rpc_force_rebind, rpc_delay, call_bind
+   - EPIPE/ENOCONN => call_bind
+   - EGAIN => call_transmit
+   - 其他 rpc_exit
+
+** call_timeout
+   - 处理所有的超时的处理, 他属于FSM中的一环, 在上面的错误处理中使用,比如bind/connect/receive中,在调用时,rpc_task可能执行了某个动作,很长时间没有结果,但也不一定.
+   - timeout只是有条件的等待一段时间,不要使CPU忙转
+   - 调整rpc_rqst->rq_timeout, 有rpc_timeout, rpc_rtt的处理.
+   > xprt_adjust_timeout(rpc_task->rpc_xprt)
+   - 所以使用rpc_rqst->rq_majortimeo表示是否真的超时, 如果返回0, 表示没有超时,否则就是真的超时
+   - SOFTCONN => rpc_exit(TIMEDOUT)
+   - SOFT => rpc_exit 不过返回错误不一样
+   - 如果不是soft, 还会重试
+   - 设置rpc_task->tk_flags的RPC_CALL_MAJORSEEN
+   > rpc_force_rebind  这里只有一个标志的改变
+   - 无效rpc_cred
+   > rpcauth_invalcred
+   - 跳转到call_bind
+
+** call_decode(rpc_task)
+   - 清除rpc_clnt->rpc_xprt->flags的RPC_CALL_MAJORSEEN
+   - 设置rpc_rqst->rq_rcv_buf->len = rpc_rqst->rq_private_buf.len, 这是接受的数据长度
+   - 上面2者都是xfs_buf, 他们使用的内存缺失完全一样的,也就是数据直接接收到rpc_rqst->rq_rcv_buf中.
+   - 那是设置的rpc_rqst->rq_rcv_buf->pages??  哪里复制的指针??
+   - 如果结果长度小于12, hard 链接 => call_bind 这算是重新开始了??
+   - 长度小于12, soft 链接 => call_timeout xprt_conditional_disconnect
+   - 如果没有问题, 检查rpc header
+   > rpc_verify_header()
+   - 数据解密
+   > rpcauth_unwrap_resp(rpc_task, decode, ...)
+   - 最后跳转到rpc_exit_task
+   - 其他情况,应该都去rpc_bind
+
+** rpc_verify_header(rpc_task)
+   - 首先是RPC_REPLY字段
+   - 然后应该是RPC_MSG_ACCEPTED, 否则,请求有错误 RPC_MSG_DENIED
+   - 如果是RPC_MISMATCH, 返回EPROTONOSUPPORT
+   - 如果不是RPC_AUTH_ERROR,返回eio
+   - RPC_AUTH_ERROR又分成多种情况
+   - 如果是RPC_AUTH_REJECTCRED/RPC_AUTH_REJECTEDEVERF/RPCSEC_GSS_CREDPROBLEM/RPCSEC_GSS_CTXPROBLEM, 这时rpcauth问题, 如果rpc_task->tk_cred_retry > 0, 跳转到call_reserve, 重新发送
+   > rpcauth_invalcred(rpc_task)
+   - 如果是RPC_AUTH_BADCRED/RPC_AUTH_BADVERF, 数据被纂改? 如果rpc_task->tk_garb_retry > 0, 重新发送, 跳转到call_bind
+   - 如果是RPC_AUTH_TOOWEK, 没有处理??
+   - auth处理?? 可能有加密
+   > rpcauth_checkverf(rpc_task, p)
+   - rpc请求的结果
+   - 如果是RPC_SUCESS, 返回p
+   - 如果是RPC_PROG_UNAVAIL/RPC_PROG_MISMATCH/RPC_PROC_UNAVAIL, 返回-EPFNOSUPPORT
+   - 后面就是结果数据
+
+** 总结
+   - 这里实际上可以说FSM处理完成,最简单的流程是
+   - start, reserve, refresh, allocate, bind, connect, transmit, status, decode, 额外的timeout
+   - 这里实现对其他模块的接口, 创建rpc_clnt, 通过构造rpc_task_setup, 或者rpc_clnt/rpc_message执行rpc请求.
+
+** rpc_ping(rpc_clnt)
+   - 构造rpc_message, 使用的prog/ver/proc都是空, encode/decode是空函数.cred也是authnull
+   > rpc_call_sync(rpc_clnt, rpc_message, RPC_TASK_SOFT|RPC_TASK_SOFTCONN)
+    
+** rpc_cal_null(rpc_clnt, rpc_cred, flags)
+   - 这个和上面的区别是使用指定的cred
+
+** call_bc_transmit(rpc_task)
+   - 这时backchannel使用的函数,也会进入FSM,但执行的函数和上面不一样
+   - 发送数据
+   > xprt_transmit(rpc_task)
+   > xprt_end_transmit(rpc_task)
+   - 最后跳转到rpc_exit_task
+   - 如果有网络错误
+   > xprt_conditional_disconnect(rpc_xprt, rpc_rqst->rq_connect_cookie)
+   - 直接执行下一个
+   > rpc_wake_up_queued_task(rpc_rqst->rpc_xprt->pending, rpc_task)

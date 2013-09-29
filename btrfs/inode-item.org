@@ -1,0 +1,105 @@
+* inode-item.c
+
+** btrfs_inode_ref
+   #+begin_src 
+	__le64 index;
+	__le16 name_len;
+	/* name goes here */
+   #+end_src
+
+** btrfs_inode_extref
+   #+begin_src 
+	__le64 parent_objectid;
+	__le64 index;
+	__le16 name_len;
+	__u8   name[0];
+	/* name goes here */
+        //这两个数据结构的区别就是parent_objectid, 使用有什么区别呢?? 对应不同的btrfs_key->type, 而且offset也不一样. 和目录的子文件索引很像..
+   #+end_src
+
+** find_name_in_backref(btrfs_path, char* , name_len, btrfs_inode_ref)
+   - btrfs_path中指向的btrfs_item是btrfs_inode_ref数组, 每个大小不是固定的.
+   - 获取btrfs_item的大小,这个约束着数组大小..
+   > btrfs_item_size_nr(extent_buffer, btrfs_path->slots[0])
+   - btrfs_item_ptr_offset(extent_buffer, btrfs_path->slots[0])
+   > btrfs_inode_ref_name_len(extent_buffer, btrfs_inode_ref)
+   > memcmp_extent_buffer(extent_buffer, name, name_ptr, name_len)
+   - 这里需要遍历多次,直到超过btrfs_item大小..这里返回的是一个extent_buffer中的偏移.
+
+** btrfs_find_name_in_ext_backref(btrfs_path, ref_objectid, name, name_len, btrfs_inode_extref)
+   - 这个函数和上面类似,不过这里的btrfs_item是btrfs_inode_extref数组..
+   > btrfs_item_size_nr(extent_buffer, btrfs_path->slots[0])
+   > btrfs_item_ptr_offset(extent_buffer, btrfs_path->slots[0])
+   - 然后遍历这个btrfs_item, 找一个btrfs_inode_extref, 它和参数匹配..
+
+** btrfs_lookup_inode_ref(btrfs_trans_handle, btrfs_root, btrfs_path, name, name_len, inode_objectid, ref_objectid, ins_len, cow)
+   - 找btree中的btrfs_inode_ref, 它是参数索引的(ref_objectid, name),ref_objectid是目录文件.inode_objectid应该都是子文件, name是文件名
+   - 构造btrfs_key(inode_objectid, BTRFS_INODE_REF_KEY, ref_objectid), 
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, ins_len, cow)
+   > find_name_in_backref(btrfs_path, btrfs_name, name_len, btrfs_inode_ref)
+
+** btrfs_lookup_inode_extref(btrfs_trans_handle, btrfs_root, btrfs_path, name, name_len, inode_objectid, ref_objectid, ins_len, cow)
+   - 和上面类似,找参数索引的btrfs_inode_extref
+   - 构造btrfs_key(inode_objectid, BTRFS_INODE_EXTREF_KEY, hash). hash根据name和ref_objectid计算. objectid和上面一样,都是文件ino..
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, ins_len, cow)
+   > btrfs_find_name_in_ext_backref(btrfs_path, ref_objectid, name, name_len)
+
+** btrfs_get_inode_ref_index(btrfs_trans_handle, btrfs_root, btrfs_path, name, name_len, inode_objectid, ref_objectid, mod, ref_index)
+   - 先找一个btrfs_inode_ref, 
+   > btrfs_lookup_inode_ref(btrfs_trans_handle, btrfs_root, btrfs_path, name, name_len, inode_objectid, ref_objectid, ins_len, cow)
+   - 如果找到就返回btrfs_inode_ref->index, 也就是子文件的索引数.如果找不到,再找hash队列..
+   > btrfs_lookup_inode_extref(btrfs_trans_handle, btrfs_root, btrfs_path, name, name_len, inode_objectid, ref_objectid, ins_len, cow)
+   > btrfs_inode_extref_index(extent_buffer, btrfs_inode_extref)
+   - 子目录的2种反向索引,一个根据parent, 索引name和index, 另一个根据hash索引parent, name, index
+
+** btrfs_del_inode_extref(btrfs_trans_handle, btrfs_root, name, name_len, inode_objectid, ref_objectid, index)
+   - 删除btree的btrfs_inode_extref, 先找到对应的btrfs_item,可能删除整个btrfs_item,可能删除一部分.
+   - 构造btrfs_key(inode_objectid, BTRFS_INODE_EXTREF_KEY, hash)
+   > btrfs_alloc_path()
+   - btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, -1, 1)
+   - 确认btrfs_item里面有需要的btrfs_inode_extref, 然后修改btrfs_item
+   > btrfs_find_name_in_ext_backref(btrfs_path, ref_objectid, name, name_len, btrfs_inode_extref)
+   - 根据item size, 决定是否全部删除
+   > btrfs_del_item(btrfs_trans_handle, btrfs_root, btrfs_path)
+   - 不全部删除就修改数据,然后修改btrfs_item
+   > memmove_extent_buffer(extent_buffer, ptr, ...)
+   > btrfs_truncate_inode_items(btrfs_trans_handle, ...)
+
+** btrfs_del_inode_ref(btrfs_trans_handle, btrfs_root, name, name_len, inode_objectid, ref_objectid, index)
+   - 删除btree中的btrfs_inode_ref, 和上面类似
+   - 构造btrfs_key(inode_objectid, BTRFS_INODE_REF_KEY, parent_inode_objectid)
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, -1, 1)
+   > find_name_in_backref(btrfs_path, name, name_len, btrfs_inode_ref)
+   - 如果找到,剩下的操作和上面一样, 如果没找到就删除ext ref 
+   > btrfs_del_inode_extref(btrfs_trans_handle, btrfs_root, name, name_len, inode_objectid, ref_objectid, index)
+   
+** btrfs_insert_inode_extref(btrfs_trans_handle, btrfs_root, name, name_len, inode_objectid, ref_objectid, index)
+   - 先btree中添加btrfs_inode_extref数据, 先找对应的btrfs_item, 如果找到就扩展它,添加到它索引的btrfs_inode_extref数组中, 如果没有就插入一个btrfs_item
+   - 构造btrfs_key(inode_objectid, BTRFS_INODE_EXTREF_KEY, hash)
+   > btrfs_alloc_path()
+   > btrfs_insert_empty_item(btrfs_trans_handle, ...)
+   - 如果返回-EEXIST,先检查是否有btrfs_inode_extref
+   > btrfs_find_name_in_ext_backref(btrfs_path, ref_objectid, name, name_len, NULL)
+   - 就在扩大原来的btrfs_item, 把btrfs_inode_backref添到里面..
+   > btrfs_extent_item(btrfs_trans_handle, btrfs_root, btrfs_path, ins_len)
+   - 然后把name, index, ref_objectid, name_len等等放进去..
+
+** btrfs_insert_inode_ref(btrfs_trans_handle, btrfs_root, name, name_len, inode_objectid, ref_objectid, index)
+   - 插入btrfs_inode_ref. 直接构造btrfs_key(inode_objectid, BTRFS_INODE_REF_KEY, ref_objectid)
+   - 如果返回-EEXIST, 就扩展现有的btrfs_item, 但扩展时没有处理错误? 哪里返回-EMLINK?
+   - 扩展或插入成功,写入btrfs_inode_ref信息.
+   - 如果失败返回-EMLINK, 太多的link, 就使用btrfs_inode_extref, 只有插入失败时.. -EOVERFLOW..
+
+** btrfs_insert_empty_inode(btrfs_trans_handle, btrfs_root, btrfs_path, objectid)
+   - 插入空的btrfs_inode_item, 构造btrfs_key(objectid, BTRFS_INODE_ITEM_KEY, 0)
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, ...)
+
+** btrfs_lookup_inode(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, mod)
+   - 在btree中查找参数btrfs_key. 这里不知到它是什么类型的key，可能是BTRFS_ROOT_ITEM_KEY.
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, ...)
+   
+** 总结
+   - 这个文件提供了inode backref的操作, 包括查找，插入和删除.
+   - 最后有提供了btrfs_inode_item的查找和插入操作
+   - 上面全部是为inode.c服务.
+

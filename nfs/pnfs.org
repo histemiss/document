@@ -1,0 +1,226 @@
+* pnfs.c
+
+** pnfs_layoutdriver_type
+   #+begin_src 
+	struct list_head pnfs_tblid;
+	const u32 id;         //对应某种layout..
+	const char *name;     //file / object/ block
+	struct module *owner; //子模块实现..
+	unsigned flags;
+
+	int (*set_layoutdriver) (struct nfs_server *, const struct nfs_fh *);
+	int (*clear_layoutdriver) (struct nfs_server *);
+
+	struct pnfs_layout_hdr * (*alloc_layout_hdr) (struct inode *inode, gfp_t gfp_flags);
+	void (*free_layout_hdr) (struct pnfs_layout_hdr *);
+
+	struct pnfs_layout_segment * (*alloc_lseg) (struct pnfs_layout_hdr *layoutid, struct nfs4_layoutget_res *lgr, gfp_t gfp_flags);
+	void (*free_lseg) (struct pnfs_layout_segment *lseg);
+
+	/* test for nfs page cache coalescing */
+	const struct nfs_pageio_ops *pg_read_ops;
+	const struct nfs_pageio_ops *pg_write_ops;
+
+	struct pnfs_ds_commit_info *(*get_ds_info) (struct inode *inode);
+	void (*mark_request_commit) (struct nfs_page *req,
+				     struct pnfs_layout_segment *lseg,
+				     struct nfs_commit_info *cinfo);
+	void (*clear_request_commit) (struct nfs_page *req,
+				      struct nfs_commit_info *cinfo);
+	int (*scan_commit_lists) (struct nfs_commit_info *cinfo,
+				  int max);
+	void (*recover_commit_reqs) (struct list_head *list,
+				     struct nfs_commit_info *cinfo);
+	int (*commit_pagelist)(struct inode *inode,
+			       struct list_head *mds_pages,
+			       int how,
+			       struct nfs_commit_info *cinfo);
+
+	/*
+	 * Return PNFS_ATTEMPTED to indicate the layout code has attempted
+	 * I/O, else return PNFS_NOT_ATTEMPTED to fall back to normal NFS
+	 */
+	enum pnfs_try_status (*read_pagelist) (struct nfs_read_data *nfs_data);
+	enum pnfs_try_status (*write_pagelist) (struct nfs_write_data *nfs_data, int how);
+
+	void (*free_deviceid_node) (struct nfs4_deviceid_node *);
+
+	void (*encode_layoutreturn) (struct pnfs_layout_hdr *layoutid,
+				     struct xdr_stream *xdr,
+				     const struct nfs4_layoutreturn_args *args);
+
+	void (*cleanup_layoutcommit) (struct nfs4_layoutcommit_data *data);
+
+	void (*encode_layoutcommit) (struct pnfs_layout_hdr *layoutid,
+				     struct xdr_stream *xdr,
+				     const struct nfs4_layoutcommit_args *args);
+   
+   #+end_src
+
+** pnfs_layout_hdr
+   #+begin_src 
+	atomic_t		plh_refcount;
+	struct list_head	plh_layouts;   /* other client layouts */
+	struct list_head	plh_bulk_recall; /* clnt list of bulk recalls */
+	struct list_head	plh_segs;      /* layout segments list */
+	nfs4_stateid		plh_stateid;
+	atomic_t		plh_outstanding; /* number of RPCs out */
+	unsigned long		plh_block_lgets; /* block LAYOUTGET if >0 */
+	u32			plh_barrier; /* ignore lower seqids */
+	unsigned long		plh_flags;
+	loff_t			plh_lwb; /* last write byte for layoutcommit */
+	struct rpc_cred		*plh_lc_cred; /* layoutcommit cred */
+	struct inode		*plh_inode;
+   #+end_src
+
+** pnfs_device
+   #+begin_src 
+	struct nfs4_deviceid dev_id;
+	unsigned int  layout_type;
+	unsigned int  mincount;
+	struct page **pages;
+	unsigned int  pgbase;
+	unsigned int  pglen;
+   #+end_src
+
+** pnfs_layout_segment
+   #+begin_src
+ 	struct list_head pls_list;
+	struct list_head pls_lc_list;
+	struct pnfs_layout_range pls_range;
+	atomic_t pls_refcount;
+	unsigned long pls_flags;
+	struct pnfs_layout_hdr *pls_layout;
+   #+end_src
+
+** pnfs_layout_range
+   #+begin_src
+ 	u32 iomode;
+	u64 offset;
+	u64 length;
+   #+end_src
+
+
+** find_pnfs_driver_locked(id)
+   - 所有的pnfs_layoutdriver_type->pnfs_tblid都放到pnfs_modules_tbl队列中.. 根据id查找..
+
+** pnfs_layoutdriver_type->pg_read_ops
+   - 看一下file layout 的具体情况..
+
+
+* pnfs_dev.c
+
+** nfs_deviceid
+   #+begin_src 
+	char data[NFS4_DEVICEID4_SIZE];
+   #+end_src
+
+* nfs4_deviceid_node
+  #+begin_src 
+	struct hlist_node		node;
+	struct hlist_node		tmpnode;
+	const struct pnfs_layoutdriver_type *ld;
+	const struct nfs_client		*nfs_client;
+	unsigned long 			flags;
+	struct nfs4_deviceid		deviceid;
+	atomic_t			ref;
+	// 这个数据结构管理pnfs_layoutdriver_type和nfs4_deviceid
+  #+end_src
+
+* nfs4filelayout.h
+
+** nfs4_pnfs_ds
+   #+begin_src 
+	struct list_head	ds_node;  /* nfs4_pnfs_dev_hlist dev_dslist */
+	u32			ds_ip_addr;
+	u32			ds_port;
+	struct nfs_client	*ds_clp;
+	atomic_t		ds_count;
+	//仅仅包含ds的网络地址
+   #+end_src
+
+** nfs4_file_layout_dsaddr
+   #+begin_src 
+	struct nfs4_deviceid_node	id_node;
+	unsigned long			flags;
+	u32				stripe_count;
+	u8				*stripe_indices;
+	u32				ds_num;
+	struct nfs4_pnfs_ds		*ds_list[1];
+	//应该是layout所使用的数据地址信息.. GETDEVINFO..
+   #+end_src
+
+** nfs4_filelayout_segment
+   #+begin_src 
+	struct pnfs_layout_segment generic_hdr;
+	u32 stripe_type;
+	u32 commit_through_mds;
+	u32 stripe_unit;
+	u32 first_stripe_index;
+	u64 pattern_offset;
+	struct nfs4_file_layout_dsaddr *dsaddr; /* Point to GETDEVINFO data */
+	unsigned int num_fh;
+	struct nfs_fh **fh_array;
+	// layout segment??
+   #+end_src
+
+** nfs4_filelayout
+   #+begin_src 
+	struct pnfs_layout_hdr generic_hdr;
+	struct pnfs_ds_commit_info commit_info;
+   #+end_src
+
+** pnfs_commit_bucket
+   #+begin_src 
+	struct list_head written;
+	struct list_head committing;
+	struct pnfs_layout_segment *wlseg;
+	struct pnfs_layout_segment *clseg;
+	// commit使用的东西..??
+   #+end_src
+
+** pnfs_ds_commit_info
+   #+begin_src 
+	int nwritten;
+	int ncommitting;
+	int nbuckets;
+	struct pnfs_commit_bucket *buckets;
+   #+end_src
+
+
+1. 
+
+pnfs_layout_hdr关联某个文件  nfs_inode
+pnfs_layout_segment 表示某次io, 关联pnfs_layout_range, pnfs_layout_hdr
+
+
+2. file layout
+
+GETDEVICEINFO, 根据deviceid4获取一个关于网络地址的2维队列. 
+device_addr4
+  layouttype4  da_layout_type
+  opaque     da_addr_body<>   
+
+da_addr_body的结构是
+  nfsv4_1_file_layout_ds_addr4
+    uint32_t  nflda_stripe_indices<>  数组大小就是stripe count
+    multipath_list4 nflda_multipath_ds_list<>  这是二维数组,第一维是数据分布，第二维是数据分发备份.
+
+LAYOUTGET, 根据一些访问信息(layout_type,file,clientid,stateid,iomode,offset,length),获取layout的信息,虽然也返回stateid,但它会更新client已经获取的layout的stateid.  这里返回的是一串layout4,也就是说一个文件可以有多个layout4.
+
+layout4
+  offset4
+  length4
+  layoutiomode4
+  layout_content4 lo_content
+    layouttype4 loc_type
+    opaque loc_body
+
+loc_body的结构是: nfsv4_1_file_layout4
+  deviceid4 nfl_deviceid
+  nfl_util4 nfl_util   #unit size
+  uint32_t  nfl_first_stripe_index  
+  offset4   nfl_pattern_offset
+  nfs_fh4   nfl_fh_list<>  #这里表示每个服务器上存储文件
+  
+从上面看来，还是很灵活的数据结构.

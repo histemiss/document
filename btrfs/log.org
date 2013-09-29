@@ -1,0 +1,826 @@
+* tree-log.c
+  - 可能log和transaction有关系. 不过什么和transaction没关系呢!
+
+** start_log_trans(btrfs_trans_handle, btrfs_root)
+   - 如果btrfs_root->log_root有效,不用再为这个btrfs_root创建log tree, 而且修改btrfs_root->log_start_pid/log_multiple_pids
+   - 创建btrfs_fs_info->log_tree
+   > btrfs_init_log_root_tree(btrfs_trans_handle, btrfs_fs_info)
+   - 创建btrfs_root->log_root使用的btree. 
+   - log_tree->last_transid = btrfs_trans_handle->transid, 这个应该不会变.其他的btrfs_root使用transaction时会变化.
+   - 创建btrfs_root/btrfs_key/btrfs_inode_item, 但是没有插入到log_root中.
+   > btrfs_add_log_tree(btrfs_trans_handle, btrfs_root)
+   - 增加btrfs_root->log_batch / log_writers
+
+** join_running_log_trans(btrfs_root)
+   - 检查btrfs_root->log_root是否有效
+   - 如果有效就是在transaction?? 增加btrfs_root->log_writers
+   - 如果无效,返回错误.
+
+** btrfs_pin_log_trans(btrfs_root)
+   - 增加btrfs_root->log_writers
+   - 这样当前的log transaction不会释放.
+
+** btrfs_end_log_trans(btrfs_root)
+   - 减小btrfs_root->log_writers, 同时唤醒等待的任务..
+   > wait_up(btrfs_root->log_writer_wait)
+
+** walk_control
+   #+begin_src 
+        //在处理log tree时使用???
+	/* should we free the extent on disk when done?  This is used
+	 * at transaction commit time while freeing a log tree
+	 */
+	int free;
+
+	/* should we write out the extent buffer?  This is used
+	 * while flushing the log tree to disk during a sync
+	 */
+	int write;
+
+	/* should we wait for the extent buffer io to finish?  Also used
+	 * while flushing the log tree to disk for a sync
+	 */
+	int wait;
+
+	/* pin only walk, we record which extents on disk belong to the
+	 * log trees
+	 */
+	int pin;
+
+	/* what stage of the replay code we're currently in */
+	int stage;
+
+	/* the root we are currently replaying */
+	struct btrfs_root *replay_dest;
+
+	/* the trans handle for the current replay */
+	struct btrfs_trans_handle *trans;
+
+	/* the function that gets used to process blocks we find in the
+	 * tree.  Note the extent_buffer might not be up to date when it is
+	 * passed in, and it must be checked or read if you need the data
+	 * inside it
+	 */
+	int (*process_func)(struct btrfs_root *log, struct extent_buffer *eb,
+			    struct walk_control *wc, u64 gen);
+   #+end_src
+
+** process_one_buffer(btrfs_root, extent_buffer, walk_control, gen)
+   - 这个是上面walk_control->process_func函数.
+   - 如过walk_control->pin != 0
+   - 这个extent_buffer(tree block)的空间已经被分配使用, 从btrfs_free_space_ctl中释放,同时在btrfs_fs_info->pinned_extents中使用EXTENT_DIRTY标志.
+   - 在transaction提交时会写回.
+   > btrfs_pin_extent_for_log_replay(btrfs_root->btrfs_fs_info->extent_root, walk_control->start, len)
+   - 然后检查tree block是否有效.  transid = gen
+   > btrfs_buffer_uptodate(extent_buffer, gen, 0)
+   - 如果walk_control->write != 0, 要写回数据, 使用pagecache
+   > btrfs_write_tree_block(extent_buffer)
+   - 如果walk_control->wait != 0, 等待,同样使用pagecache
+   > btrfs_wait_tre_block_writeback(extent_buffer)
+
+** overwrite_item(btrfs_trans_handle, btrfs_root, btrfs_path, extent_buffer, slot, btrfs_key)
+   - btrfs_root->btrfs_key->objectid != BTRFS_TREE_LOG_OBJECTID, 要把log的数据写回btrfs_root??
+   - extent_buffer/slot指向一个btrfs_item, 它要插入btrfs_root中.
+   - btrfs_key用来向btrfs_root中的插入一个btrfs_item, 先查找是否存在
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 如果btrfs_item存在,比较btree中的和extent_buffer中的,如果相同,就返回.
+   - 如果找不到,或者2个btrfs_item不相同, 就得把extent_buffer/slot的插入进去..
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, item_size)
+   - 如果返回-EEXIST, 修改btrfs_item指向数据的大小
+   > btrfs_truncate_item(btrfs_trans_handle, btrfs_root, btrfs_path, item_size, 1)
+   > btrfs_extent_item(btrfs_trans_handle, btrfs_root, btrfs_path, diff)
+   - 开始拷贝数据,检查特殊情况
+   - 如果已经存在btrfs_item, 而且是btrfs_inode_item, 需要检查要插入的btrfs_inode_item->generation不是0. 
+   - 如果是0,不需要插入,它只是一个标志.
+   - 如果btrfs_inode_item是目录,不要修改i_size. 后面会恢复btree中的值.
+   - 覆盖数据
+   > copy_extent_buffer(extent_buffer, ...)
+   > btrfs_mark_buffer_dirty(btrfs_path->nodes[0])
+
+** read_one_inode(btrfs_root, objectid)
+   - 构造btrfs_key(objectid, BTRFS_INODE_ITEM_KEY, 0)
+   > btrfs_iget(btrfs_fs_info->btrfs_super_block, btrfs_key, btrfs_root, NULL)
+   
+** replay_one_extent(btrfs_trans_handle, btrfs_root, btrfs_path, extent_buffer, slot, btrfs_key)
+   - 处理btrfs_file_extent_item, extent_buffer/slot指向的是btrfs_file_extent_item. btrfs_key同样也指向btrfs_file_extent_item.
+   - 获取btrfs_file_extent_item类型, 以及对应的extent_start/extent_end/nbytes
+   - 类型可能是BTRFS_FILE_EXTENT_PREALLOC/REG/INLINE
+   - 获取对应的inode
+   > read_one_inode(btrfs_root, btrfs_key->objectid)
+   - 获取btree中的btrfs_file_extent_item
+   > btrfs_lookup_file_extent(btrfs_trans_handle, btrfs_root, btrfs_path, inode_objectid, start, 0)
+   - 如果两个一样, 而且是REG/PREALLOC, 就直接退出. 比较就直接比较内存
+   - 插入新的btrfs_file_extent_item.
+   - 删删除之前的btrfs_file_extent_item/extent_map
+   > btrfs_drop_extents(btrfs_trans_handle, btrfs_root, inode, start, extent_end, 1)
+   - 根据类型不同,填充不同的数据
+   - 对于BTRFS_FILE_EXTENT_REG/PREALLOC
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, btrfs_file_extent_item)
+   - 很简单的插入btrfs_file_extent_item
+   > copy_extent_buffer(...)
+   - 如果不是HOLE,还要考虑对btrfs_extent_item的索引.
+   - 构造btrfs_key(bytenr, BTRFS_EXTENT_ITEM_KEY, disk_num_bytes)
+   > btrfs_lookup_extent(btrfs_root, btrfs_key.objectid, btrfs_key.offset)
+   - 如果找到,就直接加一个backref, 使用implicit backref.
+   > btrfs_inc_extent_ref(btrfs_trans_handle, btrfs_root, bytenr, offset, 0, btrfs_root->root_key.objectid, btrfs_key->objectid, offset, 0)
+   - 如果没有,在log中的这个btrfs_extent_item实际上是分配的,但没有写回btree,所以这里要重新分配一次.
+   - 它会先分配reserved的空间,然后创建btrfs_extent_item/btrfs_extent_data_ref, 使用btrfs_delayed_ref_node, 然后转移到btrfs_space_info->bytes_used.
+   > btrfs_alloc_logged_file_extent(btrfs_trans_handle, btrfs_root, btrfs_root->root_key.objectid, btrfs_key->objectid, offset, btrfs_key)
+   - 继续处理checksum.checksum使用逻辑磁盘位置.
+   > btrfs_lookup_csums_range(btrfs_root->log_root, csum_start, csum_end, ordered_sums, 0)
+   - 把checksum写到btree中.
+   > btrfs_csum_file_blocks(btrfs_trans_handle, btrfs_fs_info->csum_root, btrfs_ordered_sum)
+   - 对于BTRFS_FILE_EXTENT_INLINE, 直接覆盖btrfs_file_extent_item.
+   > overwrite_item(btrfs_trans_handle, btrfs_root, btrfs_path, ...)
+   - 最后处理inode. 它的磁盘大小增加
+   > inode_add_bytes(inode, nbytes)
+   - 保存btrfs_inode_item
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+
+** drop_one_dir_item(btrfs_trans_handle, btrfs_root, btrfs_path, inode dir, btrfs_dir_item)
+   - btrfs_path/btrfs_dir_item指向btrfs_dir_item数据
+   - 获取它的inode btrfs_key, name
+   > btrfs_dir_item_key_to_cpu(extent_buffer, btrfs_dir_item, btrfs_key)
+   > read_extent_buffer(extent_buffer, name, ...)
+   - 根据btrfs_key找到btrfs_inode
+   > read_one_inode(btrfs_root, btrfs_key.objectid)
+   - 创建它的orphan节点, 然后增加nlink??? 这样使用orphan来删除btrfs_inode_item.
+   > link_to_fixup_dir(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key.objectid)
+   - 删除这个目录索引,也就是unlink操作.
+   > btrfs_unlink_inode(btrfs_trans_handle, btrfs_root, ...)
+   > iput(inode)
+   - 提交delayed inode信息.
+   > btrfs_run_delayed_items(btrfs_trans_handle, btrfs_root)
+
+** inode_in_dir(btrfs_root, btrfs_path, dirid, objectid, index, name, name_len)
+   - 检查btrfs_root中存在btrfs_dir_item, 2中索引的都有!
+   - 先找一个btrfs_dir_item, 根据(dirid, BTRFS_DIR_INDEX_KEY, index)查找. 
+   > btrfs_lookup_dir_index_item(NULL, btrfs_root, btrfs_path, dirid, index, name, name_len, 0)
+   - 上面找到的btrfs_dir_item, 检查它指向的inode的btrfs_key
+   - btrfs_key->objectid != objectid, 直接退出.
+   > btrfs_dir_item_key_to_cpu(extent_buffer, btrfs_dir_item, btrfs_key)
+   - 再使用hash方法查找一遍..
+   > btrfs_lookup_dir_item(NULL, btrfs_root, btrfs_path, dirid, name, name_len, 0)
+
+** backref_in_log(btrfs_root, btrfs_key, ref_objectid, name, namelen)
+   - inode backreference就是和btrfs_dir_item对应的.不过方向完全相反.也有2中backfs,但不能都存在.
+   - 参数btrfs_key直接使用.
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   > btrfs_item_ptr_offset(btrfs_path->nodes[0], slots[0])
+   - 可能是BTRFS_INODE_REF_KEY,也可能是btrfs_key->type是BTRFS_INODE_EXTREF_KEY.
+   > btrfs_find_name_in_ext_backref(btrfs_path, ref_objectid, name, name_len, NULL)
+   - btrfs_item里面是一些btrfs_inode_ref数组, 检查btrfs_inode_ref是否和参数一致.
+
+** __add_inode_ref(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_root, inode dir, inode inode, extent_buffer, inode_objectid, parent_objectid, ref_index, name, namelen, search_done)
+   - inode backref和btrfs_dir_item在创建目录结构时是一块创建的.
+   - 参数有些重复了?! 根据参数可以确定2个inode的关系,包括btrfs_inode_ref/btrfs_dir_item.
+   - 找到btrfs_inode_ref数组, 遍历每个目录索引, 如果它在log tree中不存在就删除它. 还有这样log?!
+   - 构造btrfs_key(inode_objectid, BTRFS_INODE_REF_KEY, parent_objectid)
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 找到的btrfs_item是btrfs_inode_ref数组.. 遍历他们
+   - 检查对应的name在log_tree中是否存在
+   > backref_in_log(btrfs_root, btrfs_key, parent_objectid, name, name_len)
+   - 如果log_tree中没有,就删掉这个文件, 但是nlink没有改变?!
+   > btrfs_inc_nlink(inode)
+   > btrfs_unlink_inode(btrfs_trans_handle, btrfs_root, dir, inode, name, name_len)
+   > btrfs_run_delayed_items(btrfs_trans_handle, btrfs_root)
+   - 然后处理extref, 和上面一样,删除log中没有的文件.
+   > btrfs_lookup_inode_extref(NULL, btrfs_root, btrfs_path, name, namelen, inode_objectid, parent_objectid, 0, 0)
+   - 然后查找btrfs_dir_item, 删除2种子文件的index/hash索引..
+   > btrfs_lookup_dir_index_item(btrfs_trans_handle, btrfs_root, btrfs_path, dir_inode_objectid, ref_index, name, namelen, 0)
+   > drop_one_dir_item(btrfs_trans_handle, btrfs_root, btrfs_path, dir, btrfs_dir_item)
+   > btrfs_lookup_dir_item(btrfs_trans_handle, btrfs_root, btrfs_path, dir_inode_objectid, name, namelen, 0)
+   > drop_one_dir_item(btrfs_trans_handle, btrfs_root, btrfs_path, dir, btrfs_dir_item)
+   - 这个函数名字很奇怪?! 为何是add
+
+** extref_get_fields(extent_buffer, ref_ptr, namelen, name, index, parent_objectid)
+   - extent_buffer/ref_ptr指向的是btrfs_inode_extref, 读取出它的成员给参数返回..
+
+** ref_get_fields(extent_buffer, ref_ptr, namelen, name, index)
+   - 这里处理的btrfs_inode_ref.
+
+** add_inode_ref(btrfs_trans_handle, btrfs_root root, btrfs_root log, btrfs_path, extent_buffer, slot, btrfs_key)
+   - extent_buffer/slot是一个btrfs_item, 可能是btrfs_inode_ref数组, 可能是btrfs_inode_extref数组. 根据backref来修复目录结构.
+   - 获取涉及的2个inode. parent_objectid是从btrfs_inode_ref/btrfs_inode_extref中获取.
+   > read_one_inode(btrfs_root, parent_objectid)
+   > read_one_inode(btrfs_root, inode_objectid)
+   - 遍历btrfs_item的所有btrfs_inode_ref/extref
+   > extref_get_fields(extent_buffer, ptr, ...)
+   > ref_get_fields(extent_buffer, ptr, ...)
+   - 首先去原btrfs_root中检查btrfs_dir_item是否存在,如果不存在,需要创建一个.
+   - 通过2种btrfs_dir_item确认. 为何使用btrfs_inode_ref创建btrfs_dir_item??
+   > inode_in_dir(btrfs_root, btrfs_path, dir_inode_objectid, inode_objectid, ref_index, name, namelen)
+   - 如果没有就创建一个
+   - 首先删除干扰的目录索引,也就是log_tree中不存在的btrfs_inode_ref/backref/btrfs_item_dir.
+   > __add_inode_ref(btrfs_trans_handle, btrfs_root, btrfs_path, log_root, dir, inode, extent_buffer, ...)
+   - link操作. 但它的nlink没有改变. 不会再添加btrfs_inode_ref.
+   > btrfs_add_link(btrfs_trans_handle, dir, inode, name, namelen, 0, ref_index)
+   - 保存btrfs_inode_item
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, btrfs_inode)
+   - 然后把btrfs_inode_ref/extref信息复制过去.
+   > overwrite_item(btrfs_trans_handle, btrfs_root, btrfs_path, extent_buffer, slot, btrfs_key)
+
+** insert_orphan_item(btrfs_trans_handle, btrfs_root, offset)
+   - 先查找orphan节点??
+   > btrfs_find_orphan_item(btrfs_root, offset)
+   - 如果找不到,就创建一个.
+   > btrfs_insert_orphan_item(btrfs_trans_handle, btrfs_root, offset)
+
+** count_inode_extrefs(btrfs_root, inode, btrfs_path)
+   - 使用btrfs_key(inode_objectid, BTRFS_INODE_EXTREF_KEY, offset)遍历所有的btrfs_item, 累加它里面btrfs_inode_extref的计数.
+   > btrfs_find_one_extref(btrfs_root, inode_objectid, offset, path, extref, offset)
+   - 这个inode的索引数.
+
+** count_inode_refs(btrfs_root, inode, btrfs_path)
+   - 和上面一样,统计btrfs_inode_ref中的索引数.
+
+** fixup_inode_link_count(btrfs_trans_handle, btrfs_root, inode)
+   - 根据btree中的btrfs_inode_ref/backref, 更新inode->nlink.
+   > count_inode_refs(btrfs_root, inode, btrfs_path)
+   > count_inode_extrefs(btrfs_root, inode, btrfs_path)
+   - 把两者的计数加起来, 如果和inode->i_nlink不一样, 就得更新inode.
+   > set_nlink(inode, nlink)
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   - 设置btrfs_inode->index_cnt是-1, 它的子目录index需要重新计数.
+   - 如果i_nlink为0, 需要删除节点
+   - 如果是目录,需要在btrfs_root中删除这个目录,还要考虑它的子inode
+   > replay_dir_deletes(btrfs_trans_handle, btrfs_root, NULL, btrfs_path, ino, 1)
+   - 删除使用orphan节点.
+   > insert_orphan_item(btrfs_trans_handle, btrfs_root, ino)
+   
+** fixup_inode_link_counts(btrfs_trans_handle, btrfs_root, btrfs_path)
+   - 一种新的btrfs_item, 它只是一个标志,表示要重新计算一个inode的nlink
+   - 构造btrfs_key(BTRFS_TREE_LOG_FIXUP_OBJECTID, BTRFS_ORPHAN_ITEM_KEY, -1), 遍历btrfs_root
+   - 这些节点对应的inode需要fix link count..
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, -1, 1)
+   - btrfs_key.offset,是inode_objectid. 
+   - 删除btrfs_item
+   > btrfs_del_item(btrfs_trans_handle, btrfs_root, btrfs_path)
+   > btrfs_release_path(btrfs_path)
+   - 找到btrfs_inode
+   > read_one_inode(btrfs_root, inode_objectid)
+   - 根据它的btrfs_inode_ref/extref, 计算nlink
+   > fixup_inode_link_count(btrfs_trans_handle, btrfs_root, inode)
+   > iput(inode)
+
+** link_to_fixup_dir(btrfs_trans_handle, btrfs_root, btrfs_path, objectid)
+   - 向btree中增加节点(BTRFS_TREE_LOG_FIXUP_OBJECTID, BTRFS_ORPHAN_ITEM_KEY, inode_objectid),标记这个inode, 让他重新计算nlink.
+   - 同时增加inode->i_nlink, 防止这个inode被删除. 在后面计算时,重新根据btrfs_inode_ref/extref,不会考虑nlink. 所以这里添加没有影响.
+   > read_one_inode(btrfs_root, objectid)
+   - btrfs_item指向空
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, 0)
+   > btrfs_inc_nlink(inode)
+   - 保存btrfs_inode_item
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+
+** insert_one_name(btrfs_trans_handle, btrfs_root, btrfs_path, dirid, index, name, name_len, type, btrfs_key location)
+   - 先获取2个inode, dirid是父目录inode, btrfs_key是子inode
+   > read_one_inode(btrfs_root, btrfs_key->objectid)
+   > read_one_inode(btrfs_root, dirid)
+   - 建立link, 包括btrfs_inode_ref/btrfs_dir_item
+   > btrfs_add_link(btrfs_trans_handle, dir, inode, name, name_len, 1, index)
+  
+** replay_one_name(btrfs_trans_handle, btrfs_root, btrfs_path, extent_buffer, btrfs_dir_item, btrfs_key)
+   - 在遍历log_tree时使用,它处理extent_buffer/btrfs_dir_item, 检查是否要根据它修改btrfs_root.
+   - 修复btrfs_dir_item.
+   - 根据btrfs_key是指向btrfs_dir_item的, 先获取父目录的inode
+   > read_one_inode(btrfs_root, btrfs_key->objectid)
+   - 从extent_buffer/btrfs_dir_item获取name, btrfs_key
+   - 根据log的btrfs_key查找inode
+   > btrfs_lookup_inode(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, 0)
+   > btrfs_release_path(btrfs_path)
+   - 根据btrfs_dir_item的类型不用,找到在btrfs_root中对应的btrfs_dir_item
+   - 如果是BTRFS_DIR_ITEM_KEY, 根据name查找
+   > btrfs_lookup_dir_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key->objectid, name, name_len, 1)
+   - 如果是BTRFS_DIR_INDEX_KEY, 根据index,name查找.
+   > btrfs_lookup_dir_index_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key->objectid, btrfs_key->offset, name, name_len, 1)
+   - 难道log就是原样log了???
+   - 如果查找成功,而且btrfs_dir_item都一样,直接退出. 
+   - 这里有3个信息,一个是log item, 就是参数,另一个是子inode, 根据参数在btrfs_root中查找的,然后是btrfs_root的btrfs_dir_item
+   - inode不存在,btrfs_dir_item存在,而且和log_tree不一样,直接退出.
+   - 如果找到的btrfs_dir_item和log item不一致,要先删除,再添加
+   > drop_one_dir_item(btrfs_trans_handle, btrfs_root, btrfs_path, dir, btrfs_dir_item)
+   - 当这里处理的btrfs_dir_item是BTRFS_DIR_ITEM_KEY时才添加.避免重复工作.
+   > insert_one_name(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key->objectid, offset, name, name_len, type, btrfs_key)
+
+** replay_one_dir_item(btrfs_trans_handle, btrfs_root, btrfs_path, extent_buffer, slot, btrfs_key)
+   - (extent_buffer/slot)指向的btrfs_item是btrfs_dir_item数组, 遍历这些btrfs_dir_item. 
+   - 检查在btrfs_root中是否存在,如果不存在或者不一致,添加或替代已有的.
+   > verify_dir_item(btrfs_root, extent_buffer, btrfs_dir_item)
+   > replay_one_name(btrfs_trans_handle, btrfs_root, btrfs_path, extent_buffer, btrfs_dir_item, btrfs_key)
+   - btrfs_key和btrfs_item是否重复?!
+
+** btrfs_dir_log_item
+   #+begin_src 
+	__le64 end;
+	//这是什么意思??
+   #+end_src
+
+** find_dir_range(btrfs_range, btrfs_path, dirid, key_type, start_ret, end_ret)
+   - (start_ret, end_ret)表示dir的index范围,直接log了一片btrfs_dir_item
+   - 构造btrfs_key(dirid, key_type, start_ret), 查找btree, key_type是什么??
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 找到的是btrfs_dir_log_item??
+   > btrfs_dir_log_end(btrfs_path->nodes[0], item)
+   - 这样就得到一个范围(btrfs_key->offset, btrfs_dir_log_item->end), 这个范围不能在start_ret前面.
+
+** check_item_in_log(btrfs_trans_handle, btrfs_root root, btrfs_root log, btrfs_path path, btrfs_path log_path, inode dir, btrfs_key)
+   - 2套btrfs_root/btrfs_path??
+   - path指向的btrfs_item是btrfs_dir_item数组, 遍历这些数组
+   - 获取子inode名字
+   > btrfs_dir_name_len(extent_buffer, btrfs_dir_item)
+   > read_extent_buffer(extent_buffer, name, ...)
+   - 如果log_tree有效,在里面查找对应的btrfs_dir_item
+   > btrfs_lookup_dir_item(btrfs_trans_handle, log, log_path, btrfs_key->objectid, name ...)
+   > btrfs_lookup_dir_index_item(btrfs_trans_handle, log, log_path, btrfs_key->objectid, ...)
+   - 如果找不到, btrfs_tree的这个目录关系应该删除.
+   - 根据btrfs_root中的btrfs_dir_item->btrfs_key, 找到对应的子节点
+   > read_one_inode(btrfs_root, btrfs_key.objectid)
+   - 建立对应的BTRFS_TREE_LOG_FIXUP_OBJECTID节点,重新整理它的backref
+   > link_to_fixup_dir(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key->objectid)
+   - 在btrfs_root中删除inode的目录信息
+   > btrfs_inc_nlink(inode)
+   - 在里面删除hash的btrfs_dir_item, btrfs_inode_ref, 使用btrfs_delayed_item删除index的btrfs_dir_item, 在log_tree中删除所有的btrfs_inode_ref,  btrfs_dir_item. 
+   - 怎么又修改log_tree??
+   > btrfs_unlink_inode(btrfs_trans_handle, btrfs_root, btrfs_dir_item, inode, name, name_len)
+   - 提交btrfs_delayed_item数据
+   > btrfs_run_delayed_items(btrfs_trans_handle, btrfs_root)
+   
+** replay_dir_deletes(btrfs_trans_handle, btrfs_root root, btrfs_root log_root, btrfs_path, dirid, del_all)
+   - btrfs_dir_item range是记录删除动作的. range范围内的btrfs_dir_item保存到log_tree中,如果log_tree中没有range内的东西,就应该删除. 如果有呢? 好像没有添加.
+   - 这里要处理btrfs_root中dirid的btrfs_dir_item
+   - 找到对应的inode
+   > read_one_inode(btrfs_root, dirid)
+   - 先查找log中记录的range. 遍历所有的BTRFS_DIR_LOG_ITEM_KEY/BTRFS_DIR_LOG_INDEX_KEY.
+   > find_dir_range(log_root, btrfs_path, dirid, key_type, range_start, range_end)
+   - 获取的range使用是dir index, 然后遍历btrfs_root中这个范围内的btrfs_dir_item
+   - 构造btrfs_key(dirid, BTRFS_DIR_ITEM_KEY, range)
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path)
+   - 然后检查它在log_tree中是否存在,如果不存在就删除.
+   > check_item_in_log(btrfs_trans_handle, btrfs_root, log, btrfs_path, log_path, dir, btrfs_key)
+
+** replay_one_buffer(btrfs_root, extent_buffer, walk_control, gen)
+   - 这也是walk_control->process_func回调函数. 
+   - extent_buffer应该log_tree的节点. 
+   - 如果tree block/extent_buffer是btrfs_node直接退出,只处理btrfs_leaf
+   - 先读回tree block数据
+   > buffer_read_buffer(extent_buffer, gen)
+   - 遍历所有的btrfs_item
+   - walk_control->stage为LOG_WALK_PIN_ONLY/LOG_WALK_REPLAY_INODE/LOG_WALK_REPLAY_ALL, 表示不同的log合并阶段.
+   - 如果是LOG_WALK_PIN_ONLY, 这里没有操作
+   - 如果是LOG_WALK_REPLAY_INODE, 只处理其中BTRFS_INODE_ITEM_KEY类型的btrfs_item. 只修复btrfs_root的btrfs_inode_item
+   > btrfs_item_ptr(extent_buffer, i, btrfs_inode_item)
+   > btrfs_inode_mode(walk_control->btrfs_trans_handle, btrfs_root, log, btrfs_path, btrfs_key.objectid, 0)
+   - 如果inode是目录, 重新删除它不存在的目录关系
+   - replay_dir_deletes(btrfs_trans_handle, btrfs_root, log_tree, btrfs_path, dirid, 0)
+   - 然后覆盖btrfs_inode_item
+   > overwrite_item(walk_control->btrfs_trans_handle, btrfs_root, btrfs_path, extent_buffer, i, btrfs_key)
+   - 如果是普通文件, 创建orphan节点, 为truncate准备??
+   > insert_orphan_item(walk_control->btrfs_trans_handle, btrfs_root, btrfs_key->objectid)
+   - 标记,重新计算nlink
+   > link_to_fixup_dir(walk_control->btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key->objectid)
+   - 如果是LOG_WALK_REPLAY_ALL阶段, 处理所有的btrfs_key,但不会处理btrfs_inode_item
+   - 对于BTRFS_XATTR_ITEM_KEY..
+   > overwrite_item(btrfs_trans_handle, btrfs_root, btrfs_path, ...)
+   - BTRFS_INODE_REF_KEY和BTRFS_INODE_EXTREF_KEY. 
+   - 检查已经存在的btrfs_inode_ref/extref, 不管name, 而且反向检查它在log_tree中是否存在,如果不存在就删除.
+   > add_inode_ref(btrfs_trans_handle, btrfs_root, log, btrfs_path, ...)
+   - BTRFS_EXTENT_DATA_KEY. 根据确定的信息,去重新执行分配空间的操作.
+   > replay_one_extent(btrfs_trans_handle, btrfs_root, btrfs_path, ...)
+   - 其他的BTRFS_DIR_ITEM_KEY/BTRFS_DIR_INDEX_KEY.
+   - 完整的link动作,也会创建btrfs_inode_ref, 但不会更新它的nlink.
+   > replay_one_dir_item(...)
+
+** walk_down_log_tree(btrfs_trans_handle, btrfs_root, btrfs_path, level, walk_control)
+   - 这个函数是遍历tree的辅助函数, 针对每个btrfs_leaf,调用walk_control->process_func(...)
+   - 这个函数只是遍历的一部分,只会深度搜索,没有回朔
+   - 处理level对应的extent_buffer
+   - 处理slot对应的btrfs_key_ptr
+   - 获取btrfs_key_ptr->bytenr/generation
+   > btrfs_node_block_ptr(extent_buffer, slot)
+   > btrfs_node_ptr_generation(extent_buffer, slot)
+   - 获取下一层节点的数据, 对应的extent_buffer
+   > btrfs_level_size(btrfs_root, level-1)
+   - 构造extent_buffer
+   > btrfs_find_create_tree_block(btrfs_root, bytenr, blocksize)
+   - 如果level是1,那上面获取的extent_buffer就是btrfs_leaf
+   > walk_control->process_func(btrfs_root, extent_buffer, ...)
+   - 如果walk_control->free有效,还要释放??
+   - 先读回数据,验证generation等.  上面已经处理了,还要读回来??
+   > btrfs_read_buffer(extent_buffer, gen)
+   - 锁住extent_buffer
+   > btrfs_tree_lock(extent_buffer)
+   > btrfs_set_lock_blocking(extent_buffer)
+   - 清除EXTENT_BUFFER_DIRTY/PG_dirty, 在transaction提交时就不会写回.
+   > clean_tree_block(btrfs_trans_handle, btrfs_root, extent_buffer)
+   > btrfs_wait_tree_block_writeback(extent_buffer)
+   - 然后释放对应的tree block, 通过pinned_extent释放. 这段空间是reserved的??
+   > btrfs_free_and_pin_reserved_extent(btrfs_root, bytenr, blocksize)
+   - 如果level不是1,就使用上面btrfs_node->level代替它,就是深度搜索了.
+   - 更新slots[level],指向新的btrfs_node
+   - 这里没有回朔,一直深度搜索,碰到btrfs_leaf,遍历完它为止.
+
+** walk_up_log_tree(btrfs_trans_handle, btrfs_root, btrfs_path, level, walk_control)
+   - 这个函数是遍历时的回朔.
+   - 首先上面说了level的一个节点完全遍历完了,需要向上回朔..
+   - 检查slots[level+1]表示一个tree block是否遍历完,如果没有,返回.
+   - 否则需要跳到上一层节点. 跳之前先删除这个btrfs_node
+   - slot + 1 == btrfs_header_nritems(extent_buffer), 说明这个节点处理完
+   - 这个处理已经没有意义
+   > walk_control->process_func(btrfs_root, btrfs_path->nodes[level], ...)
+   - 如果walk_control->free != 0, 删除节点.
+   > btrfs_read_buffer(..)
+   > btrfs_tree_lock(extent_buffer)
+   - 这里为何等待?
+   > btrfs_wait_tree_block_writeback(extent_buffer)
+   - 释放tree block
+   > btrfs_free_and_pin_reserved_extent(btrfs_root, ...)
+   > free_extent_buffer(btrfs_path->nodes[level]
+
+** walk_log_tree(btrfs_trans_handle, btrfs_root log, walk_control)
+   - 处理btrfs_root里面的log信息,使用上面两个函数遍历树节点.. 
+   - walk_control已经设置好. 不一定从根开始遍历.
+   > walk_down_log_tree(btrfs_trans_handle, log, btrfs_path, ..)
+   > walk_up_log_tree(btrfs_trans_handle, ...)
+   - 最后处理btrfs_path->nodes[orig_level], 就是根节点..
+   > walk_control->process_func(...)
+   - 重新释放btrfs_path->nodes[orig_level]的空间??
+   > btrfs_free_and_pin_reserved_extent(btrfs_root, extent_buffer->start, len)
+   - 最后释放btrfs_path上所有的没有释放的extent_buffer
+   > free_extent_buffer(extent_buffer)
+
+** update_log_root(btrfs_trans_handle, btrfs_root)
+   - 向btrfs_fs_info->log_root_tree里面插入或更新btrfs_root, 
+   - 它是一个log tree..  如果btrfs_root->log_transid==1, 就插入.
+   > btrfs_insert_root(btrfs_trans_handle, btrfs_fs_info->log_root_tree, btrfs_key, btrfs_root_item)
+   - 否则更新log_tree中的btrfs_key/btrfs_item
+   > btrfs_update_root(btrfs_trans_handle, ...)
+
+** wait_log_commit(btrfs_trans_handle, btrfs_root root, transid)
+   - 在btrfs_root->log_commit_wait[index]上面等待,等待条件是 
+   - btrfs_fs_info->last_trans_log_full_commit != btrfs_trans_handle->transid 
+   - btrfs_root->log_transid < transid + 2
+   - btrfs_root->log_commit[index] != 0
+
+** wait_for_writer(btrfs_trans_handle, btrfs_root)
+   - 在btrfs_root->log_writer_wait队列上等待, 等待条件是
+   - btrfs_fs_info->last_trans_log_full_commit != btrfs_trans_handle->transid
+   - btrfs_root->log_writer == 0
+
+** btrfs_sync_log(btrfs_trans_handle, btrfs_root)
+   - 把log_tree写回btree, 并不是更改原来的btrfs_root, 而是把log_tree的数据写到磁盘中.
+   - 处理btrfs_root->log_root这个btrfs_root
+   - 根据btrfs_root->log_transid计算index
+   - 如果btrfs_root->log_commit[index] != 0, 说明在提交中?? 等待它完成直接返回.
+   > wait_log_commit(btrfs_trans_handle, btrfs_root, btrfs_root->log_transid)
+   - 它开始提交, 设置btrfs_root->log_commit[index] = 1
+   - 等待另一个btrfs_root->log_commit??
+   > wait_log_commit(btrfs_trans_handle, btrfs_root, btrfs_root->log_transid -1 )
+   - 等待btrfs_root->log_writer??
+   - wait_for_writers(btrfs_trans_handle, btrfs_root)
+   - btrfs_root->log_batch如果改变,也退出??
+   - btrfs_fs_info->last_trans_log_full_commit == btrfs_trans_handle->transid 表示需要一个transaction的提交, 不再提交log
+   - 写回log_tree->dirty_log_pages上的extent, extent_io_tree. mark可能使用EXTENT_DIRTY/EXTENT_NEW??
+   > btrfs_write_marked_extents(log_tree, log->dirty_log_pages, mark)
+   - 更新log_tree->btrfs_root_item
+   > btrfs_set_root_node(log->root_item, log->node)
+   - 增加btrfs_root->log_transid, 给btrfs_root/log->log_transid
+   - 增加log_root_tree->log_batch/log_writers.
+   - log_tree使用的transid和transaction不一样.这个是每个btrfs_root独立的.
+   - 把这个log_tree的根节点放到log_root_tree中.  
+   > update_log_root(btrfs_trans_handle, log)
+   - 减小log_root_tree->log_writers,唤醒等待的任务.
+   > wake_up(log_root_tree->log_writer_wait)
+   - 上面有个等待函数等待log_writer, 但它使用btrfs_root,而不是log_tree_root.
+   - 继续处理log_root_tree, 需要它做什么??
+   - 根据log_root_tree->log_transid, 选一个log_root_tree->log_commit. 如果它有效,说明它在提交中, 当前任务可以不用提交
+   - 等待数据完全写回
+   > btrfs_wait_marked_extents(log, log->dirty_log_pages, mark)
+   - 等待提交完成.
+   > wait_log_commit(btrfs_trans_handle, log_root_tree, log_root_tree->log_transid)
+   - 当前任务开始提交, 设置log_tree_root->log_commit[index] = 1
+   - 等待其他的提交任务
+   > wait_for_writer(btrfs_trans_handle, log_root_tree)
+   - 同样检查btrfs_fs_info->last_trans_log_full_commit = btrfs_trans_handle->transid, 如果一样,也无需提交.
+   - 开始提交,先把log_root_tree的脏数据写回
+   > btrfs_write_and_wait_makred_extents(log_root_tree, log_root_tree->dirty_log_pages, EXTENT_DIRTY|EXTENT_NEW)
+   - 等待上面写完成
+   - 开始处理log_tree, 等待写回metadata
+   > btrfs_wait_marked_extents(log, log->dirty_log_pages, mark)
+   - 等待写回btrfs_ordered_extent, log_tree->logged_list[index]中是btrfs_ordered_extent->log_list, 等待他们的IO完成.
+   > btrfs_wait_logged_extents(log, ...)
+   - 把当前log_root_tree根节点的属性写到btrfs_super_block中.  log_root/log_level
+   > btrfs_set_super_log_root(btrfs_fs_info->super_for_commit, log_root_tree->node->start)
+   > btrfs_set_super_log_root_level(...)
+   - log_root_tree->log_transid ++ 写回btrfs_super_block
+   > write_ctree_super(btrfs_trans_handle, btrfs_fs_info->tree_root, 1)
+   - 开始唤醒其他等待的任务
+   - btrfs_root->last_log_commit是btrfs_root->log_transid
+   - 首先是log_root_tree, log_root_tree->log_commit[index] = 0
+   > wakeup(log_root_tree->log_commit_wait[index]
+   - 然后是btrfs_root, btrfs_root->log_commit[index] = 0
+   > wakeup(btrfs_root->log_commit_wait[index]
+   
+** free_log_tree(btrfs_trans_handle, btrfs_root)
+   - 创建walk_control, free = 1, 回调函数是process_one_buffer
+   - 如果btrfs_trans_handle有效,就遍历btrfs_root, 释放tree block空间
+   > walk_log_tree(btrfs_trans_handle, log, walk_control)
+   - 开始释放log_tree->dirty_log_pages中的相关extent_state
+   > find_first_extent_bit(btrfs_root->dirty_log_pages, 0, start, end, EXTENT_DIRTY|EXTENT_NEW)
+   > clear_extent_bits(btrfs_root->dirty_log_pages, ...)
+   - 释放log_tree->logged_list[]中的所有btrfs_ordered_extent
+   > btrfs_free_logged_extents(log, 0)
+   > btrfs_free_logged_extents(log, 1)
+   - 所以这里只是释放资源, 包括log_tree本身的磁盘空间, extent_state记录, btrfs_ordered_extent
+
+** btrfs_free_log(btrfs_trans_handle, btrfs_root)
+   - 释放btrfs_root->log_root. 现在log_root也就是log_tree
+   > free_log_tree(btrfs_trans_handle, btrfs_root->log_root)
+
+** btrfs_free_log_root_tree(btrfs_trans_handle, btrfs_fs_info)
+   - 处理btrfs_fs_info->log_root_tree
+   > free_log_tree(btrfs_trans_handle, btrfs_fs_info->log_root_tree)
+
+** btrfs_del_dir_entries_in_log(btrfs_trans_handle, btrfs_root, name, name_len, inode dir, index)
+   - 这个函数在unlink操作中使用,log删除的过程
+   - btrfs_inode->logged_trans < btrfs_trans_handle->transid直接退出. 
+   - 在fsync或新创建inode时设置它. 所以在sync过程中有操作的inode才会放到log_tree中.
+   - 开始一个log trans, 就是增加btrfs_root->log_writers, 阻止它被提交.
+   > join_running_log_trans(btrfs_root)
+   - 在log_tree中,根据参数找到btrfs_dir_item. 
+   > btrfs_lookup_dir_item(btrfs_trans_handle, log, btrfs_path, dir_ino, name, name_len, -1)
+   - 如果有就直接删除
+   > btrfs_delete_one_dir_name(btrfs_trans_handle, log, btrfs_path, btrfs_dir_item)
+   - 然后是BTRFS_DIR_INDEX_KEY类型的btrfs_dir_item
+   > btrfs_lookup_dir_index_item(btrfs_trans_handle, ...)
+   > btrfs_delete_one_dir_name(btrfs_trans_handle, log, btrfs_path, btrfs_dir_item)
+   - 更新btrfs_inode_item->size
+   - 构造btrfs_key(dir_ino, BTRFS_INODE_ITEM_KEY, 0)
+   > btrfs_search_slot(btrfs_trans_handle, log, btrfs_key, btrfs_path, 0, 1)
+   - 找到对应的btrfs_inode_item, 更新inode size..
+   > btrfs_end_log_trans(btrfs_root)
+   - 实际上是在log_tree中重放一遍,这里操作btrfs_dir_item, 下面的函数操作btrfs_inode_ref
+
+** btrfs_del_inode_ref_in_log(btrfs_trans_handle, btrfs_root, name, name_len, inode inode, dirid)
+   > join_running_log_trans(btrfs_root)
+   > btrfs_del_inode_ref(btrfs_trans_handle, log, name, name_len, inode_objectid, dirid, index)
+   - 删除的是btrfs_inode_ref/extref
+   > btrfs_end_log_trans(btrfs_root)
+
+** insert_dir_log_key(btrfs_trans_handle, btrfs_root log, btrfs_path path, key_type, dirid, first_offset, last_offset)
+   - 构造一个btrfs_dir_log_item, 里面是dir index的范围.
+   - 构造btrfs_key(dirid, BTRFS_DIR_LOG_ITEM_KEY, first_offset)
+   - type根据key_type设定, 有两种索引.. BTRFS_DIR_LOG_ITEM_KEY/BTRFS_DIR_LOG_INDEX_KEY
+   > btrfs_insert_empty_item(btrfs_trans_handle, ...)
+   - item的数据就是last_offset
+
+** log_dir_items(btrfs_trans_handle, btrfs_root root, inode inode, btrfs_path path, btrfs_path dst_path, key_type, min_offset, last_offset_ret)
+   - 把btrfs_inode的所有在btrfs_trans_handle中修改的btrfs_item保存起来. 这里可是btrfs_item限于一种key_type, 可能是acl,或者btrfs_dir_item,或者btrfs_inode_ref, 或者btrfs_file_extent_item
+   - 在fsync中,把log数据replay到btree中.
+   - 构造btrfs_key(inode_objectid, key_type, -1), 和btrfs_key(inode_objectid, key_type, min_offset), 查找两个btrfs_key之间的.
+   - 它会检查btree中2个btrfs_key之间是否存在btrfs_item, 然后校正边界btrfs_key.
+   - 这个查找后面有btrfs_trans_handle->transid, 所以它会检查btrfs_item->generation??
+   > btrfs_search_forward(btrfs_root, min_key, max_key, btrfs_path, btrfs_trans_handle->transid)
+   - 如果找不到, 重新搜索确认.
+   - 构造btrfs_key(inode_objectid, key_type, -1)
+   - btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 如果找到了, 使用这个btrfs_key, 然后把(btrfs_key->offset, -1)添加到log_tree中.
+   - 如果找不到,就是没有key_type类型的btrfs_item, 不在log.
+   - 如果上面找到一个范围, 把min_key前面的btrfs_item写道log_tree中,是为了btrfs_inode_item?
+   > btrfs_previous_item(btrfs_root, btrfs_path, ino, key_type)
+   > overwrite_item(btrfs_trans_handle, log_tree, dst_path, btrfs_path->nodes[0], btrfs_path->slots[0], btrfs_key)
+   - 然后遍历范围内的btrfs_item, 给log_tree
+   - 找到第一个
+   > btrfs_search_slot(NULL, root, min_key, btrfs_path, 0, 0)
+   > overwrite_item(btrfs_trans_handle, log, dst_path, ...)
+   > btrfs_next_leaf(btrfs_root, btrfs_path)
+   - 跳到下一个btrfs_leaf时,检查btrfs_header->generation. 如果和btrfs_trans_handle->transid不想同,就停止遍历. 修改范围的上限, 这个btrfs_leaf的第一个btrfs_item.
+   - 把这个限制之外的btrfs_item也放到log_tree中.
+   - 最后把range 写到log tree中..
+   > insert_dir_log_key(btrfs_trans_handle, log, btrfs_path, key_type, ...)
+   - 对于后面的btrfs_leaf,范围肯定断了,所以需要再调用一次这个函数.
+
+** log_directory_changes(btrfs_trans_handle, btrfs_root root, inode, btrfs_path path, btrfs_path dst_path)
+   - 使用上面的函数处理BTRFS_DIR_ITEM_KEY和BTRFS_DIR_INDEX_KEY
+   > log_dir_items(btrfs_trans_handle, btrfs_root, inode, btrfs_path, dst_path, key_type, min_key, max_key)
+   - key_type是BTRFS_DIR_ITEM_KEY... 这个过程会循环,直到max_key==-1.
+
+** drop_objectid_items(btrfs_trans_handle, btrfs_root log, btrfs_path path, objectid, max_key_type)
+   - 删除log中inode的一些btrfs_item, 需要relog它.
+   - 构造btrfs_key(objectid, max_key_type, -1)
+   > btrfs_search_slot(btrfs_trans_handle, log, btrfs_key, btrfs_path, -1, 1)
+   - 为么这样搜索-1, btrfs_path->slots不能是0??
+   - 构造btrfs_key(objectid, 0, 0), 在btrfs_leaf中查找对应的btrfs_item, 它是最小的,然后整个范围一块删除.
+   > btrfs_bin_search(btrfs_path->nodes[0], btrfs_key, 0, start_slot)
+   - 一次删除多个
+   > btrfs_del_items(btrfs_trans_handle, log, btrfs_path, start_slot, slots)
+
+** fill_inode_item(btrfs_trans_handle, extent_buffer, btrfs_inode_item, inode inode, log_inode_only)
+   - extent_buffer/btrfs_inode_item指向的空间保存inode的信息
+   - 构造btrfs_map_token, 这是btree使用的东西..
+   > btrfs_init_map_token(btrfs_map_token)
+   - 这里要使用inode的信息构造这个extent_buffer/btrfs_inode_item里面的信息..
+   - 这里对btrfs_inode_item->generation/size有特殊处理,如果log_inode_only,就写为(0, 0), 否则使用inode的真是信息.
+   - overwrite_item时,会检查generation, 如果是0，不再复制.
+
+** log_inode_item(btrfs_trans_handle, btrfs_root log, btrfs_path, inode)
+   - 把inode放到log tree中..
+   > btrfs_insert_empty_item(btrfs_trans_handle, log, btrfs_path, btrfs_inode->location, btrfs_inode_item)
+   > fill_inode_item(btrfs_trans_handle, ...)
+   - 最后一个参数是0, 把所有的inode的东西都填进去..
+
+** copy_items(btrfs_trans_handle, inode, btrfs_path dst_path, extent_buffer, start_slot, nr, inode_only)
+   - 复制extent_buffer里面从start_slot开始的nr个btrfs_key/btrfs_item..
+   > btrfs_insert_empty_items(...)
+   - 这里使用2个数组,一个表示btrfs_items的大小,另一个记录btrfs_key..
+   > btrfs_item_size_nr(extent_buffer, i+start_slot)
+   > btrfs_item_key_to_cpu(extent_buffer, i+start_slot)
+   - 开始拷贝.. 如果是BTRFS_INODE_ITEM_KEY, 单独处理..
+   > fill_inode_item(btrfs_trans_handle, dst_path->nodes, inode_item, inode, inode_only == LOG_INODE_EXISTS)
+   - 这里还考虑了参数... 其他btrfs_item直接复制..
+   > copy_extent_buffer(dst_path->nodes[0], ...)
+   - 对于BTRFS_EXTENT_DATA_KEY, 需要处理checksum.   skip_csum = 0
+   - btrfs_file_extent_item->generation < btrfs_trans_handle->transid, 不再处理.
+   - 只处理BTRFS_FILE_EXTENT_REG的类型, 获取disk_bytenr/disk_num_bytes/extent_offset. 
+   - 查找btrfs_ordered_sum, 放到list_head队列中.
+   > btrfs_lookup_csums_range(check_root, start, len, list_head, 0)
+   - 最后遍历队列,把checksum写道log_tree中. 很混杂的tree
+   - btrfs_csum_file_blocks(btrfs_trans_handle, log_tree, btrfs_ordered_sum)
+
+** extent_cmp(priv, list_head a, list_head b)
+   - a和b都是extent_map->list, 比较2个extent_map->start..
+
+** drop_adjacent_extents(btrfs_trans_handle, btrfs_root, inode, extent_map, btrfs_path)
+   - 删除btrfs_file_extent_item. 可能会删除多个,对于在btrfs_leaf中连续的,一块删除.
+   - btrfs_path里面应该是指向开始的btrfs_item,遍历它后面的btrfs_file_extent_item,检查文件偏移在extent_map->start+len范围内
+   - 针对每个btrfs_file_extent_item, 还要检查是否跨越边界
+   - 根据extent_type, 获取(extent_start, extent_end), start就是btrfs_file_extent_item->offset
+   > btrfs_token_file_extent_offset(extent_buffer, btrfs_file_extent_item, token)
+   > btrfs_token_file_extent_num_bytes(extent_buffer, btrfs_file_extent_item, token)
+   - 如果extent_end < extent_map->start+len, 直接检查下一个btrfs_item
+   - 如果碰到范围外的,会有重复的?? 
+   - 检查下一个btrfs_file_extent_item, 如果btrfs_key->offset/extent_start在extent_map范围内,这个重复的直接删除. 怎么会有重叠的???
+   - 如果它就是超过范围,修改extent_offset/btrfs_key/extent_num_bytes
+   - 在切换btrfs_leaf时,一块释放多个btrfs_file_extent_item
+   > btrfs_del_items(btrfs_trans_handle, btrfs_root, ...)
+
+** log_one_extent(btrfs_trans_handle, inode, btrfs_root, extent_map, btrfs_path)
+   - log文件的extent?? 
+   - 创建btrfs_key(inode_objectid, BTRFS_EXTENT_DATA_KEY, extent_map->start)
+   - 插入log_tree中一个btrfs_file_extent_item
+   > btrfs_insert_empty_item(btrfs_trans_handle, log, btrfs_path, btrfs_key, btrfs_file_extent_item)
+   - 如果碰到BTRFS_FILE_EXTENT_INLINE, 就删除它,重新插入.
+   > btrfs_del_item(btrfs_trans_handle, log, btrfs_path)
+   - 开始填充这个btrfs_file_extent_item. 根据extent_map.
+   - generation是extent_map->generation
+   - 如果extent_map->flags = EXTENT_FLAG_PREALLOC, 设定btrfs_file_extent_item->extent_type = BTRFS_FILE_EXTENT_PREALLOC或BTRFS_FILE_EXTENT_REG.
+   - 然后是disk_bytenr / disk_num_bytes..
+   - 如果使用压缩,使用extent_map->block_start, extent_map->block_len/orig_block_len
+   - 如果没有压缩,但extent_map->block_start是普通的磁盘地址,  disk_bytenr需要偏移 (extent_map->start - extent_map->orig_start)..
+   - 如果地址是特殊值,设为(0, 0)
+   - 其他的是offset, num_bytes, ram_bytes, ...
+   - 删除log_tree中已经有的btrfs_file_extent_item, 只要使用现在的btrfs_path向后遍历就行.
+   > drop_adjacent_extents(btrfs_trans_handle, log, inode, extent_map, btrfs_path)
+   - 最后处理checksum
+   - 最后检查log_tree->logged_list[index], 里面是btrfs_ordered_extent. 
+   - 这里使用了extent_map->mod_start/mod_len. 
+   - 检查是否有btrfs_ordered_extent和extent_map交叉的, 需要等待btrfs_ordered_extent的checksum都计算完成.
+   > wait_event(btrfs_ordered_extent->wait, btrfs_ordered_extent->csum_bytes_left == 0)
+   - 然后把这些checksum写到log中.
+   - 把没有在btrfs_ordered_extent中的从btree中读出来,写到log中.
+
+** btrfs_log_changed_extents(btrfs_trans_handle, btrfs_root root, btrfs_inode, btrfs_path)
+   - log文件的extent, 只会处理extent_map.  数据写在pagecache中,也有了extent_map?
+   - 遍历btrfs_inode->extent_map_tree->modified_extents, 检查extent_map->generation, 如果<=btrfs_fs_info->last_trans_committed, 不再处理.
+   - 设置extent_map->flags的EXTENT_FLAG_LOGGING
+   - 遍历上面需要处理的extent_map
+   > log_one_extent(btrfs_trans_handle, inode, btrfs_root, extent_map, btrfs_path)
+   > clear_em_logging(extent_map_tree, extent_map)
+   > free_extent_map(extent_map)
+   - 并没有增加btrfs_extent_item的backref..
+
+** btrfs_log_inode(btrfs_trans_handle, btrfs_root, inode, inode_only)
+   - log一个inode..  
+   - btrfs_root是subvol tree, 肯定操作btrfs_root->log_root, inode是文件
+   - 构造btrfs_key(inode_objectid, BTRFS_INODE_ITEM_KEY/1, 0), 这是min_key, 再构造一个btrfs_key(inode_objectid, -1, -1)做为max_key.
+   - 检查是是否完全log
+   - inode是目录
+   - inode_only是LOG_INODE_EXISTS
+   - btrfs_inode->runtime_flags不带有BTRFS_INODE_NEEDS_FULL_SYNC
+   - 只会log一部分, 最大的btrfs_key.type=BTRFS_XATTR_ITEM_KEY. 之后log btrfs_inode_ref/btrfs_inode_item
+   - 如果是目录,或者btrfs_inode刚创建? btrfs_inode->generation > btrfs_fs_info->last_trans_committed, 先提交btrfs_delayed_item
+   > btrfs_commit_inode_delayed_items(btrfs_trans_handle, inode)
+   - 把inode的btrfs_ordered_extent, 放到log_root->logged_list队列中.
+   > btrfs_get_logged_extents(log, inode)
+   - 先清除log tree中可能重复的东西
+   - 如果是目录,就把BTRFS_DIR_LOG_INDEX_KEY前面的btrfs_item都删除.
+   - 当然如果参数inode_only有效,把BTRFS_XATTR_ITEM_KEY前面的删除
+   > drop_objectid_items(btrfs_trans_handle, log, btrfs_path, ino, max_key_type)
+   - 如果普通文件就复杂
+   - 如果btrfs_inode->runtime_flags带有BTRFS_INODE_NEEDS_FULL_SYNC
+   - 整个inode相关的都删除.包括它自己. 
+   - 清除btrfs_inode->runtime_flags的BTRFS_INODE_COPY_EVERYTHING
+   > btrfs_truncate_inode_items(btrfs_trans_handle, log. inode, 0, 0)
+   - 如果btrfs_inode->runtime_flags带有BTRFS_INODE_COPY_EVERYTHING, 删除到BTRFS_XATTR_ITEM_KEY??
+   > drop_objectid_items(btrfs_trans_handle, log, path, ino, type)
+   - 对于其他的就仅仅在log中创建btrfs_inode_item, 使用btrfs_inode填充它.
+   > log_inode_item(btrfs_trans_handle, log, dst_path, inode)
+   - 然后就退出. 
+   - 对于普通的inode, 会检查btrfs_inode->runtime_flags,但也不是很的多么细致.
+   - 开始向log tree中填充, 分两部分,显示metadata, 然后是extent 
+   - min_key一般从BTRFS_INODE_ITEM_KEY开始,min_key就看上面的具体情况.
+   - 同样查找它里面属于当前btrfs_trans_handle->transid的.
+   > btrfs_search_forward(btrfs_root, min_key, max_key, btrfs_path, btrfs_trans_handle->transid)
+   - 在遍历过程中,尽量把一个extent_buffer的一块拷贝..
+   > copy_items(btrfs_trans_handle, inode, dst_path, extent_buffer, start_slot, ins_nr, inode_only)
+   - 处理extent ..
+   > btrfs_log_changed_extents(btrfs_trans_handle, btrfs_root, inode, dst_path)
+   - 最后又处理目录
+   > log_directory_changes(btrfs_trans_handle, ...)
+   - 更新btrfs_inode->logged_trans为btrfs_trans_handle->transid, btrfs_inode->last_log_commit为btrfs_inode->last_sub_trans
+   - 这里所有的btrfs_item,大部分都是覆盖,btrfs_file_extent_item会合并或分割.
+
+** check_parent_dirs_for_sync(btrfs_trans_handle, inode, dentry, super_block, last_committed)
+   - 从inode向上查找,处理每个目录,检查是否需要sync
+   - inode是普通文件
+   - btrfs_inode->last_unlink_trans <= last_committed
+   - btrfs_inode->generation <= last_committed
+   - 它和父目录的关系的修改已经提交,不用考虑父目录
+   - 主要处理父目录dentry->d_inode
+   - 设置btrfs_inode->logged_trans = btrfs_trans_handle->transid
+   - 如果btrfs_inode->last_unlink_trans > last_committed, 就需要修改父目录.
+   - 一直遍历上去,直到遇到根inode
+   > dget_parent(parent)
+   
+** btrfs_log_inode_parent(btrfs_trans_handle, btrfs_root, inode inode, dentry parent, exists_only)
+   - log一个inode的父目录parent
+   - 如果btrfs_fs_info->last_trans_log_full_commit > btrfs_fs_info->last_trans_committed, 就不做处理?? 后者哪里使用??
+   > check_parent_dirs_for_sync(btrfs_trans_handle, ...)
+   - 检查inode是否在log中, 如果已经被log, 不处理父目录?!
+   > btrfs_inode_in_log(inode, btrfs_trans_handle->transid)
+   - 开始log
+   > start_log_trans(btrfs_trans_handle, btrfs_root)
+   - 复制btrfs_item
+   > btrfs_log_inode(btrfs_trans_handle, btrfs_root, inode_only)
+   - 检查是否向上遍历,处理父节点
+   - 条件是btrfs_inode->generation > btrfs_fs_info->last_trans_committed && btrfs_inode->last_unlink_trans <= last_committed
+   - 向上遍历直到根目录, 只处理一部分  btrfs_inode->generation > btrfs_fs_info->last_trans_committed
+   > btrfs_log_inode(btrfs_trans_handle, btrfs_root, inode, inode_only)
+   
+** btrfs_log_dentry_safe(btrfs_trans_handle, btrfs_root root, dentry dentry)
+   - log dentry和chunk root有什么关系??
+   > btrfs_log_inode_parent(btrfs_trans_handle, btrfs_root, dentry->d_inode, parent, 0)
+   
+** btrfs_recover_log_tree(btrfs_root log_root_tree)
+   - 把log的数据合并到btrfs_root上.
+   - 参数是总的log root tree... 在mount的时候做recovery操作.. 
+   - 设置btrfs_fs_info->log_root_recovering=1..
+   - 构造walk_control, 回调函数是process_one_buffer, stage = 0
+   - 回调函数是把log_tree的空间设置为pin,free space会跳过这些.但他们的空间本来就不是free?!
+   - pin除了不让释放,应该还有别的用处.
+   - 启动tree_root的btrfs_trans_handle
+   > btrfs_start_transaction(btrfs_fs_info->tree_root, 0)
+   - 设置walk_control的btrfs_trans_handle, pin = 1
+   > walk_log_tree(btrfs_trans_handle, log_root_tree, walk_control)
+   - 这里把log_root_tree的所有tree block都锁到内存中.
+   - 构造btrfs_key(BTRFS_TREE_LOG_OBJECTID, BTRFS_ROOT_ITEM_KEY, -1)
+   - 开始遍历log_root_tree中每个log_tree
+   > btrfs_search_slot(NULL, log_root_tree, btrfs_key, btrfs_path, 0, 0)
+   - 获取对应的log_tree/btrfs_root
+   > btrfs_read_fs_root_no_radix(log_root_tree, btrfs_key)
+   - 构造btrfs_key(offset, BTRFS_ROOT_ITEM_KEY, -1) 找它原来的btrfs_root
+   > btrfs_read_fs_root_no_name(btrfs_fs_info, btrfs_key)
+   - 设置btrfs_root->log_root = log_tree
+   - 把btrfs_root放到btrfs_trans_handle中.
+   - btrfs_record_root_in_trans(btrfs_trans_handle, ...)
+   - 遍历一遍,而且把它的空间变为pin空间.
+   > walk_log_tree(btrfs_trans_handle, log, walk_control)
+   > kfree(log)
+   - 这里会3次遍历,第一边是LOG_WALK_REPLAY_PIN
+   - 第二遍是LOG_WALK_REPLAY_INODES, 回调函数改为replay_one_buffer pin = 0
+   - 第三遍是LOG_WALK_REPLAY_ALL
+   - 在第三遍时,遍历完一颗树,重新计算btrfs_root中文件的nlink
+   > fixup_inode_link_counts(btrfs_trans_handle, btrfs_root, btrfs_path)
+   - 最好提交transaction, 它应该也会释放所有的log_tree,还有log_root_tree的空间等.
+   > btrfs_commit_transaction(btrfs_trans_handle, btrfs_fs_info->tree_root)
+   - 最后释放log_root_tree/btrfs_root
+
+** btrfs_record_unlink_dir(btrfs_trans_handle, inode dir, inode inode, for_rename)
+   - 在rename/unlink时使用这个函数
+   - 对于inode, 使用btrfs_inode->last_unlink_trans = btrfs_trans_handle->transid
+   - 检查dir, 如果dir/btrfs_inode->logged_trans == btrfs_trans_handle->transid, 直接退出, 它已经被当前transaction保存.
+   - 检查inode, btrfs_inode->logged_trans == btrfs_trans_handle->transid.. 也不用log
+   - 对于rename, dir/btrfs_inode->last_unlink_trans = btrfs_trans_handle->transid, 所以它会被log保存?!
+
+** btrfs_log_new_name(btrfs_trans_handle, inode inode, inode old_dir, dentry parent)
+   - 在link/rename中使用它
+   - 对于普通文件, btrfs_inode->last_unlink_trans = btrfs_trans_handle->transid..
+   - inode/btrfs_inode->logged_trans <= btrfs_fs_info->last_trans_committed, 而且old_dir/btrfs_inode->logged_trans < btrfs_fs_info->last_trans_committed, 2个inode都没有log,就需要保存log?
+   - 保存log信息.
+   > btrfs_log_inode_parent(btrfs_trans_handle, btrfs_root, inode, ...)
+
+** 总结
+   - log对外部的结构, 阻止log提交,或完成log操作.
+   - fsync/rename/unlink/link使用的结构,保存log_tree数据
+   - 在mount的时候做处理log tree, 合并数据,然后释放log tree
+   - 在transaction提交时,会删除log_tree.

@@ -1,0 +1,908 @@
+先在这里保存一下，还需要重新再看一遍，里面有很多问题。
+
+blk gelevator
+
+1. elevator_type数据结构
+  * kmem_cache icq_cache
+  * elevator_ops ops
+  * icq_size / icq_align
+  * elv_fs_entry *elevator_attrs
+  * elevator_name[ELV_NAME_MAX] / module ...
+  * icq_cache_name[ELV_NAME_MAX+5]
+  * list_head list
+
+elevator_ops
+  * elevator_merge_fn
+  * elevator_merged_fn
+  * elevator_merge_reg_fn
+  * elevator_allow_merge_fn(request_queue, request, bio) bio合并到request
+  * elevator_bio_merged_fn
+
+  * elevator_dispatch_fn
+  * elevator_add_req_fn
+  * elevator_activate_req_fn
+  * elevator_deactivate_req_fn
+  * elevator_completed_req_fn
+  * elevator_request_list_fn .. 还两个.. former/latter
+  * elevator_init_icq_fn
+  * elevator_exit_icq_fn
+
+  * elevator_set_req_fn
+  * elevator_put_req_fn
+  * elevator_may_queue_fn
+  * elevator_init_fn
+  * elevator_exit_fn
+这么多函数，都能用的到??
+
+
+elevator_queue
+  * elevator_type *type
+  * elevator_data
+  * kobject , sysfs_lock ...
+  * hlist_head  hash
+  * registered
+
+2. elv_iosched_allow_merge(request, bio) bio是否能合并到request
+ -> request->request_queue->type->ops->elevator_allow_merge_fn()
+
+3. elv_rq_merge_ok(request, bio) 是否能合并
+ -> blk_rq_merge_ok(request, bio) 检查request和bio的自身属性,REQ_DISCARD/REQ_SECURE, 读写, hd_struct是否一样?...
+ -> elv_iosched_allow_merge(request, bio) elevator算法释放允许
+
+4. elevator_find(name) 找一个elevator_type, 所有的调度算法都在elv_list队列中
+
+5. elevator_alloc(request_queue, elevator_type) 创建elevator_queue,建立hash队列
+ -> kmalloc_node(size ...)
+ -> kmalloc_node(ELV_HASH_ENTRIES, ...) hash长度为ELV_HASH_ENTRIES(64), hahs表中应该是request. 
+  
+   elevator_release(kobject) 删除elevator_queue
+
+6. elevator_init(request_queue, name) 初始化request_queue的elevator,创建队列
+ -> 初始化elevator_queue->last_merge / queue_head / end_sector / boundary_rq
+ -> elevator_alloc(request_queue, elevator_type)
+ -> elevator_type->ops.elevator_init_fn(request_queue)
+
+ elevator_exit(elevator_queue)
+ -> 调用 elevator_queue->type->elevator_exit_fn(elevator_queue)
+
+7. __elv_rqhash_del(request) 从hash队列中释放
+   elv_rqhash_del(request_queue, request) 如果request->hash->pprev有意义,则它在队列中，使用这个判断它是否在hash队列中
+
+8. elv_rqhash_add(request_queue, request) 把request添加到request_queue->elevator_queue的hash队列中, 而且加在对头
+ elv_rqhash_reposition(request_queue, request) 把request放到hash队头
+ -> __elv_rqhash_del(request)
+ -> elv_rqhash_add(request_queue, request)
+
+9. elv_rqhash_find(request_queue, sector_t offset) 查找request_queue->elevator_queue上的所有request, 比较它的最后一个sector是否是offset. 实际上offset是hash表的键.
+ -> rq_hash_key(request)
+ -> rq_mergeable(request) 如果碰到可合并的request, 直接删除? request->cmd_flags包含RQ_NOMERGE_FLAGS
+
+10. elv_rb_add(rb_root, request) 还有rbtree管理的request? 节点的值是request->__sector,表示request的开始扇区号. 这里的rbtree并不是elevator_type中的结构
+ elv_rb_add / elv_rb_del / elv_rb_find
+
+11. elv_dispatch_sort(request_queue, request) 把request插入到request_queue->queue_head队列中,按照一定顺序排列. REQ_DISCARD放到最后面, 其次是读或写的最后面,或者REQ_SOFTBARRIER/REQ_STARTED的后面,然后根据request_queue->boundary放置,它把所有的request分成两组... 最后是按照sector位置递减.
+
+12. elv_dispatch_add_tail(request_queue, request) 把request添加到request_queue的最后面
+
+13. elv_merge(request_queue, request, bio) bio是否可以和request_queue中的某个request合并?
+ -> 首先检查request_queue支持合并QUEUE_FLAG_NOMERGES
+ -> 检查bio是否可以和request_queue->last_merge合并
+ -> elv_rq_merge_ok(request_queue->last_merge, bio)
+ -> blk_try_merge(request_queue->last_merge, bio)
+ 根据bio->bi_sector(扇区位置)找一个后合并的request
+ -> elv_rqhash_find(request_queue, bio->bi_sector)
+ -> 根据elevator找合适的request > elevator_queue->type->ops.elevator_merge_fn(request_queue, request, bio) 这里的request是返回参数. 如果能合并就返回ELEVATOR_FRONT_MERGE/ELEVATOR_BACK_MERGE, bio是连续的,看来request中的操作对象扇区也是连续的.
+
+14. elv_attempt_insert_merge(request_queue, request) 把request合并到request_queue的某个request中,和上面类似,但这里使用的函数是尝试合并request,而不是检查能不能合并
+ -> blk_attempt_req_merge(request_queue->last_merge, request, request_queue)
+ -> elv_rqhash_find(request, blk_rq_pos(request)) 同样找一个可后和并的request
+ -> 如果能找到  blk_attempt_req_merge(request ...)
+
+15. elv_merged_request(request_queue, request, type) request是刚才合并过的request_queue?
+ -> request_queue->elevator_queue->type->ops->elevator_merged_fn(request_queue, request, type)
+ -> elv_rqhash_reposition(request_queue, request) request合并过，它的最后一个扇区数也改变，需要改变在hash队列中的位置
+
+16. elv_merge_requests(request_queue, request rq, request next)要把next合并到rq上面, REQ_SORTED啥意思?
+ -> elevator_queue->type->ops->elevator_merge_req_fn(request_queue, request, next)
+ -> elv_rqhash_reposition(request_queue, request)
+ -> 根据REQ_SORTED,在elevator_queue的hash队列中删除next
+
+17. elv_bio_merged(request_queue, request, bio) 包装elevator_type->ops->elevator_bio_merged_fn(request_queue, request, bio)...
+
+18. elv_requese_request(request_queue, request) 重新把request添加到elevator队列中
+ -> 去掉request->cmd_flags的REQ_STARTED
+ -> __elv_add_request(request_queue, request, ELEVATOR_INSERT_REQUEUE)
+
+19. elv_drain_elevator(request_queue) 触发下面的调度函数
+ -> request_queue->elevator_queue->type->ops->elevator_dispatch_fn(request_queue, 1)
+
+20. __elv_add_request(request_queue, request, where) where有多少中意思?
+ -> 如果request->cmd_flags带有REQ_SOFTBARRIER, 修改request_queue->end_sector/boundary_rq
+ -> 否则是REQ_ELVPRIV, 在where必须是ELEVATOR_INSERT_BACK, 不懂..
+ -> where的插入位置有6种, FRONT/BACK/SORT/REQUEUE/FLUSH/SORT_MERG
+ -> 如果REQUEUE/FRONT, 把request放到request_queue->queue_head队列中, 设置REQ_SOFTBARRIER标志
+ -> 如果BACK,  > elv_drain_elevator(request_queue), 把request放到request_queue->queue_head后面
+ -> 而且启动request_queue  > __blk_run_queue(request_queue)
+ -> MERGE : > elv_attempt_insert_merge(request_queue, request)
+ -> SORT: elv_rqhash_add(request_queue, request) 添加request到elevator_queue中
+ -> request_queue->elevator_queue->type->ops->elevator_add_req_fn(request_queue, request) 这种情况应该对应某个调度算法
+ -> FLUSH:  > blk_insert_flush(request)
+
+   elv_add_request(request_queue, request, where) 包装上面
+
+21. elv_latter_request(request_queue, request)
+ 包装elevator_queue->type->ops->elevator_latter_req_fn(request_queue, request)
+   elv_former_request(request_queue, request) 包装对应的elevator_ops中的
+   elv_set_request(request_queue, request, bio, gfp_t)
+   elv_put_request(request_queue, request)
+   elv_may_queue(request_queue, rw)
+
+22. elv_abort_queue(request_queue) 中断request_queue, 取消它所有的request
+ -> blk_start_request(request)
+ -> __blk_end_request_all(request, -EIO)
+
+23. elv_completed_request(request_queue, request)
+ -> 减小request_queue->in_flight[sync], 包装elevator_ops->elevator_completed_req_fn(request_queue, request)
+
+24. 一些sys的文件夹之类的函数,这里可能会有系统控制参数
+
+25. elevator_switch(request_queue, elevator_type) 
+ -> blk_queue_bypass_start(request_queue) 在切换时,先进入BYPASS状态,
+ -> elv_unregister_queue(request_queue) 注销调度..
+ -> ioc_clear_queue(request_queue)
+ -> elevator_alloc(request_queue, elevator_type)
+ -> elevator_type->ops->elevator_init_fn(request_queue)
+ -> elevator_exit(old elevator_type)
+ -> blk_queue_bypass_end(request_queue) 结束BYPASS状态
+
+26. elevator_change(request_queue, name) 包装上面的操作
+
+27. elv_iosched_store(request_queue, name, count) 包装,这就是系统控制的参数
+
+28. elv_rb_former_request(request_queue, request) / elv_rb_latter_request(request_queue, request) 这里操作request使用的rbtree, 和request_queue没有关系
+ -> rb_prev / rb_next(request->rb_node) ...
+
+看了这些函数还是没感觉，主要是底层的存储过程一点也不了解！！继续...
+
+看一下block/blk-merge
+1. __blk_recalc_rq_segments(request_queue, bio) 计算bio-china中内存地址段的个数.bio中数据对应的扇区位置是连续的,所以这里要找数据在内存中地址段数,如果biovec使用的page不能和driver交互,则它算单独的一段,如果request_queu支持cluster, 而且连续的biovec的物理内存连续,而且连续的数据两不超过cluster,则这些数据量算一段. 最后第一端和最后一段的大小记录在bio->bi_seg_front_size / bi_seg_back_size上面.
+
+ blk_reclac_rq_segments(request) 包装上面,bio表示一串bio
+
+2. blk_recount_segments(request_queue, bio) 重新计算一个bio的物理内存地址段数
+ -> __blk_recalc_rq_segments(request_queue, bio), 然后设置bio->bi_flags的BIO_SEG_VALID
+
+3. blk_phys_contig_segment(request_queue, bio, next_bio) 两个bio是否物理内存地址连续？ 有用吗？
+ -> bi_seg_back_size + bi_seg_front_size <= queue_limits->max_segment_size
+ -> BIOVEC_PHYS_MERGEABLE(__BVEC_END(bio), __BVEC_START(next_bio)) 物理地址是否连续
+ -> BIO_SEG_BOUNDARY(request, bio, next_bio)
+
+3. 针对上面的物理地址连续段,除了一种数据结构scatterlist, 和biovec类似
+
+4. ll_new_hw_segment(request, request, bio) 这个是把bio添加到request,首先获取bio的phys_segments
+ -> bio_phys_segments(request_queue, bio) 比较request->nr_phys_segments+bio.. 和queue_max_segments(request_queue) 
+ -> 然后bio_integrity ...
+ -> 如果能合并,增加request->nr_phys_segments, 可是没看到合并..
+ -> 如果不能合并,设置request->cmd_flags的REQ_NOMERGE, 而且request_queue->last_merge是它的话,改成NULL.
+
+5. ll_back_merge_fn(request_queue, request, bio) 把bio合并到request的最后面.先检查合并后的request的io扇区数超过限制，这里有两个
+ -> qeueu_max_hw_sectors(request_queue) queue_limits.max_hw_sectors 这是scsi的命令request特有的REQ_TYPE_BLOCK_PC
+ -> queue_max_sectors(..) queue_limits.max_hw_sectors
+ -> 如果blk_rq_sector/__data_len 和 bio_sectors/bi_size 超过限制,不能合并,设置request->cmd_flags的REQ_NOMERGE
+ -> 重新计算request->biotail的物理端数,和bio的,看来还没有把bio添加到这个单链表中
+ -> blk_recount_segments(request, bio)
+ -> ll_new_hw_segments(request_queue, request, bio) 计算request->nr_phys_segments
+
+6. ll_front_merge_fn(request_queue, request, bio) 和上面一样
+
+7. ll_merge_requests_fn(request_queue, request, request next) 合并两个request,检查request的bio和next的biotail. 这里要检查山区数,内存物理端数
+
+8. blk_rq_mixed_merge(request) 啥事mixed merge? 修改每个bio->bi_rw标志，增加request->cmd_flags的REQ_MIXED_MERGE标志
+
+9. blk_account_io_merge(request) 修改part相关的计数, part = request->part
+
+10. attempt_merge(request_queue, request, request next) 就是把两个request的bio放到一块,检查条件特别多
+ -> rq_mergeable(request) 是否可合并,有些命令的request不能合并
+ -> REQ_SECURE / REQ_DISCARD 等处理
+ -> 两个request操作的扇区必须连续 blk_rq_pos(request), blk_rq_sectors(reqest)  __sector/__data_len
+ -> rq_data_dir(request) 读写操作一致, 操作磁盘一样
+ -> ll_merge_requests_fn(request_queue, reqeust, next)
+ -> blk_rq_set_mixed_merge(request)  failfast settings...  错误处理
+ -> request->start_time ..
+ -> 修改 request->biotail -> bi_next = next->bio...  next->bio=NULL, next已经为空
+ -> 修改 __data_len / __sector
+ -> elv_merge_requests(request_queue, request, next) elevator_queue相关操作
+ -> blk_account_io_merge(request) 这里的统计很简单,它具体操作的数据量已经无效,所以这里只有in_flight之类的针对request数量的统计
+ -> ioprio_best(request->ioprio, next->ioprio) .. 找一个底的
+ -> __blk_put_request(request_queue, next) 释放request
+
+11. attemp_back_merge(request_queue, request) 
+ -> 先找一个request elv_latter_request(request_queue, request) （它包装elevator_type->ops->elevator_latter_req_fn的操作)
+ -> attempt_merge(request_queue, request, next) ... 找一个next,把request放在它前面,释放next..
+
+12. attempt_front_merge(request_queue, request)
+ -> elv_former_request(request_queue, request) ... 和上面一样..
+ -> attempt_merge
+
+ blk_attempt_req_merge 包装 attempt_merge
+
+13. blk_rq_merge_ok(request, bio) bio能否合并到request中
+
+14. blk_try_merge(request, bio) 比较扇区位置，返回ELEVATOR_BACK_MERGE/FRONT_MERGE...
+
+看完了，看了这些对block-1中的有些操作理解了.... 直接看两种调度方法, 刚才再网上找IO调度,都说的不详细. 但可以确认有4中,从CFQ开始.
+
+cfq_time 数据结构
+  * last_end_request
+  * ttime_total
+  * ttime_samples
+  * ttime_mean
+
+cfq_rb_root
+  * rb_root rb
+  * rb_node *left
+  * count / total_weight 
+  * min_vdisktime 
+  * cfq_ttime ttime
+
+每个进程的数据结构
+cfq_queue 
+  * ref, flags
+  * cfq_data *cfqd
+  * rb_node  这两个是service_tree 
+  * rb_key   
+  * rb_node p_node, 这两个是prio tree
+  * rb_root *p_root  
+  * rb_root sort_list  sorted list
+  * request *next_rq  fifo队列??
+  * queued[2] sort list上的request数量, 为何有两个
+  * allocated[2] 
+  * list_head fifo ??   
+
+  * dispatch_start , allocated_slice , slice_dispatch
+  * slice_start slice_end  cfq调度使用时间片..
+  * slice_resid
+
+  * prio_pending 
+  * dispatched
+
+  * pid_t pid??  pid,真属于某个thread group?
+  * seek_history
+  * sector_t last_request_pos
+  * cfq_rb_root *service_tree
+  * cfq_queue new_cfqq  怎么出来这么多数据结构?
+  * cfq_group cfpg
+  * nr_sectors
+
+wl_prio_t 应该是io的优先级
+  * BE_WORKLOAD 
+  * RT_WORKLOAD
+  * IDLE_WORKLOAD
+  * CFQ_PRIO_NR
+wl_type_t workload 的类型, 为何这三种
+  * ASYNC_WORKLOAD
+  * SYNC_NOIDLE_WORKLOAD
+  * SYNC_WORKLOAD
+
+cfqg_stats 统计信息 怎么和cgroup有联系了?
+
+cfq_group 数据结构
+  * blkg_policy_data pd
+  * rb_node rb_node ...
+  * vdisktime
+  * weight / new_weight / dev_weight
+  * nr_cfqq
+
+  * busy_queues_avg[CFQ_PRIO_NR]
+  * cfq_rb_root service_trees[2][3] 这两个对应上面的BE/RT和wl_type
+  * cfq_rb_root service_tree_idle  这个对应IDLE优先级的request
+  
+  * saved_workload_slice 
+  * wl_type_t saved_workload 
+  * wl_prio_t saved_servicing_prio
+
+  * dispatched
+  * cfq_ttime ttime 确定自己没有抄重复?
+  * cfqg_stats stats 
+
+cfq_io_cq
+  * io_cq icp ??  关系到了io_context
+  * cfq_queue *cfqq[2]
+  * cfq_ttime ttime
+  * blkcg_id  blkcg ID(cgroup)
+
+
+cfq_data 每个设备/request_queue的数据
+  * request_queue
+  * cfq_rb_root grp_service_tree
+  * cfq_group *root_group
+  * wl_prio_t serving_prio
+  * wl_type_t serving_type
+  * worload_expires
+  * cfq_group serving_group
+
+  * rb_root prio_trees[CFQ_PRIO_LISTS] 8个优先级?
+  * busy_queues
+  * busy_sync_queues
+  统计数据..
+  * rq_in_drivers
+  * rq_in_flight[2] 
+
+  queue_depth, 队列长度?
+  * rq_queued
+  * hw_tag
+  
+  * how_tag_est_depth ?  NCQ??
+  * hw_tag_samples
+  
+  idle管理?
+  * timer_list idle_slice_timer
+  * work_struct unplug_work
+
+  * cfq_queue active_queue
+  * cfq_io_cq active_cic
+
+  * cfq_queue *async_cfqq[2][IOPRIO_BE_NR]  BE是什么缩写?
+  * cfq_queue *async_idle_cfqq
+
+  * sector_t last_position
+  可调整的参数
+  * cfq_quantum 
+  * cfq_fifo_expire[2]
+  * cfq_back_penalty
+  * cfq_back_max
+  * cfq_slice[2]
+  * cfq_slice_async_rq
+  * cfq_slice_idle
+  * cfq_group_idle
+  * cfq_latency
+  * cfq_target_latency
+
+  * cfq_queue oom_cfqq ??
+  * last_delayed_sync
+
+cfqq_state_flags 这是cfqq的标志? cfqq是啥?
+  * CFQ_CFQQ_FLAG_on_rr  round-robin busy list
+  * CFQ_CFQQ_FLAG_wait_request  wait for request
+  * CFQ_CFQQ_FLAG_must_dispatch allowd a dispatch
+  * CFQ_CFQQ_FLAG_must_alloc_slice per-slice ??
+  * CFQ_CFQQ_FLAG_fifo_expire  FIFO check ??
+  * CFQ_CFQQ_FLAG_idle_window slice idling enable?
+  * CFQ_CFQQ_FLAG_prio_changed
+  * CFQ_CFQQ_FLAG_slice_new
+  * CFQ_CFQQ_FLAG_sync
+  * CFQ_CFQQ_FLAG_coop
+  * CFQ_CFQQ_FLAG_split_coop
+  * CFQ_CFQQ_FLAG_deep
+  * CFQ_CFQQ_FLAG_wait_busy
+
+cfqg_stats_flags 统计?  stats是什么统计? cgroup相关,先忽略
+  * CFQG_stats_waiting 
+  * CFQG_stats_idling
+  * CFQG_stats_empty
+
+NCQ: native command queue, 本地命令队列? 当多个磁盘命令同时执行时,底层磁盘决定执行顺序?.
+
+函数都好混乱,无法理解.
+1. cfq_io_thinktime_big(cfq_data, cfq_ttime, group_idle)
+ -> sample_valid ??
+   -> group_idle => cfqd->cfq_group_idle / cfqd->cfq_slice_idle??
+   
+2. iops_mode(cfq_data)
+ -> cfqd->cfq_slice_idle , cfqd->hw_tag 啥意思?  调度保持IO次数的公平性,而不是数据量? 在NCQ起作用的时候，使用它.
+
+3. cfqq_prio(cfq_queue) 获取cfqq的优先级?  就是返回cfqq->ioprio_class
+ -> fq_class_idle(cfqq)
+
+4. cfqq_type(cfq_queue) 返回cfq_queue->flags是否带标志
+ -> cfq_cfqq_sync(cfq_queue)  => ASYNC_WORKLOAD  (CFQ_CFQQ_FLAG_sync
+ -> cfq_cfqq_idle_window(cfq_queue)  => SYNC_NOIDLE_WORKLOAD  (CFQ_CFQQ_FLAG_idle_window
+ 否则返回=> SYNC_WORKLOAD
+
+5. cfq_group_busy_queues_wl(wl_prio_t, cfq_data, cfq_group) 返回请求数量?
+ -> wl==IDLE_WORKLOAD => cfq_group->service_tree_idle.count
+ -> 否则就是service_trees中wl对应的三种type的count总和.. 为何在rb_root中有count??
+
+ cfqg_busy_async_queues(cfq_data, cfq_group) 这两个参数有何区别? 这里就是获取ASYNC_WORKLOAD的请求数?  cfq_group->service_trees[RT_WORKLOAD][ASYNC_WORKLOAD] + cfq_group->service_trees[BE_WORKLOAD][ASYNC_WORKLOAD]
+
+6. icq_to_cic(io_cq) 返回cfq_io_cq, 实际上cfq_io_cq的第一个变量就是io_cq
+ cfq_cic_lookup(cfq_data, io_context)
+ -> ioc_lookup_icq(io_context, cfq_data->request_queue) 找到io_cq
+ -> icq_to_cic(io_cq) 包装上面的函数
+
+7. cic_set_cfqq(cfq_io_cq, cfq_queue, is_sync) 这里必须知道cfq_io_cq数据结构才可以
+ -> cfq_io_cq->cfq_queue[is_sync] = cfq_queue
+
+8. cic_to_cfqd(cfq_io_cq) 这个数据关系更微妙
+ -> cfq_io_cq => io_cq => request_queue=> elevator_queue->elevator_data
+
+9. cfq_bio_sync(bio) bio是否是SYNC请求?  如果是READ,REQ_SYNC, 则它是sync请求
+ -> bio_data_dir(bio)   bio->rw 带标志REQ_SYNC
+
+10. cfq_schedule_dispatch(cfq_data) cfq_data->unplug_work执行什么?
+ -> kblockd_schedule_work(cfq_data->queue, cfq_data->unplug_work) 异步执行一些工作
+
+11. cfq_prio_slice(cfq_data, sync, prio) 根据prio计算slice长度
+ -> base_slice = cfq_data->cfq_slice[sync]
+ -> base_slice += base_slice / CFQ_SLICE_SCALE(5) * (4 - prio)
+ cfq_prio_to_slice(cfq_data, cfq_queue)
+ -> cfq_cfqq_sync(cfq_queue)  cfq_queue->flags包含 CFQ_CFQQ_FLAG_sync, 而prio是cfq_queue->ioprio, 然后调用上面的函数
+
+12. cfq_scale_slice(delta, cfq_group) 这个计算还挺复杂.
+ delta << CFQ_SERVICE_SHIFT * CFQ_WEIGHT_DEFAULT cfq_group->weight
+
+13. update_min_vdisktime(cfq_rb_root) 更新cfq_rb_root->min_vdisktime, 使用cfq_rb_root->min_vdisktime, cfq_group->vdisktime最大的值.  cfq_rb_root->left是cfq_group->node
+
+14. cfq_group_get_avg_queues(cfq_data, cfq_group, rt) 更新cfq_group->busy_queues_avg[rt]
+ -> cfq_group_busy_queues_wl(rt, cfq_data, cfq_group)
+
+15. cfq_group_slice(cfq_data, cfq_group) 好像有好几个slice的函数了. cfq_data->grp_service_tree是cfq_rb_root, 根据cfq_group->weight 和 cfq_rb_root->total_weight 平分cfq_data->cfq_target_latency
+
+16. cfq_scaled_cfqq_slice(cfq_data, cfq_queue)  这个是什么的slice??
+ -> cfq_prio_to_slice(cfq_data, cfq_queue)
+
+17. cfq_set_prio_slice(cfq_data, cfq_queue)
+ -> 先计算slice > cfq_scaled_cfqq_slice(cfq_data, cfq_queue)
+ -> 设置cfq_queue的属性, slice_start = jiffies, slice_end = jiffies + slice, allocated_slice = slice
+
+18. cfq_slice_used(cfq_queue)  cfq_queue的slice是否已经用完? 
+ -> cfq_cfqq_slice_new(cfq_queue) 如果是new的cfq_queue, 则没用完。 比较jiffies和cfq_queue->slice_end
+
+19. cfq_choose_req(cfq_data, request rq1, request rq2, sector_t last) 选择rq1和rq2中哪一个更优选处理
+ -> rq_is_sync, REQ_PRIO, 有限处理sync和优先级的request
+ -> 根据request的数据扇区位置,选择那个更合适. 如果request在last后面(比last大),距离就是减法,如果小,需要成权值cfq_data->cfq_back_penalty. 如果超前太多, cfq_data->cfq_back_max*2(1kb=2sector), 则优先级最低.如果都超前很多,选择扇区位置考前的request ..
+
+20. cfq_rb_first(cfq_rb_root) 找一个cfq_queue, cfq_rb_root->count是cfq_queue的数量.
+ -> rb_first(cfq_rb_root->rb)  / cfq_rb_first->left (暂存加速). 这个rb_node就是cfq_queue->node ...
+
+21. cfq_rb_first_group(cfq_rb_root) 这个和上面一样哇?啥意思?
+ -> rb_entry_cfqg(rb_node)  cfq_group->node
+
+22. rb_erase_init(rb_node, rb_root) 这是啥意思?  从root上删除n
+ cfq_rb_erase(rb_node, cfq_rb_root)  rb_node应该是一个cfq_queue/cfq_group, 把它从cfq_rb_root上删除
+ -> rb_erase_init(rb_node, cfq_rb_root->rb),  减小cfq_rb_root->count
+
+23. cfq_find_next_rq(cfq_data, cfq_queue, request last) 找一个request, 在request之后发射,在rbtree中找相邻的两个request, request->rb_node在这个cfq_data->sort_list中
+ -> rb_next, rb_prev, rb_entry_rq
+ -> cfq_choose_req(cfq_data, next, prev, blk_rq_pos(last))  last使用的是开始扇区..
+
+24. cfq_slice_offset(cfq_data, cfq_queue) 这是个啥优先级?
+ -> cfq_queue->cfq_group->nr_cfqq -1 ) * ( cfq_prio_slice(cfq_data, 1, 0) - cfq_prio_slice(cfq_data, cfq_cfqq_sync(cfq_queue), cfq_queue->ioprio) ) 
+
+25. cfqg_key(cfq_rb_root, cfq_group)  cfq_group->vdisktime - cfq_rb_root->min_vdisktime..这是那个rbtree使用的?
+
+26. __cfq_group_service_tree_add(cfq_rb_root, cfq_group) 把cfq_group放到cfq_rb_root树中, 使用的键值为cfqg_key...
+
+27. cfq_update_group_weight(cfq_group) 计算cfq_group->weight / new_weight
+
+28. cfq_group_service_tree_add(cfq_rb_root, cfq_group) 把cfq_group添加到那个rbtree中?
+ -> cfq_update_group_weight(cfq_group)
+ -> __cfq_group_service_tree_add(cfq_rb_root, cfq_group)
+ -> cfq_rb_root->total_weight += cfq_group->weight  
+ 
+29. cfq_group_notify_queue_add(cfq_data, cfq_group) 把cfq_group添加到cfq_data->grp_service_tree这个cfq_rb_root队列中
+ -> 先更新cfq_group->vdisktime 
+ -> cfq_group_service_tree_add(cfq_rb_root, cfq_group)
+
+30. cfq_group_service_tree_del(cfq_rb_root, cfq_group) 把cfq_group从cfq_rb_root中删除,改变cfq_rb_root的权值
+
+ cfq_group_notify_queue_del(cfq_data, cfq_group) 包装上面的函数, cfq_group->nr_cfqq--
+
+31. cfq_cfqq_slice_usage(cfq_queue, unaccounted_time) cfq_queue分配的slice已经使用多少? cfq_queue->slice_start和jiffies比较. unaccounted_time表示超过slice的部分(如果使用的多了)
+
+32. cfq_group_served(cfq_data, cfq_group, cfq_queue) 哇,3个主要的数据结构. 
+cfq_data包含grp_service_tree,它是cfq_group的rbtree. cfq_group中好像有个2维数组,数组元素是cfq_rb_root,它是cfq_queue的rbtree.
+ -> 获取sync的请求数量 cfq_group->nr_cfqq(所有的queue数量?) - cfqg_busy_async_queues(cfq_data, cfq_group)(async queue的数量) - cfq_group->service_tree_idle.count(idle的数量) 还有idle类型的queue???
+ -> cfq_cfqq_slice_usage(cfq_queue, &unaccounted_sl) 使用了多少的slice
+ -> iops_mode(cfq_data)  平衡计算方式为io次数  => charge = cfq_queue->slice_dispatch ??
+ -> cfq_queue->allocated_slice.. 这个charge是啥?
+ -> cfq_group_service_tree_del(cfq_rb_root/cfq_data, cfq_group) 为何要删除这个group?
+ -> cfq_group->vdisktime += cfq_scale_slice(charge, cfq_group) 使用charge更新cfq_group?
+ -> cfq_group_service_tree_add(cfq_data, cfq_group) 重新把group加进去? 为了调整位置?
+ -> 看是否需要调度cfq_data->workload_expires和jiffies(哪里更新的cfq_data->workload_expires?  cfq_group->saved_workload_slice = cfq_data->workload_expires - jiffies? 过量使用的? 这里是把数据保存到cfq_group中.. cfq_group->saved_workload = cfq_data->serving_type, cfq_group->saved_serving_prio = cfq_data->serving_prio ...??? 都是什么东西?
+ -> cfqg_stats_update_timeslice_used(cfq_group, used_sl, unaccounted_sl)
+ -> cfqg_stats_set_start_empty_time(cfq_group)
+33. cfq_service_tree_add(cfq_data, cfq_queue, add_front)  cfq_data->service_trees中是所有包含等待request的cfq_queue. 这个函数应该是把cfq_queue添加到cfq_data中.
+ -> service_tree_for(cfq_queue->cfq_group, cfqq_prio(cfq_queue), cfqq_type(cfqq)) 获取cfq_rb_root, cfq_queue的队列. 找到要添加的rbtree
+ -> cfq_class_idle(cfq_queue), 如果是IDLE类型,把它添加到rbtree的最后面,rb_key就是rbtree中最后一个cfq_queue->rb_key+CFQ_IDLE_DELAY, 如果rbtree为空,rb_key = jiffies + CFQ_IDLE_DELAY..
+ -> cfq_slice_offset(cfq_data, cfq_queue) 这是怎么计算rb_key??
+ -> 如果参数front为1,需要添加到rbtree的队头位置,rb_key就是第一个cfq_queue->rb_key-HZ, 如果rbtree为空,就是jiffies - HZ
+ -> 如果cfq_queue在某个rbtree中, RB_EMPTY_NODE(cfq_queue->rb_node), 先从cfq_queue中删除
+ -> cfq_rb_erase(cfq_queue->rb_node, cfq_queue->service_tree)
+ -> 把cfq_queue出入到cfq_rb_root中,根据rb_key决定位置, 如果它在rbtree中最左边, cfq_rb_root->left = cfq_queue..
+ -> cfq_group_nofity_queue_add(cfq_data, cfq_group) cfq_group有了新的cfq_queue,发生变化,需要调整它在cfq_data中的位置.
+
+34. cfq_prio_tree_lookup(cfq_data, rb_root, sector_t, rb_node, rb_node, rb_link) 在rb_root中找一个cfq_queue, 这个cfq_queue->next_rq的磁盘位置和输入参数一样.在这个rb_root中, cfq_queue根据cfq_queue->next_rq的磁盘位置排序.
+
+35. cfq_prio_tree_add(cfq_data, cfq_queue)
+ -> 如果cfq_queue在rbtree中,把它从rbtree中删除. cfq_queue->p_root指的是cfq_data->prio_trees这些rbtree的根
+ -> 根据cfq_queue->org_ioprio找一个cfq_rb_root
+ -> cfq_prio_tree_lookup(cfq_data, cfq_queue->p_root, blk_rq_pos(cfq_queue->next_rq), &parent, &p) 在这个cfq_rb_root中找cfq_queue, 如果没找到,把它插入到cfs_rb_root中.
+
+36. cfq_resort_rr_list(cfq_data, cfq_queue) 调整cfq_queue在cfq_data中的位置,会在不同的cfq_queu中?
+ -> cfq_cfqq_on_rr(cfq_queue) 只有在RR list的cfq_queue才可以使用此功能
+ -> cfq_service_tree_add(cfq_data, cfq_queue, 0) 这个表示把cfq_queue添加到cfq_rb_root中
+ -> cfq_prio_tree_add(cfq_data, cfq_queue) 这个表示把cfq_queue添加到cfq_data->prio_trees这些rbtree中
+
+37. cfq_add_cfqq_rr(cfq_data, cfq_queue) 设置cfq_queue的标志,添加CFQ_QUEUE_FLAG_on_rr, 增加cfq_data->busy_queues, 如果cfq_queue带标志CFQ_QUEUE_FLAG_sync, 增加cfq_data-> busy_sync_queues
+ -> cfq_resort_rr_list(cfq_data, cfq_queue) 添加到结构中
+
+38. cfq_del_cfqq_rr(cfq_data, cfq_queue) 当cfq_queue中没有等待的request时,把它从service tree中删除. 为何处理的rr的cfq_queue??
+ -> 清楚CFQ_QUEUE_FLAG_on_rr标志
+ -> 把cfq_queue从两个rbtree中删除, service tree(rb_node/service_tree), prio tree(p_node, p_root)
+ -> cfq_group_nofity_queue_del(cfq_data, cfq_queue->cfq_group) cfq_group改变了，调整它在cfq_data中的位置
+ -> 修改cfq_data->busy_queues / busy_sync_queues
+
+39. cfq_del_rq_rb(request) 通过上面可看出数据结构的管理有这几层 cfq_data=>cfq_group=>cfq_queue=>request=>bio=>biovec(page), 这里处理request. request->elv(union)->priv[2]是两个指针,表示cfq_queue / cfq_group. 这里要从cfq_queue->sort_list这个rbtree中删除request
+ -> cfq_queue->queued[sync]--
+ -> elv_rb_del(cfq_queue->sort_list, request) 这里除了修改rbtree,没有其他动作..
+ -> 如果cfq_queue带标志CFQ_QUEUE_FLAG_on_rr, 而且cfq_queue->sort_list为空(没有request),,把它从prio tree中删除
+
+40. cfq_add_rq_rb(request) 把request添加到cfq_queue中. RQ_CFQQ(request)获取cfq_queue.
+ -> cfq_queue->queued[sync]++, 这个计数有什么用处?
+ -> elv_rb_add(cfq_queue->sort_list, request)
+ -> 如果cfq_queue没有标志CFQ_QUEUE_FLAG_on_rr, 说明它不在某些tree中?  > cfq_add_cfqq_rr(cfq_data, cfq_eueue)
+ -> cfq_choose_req(cfq_data, cfq_queue->next_rq, request, cfq_data->last_position) 检查那个request更时候cfq_data下一次操作...如果request比cfq_queue->next_rq条件(扇区位置)更好,cfq_queue->next_rq就使用它, 如果cfq_queue->next_rq改变,则要调整它在cfq_data中的整体位置.
+ -> cfq_prio_tree_add(cfq_data, cfq_queue)
+
+41. cfq_reposition_rq_rb(cfq_queue, request) 调整request在cfq_queue中的位置? 为啥调整?
+ -> elv_rb_del(cfq_queue->sort_list, request)
+ -> cfq_add_rq_rb(request) request的rb_key发生变化?
+
+42. cfq_find_rq_fmerge(cfq_data, bio) 应该是找一个request,合并bio,把bio放到request的队头
+ -> cfq_cic_lookup(cfq_data, task->io_context) 找io_cq=>cfq_io_cq, io_context中使用rdx管理io_cq, 根据cfq_data->request_queue->rq_id..
+ -> cic_to_cfqq(cfq_io_cq, is_sync)为何使用io_cq找cfq_queue?  虽然cfq_data管理cfq_queue,但好像无法通过sector_t找..
+ -> elv_rb_find(cfq_queue->sort_list, sector) 通过bio的最后一个扇区位置
+
+43. cfq_activate_request(request_queue, request) 这里应该是request_queue处理request是,通知cfq_data修改相应的属性.  request_queue->elevator->elevator_data
+ -> cfq_data->rq_in_driver ++
+ -> cfq_data->last_position 设置为request的结束扇区.  blk_rq_pos(request)+blk_rq_sectors(request)
+
+44. cfq_deactivate_request(request_queue, request) 减小cfq_data->rq_in_driver
+
+45. cfq_remove_request(request) 删除request
+ -> cfq_find_next_rq(cfq_queue->cfq_data, cfq_queue, request) 给cfq_queue找下一个, 根据request的扇区位置找一个临近的.. 这不就是调度了吗?
+ -> list_del_init(rquest->queuelist) 从request_queue的链表中删除
+ -> cfq_queue->cfq_data->rq_queued-- 减小请求的计数
+ -> cfqg_stats_update_io_remove (...)
+ -> 如果request->cmd_flags带标志REQ_PRIO, 减小cfq_queue->prio_pending
+
+46. cfq_merge(request_queue, request, bio) 找一个可以合并的request, 根据sector.
+ -> cfq_find_rq_fmerge(cfq_data, bio) 找一个合适的request
+ -> elv_rq_merge_ok(request, bio)
+
+47. cfq_merged_request(request_queue, request, type) 如果request合并了bio,而且bio放在开头位置,需要调整request, type == ELEVATOR_FRONT_MERGE
+ -> cfq_reposition_rq_rb(cfq_queue, request)
+
+48. cfq_bio_merged(request_queue, request, bio) 做些统计工作
+
+49. cfq_merged_requests(request_queue, request rq, next) rq和next合并,删除next. 这两个可能属于不同的cfq_queue. 
+ -> rq_fifo_time(request) 更新request的时间   csd.list.next.. 什么东西?
+ -> rq_set_fifo_time(request, ..) 
+ -> cfq_queue->next_rq 可能会是next,改为rq
+ -> cfq_remove_request(next)
+ -> rq和next可能不是一个cfq_queue, 如果next的cfq_queue为空,需要在cfq_data中删除它
+ -> cfq_del_cfqq_rr(cfq_data, cfq_queue)
+
+50. cfq_allow_merge(request_queue, request, bio) cfq是否允许bio和request合并, 这里显示数据结构的复杂. 就是比较bio的io_cq和request的cfs_queue是不是一个.  bio=>current->io_context=>io_cq=>cifs_io_cq=>cifs_queue;  request=>cfq_queue
+
+51. cfq_del_timer(cfq_data, cfq_queue) 删除cfq_data->idle_slice_timer，这个计时器什么工作?
+
+52. __cfq_set_active_queue(cfq_data, cfq_queue) 设置cfq_data->active_queue = cfq_queue, 需要初始化cfq_queue? 为何?  cfq_queue-> slice_start / dispatch_start ..., 去除标志CFQ_QUEUE_FLAG_wait_request, ... ，添加CFQ_QUEUE_FLAG_slice_new...
+
+53. __cfq_slice_expired(cfq_data, cfq_queue, timed_out) cfq_queue使用完slice, 选择一个新的
+ -> cfq_cfqq_wait_request(cfq_queue) 如果cfq_queue还在等待request??
+ -> cfq_del_timer(cfq_data, cfq_queue)  这个等待和idle_slice_timer啥关系?等待的时候不让idle_slice_timer唤醒?
+ -> 清除cfq_queue的标志 CFQ_QUEUE_FLAG_wait_request / CFQ_QUEUE_FLAG_wait_busy
+ -> cfq_cfqq_coop(cfq_queue...)  CFQQ_SEEKY(cfq_queue) 需要分裂cfq_queue??
+ -> timed_out什么东西? 这里要设置cfq_queue->slice_resid
+ -> cfq_group_served(cfq_data, cfq_queue->cfq_group, cfq_queue) 更新cfq_data的相关信息
+ -> 如果cfq_queue为空, 把它从cfq_data中删除  cfq_cfqq_on_rr(cfq_queue) / RB_EMPTY_ROOT(cfq_queue->sort_list) / cfq_del_cfqq_nr(cfq_data, cfq_queue)
+ -> cfq_resort_rr_list(cfq_data, cfq_queue)
+ -> 如果cfq_queue是cfq_data->active_queue,改为NULL
+ -> 如果cfq_data->active_cic, 也改为NULL
+ -> put_io_context(cfq_data->active_cic->icq.ioc) 这是啥意思???
+
+54. cfq_slice_expired(cfq_data, timeout) 包装上面的
+ -> __cfq_slice_expired(cfq_data, cfq_queue, timed_out)
+
+55. cfq_get_next_queue(cfq_data) 找一个cfq_queue, 怎么?
+ -> service_tree_for(cfq_data->serving_group, cfq_data->serving_prio, cfq_data->serving_type) 在cfq_group中找一个合适cfq_rb_root.
+ -> 返回这个cfq_rb_root的第一个cfq_queue   cfq_rb_first(service_tree)
+
+56. cfq_get_next_queue_forced(cfq_data) 和上面一样,先使用上面的找，如果找不到,再遍历所有的service_tree, 找第一个..
+
+57. cfq_set_active_queue(cfq_data, cfq_queue)
+ -> cfq_get_next_queue(cfq_data)
+ -> __cfq_set_active_queue(cfq_data, cfq_queue)
+
+58. cfq_dist_from_last(cfq_data, request) request的磁盘位置与cfq_data->last_position的磁盘位置的距离
+
+59. cfq_rq_close(cfq_data, cfq_queue, request) request和cfq_data->last_position
+ -> cfq_disk_from_last(cfq_data, request) 结果大于8k就返回0..
+
+60. cfqq_close(cfq_data, cfq_queue) 选择一个cfq_queue,作为cfq_data的下一个要出里的cfq_queue, 根据磁盘操作位置还有cfq_queue的优先级
+ -> cfq_prio_tree_lookup(cfq_data, cfq_data->prio_trees[cfs_queue->org_ioprio], sector, parent, ...)  需要保证root不是空?  如果找到cfq_queue, 直接返回.
+ -> 考虑parent, 它是比较接近的 > cfq_rq_close(cfq_data, cfq_queue, cfq_queue->next_rq)  如果距离够近，就使用它
+ -> 如果cfq_queue->next_rq不够近,检查它在prio树上两边的cfq_queue, 使用p_node..
+ -> cfq_rq_close(...) 继续判断是否足够近, 如果足够近,则返回它,否则返回NULL. 这里必须确保cfq_queue->next_rq
+
+61. cfq_close_cooperator(cfq_data, cfq_queue) 这里还是选择一个cfq_queue, 选了做什么?  选的cfq_queue必须和输入参数属于一个cfq_group
+ -> cfq_class_idle(cfq_queue) / cfq_cfqq_sync(cfq_queue) / CFQQ_SEEKY(cfq_queue) 这三个条件是啥?
+ -> cfqq_close(cfq_data, cfq_queue) 选出来之后还要判断它属于那个cfq_group, sync, worktype等属性..
+
+62. cfq_should_idle(cfq_data, cfq_queue) cfq_queue是否应该变为idle? 
+ -> cfq_data->cfq_slice_idle  / prio = IDLE_WORKLOAD   => false
+ -> cfq_cfqq_idle_window(cfq_queue) => true 带标志 CFQ_CFQQ_FLAG_idle_window
+ ->  cfq_io_thinktime_big(...) 啥意思??  这是不是偷懒?
+
+63. cfq_arm_slice_timer(cfq_data)  启动cfq_data->idle_slice_timer
+ -> blk_queue_nonrot(cfq_data->request_queue) 如果磁盘是SSD, cfq_data->hw_tag? 这是啥意思?
+ -> cfq_should_idle(cfq_data, cfq_queue) 如果cfq_data不应该变成idle,就返回
+ -> cfq_queue->dispatched 这个应该是执行中的request?  如果有不能变成idle
+ -> cfs_io_cq .. cfq_data->active_cic->icq->ioc->active_ref 表示使用它的task??  如果已经退出,则不用变成idle ? 变成idle有什么意义呢?
+ -> think time ??? 
+ -> 如果cfq_queue所在的cfq_group还有其他cfq_queue,则不能变成idle
+ -> cfq_mark_cfqq_wait_request(cfq_queue) 为何设置这个cfq_queue? 完全蒙了
+ -> mod_timer(cfq_data->idle_slice_timer, jiffies + sl) 时间是cfq_data->cfq_slice_idle / cfq_group_idle...  怎么选?
+
+64. cfq_dispatch_insert(request_queue, request)
+ -> cfq_find_next_rq(cfq_data, cfq_queue, request) 找cfq_queue->next_rq...
+ -> cfq_remove_request(request) 从cfq_queue中释放request, cfq_queue->dispatched ++, request=>cfq_group->dispatched++
+ -> elv_dispatch_sort(request_queue, request)
+ -> cfq_data->rq_in_flight[cfq_cfqq_sync(cfq_queue)] ++ ..  开始一个请求?
+ -> cfq_queue->nr_sectors += blk_rq_sectors(request) 这个成员变量统计请求的扇区数
+ -> cfqg_stats_update_dispatch(....)
+ 
+65. cfq_check_fifo(cfq_queue) 获取超时的request?
+ -> cfq_cfqq_fifo_expire(cfq_queue) 如果cfq_queue带标志CFQ_CFQQ_FLAG_fifo_expire,返回NULL
+ -> 添加标记CFQ_CFQQ_FLAG_fifo_expire, 如果cfq_queue->fifo为空,返回NULL, 这个fifo是什么东西? 应该是一个队列，里面是按照fifo time 排序的request. 如果没有超时,返回NULL, 否则返回第一个...
+
+66. cfq_prio_to_maxrq(cfq_data, cfq_queue) , 计算式涉及到 cfq_data->cfq_slice_async_rq / cfq_queue->ioprio ..  IOPRIO_BE_NR ..
+
+67. cfqq_process_refs(cfq_queue) 多少个任务使用这个cfq_queue??
+ -> cfq_queue->ref - (cfq_queue->allocated[READ]+cfq_queue->allocated[WRITE])
+
+68. cfq_setup_merge(cfq_queue,  cfq_queue new_cfqq) 合并cfq_queue? 合并cfq_queue->ref ...
+
+69. cfq_choose_wl(cfq_data, cfq_group, wl_prio_t) 遍历cfq_data的所有service tree, 挑选一个service tree, service_trees[wl_prio_t][wl]的第一个cfq_queue的rb_key最小， 返回这个service tree对应的worload 类型
+
+70. choose_service_tree(cfq_data, cfq_group) 这个是干什么的? 应该是在cfq_data找一个servicing_prio上有cfq_group, 如果这个serving_prio和cfq_data->serving_prio一样,而且cfq_data->workload_expires没有超时,则不需要任何动作.如果优先级改变,或者超时,计算一个很复杂的slice,使用它改变cfq_data->workload_expires. 可能会改变cfq_data->serving_prio..
+ -> cfq_group_busy_queues_wl(RT_WORKLOAD, cfq_data, cfq_group) 设置cfq_data的serving_prio=RT_WORLOAD, 应该是cfq_group调度执行,所以相应的设置cfq_data的属性. 如果cfq_group有RT_WORKLOAD的的任务就设置为RT_WORKLOAD,没有就检查BE_WORKOAD, 最后是IDLE_WORKLOAD   这个函数太复杂了》。。
+ 这个函数都是在一个cfq_group内部查找，遍历, 虽然改变了cfq_data的时间片..
+
+71. cfq_get_next_cfqg(cfq_data) 获取一个cfq_group,下面应该开始cfq_group的调度.
+cfq_data使用cfq_rb_root管理cfq_queue
+ -> cfq_rb_first_group(cfq_rb_root->rb) 返回第一个cfq_group, rbtree的键是啥?
+ -> update_min_vdisktime(cfq_rb_tree) 使用cfq_rb_root->left(最小节点)=>cfq_group->vdisktime更新cfq_data->vdisktime， 如果cfq_group的小.
+
+72. cfq_choose_cfqg(cfq_data)
+ -> cfq_get_next_cfqg(cfq_data) 找一个cfq_group, 给cfq_data->serving_group
+ -> 修改cfq_data->workload_expires, 参数比较混乱..
+ -> choose_service_tree(cfq_data, cfq_group) 更新cfq_data的serving_prio /
+workload_expires ..
+
+73. cfq_select_queue(cfq_data) 从cfq_data中找一个cfq_queue. 
+ -> 检查cfq_data->active_queue, 如果无效,重新找一个
+ -> cfq_data->rq_queued 啥东西?
+ -> cfq_cfqq_wait_busy(cfq_queue)   CFQ_CFQQ_FLAG_wait_busy是什么标志? 超时?
+ -> cfq_slice_used(cfq_queue), cfq_cfqq_must_dispatch(cfq_queue) cfq_queue->slice_end是否用完? cfq_queue是否必须调度? 经过一些列判断,不需要调度...
+ -> 如果cfq_queue->slice_end没有超时,就不需要调度
+ -> cfq_close_cooperator(cfq_data, cfq_queue)  找一个相关性最大的cfq_queue,
+先给cfq_queue->new_cfqq, 这个是准备merge的..
+ -> cfq_data->idle_slice_timer..  
+ -> 一些列的判断条件...
+ -> cfq_slice_expire(cfq_data, 0) 这是啥意思?忘了
+ -> cfq_set_active_queue(cfq_data, cfq_queue) 选一个cfq_queue, 给cfq_data->active_queue
+ 这个函数又长有难懂...
+
+74. __cfq_forced_dispatch_cfqq(cfq_queue)  把cfq_queue中的所有request调度执行,就是从cfq_data中移出去,给request_queue的队列.
+ -> __cfq_slice_expired(cfq_queue->cfq_data, cfq_queue, 0) 让它超时??
+
+75. cfq_forced_dispatch(cfq_data) 把cfq_data上所有cfq_queue的所有request调度执行,在barrier或关闭调度算法时使用
+ -> cfq_slice_expired(cfq_data, 0) ???
+ -> __cfq_set_active_queue(cfq_data, cfq_queue)
+ -> __cfq_forced_dispatch_cfqq(cfq_queue)
+
+76. cfq_slice_used_soon(cfq_data, cfq_queue) 判断cfq_queue的slice是否不很快用完?
+ -> cfq_data->cfq_slice_idle * cfq_queue->dispatched + jiffies > cfq_queue->slice_end ...
+
+77. cfq_may_dispatch(cfq_data, cfq_queue) 判断cfq_data是否可以执行request? 计算一个非常复杂的max_dispatch,比较cfq_queue->dispatched和max_dispatch
+
+78. cfq_dispatch_request(cfq_data, cfq_queue)
+ -> cfq_may_dispatch(cfq_data, cfq_queue) 时候可以执行, 如果不能返回false
+ -> cfq_check_fifo(cfq_queue)  从cfq_queue的fifo队列中取出一个request? 如果没有使用cfq_queue->next_rq
+ -> cfq_dispatch_insert(cfq_data->queue, request) 把request放到cfq_data中
+ -> cfq_data->active_cic 是啥? cfq_io_cq?? 设置为request->io_cq=>cfq_io_cq, 增加cfq_io_cq->io_cq->io_context->refcount
+
+79. cfq_dispatch_requests(request_queue, force) 根据request_queue获取cfq_data, request_queue->elevator->elevator_data
+ -> 如果cfq_queue中没有cfq_queue, 无法调度执行  cfq_data->busy_queues
+ -> 如果force, 执行cfq_data中的所有request  > cfq_forced_dispatch(cfq_data)
+ -> cfq_select_queue(cfq_data) 选一个cfq_queue
+ -> 调度执行这个cfq_queue中的一个request cfq_dispatch_request(cfq_data, cfq_queue)
+ -> 判断cfq_data是否该调度  > cfq_slice_expired(cfq_data, 0)
+
+80. cfq_put_queue(cfq_queue) 释放cfq_queue? 减小cfq_queue->ref
+ -> 如果cfq_queue是cfq_data当前调度的cfq_queue, 让它重新分配时间片
+ -> __cfq_slice_expired(cfq_data, cfq_queue, 0)
+ -> cfq_schedule_dispatch(cfq_data)
+ -> cfqg_put(cfq_group)  减小cfq_group的计数
+ 
+81. cfq_put_cooperator(cfq_queue)  cfq_queue->new_cfqq是啥意思?
+ -> cfq_put_queue(cfq_queue) cfq_queue->new_cfqq是一个单链,挨个释放它..
+
+82. cfq_exit_cfqq(cfq_data, cfq_queue) 销毁cfq_queue
+ -> __cfq_slice_expired(cfq_data, cfq_queue, 0)  重新调度cfq_data
+ -> cfq_schedule_dispatch(cfq_data)
+ -> cfq_put_cooperator(cfq_queue)
+ -> cfq_put_queue(cfq_queue)
+
+83. cfq_init_icq(io_cq)  开始io_cq
+ -> icp_to_cici(io_cq) 获取cfq_io_cq, 设置 cfq_io_cq->ttime->last_end_request ..
+
+84. cfq_exit_icq(io_cq) 要释放cfq_io_cq, 释放相关的的cfq_queue. io_cq=>cfq_io_cq=>cfq_data.  释放cfq_io_cq->cfqq[2]..
+ -> cfq_exit_cfqq(cfq_data, cfq_queue)
+
+85. cfq_init_prio_data(cfq_queue, cfq_io_cq) 根据cfq_io_cq,设置cfq_queue的优先级? 但前提是cfq_queue->flags带标志CFQ_CFQQ_FLAG_prio_changed.
+ -> IOPRIO_PRIO_CLASS(cfq_io_cq->ioprio) IOPRIO_CLASS_NONE/IOPRIO_CLASS_RT/IOPRIO_CLASS_BE/IOPRIO_CLASS_IDLE
+ -> 如果IOPRIO_CLASS_NONE,  > task_nice_ioprio(task) 给ioprio,  > task_nice_ioclass(task) 给ioprio_class
+ -> IOPRIO_CLASS_RT: IOPRIO_PRIO_DATA(cfq->ioprio)给ioprio, IOPRIO_CLASS_RT给ioprio_class
+ -> IOPRIO_CLASS_BE: IOPRIO_PRIO_DATA(cfq->ioprio)给ioprio, IOPRIO_CLASS_BE给 ioprio_class
+ -> IOPRIO_CLASS_IDLE: ioprio_class是IOPRIO_CLASS_IDLE, ioprio = 7
+
+86. check_ioprio_changed(cfq_io_cq, bio) 要改变谁的优先级?
+ -> 先获取ioprio, cfq_io_cq=>io_cq->io_context->io_prio
+ -> cfq_data cic_to_cfqd(cfq_io_cq) 如果cfq_io_cq->ioprio = ioprio, 或者找不到cfq_data,不用改变? 
+ -> 检查cfq_io_cq->cfqq[BLK_RW_ASYNC], 找cfq_queue  cfq_io_cq->cfqq[BLK_RW_ASYNC]
+ -> cfq_get_queue(cfq_data, BLK_RW_ASYNC, cfq_io_cq, bio, GFP_ATOMIC) 这个在下面.. 找一个cfq_queue, 给cfq_io_cq->cfqq[BLK_RW_ASYNC]...
+ -> 检查cfq_io_cq->cfqq[BLK_RW_SYNC]  > cfq_mark_cfqq_prio_changed(cfq_queue) 标注这个cfq_queue改变了prio
+ -> 最后把ioprio给cfq_io_cq->ioprio
+
+87. cfq_init_cfqq(cfq_data, cfq_queue, pid_t, is_sync) 初始化cfq_queue, 包括cfq_queue->rb_node (service tree), p_node ( sorted tree?) fifo (队列?)
+ -> ref = 0, cfq_data, pid
+ -> cfq_mark_cfqq_prio_changed(cfq_queue)
+ -> 如果是sync, 设置CFQ_CFQQ_FLAG_idle_window / CFQ_CFQQ_FLAG_sync
+ 
+88. cfq_find_alloc_queue(cfq_data, is_sync, cfq_io_cq, bio, gfp_t) 这里是查找cfq_io_cq附带的cfq_queue,如果没有，创建一个新的.
+ -> blkcg / cfq_group 从cfq_data推导来
+ -> cfq_queue > cic_to_cfqq(cfq_io_cq, is_sync)
+ -> kmem_cache_alloc_node(cfq_pool, gfp_t, node )
+ -> 如果创建成功,各种初始化. 如果没成功,使用cfq_data->oom_cfqq
+ -> cfq_init_cfqq(cfq_data, cfq_queue, current->pid, is_sync)
+ -> cfq_init_prio_data(cfq_queue, cfs_io_cq)
+ -> cfq_link_cfqq_cfqg(cfq_queue, cfq_group)
+
+89. cfq_async_queue_prio(cfq_data, ioprio_class, ioprio) 根据ioprio_class / ioprio找cfq_queue. 在cfq_data中有直接维护cfq_queue的2维数组
+ -> IOPRIO_CLASS_RT=> 
+ -> IOPRIO_CLASS_NONE/BE =>
+ -> IOPRIO_CLASS_IDLE -> async_idle_cfqq ...
+
+90. cfq_get_queue(cfq_data, is_sync, cfq_io_cq, bio, gfp_t)
+ -> cfq_async_queue_prio(cfq_data, ioprio_class, ioprio)  ioprio_class / ioprio都是从cfq_io_cq获取
+ -> 如果上面没找到request_queue, 创建一个  > cfq_find_alloc_queue(cfq_data, is_sync, cfq_io_cq, bio, gfp_t)
+ -> 如果is_sync是异步,把这个cfq_queue放到cfq_data->async_cfqq[][]这个队列中,同时增加cfq_queue->ref
+ -> 增加cfq_queue->ref
+
+91. thinktime  __cfq_update_io_thinktime(cfq_ttime, slice_idle)
+ cfq_update_to_thinktime(cfq_data, cfq_queue, cfq_io_cq)  
+
+92. cfq_update_io_seektime(cfq_data, cfq_queue, request) 更新cfq_queue->seek_history
+
+93. cfq_update_idle_window(cfq_data, cfq_queue, cfq_io_cq) 啥叫idle window? 经过大量计算,才计算出怎么才算idle window...
+
+94. cfq_should_preept(cfq_data, cfq_queue, request) 参数cfq_queue是否应该抢占cfq_data->active_queue
+ -> 根据优先级种类, IOPRIO_CLASS_RT不能抢占IOPRIO_CLASS_IDLE
+ -> 如果request是sync, 而cfq_data->active_queue是async, 应该抢占
+ -> cfq_queue和cfq_data->active_queue不是一个cfq_group, 不能抢占
+ -> cfq_slice_used(cfq_queue) 如果slice使用完成后,需要抢占
+ -> 还有种种条件
+ -> cfq_rq_close(cfq_data, cfq_queue, request) 这也算抢占
+
+95. cfq_preempt_queue(cfq_data, cfq_queue)
+ -> cfq_slice_expired(cfq_data, 1) 1是啥?
+ -> cfq_service_tree_add(cfq_data, cfq_queue, 1) 这个把cfq_queue添加到cfq_data这个rbtree中,根据调度时间??
+ -> cfq_mark_cfqq_slice_new(cfq_queue) CFQ_CFQQ_FLAG_slice_new
+
+96. cfq_rq_enqueued(cfq_data, cfq_queue, request)  把request添加到request_data中
+ -> cfq_data->rq_queued ++ ??? 如果有REQ_PRIO, cfq_queue->prio_pending ++
+ -> 更新一些东西...
+ -> cfq_update_io_thinktime(cfq_data, cfq_queue, cfq_io_cq)
+ -> cfq_update_io_seektime(cfq_data, ...)
+ -> cfq_update_idle_window(cfq ...)
+ -> cfq->last_rquest_pos = blk_rq_pos(request) + blk_rq_sectors(request) 这个request开始执行了?
+ -> cfq_queue是cfq_data->active_queue, 如果cfq_queue在等待请求,查看一些条件,去执行request_queue
+ -> cfq_del_timer(cfq_data, cfq_queue)
+ -> __blk_run_queue(cfq_data->queue) ...
+ -> 否则添加标志CFQ_CFQQ_FLAG_must_dispatch 
+ -> 如果cfq_queue可以抢占 > cfq_preempt_queue(cfq_data, cfq_queue) 然后启动cfq_queue 这是同步启动?!
+
+97. cfq_insert_request(request_queue, request) 这里request添加到request_queue->fifo中。。
+ -> cfq_init_prio_data(cfq_queue, RQ_CIC(request)) 根据cfq_io_cq修改cfq_queue的prio..
+ -> rq_set_fifo_time(request, jiffies + cfq_data->cfq_fifo_expire[])
+ -> 把request添加到cfq_queue->fifo ...
+ -> cfq_add_rq_rb(request) 把request添加到cfq_queue的rbtree中
+ -> cfq_rq_enqueued(cfq_data, cfq_queue, request) 是否需要启动request_queue..
+
+98. cfq_update_hw_tag(cfq_data)
+ cfq_should_wait_busy(cfq_data, cfq_queue) 应该是改变cfq_data的状态之类的
+
+99. cfq_completed_request(request_queue, request)  request执行完成?
+ -> cfq_update_hw_tag(cfq_data)
+ -> cfq_data->rq_in_driver / dispatched / cfq_group->dispatched / cfq_data->rq_in_flight[sync] 都递减
+ -> cfq_io_cq->ttime.last_end_request = now
+ -> 更新时间,  cfq_io_cq->ttime.last_end_request / cfq_queue->service_tree->ttime->last_end_request , cfq_data->last_delayed_sync 
+ -> 是否需要调度??
+
+98. __cfq_may_queue(cfq_queue) 是否需要等待?? CFQ_CFQQ_FLAG_wait_request / CFQ_CFQQ_FLAG_must_alloc_slice
+
+ cfq_may_queue(request_queue, rw) 
+ -> cfq_cic_lookup(cfq_data, task->io_context) 找一个cfq_io_cq
+ -> cic_to_cfqq(cfq_io_cq, sync) 找cfq_queue
+ -> cfq_init_prio_data(cfq_queue, cfq_io_cq)
+ -> __cfq_may_queue(cfq_queue)
+
+99. cfq_put_request(request) //释放request时需要的工作 先找cfq_queue, 如果找不到,就没什么可释放的
+ -> cfq_queue->allocated[rw] -- 
+ -> cfqg_put(RQ_CFQG(rq))
+ -> 设置request->elv.prio[2] = NULL, 就是cfq_queue / cfq_group
+ -> cfq_put_queue(cfq_queue)
+
+100. cfq_merge_cfqqs(cfq_data, cfq_io_cq, cfq_queue) 合并什么东西?
+ -> cic_set_cfqq(cfq_io_cq, cfq_queue->next_cfqq, 1) 
+ -> CFQ_CFQQ_coop给cfq_queue->new_cfqq???
+ -> cfq_put_queue(cfq_queue) 释放这个被合并的?
+
+101. split_cfqq(cfq_io_cq, cfq_queue) 返回cfq_queue?? split啥意思?
+ -> cfqq_process_refs(cfq_queue) 如果使用它的process只有1个(current)返回它,做一些初始化, pid / 清除CFQ_CFQQ_FLAG_coop / CFQ_CFQQ_FLAG_split_coop
+ -> 否则释放它??  cic_set_cfqq(cfq_io_cq, NULL, 1)
+ -> cfq_put_cooperator(cfq_queue)
+ -> cfq_put_queue(cfq_queue)
+
+102. cfq_set_request(request_queue, request, bio, gfp_t) 给request装备cfq_queue / cfq_group 
+ -> 关系  request_data->elevator->elevator_data => cfq_data
+ -> icq_to_cic(request->elv.icq) cfq_io_cq
+ -> check_ioprio_changed(cfq_io_cq, bio) ???
+ -> check_blkcg_changed(cfq_io_cq, bio) ??
+ -> cic_to_cfqq(cfq_io_cq, is_sync) 获取cfq_queue
+ -> cfq_get_queue(cfq_data, is_sync, cfq_io_cq, bio, gft_t) 如果cfq_io_cq没有关联, 创建一个?
+ -> cic_set_cfqq(cfq_io_cq, cfq_queue, is_sync) 把找到的cfq_queue给cfq_io_cq
+ -> 如果cfq_io_cq关联,使用这个cfq_queue, > cfq_merge_cfqqs(cfq_data, cfq_io_cq, cfq_queue)
+ -> cfq_queue->allocated[rw]++ / cfq_queue->ref ++ / cfqg_get(cfq_queue->cfq_group)
+ -> 最后设置 request->elv.priv[2] 
+
+103. cfq_kick_queue(work_struct) 这是那个work的事情?
+ -> __blk_run_queue(cfq_data->queue)
+
+104. cfq_idle_slice_timer(data)  data是cfq_data, 计时器的唤醒工作. 处理cfq_data->active_queue
+ -> cfq_cfqq_must_dispatch(cfq_queue) 如果应该调度,直接去调度
+ -> cfq_slice_used(cfq_queue) slice用光,去分配再调度
+ -> cfq_queue->sort_list 没有request可执行，去掉读
+ -> cfq->busy_queues 在忙? 不能调度
+ -> cfq_slice_expired(cfq_data, timed_out) 分配时间片
+ -> cfq_shcedule_dispatch(cfq_data)  异步执行cfq_data->unplug_work这个工作
+
+105. cfq_shutdown_timer_wq(cfq_data) 处理cfq_data->idle_slice_timer, 取消cfq_data->unplug_work...
+
+106. cfq_put_async_queues(cfq_data) 释放cfq_data->async_cfqq这些队列指向的cfq_queue, 为何每个优先级只有一个cfq_queue???  IOPRIO_BE_NR ..
+ -> cfq_put_queue(cfq_data->async_cfqq[][]
+
+107. cfq_exit_queue(elevator_queue) 要销毁cfq_data???
+ -> cfq_shutdown_timer_wq(cfq_data)
+ -> __cfq_slice_expired(cfq_data, cfq_data->active_queue, 0)
+ -> cfq_put_async_queues(cfq_data) 为何独有async的cfq_queue???
+ -> kfree(cfq_data->root_group) 只有一个cfq_group???
+ -> kfree(cfq_data) ...
+
+108. cfq_init_queue(request_queue)
+ -> kmalloc_node(...) 创建cfq_data, 关联cfq_data->queue / cfq_queue->elevator-> elevator_data
+ -> cfq_data->grp_service_tree = CFQ_RB_ROOT, 初始化cfq_group的cfq_rb_root..
+ -> 创建cfq_group, 给cfq_data->root_group
+ -> cfq_init_cfqg_base(cfq_data->root_group)
+ -> cfq_data->root_group->weight = 2*CFQ_WEIGHT_DEFAULT ?? 这是啥???
+ -> 初始化cfq_data->prio_trees[i] ...
+ -> cfq_init_cfqq(cfq_data, cfq_data->oom_cfqq, 1, 0) 初始化这个cfq_queue??
+ -> cfq_link_cfqq_cfqg(cfq_data->oom_cfqq, cfq_data->root_group) 关联起来.
+ -> cfq_data->idle_slice_timer  : cfq_idle_slice_timer
+ -> 所有的参数...
+
+其他的代码放在后面熟悉...

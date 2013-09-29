@@ -1,0 +1,138 @@
+* inode-map.c
+   - 使用btrfs_free_space_ctl管理subvolume中空间的ino, btrfs_root->free_ino_ctl. 和btrfs_block_group_cache的空闲空间管理类似.
+
+** caching_kthread(void)
+   - void 是btrfs_root, 某个subvolume.. inode map是一个mount opt,INODE_MAP_CACHE
+ i - BTRFS_CACHE_STARTED..
+   - 构造btrfs_key(BTRFS_FIRST_FREE_OBJECTID, BTRFS_INODE_ITEM_KEY, 0), 遍历btrfs_root上的BTRFS_INODE_ITEM_KEY节点.
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 找到btrfs_inode_item, 检查它和上一个是否相邻,如果不相邻,就把中间的空余空间给btrfs_free_ino_ctl
+   > __btrfs_add_free_space(btrfs_root->free_ino_ctl, last+1, len)
+   - 向前遍历时,先移动slot,然后是移动btrfs_leaf指针.
+   > btrfs_next_leaf(btrfs_root, btrfs_path)
+   - 它也会让出cpu, 或者为transaction让路. 因为它锁住btrfs_root->fs_commit_mutex
+   - 它查找的最大ino是btrfs_root->highest_objectid
+   - 设置btrfs_root->cached为BTRFS_CACHE_FINISHED, 唤醒btrfs_root->cache_wait队列
+   > btrfs_unpin_free_ino(btrfs_root)
+   - 在给transaction让路时,记录cached的进程btrfs_root->cache_progress.在transaction过程中,也会制造一些free ino, 它使用btrfs_root->free_ino_pinned管理. 如果它释放的ino是cache处理过的,就需要把那些重新添加进来. btrfs_transaction也会直接修改free_ino_ctl. 
+
+** start_caching(btrfs_root)
+   - 处理free ino的cache, 一种是快的方法,使用free ino inode, 另一种是忙的,遍历btrfs_inode_item.
+   - 如果btrfs_root->cached不是BTRFS_CACHE_NO, 说明它的inode map工作在进行或已完成.否则设置为BTRFS_CACHE_STARTED.
+   - 首先尝试free ino inode, 这里使用固定的btrfs_key去相应的btrfs_root中找一个inode
+   > load_free_ino_cache(btrfs_root->btrfs_fs_info, btrfs_root)
+   - 如果找到,就不再继续工作. 否则使用慢的方法获取inode map. 
+   - 这个过程很慢,为了不影响inode分配,先找最后一个btrfs_inode_item,构造一个free space (highest_objectid, BTRFS_LAST_FREE_OBJECTID)
+   > btrfs_find_free_objectid(btrfs_root, objectid)
+   > __btrfs_add_free_space(btrfs_free_space_ctl, objectid, BTRFS_LAST_FREE_OBJECTID - objectid +1)
+   - 启动线程去cache free ino.
+   - kthread_run(caching_kthread, btrfs_root, ...)
+
+** btrfs_find_free_ino(btrfs_root, objectid)
+   - 如果mount时没有使用inode map, 就找一个最大的.
+   > btrfs_find_free_objectid(btrfs_root, objectid)
+   - 否则去btrfs_free_space_ctl中查找
+   > btrfs_find_ino_for_alloc(btrfs_root)
+   - 如果没找到,就是没有创建cache
+   > start_caching(btrfs_root)
+   - 等待上面的过程, 当然不会等待它完成
+   - btrfs_root->cached = BTRFS_CACHE_FINISHED 或者 btrfs_root->free_ino_ctl->free_space > 0
+
+** btrfs_return_ino(btrfs_root, objectid)
+   - 如果mount不指定inode_cache, 所有关于free ino的操作都不执行.
+   - 如果btrfs_root已经建立free space的inode map, 使用btrfs_root->free_ino_ctl, 判断btrfs_root->cached = BTRFS_CACHE_FINISHED
+   > __btrfs_add_free_space(btrfs_free_space_ctl, objectid, 1)
+   - 否则,要创建这个btrfs_root->free_ino_ctl
+   > start_caching(btrfs_root)
+   - 这里不会等待它的完成,而是看btrfs_root->cache_pregress. 如果objectid < cache_progress, 或者objectid > highest_objectid, 就可以放到btrfs_root->free_ino_ctl中.
+   > __btrfs_add_free_space(ctl, ...)
+   - 否则使用btrfs_root->free_ino_pinned
+
+** btrfs_unpin_free_ino(btrfs_root)
+   - 操作btrfs_root的2个btrfs_free_space_ctl, 一个是正式的,另一个是为了cache过程暂存的.
+   - 在transaction过程中会把暂存的给正式的.
+   - 遍历btrfs_free_space_ctl->free_space_offset/rb_root, 它里面是btrfs_free_space. 
+   - 只会处理它在btrfs_root->cache_progress范围内的.范围意外的,已经写到btree中,忙的方法可以去查询.
+   > __btrfs_add_free_space(btrfs_free_space_ctl, btrfs_free_space->offset, count)
+   - 这个过程不会常用,一旦free ino inode建立起来,就不再使用它.
+
+** recalculate_thresholds(btrfs_free_space_ctl)
+   - 保证btrfs free space inode占用的内存不是太多, 不能好过使用bitmap使用的内存.
+   - 先找到最大可用的ino, 也就是最后一个btrfs_free_space->bytenr - 1
+   - 计算完全使用bitmap会占用多少内存
+   > max_ino / INODES_PER_BITMAP  , 一个page能表示4096*8个ino
+   - 如果max_bitmaps <= btrfs_free_space_ctl->total_bitmaps, 可以完全使用bitmap, btrfs_free_space_ctl->extents_thresh = 0, 不要使用extent
+   - 否则total_bitmaps剩余的ino都需要使用extent表示. 这里假定一个bitmap使用一个extent表示了
+   > ( max_bitmap - total_bitmaps ) * PAGE_CACHE_SIZE / sizeof(btrf_free_space)
+   - 无所谓,反正extent太多了就不再用了.
+
+** use_bitmap(btrfs_free_space_ctl, btrfs_free_space)
+   - 是否使用bitmap, btrfs_free_space_ctl->free_extents没有超过btrfs_free_space_ctl->extents_thresh, 就不必使用bitmap.
+   - btrfs_free_space_ctl->bytes > INODES_PER_BITMAP/10, 总数据量太小?
+
+** free_ino_op
+   #+begin_src 
+	.recalc_thresholds	= recalculate_thresholds,
+	.use_bitmap		= use_bitmap,
+	//btrfs_free_space_ctl中使用的东西.
+   #+end_src
+
+** pinned_recalc_thresholds(btrfs_free_space_ctl)
+   - 没有操作..
+
+** pinned_use_bitmap(btrfs_free_space_ctl, btrfs_free_space)
+   - pinned的btrfs_free_space_ctl不能使用bitmap
+
+** pinned_free_ino_op
+   #+begin_src 
+	.recalc_thresholds	= pinned_recalc_thresholds,
+	.use_bitmap		= pinned_use_bitmap,
+   #+end_src
+
+** btrfs_init_free_ino_ctl(btrfs_root)
+   - 初始化btrfs_root的两个btrfs_free_space_ctl ..
+
+** btrfs_save_ino_cache(btrfs_root, btrfs_trans_handle)
+   - 保存free ino数据, btrfs_free_space_header里面有一个btrfs_key指向inode,把数据写给这个inode
+   - 只有fs的tree才使用free space保存free ino. tree root 也不使用?! 
+   - 根据btrfs_root的btrfs_key, 检查它是不是subvol/snap或者fs, BTRFS_FS_TREE_OBJECTID, (BTRFS_FIRST_FREE_OBJECTID, BTRFS_LAST_FREE_OBJECTID)  BTRFS_FS_TREE_OBJECTID??
+   - 准备btrfs_path, btrfs_trans_handle, 它使用btrfs_fs_info->trans_block_rsv的空间?
+   > btrfs_alloc_path()
+   - 预留btree空间,8: 1个用于创建btrfs_inode_item, 3用于更新btrfs_inode_item? 1个用于创建btrfs_free_space_item, 3个用于pre-allocation???
+   > btrfs_calc_trans_metadata_size(btrfs_root, 8)
+   - 直接去btrfs_space_info申请空间,给btrfs_block_rsv
+   > btrfs_block_rsv_add(btrfs_root, btrfs_trans_handle->block_rsv, btrfs_trans_handle->bytes_reserved, BTRFS_RESERVE_NO_FLUSH)
+   - 找到对应的inode
+   > lookup_free_ino_inode(btrfs_root, btrfs_path)
+   - 更新btree中的btrfs_inode_item
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   - 删除之前的free ino数据.
+   > btrfs_truncate_free_space_cache(btrfs_root, btrfs_trans_handle, btrfs_path, inode)
+   - 需要把btrfs_root->free_ino_ctl的数据写道inode文件中.. 
+   - 计算占用的空间, sizeof(btrfs_free_space) * btrfs_free_space_ctl->free_extents + PAGE_CACHE_SIZE * btrfs_free_space_ctl->total_bitmaps.
+   - 先延时分配再预分配空间??
+   - 分配data需要的空间给bytes_may_use, 然后是metadata的,metadata的给btrfs_block_rsv. 为何data的就有btrfs_block_rsv管理.
+   > btrfs_delalloc_reserve_space(inode, prealloc)
+   - 去btrfs_block_group_cache中分配extent, 建立相关的btrfs_extent_item, type是PREALLOC_,extent_map.
+   > btrfs_prealloc_file_range_trans(inode, btrfs_trans_handle, 0, 0, prealloc, prealloc, prealloc, alloc_hint)
+   - 立即释放reserved的空间, 同样修改bytes_may_use
+   > btrfs_free_served_data_space(inode, prealloc)
+   - 写回数据
+   > btrfs_write_out_ino_cache(btrfs_root, btrfs_trans_handle, btrfs_path)
+   - 释放transaction的预留空间.
+   > btrfs_block_rsv_release(btrfs_root, btrfs_trans_handle->block_rsv, btrfs_trans_handle->bytes_reserved)
+   
+** btrfs_find_highest_objectid(btrfs_root, objectid)
+   - 在btree中查找btrfs_key, 它使用最大的ino objectid, 准备btrfs_key(BTRFS_LAST_FREE_OBJECTID, -1, -1)
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 应该找不到， 而且返回的btrfs_path的前一个节点就是最大的ino objectid..
+
+** btrfs_find_free_objectid(btrfs_root, objectid)
+   - objectid应该的范围是 (BTRFS_FIRST_FREE_OBJECTID, BTRFS_LAST_FREE_OBJECTID) .. btrfs_root->highest_objectid表示最大可用的,作为快速查找的东西使用.. 当小与最小值,重新查找这个值..
+   > btrfs_find_highest_objectid(btrfs_root, btrfs_root->highest_objectid)
+   - 如果大于最大值,则没有空间了.
+
+** 总结
+   - 这个文件管理subvolume的free ino, 使用free space机制,就是空间管理的东西. 给其他模块提供ino, 删除ino
+   - 在commit fs时,写回free ino信息.
+   - 还有提供笨的方法分配ino, 在tree root中也要创建inode(free space),它就没有free ino对应的.

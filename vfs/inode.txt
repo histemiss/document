@@ -1,0 +1,174 @@
+fs/inode.c
+
+1. 数据结构
+    inode
+    * i_mode
+    * i_opflags
+    * i_uid / i_gid
+    * i_flags
+    * posix_acl i_acl i_default_acl
+    * inode_operation
+    * super_block i_sb
+    * address_space i_mapping
+    * i_no
+    * i_nlink
+    * dev_t i_rdev
+    * timespec i_atime i_mtime i_ctime
+    * i_lock  i_mutex
+    * i_bytes i_blocks i_size i_blkbits
+    * i_state
+    * dirtied_when
+    * i_hash
+    * i_wb_list
+    * i_lru
+    * i_sb_list
+    * i_dentry
+    * i_ruc
+    * i_count
+    * i_version
+    * i_dio_count
+    * i_writecount
+    * file_operation i_fop
+    * file_lock i_flock
+    * address_space i_data
+    * i_devices
+    * pipe_inode_info i_pipe
+    * block_device i_bdev
+    * cdev i_cdev
+    * i_generation
+    * i_readcount
+    * i_private
+这么多成员,不一定都会涉及
+    address_space
+    * inode host
+    * radix_tree_root page_tree
+    * tree_lock
+    * i_mmap_writable
+    * prio_tree_root    i_mmap
+    * list_head i_mmap_nonlinear
+    * mutex i_mmap_mutex
+    * pgoff_t writeback_index
+    * address_space_operation a_ops
+    * flags
+    * backing_dev_info  backing_dev_info  readahead??
+    * spinlock_t private_lock
+    * list_head private_list
+    * address_space assoc_mapping
+
+
+2. 全局变量
+    inode_hashtable inode使用hash表
+
+    inode_cachep slab分配器
+    percpu变量 nr_inode, nr_unused
+
+3. 操作
+    1. get_nr_inodes_unused() / get_nr_inodes / get_nr_dirty_inodes
+    前面两个是把percpu变量累加起来，第三个是前两者相见，不是真正的dirty的
+
+    2. inode_init_always(super_block, inode)
+    初始化inode和inode->i_data address_space. 这里没有建立任何关联,除了一个bdi的东西
+
+    3. alloc_inode(super_block)
+    先使用super_block->s_op->alloc_inode, 如果没有则从slab中分配，然后做一些初始化
+    -> inode_init_alwyas(super_block, inode)
+
+    4. free_inode_nonrcu(inode)
+    为何这里不用super_block->s_op的函数？
+    -> kmem_cache_free(inode_cachep, inode)
+
+    5. __destroy_inode(inode)
+    这里销毁inode,没有注销它，因为i_nlink不一定为0，这个inode还不一定删除? 释放posix_acl, 减小percpu变量nr_inodes
+
+    6. i_callback(rcu_head)
+    这是rcu使用的回调函数,释放inode使用的内存，返给inode_cachep
+
+    7. destroy_inode(inode)
+    先调用inode->super_block->s_op->destroy_inode,如果没提供使用rcu
+    -> call_ruc(inode->i_ruc, i_callback)
+
+    8. drop_nlink(inode) / inc_nlink(inode)
+    减小inode->i_nlink / 增大
+
+    9. clear_nlink(inode) / set_nlink(inode, nlink)
+    把inode->i_nlink设为0
+
+    10. address_space_init_once(address_space)
+    初始化address_space的各种list_head，radix_tree等
+
+    11. inode_init_once(inode)
+    初始化各种list_head
+    -> address_space_init_once(inode->i_data)
+
+    12. init_once(inode)
+    -> inode_init_once(inode)
+
+    13. __iget(inode)  / ihost(inode)
+    增加inode->i_count
+
+    14. inode_lru_list_add(inode) / inode_lru_list_del(inode)
+    把不用的inode放到super_block->s_inode_lru队列中，而且修改nr_inodes_unused. 第二个函数和第一个相反
+
+    15. inode_sb_list_add(inode) / inode_sb_list_del(inode)
+    把inode添加到super_block->s_inodes中,使用inode->i_sb_list
+
+    16. hash(super_block, hashval)
+    根据suer_block指针和hashval计算hash, hashval是什么东西?
+
+    17. __insert_inode_hash(inode, hashval) / __remove_inode_hash(inode)
+    把inode加到inode_hashtable中
+
+    18. end_writeback(inode)
+    不清查哪里使用这个函数，但应该是回调函数，要释放这个inode
+    -> inode_sync_wait(inode)
+    把inode->i_state设为I_FREEING|I_CLEAR
+
+    19. evict(ionde)
+    销毁一个inode，把它从任何list中移除，释放关联的pagea, 等待IO操作. 释放它的super_block, hash关系. 
+    如果super_block提供evict_inode，则调用这个函数. 否则启用其他方法清除page和IO操作
+    -> truncate_inode_pages(inode->address_space, 0)
+    -> end_writeback(inode)
+    最终inode->i_state为I_FREEING|I_CLEAR, 唤醒等待__I_NEW标志位的任务
+
+    20. dispose_list(list_head)
+    list_head是使用inode->i_lru构成的队列，释放队列上的inode
+    -> evict(inode)
+
+    21. evict_inodes(super_block)
+    释放super_block上所有可以释放的inode, 如果inode->i_count为0，则说明它可释放. 遍历super_block->s_inodes, 把它放到某回收队列
+    -> dispose_list(list_head)
+
+    22. invalidate_inodes(super_block, kill_dentry)
+    释放super_block上的所有inode, 如果有inode->i_count不是0，则返回busy错误. kill_dentry决定是否把dirty的inode看作busy的inode, 同样遍历super_block->s_inodes. 没有用的inode只可能带有标志I_NEW|I_FREEING|I_WILL_FREE
+
+    23. can_unuse(inode)
+    检查inode是否没有使用
+    * inode->i_state中有任何不是I_REFERENCED的标志, 看来在lru中，只能有这个标志.
+    * 检查inode->address_space.private_list，是否有关联的buffer
+    * 是否关联page, inode->address_space->nrpages
+    * 检查是否在应用inode->i_count
+
+    24. prune_icache_sb(super_block, nr_to_scan)
+    遍历super_block->s_inode_lru, 发现没有用的inode,放到回收队列中，然后统一释放. 如果发现inode还在使用，把它从lru中移除，还有这样的? 如果带标志I_REFERENCED, 把它放到队列末尾. 如果inode关联buffer或page释放它们
+    -> remove_inode_buffers(inode)
+    -> invalidate_mapping_pages(inode->address_space)
+    -> dispose_list
+
+    25. find_inode(super_block, hlist_head, test_func_t, data)
+    遍历hlist_head的inode, 比较super_block和test_func_t.同时还考虑inode是否在释放过程中，也就是带有I_FREEING|I_WILL_FREE标志.最后__iget(inode).
+
+    26. find_inode_fast(super_block, hlist_head, ino)
+    和上面一样，比较ino值
+
+    27. get_next_ino()
+    获取percpu变量last_ino.
+
+    28. new_inode_pseudo(super_block) new_inode(super_block)
+    分配inode,把状态设为0
+    -> alloc_inode(super_block)
+    第二个函数把inode加到super_block的队列中
+
+    29. 
+
+
+

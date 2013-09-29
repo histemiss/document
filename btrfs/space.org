@@ -1,0 +1,2132 @@
+* extent-tree.c
+
+** btrfs_block_group_cache
+   #+begin_src 
+     btrfs_key                //extent_tree中的btrfs_key
+     btrfs_block_group_item   //btrfs_item
+     btrfs_fs_info     
+     inode                    //free space inode
+     spinlock_t lock
+     u64 pinned               //???
+     u64 reserved             //???
+     u64 bytes_super          //btrfs_block_group_cache对应的物理空间有btrfs_super_block,对应的逻辑空间也不能使用,这个参数记录空间大小
+     u64 flags
+     u64 sectorsize           //这个和btrfs_root->sectorsize有什么区别?
+     u64 cache_generation
+     int ro
+     int dirty
+     int iref
+    
+     int disk_cache_state
+    
+     int cached
+     btrfs_caching_control caching_ctl //free space信息
+     u64 last_byte_to_unpin
+     btrfs_space_info space_info     //它使用的btrfs_space_info
+    
+     btrfs_free_space_ctl   free_space_ctl  #free space cache stuff
+    
+     rb_node cache_node       //使用btrfs_fs_info->block_group_cache_tree(rb_root)管理, 使用btrfs_key->objectid排序
+    
+     list_head list           //同属于一个btrfs_space_info    
+     list_head cluster_list   //btrfs_free_cluster
+     list_head new_bg_list
+     atomic count
+   
+   #+end_src
+   
+
+** btrfs_caching_control
+   #+begin_src 
+     //这个数据结构用来空间free space的缓冲
+     list_head list      
+     mutex mutex
+     wait_queue_head_t wait      //多个任务都要缓存free space信息时,使用它保持互斥
+     btrfs_work work
+     btrfs_block_group_cache block_group
+     progress, account
+   
+   #+end_src
+
+   - extent_tree管理btrfs_block_group_item和btrfs_extent_item, 空间先分成chunk,chunk对应btrfs_block_group_cache,又分成多个extent.
+
+** btrfs_add_block_group_cache(btrfs_fs_info, btrfs_block_group_cache)
+   - 把btrfs_block_group_cache添加到btrfs_fs_info的rbtree/btrfs_fs_info->block_group_cache_tree, 使用btrfs_block_group_cache->key.objectid作为索引.
+   - btrfs_fs_info->first_logical_byte表示最小的逻辑地址,设置它和btrfs_block_group_cahce->btrfs_key->objectid比较小的
+
+** block_group_cache_tree_search(btrfs_fs_info, bytenr, contains)
+   - 查找btrfs_block_group_cache, key.objectid表示start地址,key.offset表示大小
+   - 如果contains=0,目标block_group_cache的start >= bytenr, 而且尽量接近
+   - 如果contains=1,目标start<= bytenr, 而且start+offset>bytenr..  
+
+** add_excluded_extent(btrfs_root, start, num_bytes)
+   - 下面的freed_extent是extent_io_tree, 这里使用extent_state管理状态. 设置EXTENT_UPTODATE,别人就不会用??
+   > set_extent_bits(btrfs_root->btrfs_fs_info->freed_extents[0/1], start, end, EXTENT_UPTODATE, GFP_NOFS)
+
+** free_excluded_extents(btrfs_root, btrfs_block_group_cache cache)
+   - 操作btrfs_root->btrfs_fs_info->freed_extents, 去掉EXTENT_UPTODATE标志.. 范围是btrfs_block_group_cache->btrfs_key的范围..把整个trunk都踢出去?!
+
+** exclude_super_stripes(btrfs_root, btrfs_block_group_cache)
+   - 处理不能使用的extent,把btrfs_super_block占用的extent加到freed_extents中. 
+   - 如果btrfs_block_group_cache->btrfs_key.objectid<BTRFS_SUPER_INFO_OFFSET(64K), 把64k之前的这段地址加进去... 
+   - 然后是每个btrfs_super_block使用的空间. 这里并没有考虑设备,因为在每个设备上(只要它有metadata), 都在对应的物理偏移处保存了btrfs_super_block
+   > btrfs_sb_offset(i)
+   - 第2个参数是逻辑磁盘位置, 第3个参数是物理磁盘位置,返回物理磁盘位置对应于逻辑地址的逻辑地址. 可能会有多个逻辑地址,因为多个设备.
+   - 它根据对应的extent_map->map_lookup查找,只考虑这个btrfs_block_group_cache的逻辑地址空间. 
+   > btrfs_rmap_block(btrfs_fs_info->btrfs_mapping_tree, btrfs_block_group_cache->btrfs_key->objectid, bytenr, 0, logical, nr, stripe_len)
+   - 上面logical是数组, stripe_len表示物理空间大小. stripe_len表示stripe分布在一个物理设备上的空间长度
+   - 遍历这些逻辑地址,标记出来
+   > add_excluded_extent(btrfs_root, logical, stripe_len)
+
+** get_caching_control(btrfs_block_group_cache)
+   - 获取btrfs_block_group_cache->btrfs_caching_control. 当btrfs_block_group_cache->cached是BTRFS_CACHE_STARTED时,才可以获取它
+   - BTRFS_CACHE_STARTED表示开始缓存free space信息,btrfs_caching_control才是有效的
+
+** put_caching_control(btrfs_caching_control)
+   - --btrfs_caching_control->count, 如果为0,就释放掉它.
+
+** add_new_free_space(btrfs_block_group_cache, btrfs_fs_info, start, end)
+   - 通过扫描btrfs_extent_item, 创建free space信息..在扫描一个btrfs_block_group_cache时,把找到的空闲空间,使用btrfs_free_space给btrfs_free_space_ctl管理起来..
+   - 操作btrfs_fs_info->pinned_extents,针对EXTENT_DIRTY|EXTENT_UPTODATE的范围不能处理.所以要在（start,end)中间跳过这些范围
+   > find_first_extent_bit(btrfs_fs_info->pinned_extents / extent_io_tree, extent_start, extent_end, ENTEXT_DIRTY|EXTENT_UPTODATE, NULL)
+   - 先找到有这两个标志的范围. 只要有任何一个即可. 如果找不到,完全添加
+   - 如果extent_start<start, (start, extent_end)是不能用的
+   - 如果extent_start > start, (start, extent_start)可作为free space，添加到btrfs_block_group_cache->btrfs_free_space_ctl中
+   - 处理(extent_end, end)范围,循环继续查找
+   > btrfs_add_free_space(btrfs_block_group_cache, start, size)
+
+** caching_thread(btrfs_work)
+   - btrfs_work是btrfs_caching_control..任务是用来缓存一个chunk的空闲信息,放到内存btrfs_block_group_cache->btrfs_free_space_ctl中. 
+   - 这里是慢的方法,快的方法是free space inode
+   - 构造一个btrfs_key(btrfs_block_group_cache->btrfs_key->objectid, BTRFS_EXTENT_ITEM_KEY, 0).  去遍历extent_root中所有的extent item, 来统计btrfs_block_group_cache的free space
+   > btrfs_search_slot(NULL, btrfs_fs_info->extent_root, btrfs_key, btrfs_path, 0,0)
+   - 在extent tree中查找一个btrfs_extent_item,查找并不要btrfs_item, 只要btrfs_key..
+   > btrfs_item_key_to_cup(extent_buffer / leaf, btrfs_key, slot)
+   - 找到一个btrfs_key, 然后检查空间是否连续,如果有漏洞,加到free_space中(last, btrfs_key.objectid). 
+   > add_new_free_space(btrfs_block_group_cache, btrfs_fs_info, last, btrfs_key->objectid)
+   - last就是上一个btrfs_extent_item的结束位置
+   - 最后一段, extent没有完全覆盖btrfs_block_group_cache..
+   > add_new_free_space(btrfs_block_group_cache, btrfs_fs_info, last, btrfs_block_group_cache->btrfs_key->objectid + offset)
+   - 使用btrfs_caching_control->progress记录查找的进度查找完毕后设置为-1.
+   - btrfs_block_group_cache->cached为BTRFS_CACHE_FINISHED..
+   - 最后是freed_space, 可能前面把整段空间锁定,这里把它从freed_extent[]中解锁.
+   > free_excluded_extents(btrfs_root, btrfs_block_group_cache)
+   - 唤醒等待的任务
+   > wake_up(btrfs_caching_control->wait)
+   - 释放btrfs_caching_control, btrfs_block_group_cache
+
+** cache_block_group(btrfs_block_group_cache, btrfs_trans_handle, btrfs_root, load_cache_only)
+   - 这里用来缓冲btrfs_block_group_cache的free space信息.
+   - load_cache_only表示只能处理free space inode
+   - 先准备btrfs_caching_control, 设置btrfs_caching_control->progress = btrfs_block_group_cache->btrfs_key->objectid... 回调函数btrfs_work->func是caching_thread, 上面的函数..
+   - 开始处理btrfs_block_group_cache工作时,设置cache为BTRFS_CACHE_FAST
+   - 如果btrfs_block_group_cache->cached为BTRFS_CACHE_FAST, 在btrfs_block_group_cache->btrfs_caching_control->wait队列上等待,其它任务在处理它的缓存信息
+   - btrfs_block_group_cache->cached,如果不是BTRFS_CACHE_NO,则退出,说明btrfs_block_group_cache被其他人处理了
+   - 这时btrfs_block_group_cache->cached是BTRFS_CACHE_NO,开始处理
+   - 首先设置btrfs_block_group_cache->cached为BTRFS_CACHE_FAST, btrfs_block_group_cache->btrfs_caching_control为刚建立的.使用快的方法. FAST就是使用inode管理free space info..
+   - 如果mount指定了space cache, 才可以使用free space inode
+   > load_free_space_cache(btrfs_fs_info, btrfs_block_group_cache)
+   - 如果返回1,说明没有问题,唤醒其他的任务
+   > wake_up(btrfs_caching_control->wait)
+   - 设置btrfs_block_group_cache->cache = BTRFS_CACHE_FINISHED等, 释放btrfs_caching_control. 直接退出
+   - 如果失败了, 如果load_cache_only=1,只能使用free space inode,现在就是失败了,btrfs_block_group_cache->cached=BTRFS_CACHE_NO, 同时退出. 
+   - 否则使用笨的方法,扫描所有的extent.设置btrfs_block_group_cache->cache = BTRFS_CACHE_STARTED.
+   - 提交btrfs_work到caching_workers队列
+   > list_add_tail(btrfs_caching_control->list, btrfs_fs_info->caching_block_groups)
+   > btrfs_queue_worker(btrfs_fs_info->caching_workers, btrfs_caching_control->work)
+
+** 总结
+   - 上面是创建btrfs_block_group_cache的free space数据
+
+** btrfs_lookup_first_block_group(btrfs_fs_info, bytenr)
+   - 从btrfs_fs_info->block_group_cache_tree中查找btrfs_block_group_cache.. 注意不是contain.
+   > block_group_cache_tree_search(btrfs_fs_info, bytenr, 0)
+
+** btrfs_lookup_block_group(btrfs_fs_info, bytenr)
+   - 上面2个的区别是当找不到准的时候,使用不包含的前一个,还是使用包含的这个....
+   > block_group_cache_tree_search(btrfs_fs_info, bytenr, 1)
+
+** btrfs_space_info
+   #+begin_src 
+	u64 flags;
+
+	u64 total_bytes;	/* total bytes in the space,
+				   this doesn't take mirrors into account */
+	u64 bytes_used;		/* total bytes used,
+				   this doesn't take mirrors into account */
+	u64 bytes_pinned;	/* total bytes pinned, will be freed when the
+				   transaction finishes */
+	u64 bytes_reserved;	/* total bytes the allocator has reserved for
+				   current allocations */
+	u64 bytes_readonly;	/* total bytes that are read only */
+
+	u64 bytes_may_use;	/* number of bytes that may be used for
+				   delalloc/allocations */
+	u64 disk_used;		/* total bytes used on disk */
+	u64 disk_total;		/* total bytes on disk, takes mirrors into
+				   account */
+
+	/*
+	 * we bump reservation progress every time we decrement
+	 * bytes_reserved.  This way people waiting for reservations
+	 * know something good has happened and they can check
+	 * for progress.  The number here isn't to be trusted, it
+	 * just shows reclaim activity
+	 */
+	unsigned long reservation_progress;
+
+	unsigned int full:1;	/* indicates that we cannot allocate any more
+				   chunks for this space */
+	unsigned int chunk_alloc:1;	/* set if we are allocating a chunk */
+
+	unsigned int flush:1;		/* set if we are trying to make space */
+
+	unsigned int force_alloc;	/* set if we need to force a chunk
+					   alloc for this space */
+
+	struct list_head list;
+
+	/* for block groups in our same type */
+	struct list_head block_groups[BTRFS_NR_RAID_TYPES];
+	spinlock_t lock;
+	struct rw_semaphore groups_sem;
+	wait_queue_head_t wait;
+   #+end_src
+
+** __find_space_info(btrfs_fs_info, flags)
+   - btrfs_fs_info->space_info队列中找一个btrfs_space_info, 这里根据flags的type部分, data/meta/system
+
+** btrfs_clear_space_info_full(btrfs_fs_info)
+   - 文件系统添加了新的设备,又可以分配空间,清除所有btrfs_free_space->full
+   - 遍历btrfs_fs_info->head队列上的btrfs_free_space
+
+** btrfs_find_block_group(btrfs_root, search_start, search_hint, owner)
+   - 遍历btrfs_fs_info->block_group_cache_tree上的btrfs_block_group_cache, 这里应该只能查找metadata的btrfs_block_group_cache
+   - 分多次遍历查找
+   - 第一遍从max(search_start,search_hint)开始,不处理ro的,factor是9
+   - 第二遍从search_start开始
+   - 第三遍从search_start开始,考虑ro的,factor是10
+   > btrfs_lookup_first_block_group(btrfs_root->btrfs_fs_info, last)
+   - 找到btrfs_block_group_cache, btrfs_block_group_cache必须包含BTRFS_BLOCK_GROUP_METADATA,而且有足够的剩余空间
+   - btrfs_block_group_item->used+btrfs_block_group_cache->pinned+reserved < btrfs_key->offset * factor / 10
+
+** btrfs_lookup_extent(btrfs_root, start, len)
+   - 查找btrfs_extent_item, 根据btrfs_key(start, BTRFS_EXTENT_ITEM_KEY, len)
+   > btrfs_alloc_path()
+   > btrfs_search_slot(NULL, btrfs_fs_info->extent_root, btrfs_key, btrfs_path, 0, 0)
+
+** btrfs_lookup_extent_info(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, refs, flags)
+   - 获取btrfs_extent_item->refs/flags
+   - 构造btrfs_key(bytenr,BTRFS_EXTENT_ITEM_KEY, num_bytes),先获取btree的信息
+   > btrfs_alloc_path()
+   > btrfs_search_slot(btrfs_trans_handle, extent_root, btrfs_key, btrfs_path, 0, 0)
+   - 获取btrfs_extent_item, (refs, generation, flags)
+   > btrfs_extent_refs / btrfs_extent_flags()
+   - 查找btrfs_delayed_ref_root中的信息,只需要btrfs_delayed_ref_head
+   > btrfs_find_delayed_ref_head(btrfs_trans_handle, bytenr)
+   - 获取btrfs_delayed_ref_head, 对于flags是 btrfs_delayed_ref_head->extent_op->update_flags, refs是btrfs_delayed_ref_head->btrfs_delayed_ref_node->ref_mod
+   - 第二遍看起来,就是比第一遍明白很多很多..
+   - 第三遍看起来,就是比第二遍明白很多
+
+** back reference
+   - back reference里面说明了谁索引这个extent，能够很快的找到使用者
+   - block migration很方便.., fs shrink, storage pool maintenance
+   - implicit backref是为non-shared tree blocks服务的,也是不直接的backref,它提供了索引者的btrfs_key和btrfs_root,可以根据搜索btree查找这个tree block
+   - full backref就是直接索引,它就直接把索引者的位置记录在backref信息中.它用于不同的btrfs_root之间的tree block索引使用.很难说一个tree block属于那个btrfs_root. full backref可以代替implicit backref,但是它在cow使用时会变得复杂
+   - 对于tree block,创建时使用implict backref添加对应的backref,有下面的索引和上面的索引.还有COW会释放backref,要修改2遍上面和下面的backref.
+   - 对于上面的是不可避免的,也只有一个; 对于下面的,可能有很多的操作.如果使用implicit backref,根本不用修改.但当tree block的btrfs_key变化时,需要修改它所使用的指针的backref的btrfs_tree_block_info. 如果使用full backref,需要挨个修改
+   - 当tree block有COW操作时,有4种情况
+   - 如果tree block没有共享,它属于当前的btrfs_root,使用implicit backref,就不用修改.只要向下的指针没有改变.
+   - 如果tree block没有共享,它不属于当前btrfs_root,它使用了full backref. 删除所有的full backref,使用implicit backref代替.
+   - 如果tree block被共享,它属于当前btrfs_root,也使用implicit backref.对于向下的指针,使用full backref指向原来的tree block,增加使用计数.原来的implicit backref指向新的tree block.
+   - 如果tree block被共享,它不属于当前btrfs_root,使用full backref.对于向下的指针,新的tree block使用implicit backref索引.
+   - 所以对于tree block完全使用implicit backref,implicit bacref里面有btrfs_root和btrfs_node的信息,不用担心找不到或冲突.
+   - 对于file extents, 也分implicit backref和full backref
+   - 被不同的subvol/snapshots/generation, 或者不同的file; 或者文件的不同offset索引
+   - 对于implicit backref, 包含的信息是
+     - objectid of subvolume root
+     - objectid of file holding reference
+     - original offset in the file 
+     - count, 索引数量. 
+     - btrfs_key: objectid是extent起始位置, type是,  offset是前面3个的hash..
+   - 对于full backref, btrfs_key->offset是btrfs_leaf的位置
+     - btrfs_leaf中指向它的指针的个数.
+   - 对于tree block
+     - 它可能被不同的subvol索引
+     - implicit backref和full backref只包含btrfs_key
+     - 对于implicit backref, key offset是tree objectid
+     - 对于full bakcref, key offset是父节点的extent的物理位置..
+   
+** hash_extent_data_ref(root_objectid, owner, offset)
+   - 根据三个参数计算crc32..
+
+** btrfs_tree_block_info
+   #+begin_src 
+     btrfs_disk_key key
+     level
+     //节点block的backref，key应该是节点block中的第一个key,仅仅根据key是找不到节点的,只会找到叶子节点.还得有level
+   #+end_src
+
+** btrfs_extent_data_ref
+   #+begin_src 
+     root      //subvol tree root objecitd
+     objectid  //file inode objectid
+     offset    //file offset
+     count     //bookend
+     // 文件数据extent的backref, 通过它能查找到相关的btrfs_file_extent_item,不一定和offset一致,但偏移肯定是btrfs_file_extent_item->extent_offset.
+   #+end_src
+   
+** btrfs_shared_data_ref
+   #+begin_src 
+     count
+   #+end_src
+   
+** btrfs_extent_inline_ref
+   #+begin_src 
+     type  //BTRFS_EXTENT_DATA_REF_KEY / BTRFS_SHARED_DATA_REF_KEY
+     offset  //对于btrfs_extent_data_ref, 它被覆盖,对于btrfs_shared_data_ref,这是parent. 在单独的btrfs_item中,它在btrfs_key->offset中,对于封装在inline中,需要这个成员变量
+     //这个数据结构包装btrfs_extent_data_ref / btrfs_shared_data_ref..
+   #+end_src
+
+** hash_extent_data_ref_item(extent_buffer, btrfs_extent_data_ref)
+   - 根据btrfs_extent_data_ref计算hash值,作为btrfs_key->offset
+   > btrfs_extent_data_ref_root(btrfs_leaf, btrfs_extent_data_ref)
+   > btrfs_extent_data_ref_objectid(btrfs_leaf, btrfs_extent_data_ref)
+   > btrfs_extent_data_ref_offset(btrfs_leaf, btrfs_extent_data_ref)
+   > hash_extent_data_ref(root_objectid, owner, offset)
+
+** match_extent_data_ref(extent_buffer, btrfs_extent_data_ref, root_objectid, owner, offset)
+   - root => root_objectid,  objectid => owner,  offset => offset
+
+** lookup_extent_data_ref(btrfs_trans_handle, btrfs_root, btrfs_path, bytenr, parent, root_objectid, owner, offset)
+   - 找一个extent data的索引, extent_data中有两种, BTRFS_SHARED_DATA_REF_KEY / BTRFS_EXTENT_DATA_REF_KEY. 根据parent区分.
+   - 构造btrfs_key, (bytenr, BTRFS_SHARED_DATA_REF_KEY, parent), 或者(bytenr, BTRFS_EXTENT_DATA_REF_KEY, hash) 
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, -1, 1)
+   - 如果是BTRFS_SHARED_DATA_REF_KEY, 需要精确查找. 没找到就失败.
+   - 如果是BTRFS_EXTENT_DATA_REF_KEY需要处理hash碰撞.
+   > btrfs_header_nritems(btrfs_leaf)
+   > btrfs_item_ptr(btrfs_leaf, btrfs_path->slot[0], btrfs_extent_data_ref)
+   - 检查btrfs_extent_data_ref
+   > match_extent_data_ref(btrfs_leaf, btrfs_extent_data_ref, root_objectid, owner, offset)
+
+** insert_extent_data_ref(btrfs_trans_handle, btrfs_root, btrfs_path, bytenr, parent, root_objectid, owner, offset, refs_to_add)
+   - 插入一个btrfs_shared_data_ref/btrfs_extent_data_ref,根据parent而定.
+   - 构造btrfs_key, btrfs_key(bytenr, BTRFS_SHARED_DATA_REF_KEY/BTRFS_EXTENT_DATA_REF_KEY, parent/hash)
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, size)
+   - 如果返回的是-EEXIST, 说明原来有,只需要在原来的btrfs_item上面操作..
+   - 如果是BTRFS_SHARED_DATA_REF_KEY, 填入refs_to_add, 可能本来有btrfs_shared_data_ref, 累加refs_to_add. 
+   - 如果是BTRFS_EXTENT_DATA_REF_KEY, 验证btrfs_shared_data_ref数据, 比较这些参数,如果不匹配,hash碰撞.
+   > match_extent_data_ref(..)
+   > btrfs_insert_empty_item(...)
+   - 然后填入所有这些参数,如果发现一个原来就有的,增加num_refs
+   > btrfs_mark_buffer_dirty(extent_buffer)
+
+** remove_extent_data_ref(btrfs_trans_handle, btrfs_root, btrfs_path, refs_to_drop)
+   - btrfs_path里面有btrfs_item的位置, 可能是BTRFS_EXTENT_DATA_REF_KEY/BTRFS_SHARED_DATA_REF_KEY,修改num_refs,可能删除btrfs_item
+   - btrfs_key->type区分BTRFS_EXTENT_DATA_REF_KEY/BTRFS_SHARED_DATA_REF_KEY
+   - 获取ref_count
+   > btrfs_extent_data_ref_count(btrfs_leaf, btrfs_extent_data_ref)
+   > btrfs_shared_data_ref_count(btrfs_leaf, btrfs_shared_data_ref)
+   - 修改计数,如果为0,删除节点,否则仅仅修改计数值..
+   > btrfs_del_item(btrfs_trans_handle, btrfs_root, btrfs_path)
+   > btrfs_mark_buffer_dirty(btrfs_leaf)
+
+** extent_data_ref_count(btrfs_root, btrfs_path, btrfs_extent_inline_ref iref)
+   - 如果参数btrfs_extent_inline_ref有效,使用它访问btrfs_shared_data_ref/btrfs_extent_data_ref, 否则使用btrfs_path中的btrfs_item
+   - btrfs_extent_inline_ref是对这两种数据结构的包装, btrfs_extent_inline_ref->type表示BTRFS_SHARED_DATA_REF_KEY/BTRFS_EXTENT_DATA_REF_KEY..  btrfs_extent_inline_ref后面是对应的被包装数据
+   > btrfs_extent_data_ref_count(extent_data, ref)
+   > btrfs_shared_data_ref_count(extent_data, ref)
+   - 如果iref无效,直接去btrfs_path中获取数据, btrfs_key.type决定了btrfs_item是2种的哪一种.
+
+** lookup_tree_block_ref(btrfs_trans_handle, btrfs_root, btrfs_path, bytenr, parent, root_objectid)
+   - 开始处理btree block
+   - parent有效时，使用BTRFS_SHARED_BLOCK_REF_KEY,key是(bytenr, BTRFS_SHARED_BLOCK_REF_KEY, parent)
+   - 如果parent无效,key=(bytenr/BTRFS_TREE_BLOCK_REF_KEY/root_objectid) 
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, -1, 1)
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, ..)
+
+** insert_tree_block_ref(btrfs_trans_handle, btrfs_root, btrfs_path, bytenr, parent, root_objectid)
+   - 插入空的btrfs_item,保存extent block的backref
+   - 下面btrfs_item对应的size是0, btrfs_item指的数据是空的
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, ..)
+
+** extent_ref_type(parent, owner)
+   - 检查back reference的类型,owner对于tree block是level,对于extent data是file inode_objectid. BTRFS_FIRST_FREE_OBJECTID == 256
+   - owner<BTRFS_FIRST_FREE_OBJECTID parent>0 -> BTRFS_SHARED_BLOCK_REF_KEY
+   - owner<BTRFS_FIRST_FREE_OBJECTID parent=0 -> BTRFS_TREE_BLOCK_REF_KEY
+   - owner>=BTRFS_FIRST_FREE_OBJECTID parent>0 -> BTRFS_SHARED_DATA_REF_KEY
+   - owner>=BTRFS_FIRST_FREE_OBJECTID parent=0 -> BTRFS_EXTENT_DATA_REF_KEY
+
+** find_next_key(btrfs_path, level, key)
+   - 获取btrfs_path上第level层的下一个btrfs_key.如果slots[level]是最后一个,level++,也就是看上一层.最后返回的节点可能是叶子也可能是内节点..
+   > btrfs_item_key_to_cpu(...)
+   > btrfs_node_key_to_cpu(...)
+
+** btree_extent_item
+   #+begin_src 
+	__le64 refs;
+	__le64 generation;
+	__le64 flags;   //BTRFS_EXTENT_FLAG_TREE_BLOCK / BTRFS_EXTENT_FLAG_EXTENT_DATA
+   #+end_src
+
+** lookup_inline_extent_backref(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_extent_inline_ref, bytenr, num_bytes, parent, root_objectid, owner, offset, insert)
+   - 看一下参数, (root_objectid, owner, offset)对应extent data的数据.. parent表示是否share.. (bytenr,num_bytes)表示extent的磁盘位置信息. owner用于区分tree block, 如果是tree block, 表示节点的level, 如果是extent data,表示inode objectid
+   - 在btree中找一个btrfs_extent_inline_ref的结构,里面有对应的backref信息
+   - 先确定要找的backref是什么类型
+   > extent_ref_type(parent, owner)
+   - 计算btrfs_item指向数据的最小长度
+   > btrfs_extent_inline_ref_size(want)
+   - 构造btrfs_key(bytenr, BTRFS_EXTENT_ITEM_KEY, num_bytes)
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, size, 1)
+   > btrfs_item_size_nr(extent_buf, slot)
+   - 节点的大小..节点是btrfs_extent_item,它后面的数据有多种解释..
+   > btrfs_item_ptr(extent_buffer, i, btrfs_extent_item)
+   - 如果flags是BTRFS_EXTENT_FLAG_TREE_BLOCK, 说明这个extent用于tree block, btrfs_extent_item后面是btrfs_tree_block_info,通过它找到这个树(内部)节点. 后面是btrfs_extent_inline_ref数组.
+   - 这里获取的type和上面计算的want也需要比较
+   > btrfs_extent_inline_ref_type(extent_buffer, offset)
+   > btrfs_extent_inline_ref_size(type)
+   - 遍历里面的btrfs_extent_inline_ref.
+   - 如果是BTRFS_EXTENT_DATA_REF_KEY, 比较(root_objectid,owner,offset). 对于这种遍历,考虑hash碰撞的情况,如果offset<hash,就退出遍历. hash只会增加. 
+   > btrfs_extent_inline_ref_offset(extent_buffer, btrfs_extent_inline_ref)
+   - 对于BTRFS_SHARED_DATA_REF_KEY和BTRFS_SHARED_BLOCK_REF_KEY.
+   - btrfs_extent_inline_ref->offset是parent.
+   - 对于BTRFS_TREE_BLOCK_REF_KEY,  offset就是root_objectid
+   - 如果insert!=0,表示要插入inline的信息,需要保证没有其他btrfs_item指向backref信息
+   - 检查下一个btrfs_key,确保它的type不是BTRFS_SHARED_BLOCK_REF_KEY等
+   > find_next_key(btrfs_path, 0, btrfs_key)
+
+** setup_inline_extent_backref(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_extent_inline_ref, parent, root_objectid, owner, offset, refs_to_add, btrfs_delayed_extent_op)
+   - 把btrfs_delayed_ref_head的信息写回btree,写到btrfs_extent_inline_ref指向的位置
+   - 参数btrfs_extent_inline_ref指向btrfs_extent_item里面的一个位置,把参数填充到这个位置
+   > btrfs_item_ptr(extent_buffer, slot, btrfs_extent_item)
+   - 根据不同的类型,填充不同的信息
+   > extent_ref_type(parent, owner)
+   > btrfs_extent_inline_ref_size(type)
+   > btrfs_extent_item(btrfs_trans_handle, btrfs_root, btrfs_path, size)
+   - 获取btrfs_extent_item->refs, 增加refs_to_add
+   > btrfs_extent_refs(extent_buffer, btrfs_extent_item)
+   > btrfs_set_extent_refs(extent_buffer, btrfs_extent_item)
+   - 更新btrfs_extent_item->flags和tree block的索引节点的btrfs_key信息
+   > __run_delayed_extent_op(btrfs_delayed_extent_op)
+   - 这里的btrfs_item指向的数据区已经扩大,需要移动数据
+   - BTRFS_EXTENT_DATA_REF_KEY: 插入 root_objectid/owner/offset/refs_to_add
+   - BTRFS_SHARED_DATA_REF_KEY: refs_to_add, parent
+   - BTRFS_SHARED_BLOCK_REF_KEY: parent
+   - BTRFS_TREE_BLOCK_REF_KEY: root_objectid
+   > btrfs_mark_buffer_dirty(extent_buffer)
+
+** lookup_extent_backref(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_extent_inline_ref **, bytenr, num_bytes, parent, root_objectid, owner, offset)
+   - 先找到btrfs_extent_item中的btrfs_extent_inline_ref数组
+   > lookup_inline_extent_backref(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_extent_inline_ref **, ..., 0)
+   - 如果找不到inline backref,找btrfs_item, 如过owner < BTRFS_FIRST_FREE_OBJECTID,就是tree block
+   > lookup_tree_block_ref(btrfs_trans_handle, btrfs_root, btrfs_path, bytenr, parent, root_objectid)
+   - 否则是extent data
+   > lookup_extent_data_ref(...)
+   - 返回时btrfs_path指向了backref的信息
+   - 对于implicit backref, tree block只能有1个.它在btrfs_extent_item里面
+
+** update_inline_extent_backref(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_extent_inline_ref, refs_to_mod, btrfs_delayed_extent_op)
+   - 上面是插入btrfs_inline_extent_ref,这里是更新btrfs_extent_item/btrfs_inline_extent_inline_ref信息
+   - 首先为btrfs_extent_inline_ref,扩大btrfs_extent_item的空间
+   > btrfs_item_ptr(extent_buffer, slot, btrfs_extent_item)
+   > btrfs_extent_refs(extent_buffer, btrfs_extent_item)
+   - btrfs_path里面指向btrfs_extent_item, 更新btrfs_extent_item->refs
+   > btrfs_set_extent_refs(...)
+   - 更新btrfs_extent_item->flags,以及btrfs_tree_block_info
+   > __run_delayed_extent_op(btrfs_delayed_extent_op)
+   - 然后修改对应的btrfs_extent_inline_ref的计数
+   - 对于tree block,一个btrfs_extent_inline_ref只有一个计数,因为指针是唯一的,不可能一个节点多次索引一个子节点,所以refs_to_mod必须是-1,这里是要删除指针.
+   - 对于extent data来说,需要使用内部的计数
+   > btrfs_extent_data_ref_count(extent_buffer, btrfs_extent_data_ref)
+   > btrfs_shared_data_ref_count(extent_buffer, btrfs_shared_data_ref)
+   - 更新内部内部计数
+   > btrfs_set_extent_data_ref_count(..)
+   > btrfs_set_shared_data_ref_count(...)
+   - 如果内部计数变为0,需要删除相关btrfs_extent_inline_ref
+   > btrfs_extent_inline_ref_size(type)
+   > btrfs_item_size_nr(extent_buffer, slot)
+   > memmove_extent_buffer(...)
+   > btrfs_truncate_item(btrfs_trans_handle, ...)
+   - 上面会移动btrfs_leaf中的节点数据,然后修改节点头数据..
+   > btfs_mark_buffer_dirty(extent_buffer)
+
+** insert_inline_extent_backref(btrfs_trans_handle, btrfs_root, btrfs_path, bytenr, num_bytes, parent, root_objectid, owner, offset, refs_to_add, btrfs_delayed_extent_op)
+   - 把backref数据写到inline数组中,它保证btrfs_extent_item的存在.
+   - 先找对应的btrfs_extent_item
+   > lookup_inline_extent_backref(btrfs_trans_handle...)
+   - 如果有对应的btrfs_extent_inline_ref,更新它
+   > update_inline_extent_backref(...)
+   - 如果没有创建一个新的
+   > setup_inline_extent_backref(...)
+
+** insert_extent_backref(btrfs_trans_handle, btrfs_root, btrfs_path, bytenr, parent, root_objectid, owner, offset, refs_ro_add)
+   - 把backref数据写到btree中,使用独立的btrfs_item,而不使用inline数组
+   - 使用owner区分tree block和extent data. 这里是增加计数!
+   - 如果是tree block, refs_to_add必须是1,而且btree就是简单的插入,不用关合并或冲突,他们的计数都是1
+   > insert_tree_block_ref(btrfs_trans_handle, btrfs_root, btrfs_path, bytenr, parent, root_objectid)
+   - 对于extent data,复杂一些,他们需要合并计数
+   > insert_extent_data_ref(btrfs_trans_handle, btrfs_root, btrfs_path, bytenr, parent, root_objectid, owner, offset, refs_to_add)
+
+** remove_extent_backref(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_extent_inline_ref, refs_to_drop, is_data)
+   - 减小backref使用计数
+   - 如果参数btrfs_extent_inline_ref有小,更新对应的计数,可能删除btrfs_extent_inline_ref
+   > update_inline_extent_backref(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_extent_inline_ref, -refs_to_drop, NULL)
+   - 否则是btrfs_item形式的,如果is_data!= 0, 操作extent data, 更新索引计数,可能删除btrfs_item
+   > remove_extent_data_ref(btrfs_trans_handle, ...)
+   - 对于tree block,不用考虑合并计数,直接删除btrfs_item
+   > btrfs_del_item(btrfs_trans_handle, btrfs_root, btrfs_path)
+
+** btrfs_issue_discard(block_device, start, len)
+   - 发送discard/trim请求..
+   > blkdev_issue_discard(block_device, start>>9, len>>9, GFP_NOFS, 0)
+
+** btrfs_discard_extent(btrfs_root, bytenr, num_bytes, actual_bytes)
+   - 在释放extent空间时会发送discard操作
+   - 构造discard bio, 在volume.c中,但这里才发送bio请求
+   > btrfs_map_block(btrfs_root->btrfs_fs_info, REQ_DISCARD, bytenr, num_bytes, btrfs_bio, 0)
+   - 遍历btrfs_bio->num_stripes, btrfs_bio_stripe数组, 其实主要用里面的btrfs_bio_stripe数组
+   > btrfs_issue_discard(btrfs_bio_stripe->btrfs_device->block_device, btrfs_bio_stripe->physical, btrfs_bio_stripe->length)
+   - 上面这些参数就是整个btrfs_bio_stripe. btrfs_device->can_discard记录了设备是否支持discard.
+
+** btrfs_inc_extent_ref(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, parent, root_objectid, owner, offset, for_cow)
+   - 构造btrfs_delayed_ref_node记录bakcref信息
+   - 如果是owner<BTRFS_FIRST_FREE_OBJECTID, 处理tree block
+   > btrfs_add_delayed_tree_ref(btrfs_fs_info, btrfs_trans_handle, bytenr, num_bytes, parent, root_objectid, owner, BTRFS_ADD_DELAYED_REF, NULL, for_cow)
+   - 否则就是extent data.
+   > btrfs_add_delayed_data_ref(btrfs_fs_info, btrfs_trans_handle, bytenr, num_bytes, parent, root_objectid, owner, offset, BTRFS_ADD_DELAYED_REF, NULL, for_cow)
+   - 这些怎么不在delayed ref实现?! extent data比tree block复杂
+     
+** __btrfs_inc_extent_ref(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, parent, root_objectid, owner, offset, refs_to_add, btrfs_delayed_extent_op)
+   - backref信息有2种,一种是inline,就在btrfs_extent_item后面的数组中,另一种就是直接的btrfs_item,可能因为inline形式的大小受限,所以如果btrfs_extent_item容纳不了，就添加另一种..
+   - 先尝试inline的形式,创建或更新对应的btrfs_extent_inline_ref
+   > btrfs_alloc_path()
+   > insert_inline_extent_backref(btrfs_trans_handle, btrfs_root->btrfs_fs_info->extent_root, bytenr, num_bytes, parent, root_objectid, owner, offset, refs_to_add, btrfs_delayed_extent_op)
+   - 如果上面返回EAGAIN, 说明inline不行了..btrfs_item形式
+   - 先更新btrfs_extent_item,再创建或更新单独的btrfs_item
+   - 这时的btrfs_path指向btrfs_extent_item, 更新它的refs
+   > btrfs_extent_refs(extent_buffer, item)
+   > btrfs_set_extent_refs(extent_buffer, item, refs+refs_to_add)
+   - 修改btrfs_extent_item->flags, btrfs_tree_block_info
+   - __run_delayed_extent_op(btrfs_delayed_extent_op, extent_buffer, item)
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - 然后添加直接的btrfs_item
+   > insert_extent_backref(btrfs_trans_handle, btrfs_root->btrfs_fs_info->extent_root, btrfs_path, bytenr, parent, root_objectid, owner, offset, refs_to_add)
+
+** btrfs_delayed_ref_node
+   #+begin_src 
+	struct rb_node rb_node;
+
+	/* the starting bytenr of the extent */
+	u64 bytenr;
+
+	/* the size of the extent */
+	u64 num_bytes;
+
+	/* seq number to keep track of insertion order */
+	u64 seq;
+
+	/* ref count on this data structure */
+	atomic_t refs;
+
+	/*
+	 * how many refs is this entry adding or deleting.  For
+	 * head refs, this may be a negative number because it is keeping
+	 * track of the total mods done to the reference count.
+	 * For individual refs, this will always be a positive number
+	 *
+	 * It may be more than one, since it is possible for a single
+	 * parent to have more than one ref on an extent
+	 */
+	int ref_mod;
+
+	unsigned int action:8;
+	unsigned int type:8;
+	/* is this node still in the rbtree? */
+	unsigned int is_head:1;
+	unsigned int in_tree:1;
+   #+end_src
+
+** btrfs_delayed_extent_io
+   #+begin_src 
+	struct btrfs_disk_key key;
+	u64 flags_to_set;
+	unsigned int update_key:1;
+	unsigned int update_flags:1;
+	unsigned int is_data:1;
+   #+end_src
+
+** btrfs_delayed_tree_ref
+   #+begin_src 
+	struct btrfs_delayed_ref_node node;
+	u64 root;
+	u64 parent;
+	int level;
+   #+end_src
+
+** btrfs_delayed_data_ref 
+   #+begin_src 
+	struct btrfs_delayed_ref_node node;
+	u64 root;
+	u64 parent;
+	u64 objectid;
+	u64 offset;
+   #+end_src
+   - 这边也有对应的2套, 分开tree block / extent data, 也是包装btrfs_delayed_ref_node.
+
+** run_delayed_data_ref(btrfs_trans_handle, btrfs_root, btrfs_delayed_ref_node, btrfs_delayed_extent_op, inser_reserved)
+   - 这里把btrfs_delayed_ref_node贴过来, 根据它的数据更新btree
+   - 处理extent data的delayed ref操作..
+   - 创建btrfs_key (btrfs_delayed_ref_node->bytenr, BTRFS_EXTENT_ITEM_KEY, num_bytes)查找btrfs_extent_item
+   - btrfs_delayed_data_ref->type是BTRFS_SHARED_DATA_REF_KEY/BTRFS_EXTENT_DATA_REF_KEY. 
+   - 获取btrfs_delayed_data_ref
+   > btrfs_delayed_node_to_data_ref(btrfs_delayed_ref_node)
+   - 如果是BTRFS_SHARED_DATA_REF_KEY, 获取parent = btrfs_delayed_data_ref->parent, 否则需要root_objectid
+   - 如果insert_reserved=1, action=BTRFS_ADD_DELAYED_REF,这里时分配extent,插入btrfs_extent_item和btrfs_extent_inline_ref,同时更新空间的使用信息
+   > alloc_reserved_file_extent(btrfs_trans_handle, btrfs_root, parent, ref_root, flags, objectid, offset, btrfs_key, btrfs_delayed_ref_node->ref_mode, btrfs_delayed_extent_op)
+   - action=BTRFS_ADD_DELAYED_REF,插入inline或item的backref数据
+   > __btrfs_inc_extent_ref(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, parent, ref_root, objectid, ..)
+   - action=BTRFS_DROP_DELAYED_REF,删除backref数据,可能把btrfs_extent_item一块删除,还有checksum数据
+   > __btrfs_free_extent(btrfs_trans_handle, btrfs_root, ...)
+   - btrfs_delayed_ref_node->type有4种情况
+   - BTRFS_ADD_DELAYED_REF 增加索引计数
+   - BTRFS_DROP_DELAYED_REF  减小索引计数
+   - BTRFS_ADD_DELAYED_EXTENT 创建新的btrfs_extent_item
+   - BTRFS_UPDATE_DELAYED_HEAD 更新除了计数的其他信息
+
+** __run_delayed_extent_op(btrfs_delayed_extent_op, extent_buffer, btrfs_extent_item)
+   - 处理btrfs_delayed_extent_op->update_flags/update_key, 第一个是添加flags,第二个是更新btrfs_tree_block_info中的btrfs_key
+   > btrfs_set_extent_flags(extent_buffer, btrfs_extent_item, flags)
+   > btrfs_set_tree_block_key(extent_buffer, btrfs_tree_block_info, btrfs_delayed_extent_op->btrfs_key)
+
+** run_delayed_extent_op(btrfs_trans_handle, btrfs_root, btrfs_delayed_ref_node, btrfs_delayed_extent_op)
+   - 根据btrfs_delayed_extent_op更新btree中的信息
+   - 构造btrfs_key(bytenr, BTRFS_EXTENT_ITEM_KEY, num_bytes)
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root->btrfs_fs_info->extent_root, btrfs_key, path, 0, 1)
+   - 准备好btrfs_extent_item
+   > __run_delayed_extent_op(btrfs_delayed_extent_op, btrfs_delayed_ref_head)
+   > btrfs_mark_buffer_dirty(extent_buffer)
+
+** run_delayed_tree_ref(btrfs_trans_handle, btrfs_root, btrfs_delayed_ref_node, btrfs_delayed_extent_op, insert_reserved)
+   - 上面的btrfs_delayed_ref_node是btrfs_delayed_data_ref,这里是btrfs_delayed_tree_ref, 操作tree block
+   - 获取btrfs_delayed_tree_ref
+   > btrfs_delayed_node_to_tree_ref(btrfs_delayed_ref_node)
+   - 如果insert_reserved=1, action=BTRFS_ADD_DELAYED_REF,创建btrfs_extent_item,btrfs_tree_block_info和btrfs_extent_inline_ref. 从btrfs_delayed_extent_op中获取信息,设置新的btrfs_tree_block_info
+   > alloc_reserved_tree_block(btrfs_trans_handle, btrfs_root, parent, ...)
+   - action = BTRFS_ADD_DELAYED_REF, 增加索引计数
+   > __btrfs_inc_extent_ref(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, parent, ref_root, level, 0, 1, btrfs_delayed_extent_op)
+   - BTRFS_DROP_DELAYED_REF
+   > __btrfs_free_extent(btrfs_trans_handle, ...)
+
+** run_one_delayed_ref(btrfs_trans_handle, btrfs_root, btrfs_delayed_ref_node, btrfs_delayed_extent_op, insert_reserved)
+   - 处理btrfs_delayed_ref_node,把它的信息写回btree.
+   - 如果是btrfs_delayed_ref_head,?? 他是什么作用? insert_resered=1时,要删除这段空间,还有对应的csum数据?! reserved的数据变为pinned的数据
+   > btrfs_delayed_ref_is_head(...)
+   > btrfs_pin_extent(btrfs_root, btrfs_delayed_ref_node->bytenr, num_bytes, 1)
+   - 对于其他情况,区分tree block和extent data
+   > run_delayed_tree_ref(btrfs_trans_handle, btrfs_root, btrfs_delayed_ref_node, ...)
+   > run_delayed_data_ref(...)
+
+** select_delayed_ref(btrfs_delayed_ref_head)
+   - 所有的btrfs_delayed_ref_node使用rb tree管理,节点排序使用btrfs_delayed_ref_node->bytenr. 相同的bytenr, btrfs_delayed_ref_head放在最后
+   - 向前遍历相同bytenr的btrfs_delayed_ref_node, 先找BTRFS_ADD_DELAYED_REF,然后找BTRFS_DROP_DELAYED_REF.对于其他的呢?
+   - btrfs_delayed_ref_head是一个特殊的node, 它锁住一段空间的back ref 操作  .
+   > rb_pref(btrfs_delayed_ref_head->btrfs_delayed_ref_node->rb_node)
+
+** run_cluster_refs(btrfs_trans_handle, btrfs_root, list_head)
+   - btrfs_delayed_ref_root管理所有的btrfs_delayed_ref_node, 他就是btrfs_t
+rans_handle->btrfs_transaction->delayed_refs.  
+   - list_head队列上是btrfs_delayed_ref_head. 同样在btrfs_delayed_ref_root中, 它就是在里面寻出来的一批.遍历这些btrfs_delayed_ref_head.
+   - 先锁住btrfs_delayed_ref_head->mutex
+   > btrfs_delayed_ref_lock(btrfs_trans_handle, btrfs_delayed_ref_head)
+   - 合并多余的btrfs_delayed_ref_node
+   > btrfs_merge_delayed_refs(btrfs_trans_handle, btrfs_fs_info, delayed_refs, btrfs_delayed_ref_head)
+   - 找一个btrfs_delayed_ref_node
+   > select_delayed_ref(btrfs_delayed_ref_head)
+   - 检查btrfs_delayed_data_ref->seq，如果是最新的,这个btrfs_delayed_ref_head不能处理?!
+   > btrfs_check_delayed_seq(btrfs_fs_info, btrfs_delayed_ref_head, btrfs_delayed_ref_node->seq)
+   - 处理找到的btrfs_delayed_ref_node, 从rb tree中释放  btrfs_delayed_ref_root->num_entries --
+   > rb_erase(btrfs_delayed_ref_node->rb_node, btrfs_delayed_ref_root->root)
+   - 修改btrfs_delayed_ref_head->ref_mode 减去相应的索引计数
+   - 提交它的索引信息, 如果需要插入或修改btrfs_extent_item,处理第一个btrfs_delayed_ref_node时就需要做
+   > run_one_delayed_ref(btrfs_trans_handle, btrfs_root, btrfs_delayed_ref_node, btrfs_delayed_extent_op, must_insert_reserved)
+   - 释放btrfs_delayed_ref_node/btrfs_delayed_extent_op
+   > btrfs_free_delayed_extent_op(btrfs_delayed_extent_op)
+   > btrfs_put_delayed_ref(btrfs_delayed_ref_node)
+   - 如果选不出来,可能是更新btrfs_extent_item的,处理btrfs_delayed_extent_op
+   > run_delayed_extent_op(btrfs_trans_handle, ...)
+   - 如果选不出来,但是btrfs_delayed_ref_head->must_insert_reserved/btrfs_delayed_extent_op有效,说明它被创建后又被删除,需要释放它的空间?
+   > run_one_delayed_ref(btrfs_trans_handle, ...)
+   - 这这个函数里面释放reserved空间给pinned,如果是data,释放csum. 这可能解释一些,空间是先分配,然后创建对应的btrfs_extent_item.这里虽然没有创建btrfs_extent_item,但从btrfs_block_group_cache中已经分配了,所以要回收.
+
+** btrfs_delayed_refs_qgroup_accounting(btrfs_trans_handle, btrfs_fs_info)
+   - qgroup_update封装delayed ref, ops, btrfs_trans_handle->qgroup_ref_list队列上是qgroup_update
+   > btrfs_qgoup_account_ref(btrfs_trans_handle, btrfs_fs_info, qgroup_update->btrfs_delayed_ref_node, qgroup_update->btrfs_delayed_extent_op)
+   > btrfs_put_tree_mod_seq(btrfs_fs_info, btrfs_trans_handle->seq_list)
+   - qgroup? 什么东西???
+
+** refs_newer(btrfs_delayed_ref_root, seq, count)
+   - 检查btrfs_delayed_ref_root->ref_seq, 它是否在(seq,count)范围内?
+
+** btrfs_run_delayed_refs(btrfs_trnas_handle, btrfs_root, count)
+   - 先处理qgroup.
+   - count表示需要处理的btrfs_delayed_ref_node的个数..
+   - 如果为-1,表示全部处理, 如果为0,表示处理大部分..  run_all/run_most.. 如果为run_most, 设置它为btrfs_delayed_ref_root->num_entries*2.
+   > btrfs_delayed_refs_qgroup_accounting(btrfs_trans_handle, btrfs_root->btrfs_fs_info)
+   - 如果不是run_all/run_most, 检查btrfs_delayed_ref_root->procs_running_refs, 如果不为0, 说明其他任务在处理..
+   > atomic_cmpxchg(btrfs_delayed_ref_root->procs_running_refs, 0, 1)
+   - 检查btrfs_delayed_ref_root->num_entries, 如果少于16348, 直接退出..  这个太少??
+   - 否则需要等待在btrfs_delayed_ref_root->wait队列上等待..
+   > refs_newer(btrfs_delayed_ref_root, seq, 256)
+   - 被唤醒后,检查seq, 增长了,就直接退出,不再处理
+   - 开始循环处理, 如果不是run_all/run_most, 应该只有一个任务, 对于run_all/run_most, 无所谓多个!
+   - 然后找一些btrfs_delayed_ref_head, 使用了btrfs_delayed_ref_root->run_delayed_start,表示按照磁盘位置顺序处理
+   > btrfs_find_ref_cluster(btrfs_trans_handle, clusters, btrfs_delayed_ref_root->run_delayed_start)
+   > run_clustered_refs(btrfs_trans_handle, btrfs_root, list_head)
+   - 增加btrfs_delayed_ref_root->ref_seq.. 上面返回的就是处理的btrfs_delayed_ref_node数量..
+   - 循环退出的条件是count变为0, 或者在非run_all/run_most时,btrfs_delayed_ref_root->num_heads_ready<64..
+   - 如果是run_all, 检查btrfs_trans_handle->new_bgs, 如果非空,创建对应的btrfs_block_group_cache
+   > btrfs_create_pending_block_groups(btrfs_trans_handle, btrfs_root)
+   - 再次检查btrfs_delayed_ref_root, 如果队列上第一个是btrfs_delayed_ref_head / btrfs_delayed_ref_node, 需要重新处理.为何第一个会是btrfs_delayed_ref_head?!
+   > wake_up(btrfs_delayed_ref_root->wait)
+   - 如果不是等待1s,再重新检查是否还有新的btrfs_delayed_ref_node
+   - 最后唤醒等待的..
+
+** btrfs_set_disk_extent_flags(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, flags, is_data)
+   - 创建btrfs_delayed_extent_op, 设置flags_to_set, update_falgs
+   > btrfs_add_delayed_extent_op(btrfs_root->btrfs_fs_info, btrfs_trans_handle, bytenr, num_bytes, btrfs_delayed_extent_op)
+   - 这个函数里会创建一个btrfs_delayed_ref_head.
+
+** check_delayed_ref(btrfs_trans_handle, btrfs_root, btrfs_path, objectid, offset, bytenr)
+   - 检查在btrfs_delayed_ref_root中,bytenr对应的btrfs_delayed_ref_node是否有效
+   - 先在btrfs_trans_handle->btrfs_delayed_ref_root上面找一个btrfs_delayed_ref_head
+   > btrfs_find_delayed_ref_head(btrfs_trans_handle, bytenr)
+   - 检查它的前一个btrfs_delayed_ref_node, 它必须是BTRFS_EXTENT_DATA_REF_KEY 
+   - 检查btrfs_delayed_data_ref之前的btrfs_delayed_ref_node, 两者的bytenr/seq不能完全一样.不能有多个索引?!
+   - 检查btrfs_delayed_data_ref的(root,objectid,offset)和(btrfs_root->btrfs_key->objectid, objectid, offset)
+
+** check_committed_ref(btrfs_trans_handle, btrfs_root, btrfs_path, objectid, offset, bytenr)
+   - 检查extent data的backref,它必须是BTRFS_EXTENT_DATA_REF_KEY,类型, 在btrfs_extent_item里面只有一个btrfs_extent_inline_ref
+   - 查找btrfs_extent_item,构造btrfs_key(bytenr, BTRFS_EXTENT_ITEM_KEY, -1). 
+   > btrfs_search_slot(NULL, extent_root, btrfs_key, btrfs_path, 0, 0)
+   - 然后从btrfs_extent_item里面获取btrfs_extent_inline_ref和btrfs_extent_data_ref
+   - 比较btrfs_extent_item的size
+   - 比较generation <= btrfs_root->btrfs_root_item->last_snapshot
+   - 比较btrfs_extent_inline_ref->type必须是BTRFS_EXTENT_DATA_REF_KEY
+   - 比较btrfs_extent_item->refs和btrfs_extent_inline_ref->count
+   - 比较btrfs_extent_data_ref->root和btrfs_root->btrfs_key.objectid
+   - 比较btrfs_extent_data_ref->objectid/offset和参数一致
+
+** btrfs_cross_ref_exist(btrfs_trans_handle, btrfs_root, objectid, offset, bytenr)
+   - 检查extent是否有其他索引?如果只有BTRFS_EXTENT_DATA_REF_KEY,就是没有被其他subvolume共享?!
+   - 先检查btree中已有的信息,结构有3中,-ENOENT, 0, 1. 1表示不满足要求
+   > check_committed_ref(btrfs_trans_handle, btrfs_root, btrfs_path, objectid, offset, bytenr)
+   - 然后检查delayed的信息
+   > check_delayed_ref(btrfs_trans_handle, btrfs_root, btrfs_path, objectid, offset, bytenr)
+   - 如果找不到或者满足要求,返回0. 否则返回1,不满足要求,有共享.
+
+** __btrfs_mod_ref(btrfs_trans_handle, btrfs_root, extent_buffer, full_backref, inc, for_cow)
+   - extent_buffer是btree的节点,可能是叶子节点, 如果不是叶子节点,它里面是btrfs_key_ptr数组,每个都指向一个tree block extent.. 如果是叶子节点，可能有一些btrfs_file_extent_item, 它指向了file data extent..
+   - 遍历extent_buffer中的所有指针,获取对应的extent, 增加/减小extent backref.
+   - btrfs_header->owner表示它属于那个btrfs_root?!
+   > btrfs_header_owner(extent_buffer)
+   - 修改backref使用的函数是btrfs_inc_extent_ref / btrfs_free_extent
+   - 根据full_backref计算parent, 如果full_backref != 0, parent就是extent_buffer->start.也就是父节点的位置
+   > btrfs_header_nritems(extent_buffer)
+   > btrfs_header_level(extent_buffer)
+   - 先处理level==0, 检查子节点, 只处理BTRFS_EXTENT_DATA_KEY / btrfs_file_extent_item
+   > btrfs_item_ptr(extent_buffer, i, btrfs_file_extent_item)
+   - btrfs_file_extent_item->type不能是BTRFS_FILE_EXTENT_INLINE
+   > btrfs_file_extent_type(extent_buffer, f)
+   - btrfs_file_extent_item->bytenr不是0, 0是hole
+   > btrfs_file_extent_disk_bytenr(extent_buffer, btrfs_file_extent_item)
+   - 从btrfs_file_extent_item中获取bytenr/num_bytes/offset.. 但btrfs_file_extent_item->offset并不是文件offset, 而是extent内部offset, 需要使用btrfs_key.offset - offset获取extent在文件中的offset
+   > process_func(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, parent, ref_root, btrfs_key->objectid, offset, for_cow)
+   - 如果level>0, 对于tree block extent, 索引的是btrfs_node/btrfs_leaf. num_bytes是nodesize/leafsize
+   - 找到子节点
+   > btrfs_node_blockptr(extent_buffer, i)
+   > process_func(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, parent, ref_root, level-1, 0, for_cow)
+   - 这里的数据结构设计的太复杂!!
+ 
+** btrfs_inc_ref(btrfs_trans_handle, btrfs_root, extent_buffer, full_backref, for_cow)
+   > __btrfs_mod_ref(btrfs_trans_handle, btrfs_root, extent_buffer, full_backref, 1, for_cow)
+
+** btrfs_dec_ref(...)
+   - 索引少了1个..
+
+** 总结
+   - 通过索引计数来分配或释放btrfs_extent_item. btrfs_block_group_cache里面的free space分配空间,这里记录对extent的使用.
+
+** btrfs_space_info
+   #+begin_src 
+	u64 flags;
+
+	u64 total_bytes;	/* total bytes in the space,
+				   this doesn't take mirrors into account */
+	u64 bytes_used;		/* total bytes used,
+				   this doesn't take mirrors into account */
+	u64 bytes_pinned;	/* total bytes pinned, will be freed when the
+				   transaction finishes */
+	u64 bytes_reserved;	/* total bytes the allocator has reserved for
+				   current allocations */
+	u64 bytes_readonly;	/* total bytes that are read only */
+
+	u64 bytes_may_use;	/* number of bytes that may be used for
+				   delalloc/allocations */
+	u64 disk_used;		/* total bytes used on disk */
+	u64 disk_total;		/* total bytes on disk, takes mirrors into
+				   account */
+
+	/*
+	 * we bump reservation progress every time we decrement
+	 * bytes_reserved.  This way people waiting for reservations
+	 * know something good has happened and they can check
+	 * for progress.  The number here isn't to be trusted, it
+	 * just shows reclaim activity
+	 */
+	unsigned long reservation_progress;
+
+	unsigned int full:1;	/* indicates that we cannot allocate any more
+				   chunks for this space */
+	unsigned int chunk_alloc:1;	/* set if we are allocating a chunk */
+
+	unsigned int flush:1;		/* set if we are trying to make space */
+
+	unsigned int force_alloc;	/* set if we need to force a chunk
+					   alloc for this space */
+
+	struct list_head list;
+
+	/* for block groups in our same type */
+	struct list_head block_groups[BTRFS_NR_RAID_TYPES];  //链表中是btrfs_block_group_cache
+	spinlock_t lock;
+	struct rw_semaphore groups_sem;
+	wait_queue_head_t wait;
+   #+end_src
+
+** write_one_cache_group(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_block_group_cache)
+   - 把btrfs_block_group_cache的信息写到磁盘中.. btrfs_key/btrfs_block_group_item
+   > btrfs_search_slot(btrfs_trans_handle, extent_root, btrfs_block_group_cache->key, path, 0, 1)
+   > write_extent_buffer(extent_buffer, btrfs_block_group_cache->btrfs_block_group_item, offset, sizeof(btrfs_block_group_cache->btrfs_block_group_item)
+   > btrfs_release_path(btrfs_path)
+
+** next_block_group(btrfs_root, btrfs_block_group_cache)
+   - btrfs_block_group_cache->cache_node是rb tree中的节点,根在btrfs_fs_info->block_group_cache_tree
+   > rb_next(btrfs_block_group_cache->cache_node)
+   > btrfs_get_block_group(btrfs_block_group_cache)
+
+** cache_save_setup(btrfs_block_group_cache, btrfs_trans_handle, btrfs_path)
+   - 缓存block_group, 如果它不满100M, 不会缓冲它.  btrfs_block_group_cache->btrfs_key->offset < 100M
+   - 设置btrfs_block_group_cache->disk_cache_state = BTRFS_DC_WRITTEN..
+   - 使用专用的inode管理free space
+   > lookup_free_space_inode(btrfs_root, btrfs_block_group_cache, btrfs_path)
+   - 如果没有创建一个新的..
+   > create_free_space_inode(btrfs_root, btrfs_trans_handle, btrfs_block_group_cache, btrfs_path)
+   - 比较btrfs_block_group_cache->cache_generation和btrfs_trans_handle->transid, 如果相同,而且inode有数据,这些数据就有效了..同样设置BTRFS_DC_SETUP.. 直接退出
+   - 否则重新创建free space inode信息
+   - 更新inode的btrfs_inode_item信息..
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   - 如果之前文件有数据
+   > i_size_read(inode)
+   - 删除之前的所有信息重建..
+   > btrfs_truncate_free_space_cache(btrfs_root, btrfs_trans_handle, btrfs_path, inode)
+   - 这里没有收集free space info,它要求btrfs_block_group_cache->cached=BTRFS_CACHE_FINISHED
+   - 如果mount opt: space cache无效,就是不需要free space inode,设置btrfs_block_group_cache->disk_cache_state = BTRFS_DC_WRITTEN
+   - 根据btrfs_block_group_cache计算一个空间大小,给free space info使用..
+   > btrfs_check_data_free_space(inode, num_pages)
+   - 分配extent空间,创建btrfs_file_extent_item,extent_map
+   > btrfs_prealloc_file_range_trans(btrfs_inode, btrfs_trans_handle, 0, 0, num_pages, num_pages, ....)
+   - 上面也分配了空间,但这里不会写回free space数据,所以不需要分配空间,把分配的释放掉.
+   - 这个文件还是一个普通的文件,所以它后面使用pagecache写回数据,到时候再分配空间
+   > btrfs_free_reserved_data_space(btrfs_inode, num_pages)
+   - 最后如果没有问题,设置btrfs_block_group_cache->cache_generation = btrfs_trans_handle->transid
+   - 而且设置btrfs_block_group_cache->disk_cache_state=BTRFS_DC_SETUP
+
+** btrfs_write_dirty_block_groups(btrfs_trans_handle, btrfs_root)
+   - btrfs_block_group_cache使用rbtree管理,下面处理需要写回的btrfs_block_group_cache.因为它的free space数据改变了.
+   - 对于btrfs_block_group_cache的保存分3步,4个状态
+   - 最初是BTRFS_DC_CLEAR,在创建或使用它分配空间后设置为这个状态. 第一步创建对应的free space inode, 状态变为BTRFS_DC_SETUP
+   - 第二步把btrfs_block_group_cache->btrfs_key/btrfs_block_group_item信息写回,状态变为BTRFS_DC_NEED_WRITE
+   - 第三步把数据写回去,状态变为BTRFS_DC_WRITTEN.
+   - 下面分3遍遍历,任何一遍发现BTRFS_DC_CLEAR,都会重新操作
+   - 遍历rb tree中的btrfs_block_group_cache, 只处理btrfs_block_group_cache->disk_cache_state=BTRFS_DC_CLEA的.
+   > btrfs_lookup_first_block_group(btrfs_root->btrfs_fs_info, last)
+   > next_block_group(btrfs_root, btrfs_block_group_cache)
+   - 准备好free space inode, 但没有有效数据..
+   > cache_save_setup(btrfs_block_group_cache, btrfs_trans_handle, btrfs_path)
+   > btrfs_put_block_group(btrfs_block_group_cache)
+   - 处理btrfs_transaction的btrfs_delayed_ref_root, 全部写回磁盘..
+   > btrfs_run_delayed_ref(btrfs_trans_handle, btrfs_root, -1)
+   - 再次遍历btrfs_block_group_cache, 把btrfs_block_group_cache->disk_cache_state从BTRFS_DC_SETUP改为BTRFS_DC_NEED_WRITE.
+   - 然后把btrfs_block_group_cache->btrfs_key/btrfs_item写回去. btrfs_block_group_cache->dirty = 0
+   > write_one_cache_group(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_block_group_cache
+   - 后面又遍历一遍,针对btrfs_block_group_cache->disk_cache_state等于BTRFS_DC_NEED_WRITE, 把free space info 写回磁盘
+   > btrfs_write_out_cache(btrfs_root, btrfs_trans_handle, btrfs_block_group_cache, btrfs_path)
+   - 最后btrfs_block_group_cache->disk_cache_state改为BTRFS_DC_WRITTEN..
+
+** 总结
+   - 上面是btrfs_block_group_cache的提交功能
+
+** btrfs_extent_readonly(btrfs_root, bytenr)
+   - 找到btrfs_block_group_cache，检查btrfs_block_group_cache->ro.  看他是否readonly. 如果找不到,也是readonly!
+   > btrfs_lookup_block_group(btrfs_root->btrfs_fs_info, bytenr)
+
+** update_space_info(btrfs_fs_info, flags, total_bytes, bytes_used, btrfs_space_info space_info)
+   - flags是btrfs_block_group_cache的属性,表示数据的用处, 从btrfs_fs_info->space_info队列中找一个合适的btrfs_space_info
+   > __find_space_info(btrfs_fs_info, flags)
+   - 找到之后，根据参数改变属性..  应该是分配了新的btrfs_block_group_cache, 把对应的空间属性更新到btrfs_space_info上面... 
+   - total_bytes/bytes_used 是逻辑空间
+   - disk_total/disk_used是磁盘空间,需要根据raid情况加倍..
+   - 如果队列中没找到, 创建一个,使用参数值初始化这个数据结构, 把它添加到btrfs_fs_info->space_info中.
+   - btrfs_fs_info->data_sinfo是缓存指针,如果flags是BTRFS_BLOCK_GROUP_DATA, 修改btrfs_fs_info->data_sinfo为刚刚操作的..
+
+** set_avail_alloc_bits(btrfs_fs_info, flags)
+   - flags有2部分: type, profile.. type是数据属性:data/metadata/system, profile是物理属性:dup, raid.
+   - 如果profile部分为0,就是用BTRFS_AVAIL_ALLOC_BIT_SINGLE,表示普通的磁盘使用情况
+   > chunk_to_extended(flags)
+   - flags决定数据的用途,对应btrfs_fs_info->avail_data/metadata/sys_alloc_bits, 把新的标志给这些值.
+   - 表示某种用途的数据可以使用什么属性的磁盘
+
+** btrfs_balance_control
+   #+begin_src 
+   	struct btrfs_fs_info *fs_info;
+
+	struct btrfs_balance_args data;
+	struct btrfs_balance_args meta;
+	struct btrfs_balance_args sys;
+
+	u64 flags;
+
+	struct btrfs_balance_progress stat;
+        //根据这个数据结构去balance磁盘空间
+   #+end_src
+
+** btrfs_balance_args
+   #+begin_src 
+	__u64 profiles;
+	__u64 usage;
+	__u64 devid;
+	__u64 pstart;
+	__u64 pend;
+	__u64 vstart;
+	__u64 vend;
+
+	__u64 target;   //profile
+
+	__u64 flags;
+
+	__u64 unused[8];
+   #+end_src
+
+** get_restripe_target(btrfs_fs_info, flags)
+   - restripe表示要改变profile类型,返回一个flags,包含改变什么数据,改变后的profile
+   - 检查btrfs_balance_control的每个btrfs_balance_args->target是否含有BTRFS_BALANCE_ARGS_CONVERT, 而且参数flags包含对应的type
+   - 然后合并flags中的type和btrfs_balance_args->target
+   
+** btrfs_reduce_alloc_profile(btrfs_root, flags)
+   - 磁盘的数目: btrfs_fs_info->btrfs_fs_devices->rw_devices+missing_devices
+   - 检查是否有balance操作
+   > get_restripe_target(btrfs_root->btrfs_fs_info, flags)
+   - 如果有,而且和参数flags中有相同的,就使用它.profile里面能重复吗?!
+   - 去掉BTRFS_AVAIL_ALLOC_BIT_SINGLE标志,什么都没有就是single
+   > exteneded_to_chunk(target)
+   - 如果没有balance操作,或者balance操作和参数flags没有相交的,就自己计算一个
+   - 根据系统设备数量,过滤掉不支持的profile
+   > extented_to_chunk(flags)
+
+** get_alloc_profile(btrfs_root, flags)
+   - 在分配btrfs_chunk时,计算flags. 
+   - 参数flags中只有type,首先填加上profile: btrfs_fs_info->avail_data/meta/system_alloc_bits标志
+   - 然后根据balance或者设备数量,过滤掉一些
+   > btrfs_reduce_alloc_profile(btrfs_root, flags)
+
+** btrfs_get_alloc_profile(btrfs_root, data)
+   - 为btrfs_root分配btrfs_block_group_cache
+   - 首先计算type
+   - data!=0,就是BTRFS_BLOCK_GROUP_DATA
+   - data=0, btrfs_root是chunk_root, 是BTRFS_BLOCK_GROUP_SYSTEM
+   - 其他是BTRFS_BLOCK_GROUP_METADATA
+   - 然后计算profile
+   > get_alloc_profile(btrfs_root, flags)
+
+** btrfs_check_data_free_space(inode, bytes)
+   - 为inode的数据预留空间,检查btrfs_space_info,如果空间不够需要分配新的btrfs_chunk或者提交transaction来回收空间.
+   - 检查btrfs_fs_info->data_sinfo,如果还没有这个btrfs_space_info,先去分配btrfs_chunk
+   - btrfs_space_info-> bytes_used/bytes_reserved/bytes_pinned/bytes_readonly/bytes_may_use 累加就是已经使用的空间used. used + bytes <= btrfs_space_info->total_bytes就可以分配
+   - 否则检查是否需要分配新的btrfs_chunk
+   - 如果inode属于free space inode或者是free ino, 不能分配新chunk, 需要靠commit来省空间.
+   - 如钩btrfs_space_info->full=1, 没有必要去分配空间,系统没有多的空间
+   - 首先准备一个flags, type = BTRFS_BLOCK_GROUP_DATA
+   > btrfs_get_alloc_profile(btrfs_root, 1)
+   - 分配chunk,创建对应的btrfs_dev_extent/btrfs_block_group_cache/btrfs_chunk,也是btree操作,所以使用transaction
+   > btrfs_join_transaction(btrfs_root)
+   > do_chunk_alloc(btrfs_trans_handle, btrfs_root->btrfs_fs_info->extent_root, alloc_target, CHUNK_ALLOC_NO_FORCE)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 如果上面分配失败,去transaction中回收空间
+   - btrfs_space_info->bytes_pinned表示可以回收的空间,应该是释放了还没有给提交到btree中的 btrfs_space_info->bytes_pinned < bytes, transaction中也没有足够的空间
+   > btrfs_join_transaction(btrfs_root)
+   > btrfs_commit_transaction(btrfs_trans_handle, btrfs_root)
+   - 最后分配更新btrfs_space_info->bytes_may_use
+
+** btrfs_free_reserved_data_space(inode, bytes)
+   - 释放reserved的空间, 修改btrfs_root->btrfs_fs_info->btrfs_space_info->bytes_may_use..
+
+** force_metadata_allocation(btrfs_fs_info)
+   - 遍历btrfs_fs_info->space_info队列上的btrfs_space_info, 如果是BTRFS_BLOCK_GROUP_METADATA, 设置force_alloc = CHUNK_ALLOC_FORCE.
+   - 为何有重复的btrfs_free_space?!
+   - 在metadata空间不够时,它会主动分配新的btrfs_chunk.
+   - 在分配了data空间,发现比率失调时会使用这个函数
+
+** should_alloc_chunk(btrfs_root, btrfs_space_info, force)
+   - 检查是否需要分配chunk
+   - 如果force=CHUNK_ALLOC_FORCE肯定需要.. 
+   - btrfs_space_info->total_bytes - btrfs_space_info->bytes_readonly 表示可用的num_bytes,  btrfs_space_info->bytes_used - bytes_reserved, 表示已经分配的num_allocated
+   - 如果force=CHUNK_ALLOC_LIMITED, 计算thresh. 
+   - 获取btrfs_super_block->total_bytes, thresh是总空间的1/10
+   > btrfs_super_total_bytes(btrfs_super_block)
+   - num_bytes - num_allocated < thresh, 空闲空间相比总空间太少,需要分配新的
+   - num_allocated < num_bytes * 8/10, 如果已经分配的空间占可用空间的比率太少,也不能分配
+   - 其他情况可以分配
+
+** get_system_chunk_thresh(btrfs_root, type)
+   - 这里计算的因该是分配chunk时需要使用的btree的空间.也就是修改chunk_tree和device_tree使用的空间. device_tree也使用chunk空间?!
+   - 针对不同的profile,会创建不同的btrfs_dev_extent.
+   - RAID0/RADI10会使用所有的rw设备btrfs_fs_devices->rw_devices
+   - RAID1使用2个,  DUP或SINGLE使用1
+   > btrfs_calc_trans_metadata_size(btrfs_root, num_dev+1)
+
+** check_system_chunk(btrfs_trans_handle, btrfs_root, byte)
+   - 检查BTRFS_BLOCK_GROUP_SYSTEM的btrfs_space_info是否有足够的空间,如果没有分配一个btrfs_chunk
+   - 找一个btrfs_space_info
+   > __find_space_info(btrfs_root->btrfs_fs_info, BTRFS_BLOCK_GROUP_SYSTEM)
+   - 计算btrfs_space_info的剩余空间.left
+   - btrfs_space_info->total_bytes - bytes_used - bytes_pinned - bytes_reserved - bytes_readonly.
+   - 计算这次chunk分配需要使用的空间
+   > get_system_chunk_thresh(btrfs_root, type)
+   - 针对profile计算thresh, 如果thresh少于可用空间, 通过printk打印出..
+   - 既然btrfs_space_info说明没有足够的空间 left < thresh,需要分配新的chunk
+   - 先计算一个flags
+   > btrfs_get_alloc_profile(btrfs_root->btrfs_fs_info->chunk_root, 0)
+   - 分配chunk
+   > btrfs_alloc_chunk(btrfs_trans_handle, btrfs_root, flags)
+
+** do_chunk_alloc(btrfs_trans_handle, btrfs_root, flags, force)
+   - btrfs_root是extent_root,
+   > __find_space_info(btrfs_root->btrfs_fs_info, flags)
+   - 如果btrfs_space_info没找到, 创建一个..
+   > update_space_info(btrfs_fs_info, flags, 0, 0, btrfs_space_info)
+   - 检查force和btrfs_space_info->force_alloc, 使用一个小的.
+   - btrfs_space_info->full表示整个磁盘空间已经分配完,没有必要分配btrfs_chunk
+   - 计算是否需要分配..
+   > should_alloc_chunk(extent_tree, btrfs_space_info, force)
+   - 如果不应该分配,就退出.  
+   - btrfs_trans_handle->allocating_chunk, btrfs_space_info->chunk_alloc, btrfs_fs_info->chunk_mutex, 都用来同步chunk分配. 
+   - 如果btrfs_trans_handle->allocating_chunk=true,直接退出.
+   - 如果btrfs_space_info->chunk_alloc=1,其他人在分配,等待chunk_mutex
+   - 否则设置btrfs_space_info->chunk_alloc = 1, 让其他人等待
+   > btrfs_mixed_space_info(btrfs_space_info)
+   - 检查btrfs_space_info->flags是否是混用的，DATA/METADATA, 把对应的type给flags
+   - 如果flags有BTRFS_BLOCK_GROUP_DATA,需要检查系统的metadata_ratio, 分配的chunk数目需要均衡,保持一定比率..
+   > force_metadata_allocation(btrfs_fs_info)
+   - 检查system的trunk是否够用, 如果不够用,为他分配新的btrfs_chunk
+   > check_system_chunk(btrfs_trans_handle, extent_root, flags)
+   - 去volume.c中分配新的btrfs_chunk等.
+   > btrfs_alloc_chunk(btrfs_trans_handle, extent_root, flags)
+   - 如果分配返回-ENOSPC, 设置btrfs_space_info->full=1, 其他人也不必去分配了
+   - 分配后,设置btrfs_space_info->force_alloc设为CHUNK_ALLOC_NO_FORCE, chunk_alloc=0，唤醒btrfs_fs_info->chunk_mutex信号量.
+
+** btrfs_reserve_flush_enum
+   #+begin_src 
+   BTRFS_RESERVE_NO_FLUSH       //在transaction,不能flush
+   BTRFS_RESERVE_FLUSH_LIMIT    //flush delalloc??
+   BTRFS_RESERVE_FLUSH_ALL
+   #+end_src
+
+** can_overcommit(btrfs_root, btrfs_space_info, bytes, btrfs_reserve_flush_enum)
+   - 检查是否能over-commit??  过量分配磁盘空间..
+   - 需要在参数btrfs_space_info中分配空间,先检查它的参数
+   - 已经使用的是累加bytes_used + bytes_reserved + bytes_pinned + bytes_readonly = used
+   - 检查剩余可用的空间能否满足global_block_rsv, 如果不满足,不能继续分配
+   - used = global_block_rsv->size < btrfs_space_info->total_bytes
+   - bytes_may_use是预留的,同样看作已经使用  used += bytes_may_use
+   - btrfs_fs_info->free_chunk_space, 它是可以用于分配btrfs_chunk的空间.avail
+   > btrfs_get_alloc_profile(btrfs_root, 0)
+   - 如果要分配的profile使用DUP/DAID1/RAID10等,需要减半. avail /= 2
+   - 计算一个to_add,表示分配后,空间可以超过多少
+   - 如果flush是BTRFS_RESERVE_FLUSH_ALL, to_add = btrfs_space_info->total_bytes / 8, 尽量分配失败,让他提交transaction
+   - 如果flush是其他, to_add = btrfs_space_info->total_bytes / 2, 可以多分配
+   - 但to_add不能超过avail
+   - used + bytes < btrfs_space_info->tatal_bytes + to_add 可以分配, 否则不能分配.
+   - 这也算是过量分配?!
+
+** btrfs_writeback_inodes_sb_nr(btrfs_root, nr_pages)
+   - 释放inode占用的资源.可以释放delalloc的空间?
+   - 使用bdi创建writeback_control, 需要看看相关的流程??
+   > try_to_writeback_inodes_sb_nr(super_block, nr_pages, WB_REASON_FS_FREE_SPACE)
+   - 如果上面失败,就是在umount,不过这里不用管.它使用自己的方式提交文件. 
+   - 处理btrfs_fs_info->delalloc_inodes队列上的所有文件
+   > btrfs_start_delalloc_inodes(btrfs_root, 0)
+   - 等待提交完成
+   > btrfs_wait_ordered_extents(btrfs_root, 0)
+
+** shrink_delalloc(btrfs_root, to_reclaim, orig, wait_ordered)
+   - 释放delalloc过程中预留的metadata空间. metadata多分配了?!
+   - current->journal_info是btrfs_trans_handle,在使用trans会设置它.
+   - btrfs_fs_info->delalloc_bytes表示delalloc的数量,如果为0, 就直接返回. 
+   - 但这里可能btrfs_trans_handle无效,需要等待ordered extent??
+   > btrfs_wait_ordered_extents(btrfs_root, 0)
+   - 开始循环处理,直到delalloc_bytes变为0
+   - 先释放inode占用的空间. 这里的nr_pages是内存空间,还是磁盘空间?!
+   > try_to_writeback_inodes_sb_nr(btrfs_root->btrfs_fs_info->super_block, nr_pages, WB_REASON_FS_FREE_SPACE)
+   - 等待互斥变量 btrfs_fs_info->async_delalloc_pages, 在btrfs_root->btrfs_fs_info->async_submit_wait队列上, 需要所有的delalloc的空间都提交??
+   > wait_event(btrfs_root->btrfs_fs_info->async_submit_wait, btrfs_root->btrfs_fs_info->async_delalloc_pages != 0)
+   - 如果btrfs_trans_handle无效就是BTRFS_RESERVE_FLUSH_ALL, 否则是BTRFS_RESERVE_NO_FLUSH..当前任务是否在transaction任务中, 就无法提交???
+   - 检查是否能over commit, 如果可以不需要再回收空间,直接退出. orig表示本来要分配的空间
+   > can_overcommit(btrfs_root, btrfs_space_info, orig, flush)
+  - 下一次循环前先等待, 等待有2种,一种是没有transaction, 等待数据写回.
+  > btrfs_wait_ordered_extents(btrfs_root, 0)
+  - 另一种是等待1s.
+  > schedule_timeout_killable(1)
+
+** may_commit_transaction(btrfs_root, btrfs_space_info, bytes, force)
+   - 提交transaction,来释放空间.需要的空间是bytes
+   - current->journal_info是btrfs_trans_handle, 表示当前操作在transaction中,不能提交.
+   - force表示必须commit.
+   - btrfs_space_info->bytes_pinned表示可以回收的空间, bytes_pinned > bytes就可以提交试试
+   - 检查btrfs_fs_info->delalloc_block_rsv使用当前分配的btrfs_space_info, 它的空间在提交之后也会释放
+   - bytes_pinned + btrfs_block_rsv->size < bytes, 这是真的不能提交
+   - 经过这些检查,commit操作反而很简单.
+   > btrfs_join_transaction(btrfs_root)
+   > btrfs_commit_transaction(btrfs_trans_handle, btrfs_root)
+
+** flush_state
+   #+begin_src 
+	FLUSH_DELAYED_ITEMS_NR	=	1,
+	FLUSH_DELAYED_ITEMS	=	2,
+	FLUSH_DELALLOC		=	3,
+	FLUSH_DELALLOC_WAIT	=	4,
+	ALLOC_CHUNK		=	5,
+	COMMIT_TRANS		=	6,
+   #+end_src
+   
+
+** flush_space(btrfs_root, btrfs_space_info, num_bytes, orig_bytes, state)
+   - 在分配metadata空间是，没有空间可用,就需要flush,回收空间
+   - 通过提交delayed-inode来回收空间,纯粹是metadata的空间. 这个会有很多吗?!
+   - 提交delalloc回收空间,也是回收metadata,因为delalloc磁盘,刷回的时候会使用数据占用那些分配的,而没有用完的metadata的可能会释放出来.
+   - 分配新的btrfs_chunk来创造新的空间
+   - 提交已有的transaction来回收空间,它应该有很多方法.
+   - 上面这4方法有不同的权值
+   - 对于FLUSH_DELAYED_ITEMS_NR/FLUSH_DELAYED_ITEMS,回收delayed-inode空间
+   - FLUSH_DELAYED_ITEMS_NR表示要精确的释放,计算nr = num_bytes / metadata_size. 每个btrfs_delayed_item都对应一个btree的操作,所以只要回收nr*2个就足够
+   > btrfs_join_transaction(btrfs_root)
+   - delayed inode是缓存的inode操作,比如创建或修改文件/目录?!
+   > btrfs_run_delayed_items_nr(btrfs_trans_handle, btrfs_root, nr)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 对于FLUSH_DELALLOC/FLUSH_DELALLOC_WAIT, 要求回收delalloc空间
+   > shrink_delalloc(btrfs_root, num_bytes, orig_bytes, state==FLUSH_DELALLOC_WAIT)
+   - 2者的区别是是否等待ordered data都写回..
+   - 对于ALLOC_CHUNK, 分配chunk
+   > btrfs_join_transaction(btrfs_root)
+   > do_chunk_alloc(btrfs_trans_handle, btrfs_root->btrfs_fs_info->extent_root, btrfs_get_alloc_profile(btrfs_root, 0), CHUNK_ALLOC_NO_FORCE)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 对于COMMIT_TRANS, 提交transaction.
+   > may_commit_transaction(btrfs_root, btrfs_space_info, orig_bytes, 0)
+
+** reserve_medatata_bytes(btrfs_root, btrfs_block_rsv, orig_bytes, btrfs_reserve_flush_enum)
+   - 这应该是提前分配metadata空间,或者叫预留reserve.
+   - 这里使用了btrfs_block_rsv,但没有涉及它的成员reserved/size??
+   - 这里从btrfs_space_info中预留空间,把空间放到btrfs_space_info->bytes_may_use
+   - btrfs_space_info->flush表示有人在flush..如果参数flush是BTRFS_RESERVE_FLUSH_ALL, 等待flush动作完成.
+   > wait_event_killable(btrfs_space_info->wait, btrfs_space_info->flush)
+   - 一些网上的资料[[https://btrfs.wiki.kernel.org/index.php/ENOSPC][overcommit]] [[http://lwn.net/Articles/434630/][delayed inode]], 
+   - 检查btrfs_space_info中的参数,累加used = bytes_used + bytes_pinned + bytes_reserved + bytes_may_use + bytes_readonly. 
+   - used + orig_bytes < total_bytes 表示空间够用,先预留空间修改bytes_may_use
+   - 如果used + orig_bytes < total_bytes 或者 used < total_bytes, 表示btrfs_space_info空间不够用,先检查overcommit. 如果可以也直接分配.
+   > can_overcommit(btrfs_root, btrfs_space_info, orig_bytes, flush)
+   - 如果flush是BTRFS_RESERVE_NO_FLUSH 或者上面已经分配直接退出
+   - 开始flush, 设置btrfs_space_info->flush=1. 
+   > flush_space(btrfs_root, btrfs_space_info, num_bytes, orig_bytes, flush_state)
+   - 参数flush_state表示flush的方法,它一般会遍历每一种情况. 它又受到flush的影响.
+   - flush是BTRFS_RESERVE_NO_FLUSH时,不会去flush. 
+   - flush是BTRFS_RESERVE_FLUSH_LIMIT时,不会去delalloc和transaction??为什么??
+   - flush是BTRFS_RESERVE_FLUSH_ALL是,会采取所有操作,但是会保持互斥. 如果其他任务在flush这个btrfs_space_info, 它会检查是否在current->btrfs_trans_handle,如果有transaction直接退出.或者等待btrfs_space_info->flush=1. 就是一开始的检查.
+   - 最后还是无法分配,btrfs_root->orphan_cleanup_state是ORPHAN_CLEANUP_STARTED,使用从global_block_rsv中分配空间???
+   > btrfs_rsv_use_bytes(global_block_rsv, orig_bytes)
+   - 退出时检查flushing, 唤醒其他要flush的任务.
+   > wake_up_all(btrfs_space_info->wait)
+
+** get_block_rsv(btrfs_trans_handle, btrfs_root)
+   - 获取btrfs_block_rsv, 在metdata操作中,使用它管理空间分配.
+   - 如果btrfs_root->ref_cows有效,使用btrfs_trans_handle->block_rsv. 所有的btrfs_root都应该有效?!
+   - root是csum_root, btrfs_trans_handle->adding_csums有效,也使用btrfs_trans_handle->block_rsv. 
+   - 如果上面条件不满足,使用btrfs_root->block_rsv 
+   - 否则是btrfs_root->btrfs_fs_info->empty_block_rsv
+
+** btrfs_block_rsv
+   #+begin_src 
+   size
+   reserved
+   btrfs_space_info space_info
+   lock
+   full      //size<reserved是为0,否则为1
+   type
+   failfase
+   //还不算麻烦的数据结构
+   #+end_src
+
+** block_rsv_use_bytes(btrfs_block_rsv, num_bytes)
+   - 使用它的reserved空间
+   - btrfs_block_rsv->reserved > num_bytes, 要减少reserved.  
+   - btrfs_block_rsv->reserved<btrfs_block_rsv->size,full=0
+   - 否则返回ENOSPC..
+
+** block_rsv_add_bytes(btrfs_block_rsv, num_bytes, update_size)
+   - 增加btrfs_block_rsv管理的空间, reserved, 如果update_size!=0,增加size
+   - btrfs_block_rsv->reserved增加num_bytes
+   - 更新btrfs_block_rsv->full
+
+** block_rsv_release_bytes(btrfs_fs_info, btrfs_block_rsv, block_rsv, btrfs_block_rsv dest, num_bytes)
+   - 释放btrfs_block_rsv->size表示的空间
+   - 如果num_bytes==-1, 则num_bytes = btrfs_block_rsv->size
+   - btrfs_block_rsv->size -= num_bytes
+   - 需要btrfs_block_rsv->reserved不超过size
+   - 如果超了,处理多出来的reserved空间 btrfs_block_rsv-reserved - btrfs_block_rsv->size = num_bytes, full=1
+   - 如果dst btrfs_block_rsv有效,把多余的reserved空间给它,但不能让它reserved太多..num_bytes -= (dst->size - dst->reserved), 如果reserved=size, 设置btrfs_block_rsv->full
+   - 处理最后剩下的num_bytes, 把他从btrfs_space_info->bytes_may_use中删除
+   - 看来btrfs_block_rsv->reserved都来自btrfs_space_infobytes_may_use
+
+** block_rsv_migrate_bytes(btrfs_block_rsv src, dst, num_bytes)
+   - 第一个减小reserved空间,第二个增加reserved, 但为何要更新dst->size
+   > block_rsv_use_bytes(src, num_bytes)
+   > block_rsv_add_bytes(dst, num_bytes,1)
+   
+** btrfs_init_block_rsv(btrfs_block_rsv, type)
+   - 初始化btrfs_block_rsv, 设置type..
+
+** btrfs_block_rsv->type
+   #+begin_src 
+      	BTRFS_BLOCK_RSV_GLOBAL		1
+      	BTRFS_BLOCK_RSV_DELALLOC	2
+      	BTRFS_BLOCK_RSV_TRANS		3
+      	BTRFS_BLOCK_RSV_CHUNK		4
+      	BTRFS_BLOCK_RSV_DELOPS		5
+      	BTRFS_BLOCK_RSV_EMPTY		6
+      	BTRFS_BLOCK_RSV_TEMP		7
+   #+end_src
+
+** btrfs_alloc_block_rsv(btrfs_root, type)
+   - 创建一个btrfs_block_rsv, 关联metadata的btrfs_space_info
+   > btrfs_init_block_rsv(btrfs_block_rsv, type)
+   > __find_space_info(btrfs_fs_info, BTRFS_BLOCK_GROUP_METADATA)
+   
+** btrfs_free_block_rsv(btrfs_root, btrfs_block_rsv)
+   - 释放btrfs_block_rsv, 同时释放btrfs_block_rsv->size空间
+   > btrfs_block_rsv_release(btrfs_root, btrfs_block_rsv, -1)
+
+** btrfs_block_rsv_add(btrfs_root, btrfs_block_rsv, num_bytes, btrfs_reserve_flush_enum)
+   - 给btrfs_block_rsv分配空间,大小是num_bytes.  size/reserved都增加
+   > reserve_metadata_bytes(btrfs_root, btrfs_block_rsv, num_bytes, flush)
+   > block_rsv_add_bytes(btrfs_block_rsv, num_bytes, 1)
+
+** btrfs_block_rsv_check(btrfs_root, btrfs_block_rsv, int)
+   - 检查btrfs_block_rsv->reserved是否太多,超过size * min_factor / 10.. 否则返回-ENOSPC
+   - 这个函数没人使用哇!
+
+** btrfs_block_rsv_refill(btrfs_root, btrfs_block_rsv, min_reserved, btrfs_reserve_flush_enum)
+   - 需要在btrfs_block_rsv中分配空间,如果reserved足够,直接返回, 如果不够,需要去metadata中分配一些,把reserved填充起来..
+   - 检查btrfs_block_rsv->reserved是否大于min_reserved, 如果能就返回,没有分配..
+   > reserve_metadata_bytes(btrfs_root, btrfs_block_rsv, num_bytes, flush)
+   > block_rsv_add_bytes(btrfs_block_rsv, num_bytes, 0)
+   - 这里和上面的区别是,参数0没有更新btrfs_block_rsv->size
+
+** btrfs_block_rsv_migrate(btrfs_block_rsv src, dst, num_bytes)
+   > block_rsv_migrate_bytes(src, dst, num_bytes)
+
+** btrfs_block_rsv_release(btrfs_root, btrfs_block_rsv, num_bytes)
+   - 释放btrfs_block_rsv, 把里面的空间在还给btrfs_space_info
+   - 检查btrfs_root->btrfs_fs_info->global_block_rsv, 看他是否能接受空间.. 如果它就是参数btrfs_block_rsv, 不能接受, 如果full也不能, 如果他们使用的btrfs_space_info不一样,也不能接受.
+   > block_rsv_release_bytes(btrfs_root->btrfs_fs_info, btrfs_block_rsv, global_rsv, num_bytes)
+   - 他们的btrfs_space_info会不一样? 如果直接释放, global_block_rsv可能会减小超出的reserved空间.
+
+** calc_global_metadata_size(btrfs_fs_info)
+   - global_block_rsv给extent tree, checksum tree, root tree的操作提供空间
+   - 为btrfs_block_rsv/global计算reserve
+   - 先计算所有的data需要使用的checksum空间
+   > btrfs_super_csum_size(btrfs_fs_info->btrfs_super_block)
+   > __find_space_info(btrfs_fs_info, BTRFS_BLOCK_GROUP_DATA)
+   - btrfs_space_info->bytes_used, 表示磁盘中的数据量. bytes_used / blocksize * csum_size
+   - 然后找出metadata btrfs_space_info.
+   - 还有添加(data_used + meta_used)/50, 为何?
+   - 最后结果不能超过metadata btrfs_space_info->bytes_used / 3
+   - 这只是一个估计的数据,但也太大!
+
+** update_global_block_rsv(btrfs_fs_info)
+   - 更新btrfs_fs_info->global_block_rsv的空间
+   - 先计算global需要的预留空间,设定size.. 所以这个size只是一个限制性的??
+   > calc_global_metadata_size(btrfs_fs_info)
+   - 使用btrfs_space_info的空间填充reserved空间, 累加used = bytes_used + bytes_pinned + ..
+   - used < btrfs_space_info->total_bytes, 就把剩余的都给reserved, 同时也给了btrfs_space_info->bytes_may_use.
+   - 再检查btrfs_block_rsv, reserved的空间不能超过size,多的再从btrfs_space_info->bytes_may_use删除
+
+** init_global_block_rsv(btrfs_fs_info)
+   - 初始化btrfs_fs_info->chunk_block_rsv, 找一个SYSTEM的btrfs_space_info,给这个btrfs_block_rsv..
+   > __find_space_info(btrfs_fs_info, BTRFS_BLOCK_GROUP_SYSTEM)
+   - 再找一个BTRFS_BLOCK_GROUP_METADATA的btrfs_space_info,给其他类型的btrfs_block_rsv,  包括global_block_rsv/delalloc_block_rsv/empty_block_rsv/delayed_block_rsv..
+   - 然后把global_block_rsv给相关的btrfs_root: extent_root/csum_root/dev_root/tree_root.  但是chunk_root使用chunk_block_rsv..
+   - 给global_block_rsv分配空间..
+   > update_global_block_rsv(btrfs_fs_info)
+
+** release_global_block_rsv(btrfs_fs_info)
+   - 释放空间给btrfs_space_info.. 只能把reserved给btrfs_space_info->bytes_may_use
+   > block_rsv_release_bytes(btrfs_fs_info, btrfs_fs_info->global_block_rsv, NULL, -1)
+
+** btrfs_trans_release_metadata(btrfs_trans_handle, btrfs_root)
+   - 释放btrfs_trans_handle预留的空间,管理使用btrfs_trans_handle->btrfs_block_rsv
+   > btrfs_block_rsv_release(btrfs_root, btrfs_trans_handle->btrfs_block_rsv, btrfs_trans_handle->bytes_reserved)
+   - 把空间还给btrfs_space_info/global_block_rsv
+
+** 总结
+   - 上面大量的函数操作btrfs_block_rsv, 但对使用着来说就是使用reserved空间,和释放给reserved空间..使用时,如果空间不够需要去btrfs_space_info分配, 释放时会把空间还给btrfs_space_info..
+   - btrfs_block_rsv->reserved和btrfs_space_info->bytes_may_use是一致的.无论是填充/创建btrfs_block_rsv,还是释放btrfs_block_rsv,都和btrfs_space_info->bytes_may_use交互.
+   - btrfs_block_rsv->size只是一个限制性的.
+
+** btrfs_orphan_reserve_metadata(btrfs_trans_handle, inode)
+   - btrfs_root->orphan_block_rsv是为orphan操作服务,先预留空间给orphan_block_rsv.
+   - 先找从哪个btrfs_block_rsv分配空间..
+   > get_block_rsv(btrfs_trans_handle, btrfs_root)
+   - 普通btree需要这些空间.
+   > btrfs_calc_trans_metadata_size(btrfs_root, 1)
+   - btrfs_root是inode对应的, 上面计算btree中节点使用的空间
+   > block_rsv_migrate_bytes(btrfs_block_rsv, orphan_block_rsv, num_bytes)
+   - orphan操作使用btrfs_root自己的btrfs_block_rsv
+
+** btrfs_orphan_release_metadata(inode)
+   - orphan操作完成,把没有用调的reserved空间换掉..
+   > btrfs_calc_trans_metadata_size(btrfs_root, 1)
+   > btrfs_block_rsv_release(btrfs_root, btrfs_root->orphan_block_rsv, num_bytes)
+   - 奇怪,这里为何不全部归还?? 而且归还的不是分配的来源.. 只考虑global_block_rsv
+
+** btrfs_subvolume_reserve_metadata(btrfs_root, btrfs_block_rsv, items, qgroup_reserved)
+   - 为snapshot/subvolume的创建/删除预留空间,它和普通文件操作不一样..它会修改2个fs tree, 还有tree root..
+   - 计算预留的空间大小..
+   > btrfs_calc_trans_metadata_size(btrfs_root, items)
+   > __find_space_info(btrfs_fs_info, BTRFS_BLOCK_GROUP_METADATA)
+   - 去btrfs_space_info中分配空间, 而且把空间给btrfs_block_rsv..
+   > btrfs_block_rsv_add(btrfs_root, btrfs_block_rsv, num_bytes, BTRFS_RESERVE_FLUSH_ALL)
+   - 这里好像使用专门的btrfs_block_rsv
+
+** btrfs_subvolume_release_metadata(btrfs_root, btrfs_block_rsv, qgroup_reserved)
+   - 把btrfs_block_rsv的空间全部释放掉!!
+   - btrfs_block_rsv_release(btrfs_root, btrfs_block_rsv, -1)
+
+** drop_outstanding_extent(inode)
+   - 在delalloc操作中,处理预留数据空间,checksum空间,还有btrfs_file_extent_item使用的metadata空间. 这里应该是释放metadata空间.
+   - btrfs_inode->outstanding_extents表示inode中delalloc的extent的数量.reserved_extents表示已经预留metadata空间的extent的数量. 
+   - reserved_extents只会在释放或分配metadata时和outstanding_extents同步.
+   - outstanding_extents会在inode的extent数据变化是操作,比如设置EXTENT_DELALLOC时,或者分裂或合并extent时.
+   - 这个函数在写操作完成,1个extent已经写到磁盘中,可以释放它预留的metadata空间.当然不是全部是放, 具体数量由btrfs_block_rsv->reserved决定.
+   - 减小btrfs_inode->outstanding_extents, 如果减为0, 去掉btrfs_inode->runtime_flags的BTRFS_INODE_DELALLOC_META_RESERVED标志. 这样需要多释放一些,因为在添加标志时,还预留了空间,为修改btrfs_inode_item服务. 现在还了!
+   - outstanding_extents > reserved_extents,应该分配,但这里不管这事,它只是返回上面计算的空间.
+   - outstanding_extents < reserved_extents, 应该释放多分配的, 修改reserved_extents, 而且返回多出来的.
+
+** calc_csum_metadata_size(inode, num_bytes, reserve)
+   - btrfs_inode->csum_bytes表示使用checksum的数据的数量,不是checksum的数量..根据reserve去增加/减少num_bytes. 计算对应的checksum使用的metadata空间变化
+   - btrfs_inode->flags的BTRFS_INODE_NODATASUM表示是否使用csum,如果不使用,函数退出. 
+   - csum是以块为单位.. 根据新的btrfs_inode->csum_bytes计算新的checksum需要的btree空间.. 基本上就是需要的btree叶子数量..
+   > btrfs_calc_trans_metadata_size(btrfs_root, modify)
+   - 无论增建都需要空间.
+
+** btrfs_delalloc_reserve_metadata(inode, num_bytes)
+   - 为了delalloc预留metadata. 计算可能会改动的btree节点的数量..
+   - 如果是free space inode, 下面不会锁btrfs_inode->delalloc_mutex.. 而且分配空间时使用BTRFS_RESERVE_NO_FLUSH. 
+   - 对于这些特殊的inode,在保存btrfs_block_group_cache时才会用到,应该是transaction里面?!
+   > btrfs_is_free_space_inode(inode)
+   - 开始操作,锁住btrfs_inode->delalloc_mutex. 对于普通的文件.
+   - 增加btrfs_inode->outstanding_extents, outstanding_extents > reserved_extents, reserved_extents不够使用,对应的metadata空间
+   - 检查btrfs_inode->running_flags的BTRFS_INODE_DELALLOC_META_RESERVED标志..如果没有,说明之前inode没有delalloc, 需要修改btrfs_inode_item, 又需要一个btree操作的metadata空间.
+   > btrfs_calc_trans_metadata_size(btrfs_root, nr_extents)
+   - 计算checksum需要的metadata预留空间
+   > btrfs_csum_metadata_size(inode, num_bytes, 1)
+   - 然后是quote group...
+   > btrfs_qgroup_reserve(btrfs_root, num_bytes+nr_extents+btrfs_root->leafsize)
+   - 使用delalloc_block_rsv预留空间, flush普通是BTRFS_RESERVE_FLUSH_ALL.
+   > reserve_metadata_bytes(btrfs_root, btrfs_block_rsv, to_reserve, flush)
+   - 如果预留成功, 设置BTRFS_INODE_DELALLOC_META_RESERVED, 放到btrfs_inode->runtime_flags
+   - 增加btrfs_inode->reserved_extents
+   - 把预留的空间给delalloc_block_rsv
+   > block_rsv_add_bytes(btrfs_fs_info->delalloc_block_rsv, to_reserve, 1)
+   - 如果预留失败, 基本上要还原上面的操作.. 释放reserved的空间,修改checksum大小..
+   > drop_outstanding_extent(inode)
+   - 删除inode的多余reserve的extent,应该是预留的数据量，还有对应的csum使用的空间   
+   > calc_csum_metadata(inode, num_bytes, 0)
+   > btrfs_block_rsv_release(btrfs_root, btrfs_fs_info->delalloc_block_rsv, to_free)
+
+** btrfs_delalloc_release_metadata(inode, num_bytes)
+   - 就是上面函数的逆操作. 释放一个extent,数据量是num_bytes
+   - 计算extent使用的metadata空间
+   > drop_outstanding_extent(inode)
+   > btrfs_calc_trans_metadata_size(btrfs_root, dropped)
+   - 然后是checksum释放的空间.
+   > calc_csum_metadata_size(inode, num_bytes, 0)
+   > btrfs_block_rsv_release(btrfs_root, btrfs_root->btrfs_fs_info->delalloc_block_rsv, to_free)
+   - 从btrfs_fs_info->delalloc_block_rsv中释放预留的空间
+   > btrfs_block_rsv_release(btrfs_root, btrfs_block_rsv, to_free)
+
+** btrfs_delalloc_reserve_space(inode, num_bytes)
+   - 为delalloc预留data和metadata空间,包括extent tree, csum
+   - 预留data空间,它不像metadata那么复杂,如果btrfs_space_info没空间,就去分配btrfs_chunk或者提交transaction
+   > btrfs_check_data_free_space(inode, num_bytes)
+   - 然后是metadata空间..
+   > btrfs_delalloc_reserve_metadata(inode, num_bytes)
+   - 可能失败
+   > btrfs_free_reserved_data_space(btrfs_inode, num_bytes)
+
+** btrfs_delalloc_release_space(inode, num_bytes)
+   - 释放预留的空间.. 先释放metadata, 然后是data
+   > btrfs_delalloc_release_metadata(inode, num_bytes)
+   > btrfs_free_reserved_data_space(inode, num_bytes)
+
+** 总结
+   - 所以预留空间针对的是btrfs_space_info->bytes_may_use, 把空间转移到btrfs_block_rsv->reserve中. 这里可能是专门的btrfs_block_rsv, 或者临时的,或者btrfs_trans_handle的. 在真正分配空间时使用他们
+
+** update_block_group(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, alloc)
+   - 在btrfs_block_group_cache中释放或分配一些空间..alloc表示分配还是释放,完全相反. (bytenr,num_bytes) 一段范围,但应该是一个连续的extent. 更新btrfs_block_group_cache的信息
+   - 更新btrfs_super_bock->bytes_used, 根据alloc,增加或减小num_bytes
+   > btrfs_super_bytes_used(btrfs_fs_info->btrfs_super_block)
+   > btrfs_set_super_bytes_used(btrfs_fs_info->btrfs_super_block, new_val)
+   - (bytenr,num_bytes)可能跨越btrfs_block_group_cache?!
+   - 处理btrfs_block_group_cache, 根据bytenr查找btrfs_block_group_cache, 循环下去,直到空间范围都处理完.
+   > btrfs_lookup_block_group(btrfs_fs_info, bytenr)
+   - 如果btrfs_block_group_cache->cached是BTRFS_CACHE_NO, 建立它的btrfs_free_space_ctl,只使用fast方法.
+   > cache_block_group(btrfs_block_group_cache, 1)
+   - 找到btrfs_block_group_cache, （bytenr, num_bytes)可能不会全部覆盖它,计算btrfs_block_group_cache中的范围大小
+   - 更新btrfs_block_group_cache的信息, 设置btrfs_block_group_cache->dirty = 1, disk_cache_state = BTRFS_DC_CLEAR
+   - 如果是分配 alloc!=0
+   - btrfs_block_group_item->used += byte_in_group
+   - btrfs_space_info->reserved / btrfs_space_info->bytes_reserved 减小byte_in_group
+   - btrfs_space_info->bytes_used / disk_used 增加bytes_in_group, disk可能会翻倍
+   - 如果是释放, alloc = 0
+   - btrfs_block_group_item->used -= byte_in_group
+   - btrfs_block_group_cache->pinned / btrfs_space_info->bytes_pinned 增加byte_in_group
+   - btrfs_space_info->bytes_used / disk_used 减小byte_in_group
+   - 在pinned_extents中使用EXTENT_DIRTY标志
+   > set_extent_dirty(btrfs_fs_info->pinned_extents, bytenr, end ...)
+   - btrfs_block_group_cache->reserved 和btrfs_space_info->bytes_reserved同时变化;  pinned和bytes_pinned同时变化. 其他呢???
+
+** first_logical_byte(btrfs_root, search_start)
+   - 搜索一个btrfs_block_group_cache, 获取它的起始位置. 需要在search_start后面.
+   - 首先检查btrfs_fs_info->first_logical_byte, 如果=-1,去btree中搜索
+   > btrfs_lookup_first_block_group(btrfs_root->btrfs_fs_info, search_start)
+
+** pin_down_extent(btrfs_root, btrfs_block_group_cache, bytenr, num_bytes, reserved)
+   - 增加btrfs_block_group_cache->pinned/btrfs_space_info->bytes_pinned
+   - 如果reserved为1,同时减小btrfs_block_group_cache->reserved/btrfs_space_info->byte_reserved. 空间从reserved转为pinned.
+   - 在extent_io_tree上记录对应的空间
+   > set_extent_dirty(btrfs_root->btrfs_fs_info->pinned_extents, bytenr, ...)
+
+** btrfs_pin_extent(btrfs_root, bytenr, num_bytes, reserved)
+   - 分配pinned的空间
+   > btrfs_lookup_block_group(btrfs_root->btrfs_fs_info, bytenr)
+   > pin_down_extent(btrfs_root, btrfs_block_group_cache, num_bytes, reserved)
+
+** btrfs_pin_extent_for_log_replay(btrfs_trans_handle, btrfs_root, bytenr, num_bytes)
+   - transaction中使用的函数..
+   - 申请一段空间,标志为pinned
+   - 找到对应的btrfs_block_group_cache
+   > btrfs_lookup_block_group(btrfs_root->btrfs_fs_info, bytenr)
+   - 建立free space cache,只会使用fast方式,因为slow方法会检查pinned的extent
+   > cache_block_group(btrfs_block_group_cache, 1)
+   - 仅仅增加pinned的空间.并且在pinned的extent_io_tree中标记出来
+   > pin_down_extent(btrfs_root, btrfs_block_group_cache, bytenr, num_bytes, 0)
+   - 从btrfs_free_space_ctl中分配.
+   > btrfs_remove_free_space(btrfs_block_group_cache, bytenr, num_bytes)
+
+** btrfs_update_reserved_bytes(btrfs_block_group_cache, num_bytes, reserve)
+   - reserve在上面: RESERVE_FREE|RESERVE_ALLOC|RESERVE_ALLOC_NO_ACCOUNT.  表示分配或释放动作
+   - 对于RESERVE_FREE, 从reserved中释放, 减小btrfs_block_group_cache->reserved / btrfs_space_info->bytes_reserved, btrfs_space_info->reservation_progress++. 如果btrfs_block_grup_cache->ro != 0, 增加btrfs_space_info->bytes_readonly
+   - 对于其他情况, 就是ALLOC.. 增加btrfs_block_group_cache->reserved/btrfs_space_info->bytes_reserved.. 
+   - 如果是RESERVE_ALLOC(不是NO_ACCOUNT), 修改btrfs_space_info->bytes_may_use. 这里把预留的空间转化为分配的
+
+** btrfs_caching_type
+   #+begin_src 
+	BTRFS_CACHE_NO		= 0,  //没有free space info
+	BTRFS_CACHE_STARTED	= 1,  //开始慢收集方法
+	BTRFS_CACHE_FAST	= 2,  //使用free space inode
+	BTRFS_CACHE_FINISHED	= 3,  //free space info准备好..
+   #+end_src
+
+** disk_cache_state
+   #+begin_src 
+	BTRFS_DC_WRITTEN	= 0, //这是最终状态..
+	BTRFS_DC_ERROR		= 1,
+	BTRFS_DC_CLEAR		= 2,   //默认状态..需要建立free space info, 变为SETUP
+	BTRFS_DC_SETUP		= 3,   //btrfs_block_group_cache->dirty,写回btrfs_block_group_item,变为NEED_WRITE
+	BTRFS_DC_NEED_WRITE	= 4,   //把free space info写回磁盘,变为BTRFS_DC_WRITTEN
+   #+end_src
+   
+** btrfs_prepare_extent_commit(btrfs_trans_handle, btrfs_root)
+   - btrfs_caching_control是用来缓冲btrfs_free_space_ctl. 它去扫描btree, 查找free space信息. 扫面时更新进度btrfs_caching_control->progress, 完毕后设置btrfs_block_group_cache->cached为BTRFS_CACHE_FINISHED.
+   - 这里检查扫面的进度或结果,更新到btrfs_block_group_cache->last_byte_to_unpin
+   - 遍历btrfs_fs_info->caching_block_groups上面的btrfs_caching_control, 检查它对应的btrfs_block_group_cache->cached,如果是BTRFS_CACHE_FINISHED,已经完成, 可以删除这个btrfs_caching_control.
+   - 否则btrfs_block_group_cache->last_byte_to_unpin为btrfs_caching_control->progress
+   - pinned_extent总是指向freed_extents的一个,切换指针..
+   - 重新填充global_block_rsv
+   > update_global_block_rsv(btrfs_fs_info)
+   - 在transaction提交过程中用到这个..
+
+** unpin_extent_range(btrfs_root, start, end)
+   - pinned空间表示已经释放,但没有添加到btrfs_free_space_ctl中的空间. 由于slow btrfs_caching_control的原因
+   - 遍历(start,end)之间的btrfs_block_group_cache
+   - 首先把btrfs_block_group_cache和范围(start,end)重叠的部分放到free space中
+   > btrfs_add_free_space(btrfs_block_group_cache, start, len)
+   - 减小btrfs_block_group_cache->pinned / btrfs_space_info->bytes_pinned
+   - 如果btrfs_block_group_cache->ro != 0, 增加btrfs_space_info->bytes_readonly
+   - 否则, 检查btrfs_block_group_cache->btrfs_space_info是否和global_block_rsv->btrfs_space_info一样,如果一样,把空间直接给global_block_rsv
+   - 增加global_block_rsv->reserved / btrfs_space_info->bytes_may_use. 当然不能是global_block_rsv->reserved超过size
+
+** btrfs_finish_extent_commit(btrfs_trans_handle, btrfs_root)
+   - 在commit transaction时使用.
+   - 要释放btrfs_fs_info->freed_extents的空间. pinned_extents表示当前在使用的freed_extents,这里使用另一个.
+   - 在extent_io_tree上查找EXTENT_DIRTY的空间
+   > find_fist_extent_bit(extent_io_tree, 0, start, end, EXTENT_DIRTY, NULL)
+   - 如果支持discard, 把这段空间释放掉..
+   > btrfs_discard_extent(btrfs_root, ...)
+   > clear_extent_dirty(extent_io_tree, start, end, ..)
+   - 释放这段空间
+   > unpin_extent_range(btrfs_root, start, end)
+
+** __btrfs_free_extent(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, parent, root_objectid, owner_objectid, owner_offset, refs_to_drop, btrfs_delayed_extent_op)
+   - 去btree中修改extent的backref,如果计数变为0,删除extent的空间给btrfs_block_group_cache, bytes_used空间转移到pinned, 而且在freed_extent中标注出来.
+   - 先去btree中查找对应的btrfs_extent_inline_ref, 或者独立的btrfs_item.
+   > btrfs_alloc_path()
+   > lookup_extent_backref(btrfs_trans_handle, extent_root, btrfs_path, btrfs_extent_inline_ref, bytenr, num_bytes, parent, root_objectid, owner_objectid, owner_offset)
+   - 如果上面找到的是btrfs_item, 也需要找到对应的btrfs_extent_item,只要向前遍历btrfs_item
+   - 如果没有btrfs_extent_item,先更新索引计数  refs_to_drop
+   > remove_extent_backref(btrfs_trans_handle, extent_root, btrfs_path, NULL, refs_to_drop, is_data)
+   - 重新查找btree, 创建btrfs_key(bytenr, BTRFS_EXTENT_ITEM_KEY, num_bytes), 再找一边.
+   > btrfs_search_slot(btrfs_trans_handle, extent_root, btrfs_key, ...)
+   - 这类保证btrfs_path里面指向BTRFS_EXTENT_ITEM_KEY类型的item
+   > btrfs_item_ptr(extent_buffer, extent_slot, btrfs_extent_item)
+   - 在btrfs_extent_item上修改refs.. 如果修改后计数>0, 修改flags/btrfs_key
+   > __run_delayed_extent_op(btrfs_delayed_extent_op, extent_buffer, btrfs_extent_item)
+   - 如果上面还没有更新item的backref,这里更新它. 虽然看起来多次查找有些乱,但这里是为了节省查找次数. 
+   - 如果上面找到inline的backref,直接操作btrfs_extent_item
+   - 如果上面找到item的backref,就偏移找到btrfs_extent_item
+   - 如果上面找到item的backref,偏移没有找到btrfs_extent_item,就先操作这些btrfs_item,然后第二次查找btrfs_extent_item. 只使用一个btrfs_path
+   - 如果btrfs_extent_inline_ref有效,这里一定找到了btrfs_extent_item,使用一个函数操作
+   > remove_extent_backref(...)
+   - 如果无效,那item的backref已经更新,这里需要更新btrfs_extent_item的计数
+   > btrfs_set_extent_refs(extent_buffer, btrfs_extent_item, refs)
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - 如果计数变为0，需要删除btrfs_extent_item, 还需要删除额外的backref的btrfs_item
+   - 目前的情况应该是特定的.
+   - 如果找到btrfs_extent_item,对于extent_data, btrfs_extent_inline_ref必须有效吗?
+   - 假使btrfs_extent_inline_ref有效,它必须是最后一个,count = refs_to_drop
+   - 如果btrfs_extent_inlien_ref无效,这个extent应该只有2个btrfs_item, 一个是btrfs_extent_item,一个是backref, 一块删除他们
+   > btrfs_del_items(btrfs_trans_handle, extent_root, btrfs_path, slot, num_to_del)
+   - 如果是extent data, 还要删除csum..
+   > btrfs_del_csums(btrfs_trans_handle, btrfs_root, bytenr, num_bytes)
+   - 更新到btrfs_block_group_cache中, bytes_used转变为pinned,把释放的空间在freed_extents中使用EXTENT_DIRTY标注出来.
+   > update_block_group(btrfs_trans_handle, ...)
+
+** check_ref_cleanup(btrfs_trans_handle, btrfs_root, bytenr)
+   - 清理没用的btrfs_delayed_ref_head
+   - 在btrfs_trans_handle->btrfs_transaction->delayed_refs查找btrfs_delayed_ref_head
+   > btrfs_find_delayed_ref_head(btrfs_trans_handle, bytenr)
+   - 如果它是第一个rb node,不处理? 它顶多就是孤单的btrfs_delayed_ref_head?为何不处理?!
+   - 检查它的前一个rb node, 如果是对应的btrfs_delayed_ref_node, 说明它还有索引计数的修改,不能释放btrfs_delayed_ref_head,直接退出.
+   - btrfs_delayed_ref_head->extent_op存在,must_insert_reserved无效,是需要修改btrfs_extent_item, 直接退出
+   - 如果extent_op有效, must_insert_reserved也有效,说明分配了tree block,又立即释放掉.现在它需要释放它
+   - 减小btrfs_delayed_ref_root->num_entries/num_heads, 释放btrfs_delayed_ref_head->cluster关系.
+   > btrfs_put_delayed_ref(btrfs_delayed_ref_head->node)
+   - 最后返回btrfs_delayed_ref_head->must_insert_reserved,表示需要释放已经分配的空间.
+
+** btrfs_free_tree_block(btrfs_trans_handle, btrfs_root, extent_buffer, parent, last_ref)
+   - 释放tree block, 使用btrfs_delayed_ref_node记录索引删除操作.如果last_ref有效,还要检查是否可以删除这个tree block.
+   - 创建btrfs_delayed_ref_node,和btrfs_delayed_ref_head,添加到btrfs_delayed_ref_root中
+   > btrfs_add_delayed_tree_ref(btrfs_root->btrfs_fs_info, btrfs_trans_handle, extent_buffer->start, extent_buffer->len, parent, btrfs_root->btrfs_key.objectid, level, BTRFS_DROP_DELAYED_REF, NULL, 0)
+   - 如果last_ref无效,直接退出,否则尝试删除它
+   - 找到对应的btrfs_block_group_cache
+   > btrfs_lookup_block_group(btrfs_root->btrfs_fs_info, extent_buffer->start)
+   - btrfs_header->generation = btrfs_trans_handle->transid, 继续处理
+   - 如果还有索引或者需要更新btrfs_extent_item就不能释放,或者只是一个空的btrfs_delayed_ref_head,也没有空间操作. 如果返回1,需要释放已经分配的空间.
+   > check_ref_cleanup(btrfs_trans_handle, btrfs_root, extent_buffer->start)
+   - 检查extent_buffer的btrfs_header->flags的BTRFS_HEADER_FLAG_WRITTEN,就是数据已经写回? 需要缓冲一段时间?
+   - 把数据放到pinned空间中,等到transaction结束时释放. reserved空间转为pinned空间
+   > pin_down_extent(btrfs_root, btrfs_block_group_cache, start, len, 1)
+   - 否则直接释放掉,把空间归还给btrfs_block_group_cache / btrfs_space_info
+   > btrfs_add_free_space(btrfs_block_group_cache, extent_buffer->start, extent_buffer->len)
+   - 释放reserved空间
+   > btrfs_update_reserved_bytes(btrfs_block_group_cache, extent_buffer->len, RESERVE_FREE)
+
+** btrfs_free_extent(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, parent, root_objectid, owner, offset, for_cow)
+   - 如果root_objectid是BTRFS_TREE_LOG_OBJECTID, 把空间直接还给btrfs_block_group_cache的pinned空间.
+   > btrfs_pin_extent(btrfs_root, bytenr, num_bytes, 1)
+   - 如果是tree block
+   > btrfs_add_delayed_tree_refs(btrfs_fs_info, btrfs_trans_handle, bytenr, num_bytes, parent, root_objectid, owner, BTRFS_DROP_DELAYED_REF, NULL, for_cow)
+   - 如果是extent data.
+   > btrfs_add_delayed_data_ref(btrfs_fs_info, btrfs_trans_handle, bytenr, num_bytes, parent, root_objectid, owner, offset, BTRFS_DROP_DELAYED_REF, NULL, for_cow)
+
+** stripe_align(btrfs_root, val)
+   - 返回val对于btrfs_root->stripesize对其的上值..
+
+** wait_block_group_cache_progress(btrfs_block_group_cache, num_bytes)
+   - 等待btrfs_caching_control的进程, 如果没有btrfs_caching_control, 直接退出.
+   > get_caching_control(btrfs_block_group_cache)
+   - 在btrfs_block_group_cache->wait队列上等待..
+   - 等待条件是btrfs_block_group_cache->cached是BTRFS_CACHE_FINISHED, 或者btrfs_caching_control->free_space超过了num_bytes
+   > wait_event(btrfs_caching_control->wait, block_group_cahce_done(btrfs_block_group_cache) || btrfs_block_group_cache->free_space_ctl->free_space>=num_bytes)
+
+** wait_block_group_cache_done(btrfs_block_group_cache)
+   - 和上面类似,等待条件是BTRFS_CACHE_FINISHED
+   > block_group_cache_done(btrfs_block_group_cache)
+
+** __get_raid_index(flags)
+   - 根据flags返回index,  RAID10/RAID1/DUP/RAID0/other,  profile信息
+
+** get_block_group_index(btrfs_block_group_cache) 
+   > __get_raid_index(btrfs_block_group_cache index)
+
+** btrfs_loop_type
+   #+begin_src 
+	LOOP_CACHING_NOWAIT = 0,
+	LOOP_CACHING_WAIT = 1,
+	LOOP_ALLOC_CHUNK = 2,
+	LOOP_NO_EMPTY_SIZE = 3,
+   #+end_src
+
+** find_free_extent(btrfs_trans_handle, btrfs_root, num_bytes, empty_size, hint_byte, btrfs_key, data)
+   - 分配extent， btrfs_key保存结果, empty_size只有在分配多个btrfs_node时使用,对于extent data没有用. hint_byte应该是分配起始位置. num_bytes表示分配空间大小
+   - 参数data是flags, 包含type, profile
+   > __get_raid_index(data)
+   - 如果data是BTRFS_BLOCK_GROUP_DATA, alloc_type就是RESERVE_ALLOC_NO_ACCOUNT,否则是RESERVE_ALLOC. 如果是RESERVE_ALLOC_NO_ACCOUNT,这里不会操作bytes_may_use空间?!在delalloc中操作??
+   - 找到对应的btrfs_space_info
+   > __find_space_info(btrfs_root->btrfs_fs_info, data)
+   - 如果btrfs_space_info支持data/metadata, 说明这是一个小文件系统,不支持cluster, btrfs_free_cluster是在btrfs_block_group_cache中缓冲一层,它管理一套btrfs_free_space.
+   - 如果使用cluster, 先选一个btrfs_free_cluster, metadata就用btrfs_fs_info->meta_alloc_cluster, data就用btrfs_fs_info->data_alloc_cluster
+   - 如果使用btrfs_free_cluster, btrfs_free_cluster->window_start代替hint_byte
+   - 如果search, 如果search_start == hint_byte, 需要就近分配.
+   - 使用hint_byte找一个btrfs_block_group_cache, 检查是否能用
+   > btrfs_lookup_block_group(btrfs_fs_info, search_start)
+   - btrfs_block_group_cache->flags和data一样; cached不是BTRFS_CACHE_NO, 已经建立free space info; btrfs_block_group_cache->list不为空,它没有被释放; ro无效.
+   - 如果上面条件不满足,根据profile, 从btrfs_space_info->block_groups[index]中选一个队列,遍历队列上的btrfs_block_grup_cache
+   - 先检查btrfs_block_group_cache->flags是否包含data的需求, 如果因为某些RAID(除了RAID0)/DUP,就继续下一次循环.
+   - 再检查cache状态, 如果还没有完成,就触发cache任务. 只是还没有完成..
+   > block_group_cache_done(btrfs_block_group_cache)
+   > cache_block_group(btrfs_block_group, btrfs_trans_handle, orig_root, 0)
+   - 如果使用cluster分配. btrfs_free_cluster关联一个btrfs_block_group_cache, 检查这个btrfs_block_group_cache能否用于分配.
+   - 如果btrfs_free_cluster->btrfs_block_group_cache不是当前遍历的,而且是只读或者flags和参数一致,需要重新填充btrfs_free_cluster中的btrfs_free_space.
+   - 如果可以使用,即使不一样也可以使用,直接分配. 找一个足够大的btrfs_free_space
+   > btrfs_alloc_from_cluster(btrfs_block_group_cache, btrfs_free_cluster, num_bytes, btrfs_block_group_cache->btrfs_key.objectid)
+   - 使用当前遍历的btrfs_block_group_cache填充cluster
+   - 首先归还btrfs_free_cluster中的btrfs_free_space
+   > btrfs_return_cluster_to_free_space(NULL, btrfs_free_cluster)
+   - 先btrfs_free_cluster分配空间
+   > btrfs_find_space_cluster(btrfs_trans_handle, btrfs_root, btrfs_block_group, last_ptr, search_start, num_bytes, size)
+   - 再次尝试从btrfs_free_cluster分配
+   > btrfs_alloc_from_cluster(btrfs_block_group_cache, btrfs_free_cluster, num_bytes, search_start)
+   - 如果cluster不支持,或者上面使用cluster分配失败,使用非cluster方式分配.
+   - 检查btrfs_block_group_cache是否有足够的空间
+   - btrfs_block_group_cache->btrfs_free_space_ctl->free_space < num_bytes + empty_size, 不用考虑.
+   - 首先等待btrfs_caching_control已经有了足够的空间
+   > wait_block_group_cache_progress(btrfs_block_group_cache, size)
+   - btrfs_find_space_alloc(btrfs_block_group_cache, search_start, num_bytes, empty_size)
+   - 无论怎么分配成功后,检查分配结果offset/num_bytes
+   - offset对齐stripe后是search_start
+   > stripe_align(btrfs_root, btrfs_block_group_cache, offset, num_bytes)
+   - 检查是否越过btrfs_block_group_cache的边界, search_start + num_bytes > btrfs_block_group_cache->btrfs_key->objectid + offset
+   - 空间(offset, search_start)还给btrfs_free_space_ctl
+   > btrfs_add_free_space(btrfs_block_group_cache, offset, search_start - offset)
+   - 添加reserved空间, 更新btrfs_block_group_cache->reserved, 如果是tree block, 减小btrfs_space_info->bytes_may_use
+   > btrfs_update_reserved_bytes(btrfs_block_group, num_bytes, alloc_type)
+   - 最后搜到的结果就是search_start/num_bytes, 放到参数btrfs_key中.
+   - 实际上这里有3重循环.
+   - 如果找一遍队列,没找到,就换一种raid,也就是index
+   - 然后更换loop,LOOP_CACHING_NOWAIT / LOOP_CACHING_WAIT / LOOP_ALLOC_CHUNK / LOOP_NO_EMPTY_SIZE.. 4种挨个使用, 第一种是最快的,发现caching的btrfs_block_group_cache,不会等待. 第二种会等待caching完成一定的阶段. 第三种会分配新的chunk, 第四种会把empty_size,empty_cluster设为0.
+   - 这个过程和预留空间怎么没有联系,预留空间只会计算统计数,而且会回收空间,为何这里不再回收空间?!
+
+** btrfs_reserve_extent(btrfs_trans_handle, btrfs_root, num_bytes, min_alloc_size, empty_size, hint_byte, btrfs_key, data)
+   - 分配空间extent, num_bytes表示要分配的空间, min_alloc_size表示最小分配空间
+   > btrfs_get_alloc_profile(btrfs_root, data)
+   > find_free_extent(btrfs_trans_handle, btrfs_root, num_bytes, empty_size, hint_byte, btrfs_key, data)
+   - 如果分配失败,把num_bytes降低一半,直到小于min_alloc_size
+
+** __btrfs_free_reserved_extent(btrfs_root, start, len, pin)
+   - 释放reserve的extent data. 前面有释放tree block. 
+   - 找到btrfs_block_group
+   > btrfs_lookup_block_group(btrfs_root->btrfs_fs_info, start)
+   - 如果支持discard, 发送discard请求.
+   > btrfs_discard_extent(btrfs_root, ...)
+   - pin!=0, 先把空间释放给pinned / freed_extents
+   > pin_down_extent(btrfs_root, btrfs_block_group_cache, start, len, 1)
+   - 不是pinned空间,添加到btrfs_free_spae, 释放reserved的空间.
+   > btrfs_add_free_space(btrfs_block_group_cache, start, len)
+   > btrfs_update_reserved_bytes(btrfs_block_group, len, RESERVE_FREE)
+
+** btrfs_free_reserved_extent(btrfs_root, start, len)
+   > __btrfs_free_reserved_extent(btrfs_root, start, len, 0)
+
+** btrfs_free_and_pin_reserved_extent(btrfs_root, start, len)
+   > __btrfs_free_reserved_extent(btrfs_root, start, len, 1)
+
+** alloc_reserved_file_extent(btrfs_trans_handle, btrfs_root, parent, root_objectid, flags, owner, offset, btrfs_key, ref_mod)
+   - 分配extent data空间,先btree添加btrfs_extent_item和backref
+   > btrfs_alloc_path()
+   - 空间是新创建的,使用btrfs_extent_inline_ref保存backref.
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_fs_info->extent_root, btrfs_path, btrfs_key, size)
+   - 根据参数填充btrfs_extent_inline_ref
+   - 然后更新btrfs_block_group_cache, 把空间从bytes_reserved转移到bytes_used
+   > update_block_group(btrfs_root, bytenr, len, 1)
+   - 分配空间是先预留,空间到了bytes_may_use
+   - 然后去btrfs_free_space_ctl分配,空间到reserved
+   - 然后添加btrfs_item, 空间到bytes_used
+
+** alloc_reserved_tree_block(btrfs_trans_handle, btrfs_root, parent, root_objectid, flags, btrfs_disk_key, level, btrfs_key)
+   - 和上面相对,分配tree block使用的extent, 先btree中添加btrfs_extent_item/btrfs_tree_block_info/btrfs_extent_inline_ref.
+   - 插入btree item, 填充数据.
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - 把申请的空间统计到bytes_used
+   > update_block_group(btrfs_root, start, len, 1)
+
+** btrfs_alloc_reserved_file_extent(btrfs_trans_handle, btrfs_root, root_objectid, owner, offset, btrfs_key)
+   - 创建btrfs_file_extent_item, 添加对btrfs_extent_item的索引计数
+   > btrfs_add_delayed_data_ref(btrfs_root->btrfs_fs_info, btrfs_trans_handle, btrfs_key->objectid, btrfs_key->offset, 0, root_objectid, owner, offset, BTRFS_ADD_DELAYED_EXTENT, NULL, 0)
+
+** btrfs_alloc_logged_file_extent(btrfs_trans_handle, btrfs_root, root_ojbectid, owner, offset, btrfs_key)
+   - 这里用于处理log数据,它的参数对应btrfs_file_extent_item.
+   - log tree处理fsync操作?? 先获取btrfs_block_group_cache
+   > btrfs_lookup_block_group(btrfs_root->btrfs_fs_info, btrfs_key->objectid)
+   - 建立btrfs_free_space_ctl
+   > cache_block_group(btrfs_block_group_cache, NULL, 0)
+   > get_caching_control(btrfs_block_group_cache)
+   - 如果free space cache完成, 从free space info中删除对应的btrfs_free_space.这段空间已经使用?!
+   > btrfs_remove_free_space(btrfs_block_group_cache, start, num_bytes)
+   - 没有完成, 检查cache到了什么程度? btrfs_caching_control->progress
+   - 如果start > btrfs_caching_control->progress, 说明没有完成,但去freed_extents设置UPTODATE就可以了.在添加btrfs_free_space时,会跳过这段.
+   > add_excluded_extent(btrfs_root, start, num_bytes)
+   - 如果start+num_bytes<progress, 说明对应这个空间的btrfs_free_space已经有了,直接删除free space
+   > btrfs_remove_free_space(btrfs_block_group_cache, start, num_bytes)
+   - 如果extent跨越progress, 就把progress之前的btrfs_free_space释放掉,之后的设置为UPTODATE.
+   > btrfs_update_reserved_bytes(btrfs_block_group_cache, btrfs_key->offset, RESERVE_ALLOC_NO_ACCOUNT)
+   - 这里的操作锁住btrfs_caching_control->mutex, 所以保持互斥..
+   - 空间已经分配,更新到reserved的状态
+   - 创建btrfs_extent_item/backref,空间到bytes_used状态
+   > alloc_reserved_file_extent(btrfs_trans_handle, btrfs_root, ..)
+
+** btrfs_init_new_buffer(btrfs_trans_handle, btrfs_root, bytenr, blocksize, level)
+   - 应该是创建一个tree block extent..
+   - 先创建一个extent_buffer, 关联btrfs_fs_info->btree_inode->extent_io_tree.
+   > btrfs_find_create_tree_block(btrfs_inode->io_tree, bytenr, blocksize)
+   - 创建的extent_buffer只有page,还没有磁盘extent
+   - 初始化extent_buffer中的btrfs_header, 设置spinning write lock
+   > btrfs_tree_lock(extent_buffer)
+   - 去除EXTENT_BUFFER_DIRTY标志, 怎么之前是dirty的?
+   > clean_tree_block(btrfs_trans_handle, btrfs_root, extent_buffer)
+   - 无论如何都要blocking write lock
+   > btrfs_set_lock_blocking(extent_buffer)
+   > btrfs_set_buffer_uptodate(extent_buffer)
+   - 如果是log extent, 去btrfs_root->dirty_log_pages中设置标志??
+   - 如果是普通的tree block, 放到btrfs_transaction管理的extent_io_tree中.
+   > set_extent_dirty(btrfs_trans_handle->btrfs_transaction->extent_io_tree/dirty_pages, start, ...)
+   - 增加btrfs_trans_handle->blocks_used..
+
+** use_block_rsv(btrfs_trans_handle, btrfs_root, blocksize)
+   - 从预留的空间中使用一些作为tree block.
+   - 首先选择一个btrfs_block_rsv
+   > get_block_rsv(btrfs_trans_handle, btrfs_root)
+   - 如果btrfs_block_rsv->size是0, 预分配一些空间
+   > reserve_metadata_bytes(btrfs_root, btrfs_block_rsv, blocksize, BTRFS_RESERVE_NO_FLUSH)
+   - 如果预留成功,返回这个btrfs_block_rsv
+   - 如果分配失败,而且它不是global_block_rsv, 使用global_block_rsv分配reserved空间
+   > block_rsv_use_bytes(global_block_rsv, blocksize)
+   - 而且返回global_block_rsv. 
+   - 如果btrfs_block_rsv->size不是0, 使用它分配.
+   - 如果分配失败,而且btrfs_block_rsv->failfast != 0, 重新去btrfs_space_info中分配或者global_block_rsv中分配.
+   - 否则返回-ENOSPC
+   - 占用了预留的空间,仅仅减少btrfs_block_rsv->reserved.
+
+** unuse_block_rsv(btrfs_fs_info, btrfs_block_rsv, blocksize)
+   - 把占用的预留空间还给btrfs_block_rsv
+   > block_rsv_add_bytes(btrfs_block_rsv, blocksize, 0)
+   - 然后在把空间给btrfs_space_info, 释放多余的reserved的空间. 防止btrfs_block_rsv->size超过reserved
+   > block_rsv_release_bytes(btrfs_fs_info, btrfs_block_rsv, NULL, 0)
+
+** btrfs_alloc_free_block(btrfs_trans_handle, btrfs_root, blocksize, parent, root_objectid, btrfs_disk_key, level, hint, empty_size)
+   - 分配tree block,并初始化它
+   - 挑选一个btrfs_block_rsv, 占用它的预留空间
+   > use_block_rsv(btrfs_trans_handle, btrfs_root, blocksize)
+   - 去btrfs_free_space_ctl中申请空闲空间
+   > btrfs_reserve_extent(btrfs_trans_handle, btrfs_root, blocksize, blocksize, empty_size, hint, btrfs_key, 0)
+   - 如果失败,归还预留空间
+   > unuse_block_rsv(btrfs_root->btrfs_fs_info, btrfs_block_rsv, blocksize)
+   - 分配对应的extent_buffer, 并初始化.
+   > btrfs_init_new_buffer(btrfs_trans_handle, btrfs_root, btrfs_key.objectid, blocksize, level)
+   - 准备好了extent_buffer, 使用btrfs_delayed_ref_node创建btrfs_extent_item/backref等
+   - 创建btrfs_delayed_extent_op, 要更新update_key / update_flags, is_data=0, 这是tree block
+   > btrfs_add_delayed_tree_ref(btrfs_root->btrfs_fs_info, btrfs_trans_handle, btrfs_key.objectid, offset, parent, root_objectid, level, BTRFS_ADD_DELAYED_EXTENT, btrfs_delayed_extent_io, 0)
+   - 最后返回extent_buffer..
+
+** 总结
+   - 上面结合volumes介绍了分配和释放extent
+
+** walk_control
+   #+begin_src 
+   refs[BTRFS_MAX_LEVEL]
+   flags[BTRFS_MAX_LEVEL]
+   btrfs_key update_progress
+   stage
+   level
+   shared_level
+   update_ref
+   keep_locks
+   reada_slot
+   reada_count
+   for_reloc
+   //应该是遍历工具? 怎么使用呢?
+   #+end_src
+
+** reada_walk_down(btrfs_trans_handle, btrfs_root, walk_control, btrfs_path)
+   - 遍历一个节点, btrfs_path->nodes[walk_control->level], 从btrfs_path->slots[walk_control->level]开始,到最后一个子节点.
+   - 先修改walk_control->reada_count, 它根据btrfs_path->slots[walk_control->level]伸缩, 如果它超过walk_control->reada_slot, 就增大 *3/2, 如果小,就*2/3
+   - 处理btrfs_path->nodes[walk_control->level], 遍历它的btrfs_item / btrfs_key_ptr, 从btrfs_pat->slots指向的开始.
+   - 首先获取当前指针的generation, 它和btrfs_root->btrfs_key->offset比较? 如果generation<=offset, 不再处理?
+   - 找到指针指向的tree block extent的refs/flags信息
+   > btrfs_lookup_extent_info(btrfs_trans_handle, btrfs_root, bytenr, blocksize, refs, flags)
+   - walk_control->state表示遍历的用途?? UPDATE_BACKREF / DROP_REFERENCE
+   - 如果是DROP_REFERENCE, 而且refs=1, 就预读出来? 
+   > readahead_tree_block(btrfs_root, bytenr, blocksize, generation)
+   - 下面还有一些检查,是否要读出来..
+   - walk_control->level=1, flags表示BTRFS_BLOCK_FLAG_FULL_BACKREF?? 不再处理
+   - walk_control->update_ref, 或者generation<= offset, 不再处理
+   - 比较btrfs_key_ptr中的key和walk_control->update_progress, 如果小,就说明已经处理过去? 不再处理.
+   - 如果UPTODATE_BACKREF, 而且level=1, flags包含BTRFS_BLOCK_FLAG_FULL_BACKREF, 不再处理.
+   - 迷糊.. btree中的flags还不清楚
+
+** walk_down_proc(btrfs_trans_handle, btrfs_root, btrfs_path, walk_control, lookup_info)
+   - lookup_info表示要把extent的信息取出来. 参数什么意义?
+   - 当前处理btrfs_path->nodes[walk_control->level]的extent_buffer, 各种检查是否需要extent_buffer的信息, 取出来就放到walk_control->refs/flags数组中
+   - walk_control->state是UPDATE_BACKREF, 而且extent_buffer的owner不是btrfs_root, 直接退出1
+   - 如果lookup_info有效, 而且stage是DROP_REFERENCE, walk_control->refs[level]不是1,或者UPDATE_BACKREF, walk_control->flags[leve]没有BTRFS_BLOCK_FLAG_FULL_BACKREF, 需要重新获取info
+   > btrfs_lookup_extent_info(btrfs_trand_handle, ...)
+   - 如果walk_control->stage是DROP_REFERENCE, 这次遍历是处理refs, 如果refs>1,返回1，否则返回0
+   - 如果是UPDATE_BAKCREF, 要处理flags.
+   > btrfs_inc_ref(btrfs_trans_handle, btrfs_root, extent_buffer, 1, walk_control->for_reloc)
+   > btrfs_dec_ref(..)
+   > btrfs_set_disk_extent_flags(..)
+   - 设置btrfs_extent的BTRFS_BLOCK_FLAG_FULL_BACKREF
+
+** do_walk_down(btrfs_trans_handle, btrfs_root, btrfs_path, walk_control, lookup_info)
+   - 处理btrfs_path上的节点, level是walk_control->level,也就是btrfs_path->nodes[level]这个extent_buffer的第slots[level]个指针.
+   - 先获取generation
+   > btrfs_node_blockptr_generation(btrfs_path->nodes[level], slot)
+   - 如果generation <= btrfs_root->btrfs_key->offset, 而且要UPDATE_BACKREF, 不用继续处理.btrfs_root是snapshot, offset表示它的generation/transid, 只处理新的extent
+   - 根据btrfs_key_ptr, 获取子节点extent
+   - btrfs_node_blockptr(extent_buffer, slot)
+   - 获取extent_buffer, 它在extent_buffer中使用radix tree管理.
+   > btrfs_find_tree_block(btrfs_root, bytenr, blocksize)
+   - 如果找不到,就创建一个
+   > btrfs_find_create_tree_block(btrfs_root, bytenr, blocksize)
+   > btrfs_tree_lock(extent_buffer)
+   - 怎么不直接使用blocking write lock
+   > btrfs_set_lock_blocking(extent_buffer)
+   - 读回extent的refs/flags信息, 但这个是下一层的信息了
+   > btrfs_lookup_extent_info(btrfs_trans_handle, btrfs_root, bytenr, blocksize, walk_control->refs[level-1], walk_control->refs[level-1])
+   - 如果walk_control->stage是DROP_REFERENCE, 而且refs[level-1] > 1, 检查是否需要有所处理? 什么处理
+   - 如果level=1, 现在要处理叶子节点, 它的标志有BTRFS_BLOCK_FLAG_FULL_BACKREF, 不需要处理
+   - walk_control->update_ref无效,而且generation <= root_key.offset, 不再处理
+   - 叶子节点的btrfs_key小于walk_control->update_progress, 不处理
+   - 设置state为UPDATE_BACKREF, shared_level = level-1 ? 这什么意思? 这就是处理
+   > btrfs_buffer_uptodate(extent_buffer, generation, 0)
+   - 如果stage是UPDATE_BACKREF, 不处理叶子节点,而且它的flags包含BTRFS_BLOCK_FLAG_FULL_BACKREF
+   - 开始处理?
+   - 检查extent_buffer时不是uptodate
+   > btrfs_buffer_uptodate(extent_buffer, generation, 0)
+   - 如果不是要去读磁盘
+   - 如果reada有效,而且level=1, 继续往下走? 
+   > reada_walk_block(btrfs_root, blocksize, generation)
+   > read_tree_block(btrfs_root, bytenr, blocksize, generation)
+   - 然后把当前检查的子节点放到walk_control的栈中, 继续遍历, 设置btrfs_path->nodes/slots=1
+
+** walk_up_proc(btrfs_trans_handle, btrfs_root, btrfs_path, walk_control)
+   > find_next_key(btrfs_path, level+1, walk_control->update_progress)
+
+*** 先不看这个遍历,太复杂..
+
+** btrfs_drop_snapshot(btrfs_root, btrfs_block_rsv, update_ref, for_reloc)
+   - 遍历tree, 释放它使用的tree block/节点. 如果有共享的block,它就减小计数. 如果参数update_ref有效, 它还要更新它的底层的节点?什么是更新?减小吗?
+   - 创建btrfs_path / walk_control 
+   > btrfs_alloc_path()
+   - 开始transaction,使用参数tree_root, 设置btrfs_trans_handle->block_rsv为参数的..
+   > btrfs_start_transaction(tree_root, 0)
+   - btrfs_root->drop_progress表示释放的时候中途停止了?? 如果这里是0, 是从头开始的.. 初始化btrfs_path
+   - level是btrfs_root->extent_buffer => btrfs_header->level
+   - 把extent_buffer锁住,给btrfs_path->nodes[level]
+   > btrfs_lock_root_node(btrfs_root)
+   > btrfs_set_lock_blocking(extent_buffer)
+   - btrfs_path->slots[level] = 0
+   - 如果不是从头开始,使用btrfs_root->drop_progress查找
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, ...)
+   - 上面找到的btrfs_path会指向叶子,还需要btrfs_item->drop_level, 确定精确节点.
+   - 从高向低(叶子)遍历btrfs_path,锁住每个extent_buffer, 查询refs/flags
+   > btrfs_lookup_extent_info(btrfs_trans_handle, ...)
+   - 设置walk_control, level是btrfs_root->drop_level.  设置walk_control->state是DROP_REFERENCE, reada_count/for_reloc/update_ref
+   - 开始遍历
+   > walk_down_tree(btrfs_trans_handle, btrfs_root, btrfs_path, walk_control)
+   > walk_up_tree(btrfs_trans_handle, btrfs_root, btrfs_path, walk_control, BTRFS_MAX_LEVEL)
+   - 遍历是注意transaction是否应该结束,影响其他模块? 换一个新的btrfs_trans_handle
+   > btrfs_update_root(btrfs_trans_handle, tree_root, btrfs_key, ...)
+   - 遍历完成,删除root节点
+   > btrfs_del_root(btrfs_trans_handle, tree_root, btrfs_key)
+   > btrfs_find_last_root(tree_root, bytenr, ...)
+   > btrfs_free_fs_root(btrfs_root->btrfs_fs_info, btrfs_root)
+   - 从radix tree中删除.
+
+** btrfs_drop_subtree(btrfs_trans_handle, btrfs_root, extent_buffer node, extent_buffer parent)
+   - 和上面类似..
+   > btrfs_alloc_path()
+   - 但是少了从哪里开始的检查,直接初始化walk_control, 
+   > walk_down_tree(btrfs_trans_handle, ...)
+   > walke_up_tree(...)
+
+*** 上面是处理subvol/snapshot, 如果要了解他们的实质,必须看明白上面...
+
+** update_block_group_flags(btrfs_root, flags)
+   - 检查flags是否有效. 首先检查它是否满足balance操作的需求.   
+   > get_restripe_target(btrfs_root->btrfs_fs_info, flags)
+   - 如果balance和flags一致,返回可用的profile
+   > extented_to_chunk(stripped)
+   - 否则根据文件系统的设备数量,过滤掉不合适的.
+   - 如果只有1个,就把RAID0变为single, 把RAID1/RAID10变为DUP
+   - 如果有多个,可以使用任意RAID, 而且把DUP变为RAID1.
+
+** set_block_group_ro(btrfs_block_group_cache, force)
+   - 把btrfs_block_group_cache设为readonly,这样不能在这个btrfs_block_group_cache中分配空间
+   - 原来btrfs_block_group_cache->ro有效, 直接退出.
+   - 设置btrfs_block_group_cache为只读,btrfs_space_info的可用空间就要减小. 相当于分配一些空间作为readonly
+   - 计算btrfs_block_group_cache的没有使用的空间: offset - reserved - pinned - bytes_super - used
+   - 计算btrfs_space_info的剩余空间, num_bytes + min_allocable_bytes + bytes_used + reserved + pinned + bytes_may_use + readonly 不超过total_bytes, 这样就可以把它改为ro..
+   - 而且btrfs_space_info->bytes_readonly += num_bytes (btrfs_block_group_cache剩余的空间)
+
+** btrfs_set_block_group_ro(btrfs_root, btrfs_block_group_cache) 
+   - 设置btrfs_block_group_cache为只读
+   - 使用transaction支持
+   - 可能会需要分配btrfs_chunk,代替只读btrfs_block_group_cache的可用空间
+   > update_block_group_flags(btrfs_root, btrfs_block_group_cache->flags)
+   - 比较flags和btrfs_block_group_cache->flags, 如果不一样,分配新的chunk. 也就是profile不一样.
+   > do_chunk_alloc(btrfs_trans_handle, btrfs_root, alloc_flags, CHUNK_ALLOC_FORCE)
+   - 修改btrfs_block_group_cache/btrfs_space_info的空间计数
+   > set_block_group_ro(btrfs_block_group_cache, 0)
+   - 如果有问题,继续分配, 再变它为ro. 
+   - 这次分配使用系统的flags
+   > get_alloc_profile(btrfs_root, btrfs_block_group_cache->btrfs_space_info->flags)
+   > do_chunk_alloc(...)
+   > set_block_group_ro(...)
+
+** btrfs_force_chunk_alloc(btrfs_trans_handle, btrfs_rot, type)
+   - 强制分配chunk. 
+   > get_alloc_profile(btrfs_root, type)
+   > do_chunk_alloc(btrfs_trans_handle, btrfs_root, alloc_flags, CHUNK_ALLOC_FORCE)
+
+** __btrfs_get_ro_block_group_free_space(list_head)
+   - 遍历list_head队列里的btrfs_block_group_cache, 统计ro设备的物理空间. 
+   - btrfs_key->offset - btrfs_block_group_item->used * factor
+
+** btrfs_account_ro_block_groups_free_space(btrfs_space_info)
+   - 遍历btrfs_space_info->block_groups[i]的所有队列, 累加ro的btrfs_block_group_cache的空闲空间..
+   > __btrfs_get_ro_block_group_free_space(..)
+   - btrfs_key->offset - btrfs_block_group_item->used
+
+** btrfs_set_block_group_rw(btrfs_root, btrfs_block_grup_cache)
+   - 把btrfs_block_group_cache设为可读写的
+   - 首先计算可用rw空间, btrfs_key->offset - reserved - pinned - bytes_used - used
+   - 从bytes_readonly中减去这些.
+   - 设置btrfs_block_group_cache->ro = 0
+
+** btrfs_can_relocate(btrfs_root, bytenr)
+   - 检查btrfs_block_group_cache是否能重定位. relocate. 参数是bytenr
+   - 根据bytenr查找btrfs_block_group_cache
+   > btrfs_lookup_block_group(btrfs_root->btrfs_fs_info, bytenr)
+   - 要重定位,就需要把已有的数据放到其他地方
+   - 如果没有已经使用的数据,可以移动
+   > btrfs_block_group_used(btrfs_block_group_item)
+   - btrfs_block_group_cache->btrfs_key->offset = total_bytes, 如果btrfs_space_info中没有其他btrfs_block_group_cache, 也不可以使用.
+   - 检查btrfs_space_info有足够的空间,也可以relocate
+   - used + btrfs_space_info->bytes_used + bytes_reserved + bytes_pinned + bytes_readonly  < total_bytes
+   - 如果没有足够空间,尝试分配新的btrfs_chunk,去relocate
+   - 如果这个btrfs_block_group_cache在balance, 使用新的flags
+   > get_restripe_target(btrfs_root->btrfs_fs_info, btrfs_block_group_cache->flags)
+   - __get_raid_index(flags)
+   - 如果没有balance,使用原来的flags
+   - get_block_group_index(btrfs_block_group_cache)
+   - 这里为何不直接分配一个chunk? 下面开始遍历所有的btrfs_device,检查是否有足够的空间.
+   - 对于不同的profile,需要的物理空间不同
+   - RAID10, 需要4个设备, 每个设备上min_free/2的空间
+   - RAID0, 需要btrfs_fs_devices->rw_devices个设备,每个设备空间 min_free / dev_min
+   - RAID1, 需要2个设备, 每个空间 min_free
+   - DUP, 1个设备,空间min_free*2
+   - 遍历btrfs_fs_info->btrfs_devices->alloc_list,所有的btrfs_device, 检查空闲空间
+   > find_free_dev_extent(btrfs_device, min_free, ...)
+   - 最后如果能找到足够的btrfs_device,就可以relocate,但这里没有分配btrfs_chunk
+
+** find_first_block_group(btrfs_root, btrfs_path, btrfs_key)
+   - 去btree中找一个BTRFS_BLOCK_GROUP_ITEM_KEY.. 保证bytenr大于btrfs_key->objectid
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, ...)
+   
+** btrfs_put_block_group_cache(btrfs_fs_info)
+   - 遍历所有的btrfs_block_group_cache, 释放它的free space inode
+   > btrfs_lookup_first_block_group(btrfs_fs_info, last)
+   > next_block_group(btrfs_fs_info->tree_root, btrfs_block_group_cache)
+   - btrfs_block_group_cache->iref != 0, btrfs_block_group_cache->inode才需要释放
+   > iput(inode)
+
+** btrfs_free_block_groups(btrfs_fs_info)
+   - 释放所有的btrfs_block_group_cache
+   - 首先释放在cache free space的btrfs_block_group_cache, 仅仅释放btrfs_caching_control, btrfs_fs_info->caching_block_groups上的btrfs_caching_control.
+   > put_caching_control(btrfs_caching_control)
+   - 遍历btrfs_fs_info->block_group_cache_tree上的btrfs_block_group_cache.
+   - 释放btrfs_fs_info->block_group_cache_tree
+   - 如果在扫面free space过程中,等待完成 btrfs_block_group_cache->cached = BTRFS_CACHE_STARTED
+   > wait_block_group_cache_done(btrfs_block_group_cache)
+   - 如果没有cache free space,BTRFS_CACHE_NO, 释放excluded extent. 这是不能使用的空间
+   > free_excluded_extents(btrfs_fs_info->extent_root, btrfs_block_group_tree)
+   - 删除所有的btrfs_free_cluster, 还有btrfs_free_space
+   > btrfs_remove_free_space_cache(btrfs_block_group_cache)
+   - 然后是btrfs_free_space_ctl和它自己
+   > btrfs_put_block_group(btrfs_block_group_cache)
+   - 释放global_block_rsv的reserve空间.
+   > release_global_block_rsv(btrfs_fs_info)
+   - 然后检查btrfs_fs_info->space_info中的所有btrfs_space_info, 释放前检查他们的各种变量,应该为0
+
+** __link_block_group(btrfs_space_info, btrfs_block_group_cache)
+   - 先计算profile对应的index.
+   > get_block_group_index(btrfs_block_group_cache)
+   - 把btrfs_block_group_cache添加到btrfs_fs_info->block_groups[index]队列中..
+
+** btrfs_read_block_groups(btrfs_root)
+   - 从extent_tree中读取所有的btrfs_block_group_item,创建btrfs_block_group_cache
+   - btrfs_super_block->cache_generation != btrfs_super_block->generation,需要重新扫描free space信息
+   - mount option clear_cache, 表示重新扫描free space信息
+   - 构造btrfs_key(0, BTRFS_BLOCK_GORUP_ITEM_KEY,0),遍历extent_root树的btrfs_block_group_item.
+   > find_first_block_group(btrfs_root, btrfs_path, btrfs_key)
+   - 为每个block group创建一个btrfs_block_group_cache和btrfs_caching_control
+   - 如果需要清楚cache free space, 就设置btrfs_block_group_cache->disk_cache_state为BTRFS_DC_CLEAR, dirty = 1, 它的free space inode的数据就不会使用.
+   - 把btrfs_block_group_item/btrfs_key读到btrfs_block_group_cache中
+   > read_extent_buffer(extent_buffer, btrfs_block_group_cache->btrfs_key, ...)
+   - 获取stripe_len, 对于RAID0/10等都是固定的. 下面找extent_map,在处理btrfs_chunk时,建立extent_map信息.
+   > btrfs_full_stripe_len(btrfs_root, btrfs_map_tree, logical)
+   - 初始化btrfs_free_space_ctl
+   > btrfs_init_free_space_control(btrfs_block_group_cache)
+   - 把它范围内的super_block的extent标志出来,如果有的话. 这里会计算btrfs_block_group_cache->bytes_super
+   > exclude_super_stripes(btrfs_root, btrfs_block_group_cache)
+   - btrfs_block_group_item->used为已经使用的空间,如果和btrfs_key->offset一样,没有空闲空间, 设置btrfs_block_group_cache->cache = BTRFS_CACHE_FINISHED
+   - 可以释放掉它的excluded空间,反正不会创建btrfs_free_space_ctl
+   > free_excluded_extents(btrfs_root, btrfs_block_group_cache)
+   - 如果还没有使用的空间, btrfs_block_group_item->used=0, 设置last_byte_to_unpin=-1, cached是BTRFS_CACHE_FINISHED, 把整个空间作为btrfs_free_space添加进去
+   > add_new_free_space(btrfs_block_group_cache, btrfs_root->btrfs_fs_info, start, end)
+   - btrfs_caching_control的过程处理完后,都会释放这个exclude空间
+   > free_exclude_extents(btrfs_root, btrfs_block_group_cache)
+   - 根据flags找一个btrfs_space_info, 相当于新创建的btrfs_block_group_cache,增加btrfs_space_info的空间
+   - 如果没有就创建一个新的, 只增加bytes_total, bytes_used.
+   > update_space_info(btrfs_fs_info, btrfs_block_group_cache->flags, offset, used, btrfs_space_info)
+   - btrfs_block_group_cache->bytes_readonly += btrfs_block_group_cache->bytes_super
+   - 把btrfs_block_group_cache放到对应的raid类型中, 
+   > __link_block_group(btrfs_space_info, btrfs_block_group_cache)
+   - 然后是rbtree
+   > btrfs_add_block_group_cache(btrfs_root->btrfs_fs_info, btrfs_block_group_cache)
+   - 设置btrfs_fs_info->avali_data/metadata_alloc_bits的标志
+   > set_avail_alloc_bits(btrfs_fs_info, flags)
+   - 上面的过程会一直循环,处理所有的btrfs_block_group_item
+   - 下面很奇怪,设置raid0/single的btrfs_block_group_cache为只读..开始先不在这里面分配空间?
+   - 为global_block_rsv填充空间
+   > init_global_block_rsv(btrfs_f_info)
+   
+** btrfs_create_pending_block_groups(btrfs_trans_handle, btrfs_root)
+   - 遍历btrfs_trans_handle->new_bgs，队列是btrfs_block_group_cache, 获取每个的btrfs_block_group_item/btrfs_key, 插入extent_root..
+   > btrfs_insert_item(btrfs_trans_handle, extent_root, ...)
+   - 在新创建了btrfs_block_group_cache后,加到这个队列中
+
+** btrfs_make_block_group(btrfs_trans_handle, btrfs_root, bytes_used, type, chunk_objectid, chunk_offset, size)
+   - 通过参数,应该是分配一个chunk,创建对应的btrfs_block_group_cache.. 
+   - 先创建btrfs_block_group_cache/btrfs_caching_control
+   > btrfs_full_stripe_len(btrfs_root, extent_map_tree, chunk_offset)
+   > btrfs_init_free_space_control(btrfs_block_group_cache)
+   - 使用参数填充它的btrfs_block_group_item/btrfs_key
+   > btrfs_set_block_group_used(..)
+   > exclude_super_stripes(btrfs_root, btrfs_block_group_cache)
+   - 开始整个空间都是btrfs_free_space
+   > add_new_free_space(btrfs_block_group_cache, ...)
+   > free_excluded_extents(btrfs_root, btrfs_block_group_cache)
+   - 更新btrfs_space_info
+   > update_space_info(btrfs_fs_info, flags, ...)
+   - 更新global_block_rsv
+   > update_global_block_rsv(btrfs_fs_info)
+   - 建立raid/rb tree关系
+   - 把btrfs_block_group_cache->new_bg_list 放到btrfs_trans_handle->new_bgs
+   > set_avail_alloc_bits(...)
+
+** clear_avail_alloc_bits(btrfs_fs_info, flags)
+   - 更新btrfs_fs_info->avali_data/metadata.._alloc_bits的标志,去掉对应的profile
+   > chunk_to_extented(flags)
+
+** btrfs_remove_block_group(btrfs_trans_handle, btrfs_root, group_start)
+   - 删除一个btrfs_block_group_cache, 但参数仅提供一个位置.
+   - 找到btrfs_block_group_cache
+   > btrfs_lookup_block_group(btrfs_root->btrfs_fs_info, grou_start)
+   - 删除excluded的地址, 为何又释放?! 不写到btrfs_free_space_ctl中?!
+   > free_excluded_extents(btrfs_root, btrfs_block_group_cache)
+   - 把btrfs_free_cluster的空间归还 meta_alloc_cluster/data_alloc_cluster
+   > btrfs_return_cluster_to_free_space(btrfs_block_group_cache, btrfs_free_cluster)
+   - 查找对应的free space inode
+   > lookup_free_space_inode(tree_node, btrfs_block_group, path)
+   - 需要删除inode,先创建orphan inode
+   > btrfs_orphan_add(btrfs_trans_handle, inode)
+   - clear_nlink(inode)
+   - 需要释放释放这个btrfs_inode
+   > btrfs_add_delayed_iput(inode)
+   - 对这个inode, btrfs_block_group_cache->iref表示是否有free space cache, 删除这个inode.
+   > iput(inode)
+   - 创建btrfs_key(start, BTRFS_FREE_SPACE_OBJECTID, 0), 这是指向free space inode的btrfs_key
+   > btrfs_del_item(btrfs_trans_handle, tree_root, btrfs_path)
+   - 释放btrfs_block_group_cache的关系. rb tree, btrfs_space_info中的链表关系.
+   - 如果btrfs_caching_control在运行等待结束.
+   > wait_block_group_cache_done(btrfs_block_group_cache)
+   - 释放btrfs_free_space_ctl
+   > btrfs_remove_free_space_cache(btrfs_block_group_cache)
+   - 在释放btrfs_block_group_cache之前,应该把它设为ro, 所以它的总空间在readonly中.
+   - 从btrfs_space_info中释放空间统计, total_bytes, bytes_readonly.
+   - 清除btrfs_space_info->full标志?
+   > btrfs_clear_space_info_full(btrfs_fs_info)
+   - 最后从extent_root中删除btrfs_block_group_item
+
+** btrfs_init_space_info(btrfs_fs_info)
+   - 为btrfs_fs_info初始化btrfs_space_info
+   - 获取btrfs_fs_info->btrfs_super_block, btrfs_super_block->root != 0
+   - 从btrfs_super_block->incompat_flags表示是否混用, data/metadata混用.
+   - 创建BTRFS_BLOCK_GROUP_SYSTEM对应的btrfs_space_info
+   > update_space_info(btrfs_fs_info, flags, 0, 0, btrfs_space_info)
+   - 然后是BTRFS_BLOCK_GROUP_DATA/METADATA对应的
+
+** btrfs_trim_fs(btrfs_root, fstrim_range)
+   - 对文件系统使用的磁盘空间,发送trim命令. discard命令. 以btrfs_block_group_cache为单位. 遍历btrfs_block_group_ctl中的btrfs_free_space, 发送discard BIO.
+   - 检查fstrim_range->len是否是整个文件系统的大小. btrfs_super_block->total_bytes, 如果是就释放所有的btrfs_block_group_cache, 否则就根据fstrime_range->start找一个
+   > btrfs_lookup_first_block_group(btrfs_fs_info, start)
+   > btrfs_lookup_block_group(btrfs_fs_info, start)
+   - 遍历fstrim_range范围内的btrfs_block_group_cache
+   > cache_block_group(btrfs_block_group_cache, NULL, ..)
+   - trim它的free space info ?
+   > btrfs_trim_block_group(btrfs_block_group_cache, ...)
+   > next_block_group(btrfs_fs_info->tree_root, btrfs_block_group_cache)
+
+** 总结
+   - btrfs_block_group_cache的管理使用rb tree, 使用逻辑地址索引. 还是用链表,和btrfs_space_info关联起来, 还通过链表,让btrfs_trans_handle管理新创建的btrfs_block_group_cache
+   - btrfs_block_group_cache的free space管理. fast的方法是操作free space inode, 慢的方法是扫描extent_tree
+   - 管理extent的backref, 管理btrfs_delayed_ref_node,还有btree中的索引计数
+   - 在写回btrfs_block_group_cache信息或提交transaction时,批量提交btrfs_delayed_ref_node信息
+   - 给transaction提供接口,提交btrfs_delayed_ref_node/btrfs_block_group_cache信息.
+   - 通过btrfs_block_rsv/btrfs_space_info管理空间.提供接口预留data/metadata空间.
+   - 预留空间时,如果空间不够用去flush,回收多预留的空间.
+   - 提供delalloc接口,预留data/metadata的空间
+   - 提供分配空间的接口,把预留空间转化为占用的空间
+   - 管理pinned空间,这是一种分配后有释放的空间.这里看来唯一的用途是发送discard操作. 在transaction提交时处理
+   - 最后提供了relocate和snapshot的一些操作????
+  

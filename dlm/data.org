@@ -1,0 +1,75 @@
+* dir.c
+  - 这个文件介绍lock resource block的管理. 
+  - lsb也就是lock的master,请求锁时,先找到锁是否已经存在,它已经有master,然后向master请求.
+  - master是那个节点，需要先去dir中查找. 
+  - dir根据dlm_ls->name计算hash, 找到它对应的dir在那个节点, 然后去这个节点查找它的master
+  - 如果找到, 向它发送请求. 否则它创建一个,而且它是master, 然后告诉dir节点
+
+** dlm_hash2nodeid(dlm_ls, hash)
+   - hash是怎么计算的??
+   - 如果dlm_ls->ls_num_nodes == 1, 只有一个node?
+   > dlm_our_nodeid()
+   - 使用hash高16位,计算node  (hash>>16) % dlm_ls->ls_total_weight
+   - 使用上面值索引dlm_ls->ls_node_array[node]
+
+** dlm_dir_nodeid(dlm_rsb) 
+   - 返回dlm_rsb对应的nodeid?   dlm_rsb->res_dir_nodeid
+
+** dir_recover_dir_nodeid(dlm_ls)
+   - 遍历dlm_ls->ls_root_list,里面是dlm_rsb, 计算dlm_rsb->res_dir_nodeid
+   > dlm_hash2nodeid(dlm_ls, dlm_rsb->res_hash)
+
+** dlm_member
+   #+begin_src 
+	struct list_head	list;
+	int			nodeid;
+	int			weight;
+	int			slot;
+	int			slot_prev;
+	int			comm_seq;
+	uint32_t		generation;   
+   #+end_src
+
+** dlm_recover_directory(dlm_ls)
+   - dlm_ls->ls_flags & LSFL_NODIR 表示什么??
+   - 遍历dlm_ls->ls_nodes, 里面是dlm_member, 它表示node?
+   - 跳过本地nodeid,  dlm_member->nodeid
+   - 设置dlm_ls->ls_flags的LSFL_RECOVERY_STOP, 表示covery动作停止??
+   - rcom是什么操作??
+   > dlm_rcom_names(dlm_ls, dlm_member->nodeid, last_name, last_len)
+   - 查找什么东西??
+   > dlm_master_lookup(dlm_ls, dlm_member->nodeid, name, namelen, DLM_LU_RECOVER_DIR, nodeid, result)
+   
+
+** dlm_rsbtable
+   #+begin_src 
+	struct rb_root		keep;
+	struct rb_root		toss;
+	spinlock_t		lock;
+	uint32_t		flags;
+   #+end_src
+
+** find_rsb_root(dlm_ls, name, len)
+   - 根据name计算hash
+   > jhash(name, len, 0)
+   - 根据hash计算bucket = hash & (dlm_ls->ls_rsbtbl_size - 1)
+   - 去dlm_rsbtable中查找dlm_rsb
+   > dlm_search_rsb_tree(dlm_ls->dlm_rsbtable[bucket].keep, name, len, dlm_rsb)
+   - 如果没找到，去dlm_ls->dlm_rsbtable[bucket].toss中查找
+   - 如果也没有找到, 查找dlm_ls->ls_root_list, 里面是dlm_rsb
+   - 如果和参数有一样的dlm_rsb->res_name == name, 返回这个dlm_rsb
+
+** dlm_copy_master_names(dlm_ls, char *inbuf, inlen, outbuf, outlen, nodeid)
+   - 找什么??
+   - 这里要遍历所有的dlm_rsb, 首先找一个起始点
+   - 如果inlen > 1, 查找dlm_rsb 
+   > find_rsb_root(dlm_ls, inbuf, inlen)
+   - 否则使用dlm_ls->ls_root_list的第一个
+   - 开始遍历
+   - 找到对应的nodeid
+   > dlm_dir_nodeid(dlm_rsb)
+   - 如果找到的nodeid和参数nodeid相同,把它的信息使用outbuf返回
+   
+** 总结
+   - 完全没看懂!!
+

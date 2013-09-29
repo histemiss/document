@@ -1,0 +1,2340 @@
+* file.c
+
+** inode_defrag
+   #+begin_src 
+        //碎片整理是针对inode进行的..
+	struct rb_node rb_node;
+	/* objectid */
+	u64 ino;   // inode btrfs_key->objectid
+	/*
+	 * transid where the defrag was added, we search for
+	 * extents newer than this
+	 */
+	u64 transid;
+
+	/* root objectid */
+	u64 root; //btrfs_root->btrfs_key->objectid
+
+	/* last offset we were able to defrag */
+	u64 last_offset;
+
+	/* if we've wrapped around back to zero once already */
+	int cycled;
+   
+   #+end_src
+
+** __btrfs_add_inode_defrag(inode, inode_defrag)
+   - btrfs_root->btrfs_fs_info->defrag_inodes管理所有的inode_defrag.. 把参数inode_defrag插入到rb tree中. rb tree中的顺序根据root objectid和inode objectid排序.
+   - 设置btrfs_inode->runtime_flags的BTRFS_INODE_IN_DEFRAG
+   - 如果rb tree已经存在一个,更新transid和last_offset
+
+** __need_auto_defrag(btrfs_root)
+   - mount option  AUTO_DEFRAG 表示是否自动整理碎片. autodefrag
+   > btrfs_fs_closing(btrfs_root->btrfs_fs_info)
+   - btrfs_fs_info->closing表示文件系统正在卸载,不需要整理碎片..
+
+** btrfs_add_inode_defrag(btrfs_trans_handle, inode)
+   - 为inode创建一个inode_defrag, 放到btrfs_fs_info->defrag_inodes中,btrfs_inode->runtime_flags的BTRFS_INODE_IN_DEFRAG表示btrfs_inode已经有对应的inode_defrag
+   - 创建inode_defrag, 使用参数填充..
+   > __btrfs_add_inode_defrag(inode, inode_defrag)
+   - inode_defrag->transid是btrfs_trans_handle->transid, 如果btrfs_trans_handle没有意义,使用btrfs_root->last_trans
+
+** btrfs_requeue_inode_defrag(inode, inode_defrag)
+   - inode_defrag放到rb tree中.
+   > __btrfs_add_inode_defrag(inode, inode_defrag)
+
+** btrfs_pick_defrag_inode(btrfs_fs_info, root, ino)
+   - 在btrfs_fs_info->defrag_inodes中找一个inode_defrag, 和参数一致, (root, ino)..
+   > __compare_inode_defrag(inode_defrag, inode_defrag)
+   - 如果没找到,就找一个临近的,同时把找到的inode_defrag删除.
+
+** btrfs_cleanup_defrag_inodes(btrfs_fs_info)
+   - 删除btrfs_fs_info->defrag_inodes中所有的inode_defrag节点.
+   - inode_defrag没有带外索引信息,它不需要释放什么
+
+** btrfs_ioctl_defrag_range_args
+   #+begin_src 
+	/* start of the defrag operation */
+	__u64 start;  //开始的文件偏移?
+
+	/* number of bytes to defrag, use (u64)-1 to say all */
+	__u64 len;    //数据长度
+
+	/*
+	 * flags for the operation, which can include turning
+	 * on compression for this one defrag
+	 */
+	__u64 flags;
+
+	/*
+	 * any extent bigger than this will be considered
+	 * already defragged.  Use 0 to take the kernel default
+	 * Use 1 to say every single extent must be rewritten
+	 */
+	__u32 extent_thresh;
+
+	/*
+	 * which compression method to use if turning on compression
+	 * for this defrag operation.  If unspecified, zlib will
+	 * be used
+	 */
+	__u32 compress_type;
+
+	/* spare for later */
+	__u32 unused[4];
+   #+end_src
+
+** __btrfs_run_defrag_inode(btrfs_fs_info, inode_defrag)
+   - 根据inode_defrag的启动defrag操作. 
+   - 先找到btrfs_root, 构造btrfs_key(root_objectid, BTRFS_ROOT_ITEM_KEY, -1)
+   > btrfs_read_fs_root_no_name(btrfs_fs_info, btrfs_key)
+   - 检查btrfs_root_item->refs, 如果为0, 不再处理.
+   - 然后获取对应的inode, 使用btrfs_key(inode_defrag->ino, BTRFS_INODE_ITEM_KEY, 0)
+   > btrfs_iget(btrfs_fs_info->btrfs_super_block, btrfs_key, btrfs_root, NULL)
+   - 去掉btrfs_inode->runtime_flags的BTRFS_INODE_IN_DEFRAG标志.
+   - 准备btrfs_ioctl_defrag_range_args, start=inode_defrag->last_offset, len=-1..
+   > sb_start_write(btrfs_fs_info->btrfs_super_block)
+   > btrfs_defrag_file(inode, NULL, btrfs_ioctl_defrag_range_args, transid, BTRFS_DEFRAG_BATCH)
+   > sb_end_write(btrfs_fs_info->btrfs_super_block)
+   - 一些写磁盘操作都要嵌入在这两个函数中,防止freeze..
+   - 根据上面defrag操作的返回,决定是否需要继续. 
+   - 如果返回的是BTRFS_DEFRAG_BATCH,defrag没有完成,更新inode_defrag->last_offset = range.start, 重新放到btrfs_fs_info->defrag_inodes中.
+   > btrfs_requeue_inode_defrag(inode, inode_defrag)
+   - 如果inode_defrag->last_offset不是0，不是从0开始的,而且range->cycled无效,需要重新从0开始.而且把last_offset改为0.
+   > btrfs_requeue_inode_defrag(inode, inode_defrag)
+   - 否则删除这个inode_defrag..
+
+** btrfs_run_defrag_inodes(btrfs_fs_info)
+   - 处理btrfs_fs_info上面的所有inode_defrag. 遍历没有使用rb tree的方法,每次都去搜索一个.
+   > btrfs_pick_defrag_inode(btrfs_fs_info, root_objectid, first_ino)
+   - 记录inode_defrag->ino, 下次查找它的下一个inode_defrag.
+   > __btrfs_run_defrag_inode(btrfs_fs_info, inode_defrag)
+   - 开始时, root_objectid, first_ino是最小的, 然后增加first_ino..
+   - umount/remount时会等待defrag过程,最后唤醒等待的任务
+   > wake_up(btrfs_fs_info->transaction_wait)
+
+*** defrag的东西
+
+** btrfs_copy_from_user(loff_t pos, int num_pages, size_t write_bytes, page, iov_iter)
+   - 把iov_iter的数据复制到page数组中, 复制的数据是write_bytes..
+   > pagefault_disable()
+   > iov_iter_copy_from_user_atomic(page, iov_iter, offset, count)
+   > pagefault_enable()
+   > iov_iter_advance(iov_iter, copied)
+   - buffered write???
+
+** btrfs_drop_pages(pages, num_pages)
+   - 在btrfs_file_write中使用.. 释放page cache..
+   > ClearPageChecked(page)
+   > unlock_page(page)
+   > mark_page_accessed(page)
+   > page_cache_release(page)
+
+** btrfs_dirty_pages(btrfs_root, inode, page, num_pages, pos, write_bytes, extent_state)
+   - 操作的范围是(pos, write_bytes), 但地址边界要对btrfs_root->sectorsize对齐.
+   - 设置extent_state的EXTENT_DELALLOC|EXTENT_UPTODATE标志
+   > btrfs_set_extent_delalloc(inode, start_pos, end_of_last_block, extent_state)
+   - 设置PG_DIRTY标志, 设置extent_state的EXTENT_DIRTY?
+   > SetPageUptodate(page)
+   > ClearPageChecked(page)
+   > set_page_dirty(page)
+   - 更新文件大小???
+   > i_size_write(inode, end_pos)
+
+** btrfs_drop_extent_cache(inode, start, end, skip_pinned)
+   - (start,end)应该是文件偏移, 
+   - 操作的是btrfs_inode->extent_tree, extent_map_tree . 
+   - 遍历extent_map_tree中在这个范围内的所有extent_map, 先根据start找到extent_map
+   > lookup_extent_mapping(extent_map_tree, start, len)
+   - 检查skip_pinned, 如果有效, 而且extent_map->flags有EXTENT_FLAG_PINNED, 不再处理它
+   - 出去extent_map->flags的EXTENT_FLAG_PINNED/EXTENT_FLAG_LOGGING标志.
+   - 从extent_map_tree的rb tree中释放
+   > remove_extent_mapping(extent_map_tree, extent_map)
+   - 如果extent_map有覆盖的,就把原来的分裂开. 涉及到extent_map->orig_block_len, 就是继承被分裂的extent_map的,还有orig_start..  如果compressed, block_len/block_start和原来的一样,如果不是就是计算一下,估计和start/len一样..
+   - 可能会产生2个新的extent_map. 构造新的extent_map, 对于前端的, 
+   - start = extent_map->start, len = start - extent_map->start, orig_start = extent_map->orig_start, block_start = extent_map->block_start. generation/block_device还是原来的. 
+   - 对于compress的extent, 它的block_len不变,对于非compress, block_len和len一样变化.
+   - 对于某端的, 和前面类似.  添加到extent_map_tree中. 同时把extent_map添加到extent_map_tree->modified_extents队列中.
+   > add_extent_mapping(extent_map_tree, extent_map)
+
+** btrfs_file_extent_item
+   #+begin_src 
+	/*
+	 * transaction id that created this extent
+	 */
+	__le64 generation;
+	/*
+	 * max number of bytes to hold this extent in ram
+	 * when we split a compressed extent we can't know how big
+	 * each of the resulting pieces will be.  So, this is
+	 * an upper limit on the size of the extent in ram instead of
+	 * an exact limit.
+	 */
+	__le64 ram_bytes;
+
+	/*
+	 * 32 bits for the various ways we might encode the data,
+	 * including compression and encryption.  If any of these
+	 * are set to something a given disk format doesn't understand
+	 * it is treated like an incompat flag for reading and writing,
+	 * but not for stat.
+	 */
+	u8 compression;
+	u8 encryption;
+	__le16 other_encoding; /* spare for later use */
+
+	/* are we inline data or a real extent? */
+	u8 type;
+
+	/*
+	 * disk space consumed by the extent, checksum blocks are included
+	 * in these numbers
+	 */
+	__le64 disk_bytenr;   //extent的磁盘位置?
+	__le64 disk_num_bytes;
+	/*
+	 * the logical offset in file blocks (no csums)
+	 * this extent record is for.  This allows a file extent to point
+	 * into the middle of an existing extent on disk, sharing it
+	 * between two snapshots (useful if some bytes in the middle of the
+	 * extent have changed
+	 */
+	__le64 offset;
+	//这个offset不是文件偏移,文件偏移在btrfs_key中,这里是extent内部偏移,共享extent使用..
+	/*
+	 * the logical number of file blocks (no csums included).  This
+	 * always reflects the size uncompressed and without encoding.
+	 */
+	__le64 num_bytes;
+	//应该是这个file extent的长度,而不是实际extent block的长度. 
+
+   #+end_src
+
+** __btrfs_drop_extents(btrfs_trans_handle, btrfs_root, inode, btrfs_path, start, end, drop_end, drop_cache)
+   - 释放btrfs_file_extent_item, 应该有对应的btrfs_extent_item的索引的变化
+   - 如果drop_cache有效,就释放extent_map.
+   > btrfs_drop_extent_cache(inode, start, end-1, 0)
+   - 然后处理(start, end)之间的btrfs_file_extent_item, 先找到开始的一个
+   > btrfs_lookup_file_extent(btrfs_trans_handle, btrfs_root, btrfs_path, inode, search_start, modify_tree)
+   - 遍历后续的slot/leaf.
+   > btrfs_item_ptr(extent_buffer, slot, btrfs_file_extent_item)
+   - btrfs_file_extent_item->type包括BTRFS_FILE_EXTENT_REG/PREALLOC/INLINE..
+   - 如果是PRE/PREALLOC, 读取上面的disk_bytenr/disk_num_bytes/offset/num_bytes, 这些是extent的空间信息
+   - 如果是INLINE,就是用ram_bytes表示extent长度, 它的磁盘空间在btrfs_item中.
+   - 当前处理的file extent范围是 (btrfs_key.offset, btrfs_file_extent_item->num_bytes)
+   - 如果extent的范围在(start, end)前面,检查下一个,如果在后面,遍历完成.
+   - 这里遍历时,如果换了btrfs_leaf, 会重新查找. 看来换btrfs_leaf只是为了预检查,不用浪费查找.
+   > btrfs_next_leaf(btrfs_root, btrfs_path)
+   - 比较2个范围(start, end) 和 (extent_start, extent_end)
+   - 如果extent包含(start,end), 需要分裂btrfs_file_extent_item. 先把它分裂成2个,在start地方.后半端可以随后处理.
+   - 先复制一个btrfs_file_extent_item, btrfs_key(ino, BTRFS_FILE_EXTENT_ITEM, start)
+   > btrfs_duplicate_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key)
+   - 修改2个新的btrfs_file_extent_item, btrfs_key不用改动. 第一个就修改file extent的长度extent_num_bytes = start - extent_start.
+   > btrfs_set_file_extent_num_bytes(extent_buffer, btrfs_file_extent_item, start - btrfs_key.offset)
+   - 第二个修改extent内部偏移和长度, extent_num_bytes = extent_end - start, offset = offset + start - extent_start. extent_start是原来的btrfs_key->offset.
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - 还要增加对btrfs_extent_item的索引,  disk_bytenr是磁盘位置,num_bytes是extent的磁盘长度. 下面会创建一个btrfs_extent_data_ref. btrfs_extent_item在btree中会覆盖吗?
+   > btrfs_inc_extent_ref(btrfs_trans_handle, btrfs_root, disk_bytenr, num_bytes, 0, btrfs_root->root_key.objectid, btrfs_key.objectid, start - offset, 0)
+   - disk_bytenr应该是extent的磁盘地址(logical), num_bytes是磁盘长度, parent是0,表示没有共享??还是表示同一个文件的共享? root_key.objectid表示btree的树, btrfs_key.objectid表示inode, offset是原始的extent在表示文件偏移.. 这个操作只有在root tree或ref_cows有效时才用..
+   - 如果start < extent_start && end<extent_end,表示extent的前半段需要删除, 只需要缩短原来的btrfs_file_extent_item, 修改btrfs_key, extent_offset, extent_num_bytes, btrfs_key->offset=end,extent_offset += end - extent_start, extent_num_bytes -= end - extent_start.不用更改对extent的计数.
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - 改变文件大小.  
+   > inode_sub_bytes(inode, end-extent_start)
+   - 然后停止搜索.
+   - 如果start > extent_start && end >= extent_end, extent的后半端需要删除,同样缩短btrfs_file_extent_item, 只需要修改extent_num_bytes = start - extent_start. 继续搜索下一个slot/leaf
+   - 如果start < extent_start && end > extent_end, 整个extent应该被删除
+   > btrfs_free_extent(btrfs_trans_handle, btrfs_root, disk_bytenr, num_bytes, 0, root_objectid, inode_objectid, extent_start - extent_offset, 0)
+   - 还要删除btrfs_file_extent_item, 如果删除多个,同属于一个leaf的应该相邻,同时删掉!
+   > btrfs_del_items(btrfs_trans_handle, btrfs_root, btrfs_path, del_slot, del_nr)
+     
+** btrfs_drop_extents(btrfs_trans_handle, btrfs_root, inode, start, end, drop_cache)
+   - 删除文件使用的btrfs_file_extent_item
+   > btrfs_alloc_path()
+   > __btrfs_drop_extents(btrfs_trans_handle, btrfs_root, inode, btrfs_path, start, end, NULL, drop_cache)
+
+** extent_mergeable(extent_buffer, slot, objectid, bytenr, orig_offset, start, end)
+   - btrfs_path和slot指向一个btrfs_file_extent_item, 整个参数也是一个btrfs_file_extent_item, 检查2个extent是否能合并,合并表示使用同一个extent block. 
+   - item必须是btrfs_file_extent_item, objectid和参数一样
+   - type是BTRFS_FILE_EXTENT_REG
+   - disk_bytenr是bytenr
+   - 没有压缩加密
+   - extent_offset 是 btrfs_key->offset - orig_offset. orig_offset是extent在文件中的原始offset
+   - (extent_start, extent_end)和参数(start, end)一样.
+     
+** btrfs_mark_extent_written(btrfs_trans_handle, inode, start, end)
+   - 标志inode的(start, end)范围被写过. 把btree中的extent type从pre-allocate,改为regular
+   - 构造btrfs_key(inode_objectid, BTRFS_EXTENT_DATA_KEY, offset), 开始offset是start, 估计遍历所有的btrfs_file_extent_item.
+   - 根据start查找btrfs_file_extent_item
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, -1, 1)
+   - type必须是BTRFS_FILE_EXTENT_PREALLOC?? 取出btrfs_file_extent_item的信息, disk_bytenr, disk_num_bytes, orig_offset.
+   - 如果start = btrfs_key.offset && end<extent_end, 范围不超过1个extent, 考虑和前一个合并, 2个extent使用同一个extent block, 而且前一个是BTRFS_EXTENT_DATA_REG, 而且它的extent_end必须是start
+   > extent_mergeable(extent_buffer, slot-1, ino, bytenr, orig_offset, 0, start)
+   - 检查前一个extent_buffer是连续的，就把前一个扩大,因为它是BTRFS_FILE_EXTENT_REG, 而且把当前的范围改小..
+   - 先该当前的btrfs_file_extent_item, btrfs_key->offset = end, extent_num_bytes = extent_end - end, extent_offset = end - orig_offset, 更新generation  = btrfs_trans_handle->transid.
+   - 该前一个,增加它的extent_num_bytes = end - other_start), other_start是上面返回的, generation
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   > btrfs_set_file_extent_generation(extent_buffer, btrfs_file_extent_item, btrfs_trans_handle->transid)
+   > btrfs_set_file_extent_num_bytes(extent_buffer, btrfs_file_extent_item,...)
+   > btrfs_set_file_extent_offset(extent_buffer, btrfs_file_extent_item, ...)
+   > btrfs_set_file_extent_generation(extent_buffer, btrfs_file_extent_item, ...)
+   - 停止搜索
+   - 如果start>btrfs_key.offset && end = extent_end, 和后面一个合并,后一个extent_start必须是end
+   > extent_mergeable(extent_buffer, slot+1, ino, bytenr, orig_offset, other_start, other_end)
+   - 修改和上面类似, 不过把前一个extent改小,把后面的该大. 这上面两种修改都没有改变file extent对extent block的使用计算,也就是extent backref不用修改.
+   - 前面这2种情况只是最优情况,能够合并使用btrfs_extent_item, 一般情况下不是这样的.
+   - 需要分裂btrfs_file_extent_item,而且增加对btrfs_extent_item的使用计数. 查找是extent范围包含(start, end)??
+   - 分裂的点是start, 如果extent_start == start, 就是end. 这里使用循环处理.
+   > btrfs_duplicate_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key)
+   - 对于前面的减小extent_num_bytes, 对于后面的修改extent_start, extent_offset, extent_num_bytes. 
+   > btrfs_inc_extent_ref(btrfs_trans_handle, btrfs_root, bytenr, num_bytes, 0, btrfs_root->btrfs_key->objectid, ino, orig_offset, 0)
+   - 这里的参数全部是针对extent block的, orig_offset也是相同的.. 不过这里是增加计数..
+   - 最后分裂完毕后,还得考虑新分裂处理的能否和两边合并, 有必要吗? 难道别人修改他们了?
+
+** prepare_uptodate_page(page, pos, force_uptodate)
+   - 准备一个uptodate的page.
+   > PageUptodate(page)
+   - 如果page不是uptodate的,就读回page
+   > btrfs_readpage(NULL, page)
+   - 这是普通的inode读,不是btree读.
+
+** prepare_pages(btrfs_root, file, pages, num_pages, pos, first_index, write_bytes, force_uptodate)
+   - 这个文件正在实现普通文件的IO操作.  应该是为写准备的, 写的范围是(pos, write_bytes)
+   - pos应该是文件偏移.pages数组是空的,去address_space中查找page
+   > find_or_create_page(inode->address_space, index+i, mask)
+   - 对于第1页,根据参数force_uptodate决定师傅读回数据, 对于最后1页,如果地址不是地址对其,读回数据. (pos + write_bytes)
+   > prepare_uptodate_page(page[0], pos, force_uptodate)
+   - 等待page的写回
+   > wait_on_page_writeback(page)
+   - 如果操作位置pos < inode->i_size, 检查是否有冲突的btrfs_ordered_extent, 先锁住extent
+   > lock_extent_bits(btrfs_inode->extent_io_tree, start_pos, last_pos-1, 0, extent_state)
+   - 根据结束位置查找btrfs_ordered_extent?
+   > btrfs_lookup_first_ordered_extent_inode, last_pos-1)
+   - 如果有, 而且范围和这里的写范围交叉,先等待ordered extent操作
+   > unlock_extent_cached(...)
+   - 上面去address_space查找page时上了锁
+   > unlock_page(page)
+   > page_cache_release(page)
+   - 等待ordered extent??
+   > btrfs_wait_ordered_range(inode, start_pos, ..)
+   - 如果不受btrfs_ordered_extent的影响,清除extent的标志.
+   > clear_extent_bit(btrfs_inode->extent_io_tree, start_pos, last_pos-1, EXTENT_DIRTY | EXTENT_DELALLOC | EXTENT_DO_ACCOUNTING | EXTENT_DEFRAG, 0, 0, ..)
+   > unlock_extent_cached(btrfs_inode->extent_io_tree, start_pos, ...)
+   - 对于每个page,准备好写
+   > clear_page_dirty_for_io(page)
+   > set_page_extent_mapped(page)
+   - 设置page->private是EXTENT_PAGE_PRIVATE..
+
+** __btrfs_buffered_write(file, iov_iter, loff_t)
+   - iov_iter表示要操作的内存数据, 数据量是iov_iter->len, loff_t pos是文件位置.
+   - 计算写的数据量 nrptrs, 以PAGESIZE为单位, 不能超过current->nr_dirtied_pause - current->nr_dirtied, 不能小于8??
+   > iov_iter_count(iov_iter)
+   - 根据上面的计算分配page, 倒腾数据. iov_iter可能会超过8个page的数据,这里循环多次写.
+   > iov_iter_fault_in_readable(iov_iter, write_bytes)
+   - 计算每次写的数据量, 不能超过nrptrs个page, 延时分配对应的空间, 给btrfs_space_info->bytes_may_use, 还有对应的metadata使用的空间
+   > btrfs_delalloc_reserve_space(inode, num_pages << PAGE_CACHE_SHIFT)
+   - 获取相应的page, 把数据放进去.
+   > prepare_pages(btrfs_root, file, pages, num_pages, pos, first_index, write_bytes, force_page_uptodate)
+   > btrfs_copy_from_user(pos, num_pages, write_bytes, pages, iov_iter)
+   - 里面会设置extent_state的EXTENT_DELALLOC标志, 都配置好了!
+   > btrfs_dirty_pages(btrfs_root, inode, pages, dirty_pages, pos, copied, NULL)
+   - 然后释放page的锁,让bdi把它刷会内存.
+   > btrfs_drop_pages(pages, num_pages)
+   > balance_dirty_pages_ratelimited(address_space)
+   - 还不到ordered data的步骤?
+
+** __btrfs_direct_write(kiocb, iovec, nr_segs, pos, ppos, count, ocount)
+   - 直接调用address_space_operations->direct_IO, 如果不能完全写完,就是用buffered写,但要等待树会磁盘
+   > generic_file_direct_write(kiocb, iovec, nr_segs, pos, ppos, count, ocount)
+   - 上面返回写回的数据量,可能会写不完吗? 剩下的使用buffered write
+   > __btrfs_buffered_write(file, iov_iter, pos)
+   - 等待写返回
+   > filemap_write_and_write_range(file->address_space, pos, endbyte)
+   > invalidate_mapping_pages(file->address_space, pos>>PAGE_CACHE_SHIFT, endbyte>>PAGE_CACHE_SHIFT)
+
+** update_time_for_write(inode)
+   - 更新文件的ctime, mtime, 还有inode->i_version
+
+** btrfs_file_aio_write(kiocb, iovec, nr_segs, pos)
+   - file->f_flags的O_DSYNC表示同步操作, inode->i_flags的S_SYNC表示同步操作.
+   > generic_segment_checks(iovec, nr_segs, ocount, VERIFY_READ)
+   > generic_write_checks(file, pos, count, S_ISBLK) 
+   > update_time_for_write(inode)
+   - 如果pos超过文件大小,说明需要给文件打洞..
+   > btrfs_cont_expand(inode, i_size_read(inode), pos)
+   - 如果sync操作，增加btrfs_inode->sync_writers
+   - 如果是direct操作
+   > __btrfs_direct_write(kiocb, iovec, nr_segs, pos, ppos, count, ocount)
+   - 如果不是direct操作..
+   > __btrfs_buffered_write(file, iovec_iter, pos)
+   > generic_write_sync(file, pos, num_written)
+   - 只有sync操作时,这个函数才有意义..而且减小btrfs_inode->sync_writers
+   - 设置btrfs_inode->last_trans为btrfs_fs_info->generation+1, 它是transaction的transid, btrfs_inode->last_sub_trans = btrfs_root->log_transid??
+
+** btrfs_release_file(inode, file)
+   - 关闭文件?这里有件事要做. 
+   - 检查btrfs_inode->runtime_flags的BTRFS_INODE_ORDERED_DATA_CLOSE, commit trans??
+   > btrfs_start_transaction(btrfs_root, 0)
+   > btrfs_add_ordered_operation(btrfs_trans_handle, btrfs_inode->btrfs_root, inode)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 如果inode->i_size超过BTRFS_ORDERED_OPERATIONS_FLUSH_LIMIT, 还要再刷新?
+   > filemap_flush(inode->address_space)
+   - 检查file->private_data,它是ioctl之类的东西???
+   > btrfs_ioctl_trans_end(file)
+   - 都要把文件大小改为0,为何还关心ordered data??
+
+** btrfs_sync_file(file, start, end, datasync)
+   - fsync把数据刷到log tree中?
+   - 刷新文件数据.. 在操作过程中,增加btrfs_inode->sync_writers..
+   > filemap_fdatawrite_range(inode->address_space, start, end)
+   - btrfs_inode->runtime_flags的BTRFS_INODE_HAS_ASYNC_EXTENT表示有数据在写回, 再写一边??
+   > filemap_fdatawrite_range(...)
+   - 增加btrfs_root->log_batch, 检查btrfs_inode->runtime_flags的BTRFS_INODE_NEED_FULL_SYNC, 等待ordered extent
+   > btrfs_wait_ordered_range(inode, start, end-start)
+   - 又增加btrfs_root->log_batch
+   - 检查btrfs_inode->last_trans, 如果无效,就没有修改?
+   - 检查inode的修改是否被之前的transaction提交? 就不需要再提交
+   > btrfs_inode_in_log(inode, btrfs_fs_info->generation)
+   > btrfs_inode->last_trans < btrfs_fs_info->last_trans_committed
+   - 如果不需要把btrfs_inode->last_trans改为0, 清除btrfs_inode->runtime_flags的BTRFS_INODE_NEEDS_FULL_SYNC
+   - 处理file->private_data, 这是ioctl trans?
+   > btrfs_ioctl_trans_end(file)
+   - 开始处理metadata, 放到log中..
+   > btrfs_start_transaction(btrfs_root, 0)
+   > btrfs_log_dentry_safe(btrfs_trans_handle, btrfs_root, dentry)
+   > btrfs_sync_log(btrfs_trans_handle, btrfs_root)
+   > btrfs_commit_transaction(btrfs_trans_handle, btrfs_root)
+   - ???全是问号
+
+** btrfs_file_mmap(file, vm_area_struct)
+   - 设置vm_area_struct->vm_ops为btrfs_file_vm_ops..
+
+** hole_mergeable(inode, extent_buffer, slot, start, end)
+   - (extent_buffer, slot)指向btrfs_file_extent_item, 判断它是不是满足条件的hole extent
+   - type是BTRFS_FILE_EXTENT_REG
+   - disk_bytenr是0, 说明没有extent, 是hole
+   - extent_start = end 或 extent_end = start, 和参数范围埃着
+
+** fill_holes(btrfs_trans_handle, inode, btrfs_path, offset, end)
+   - 给文件插入hole btrfs_file_extent_item, 创建对应的extent_map.
+   - 构造btrfs_key(inode_objectid, BTRFS_EXTENT_DATA_KEY, offset), 查找btrfs_file_extent_item, 应该查找不到
+   - 尝试和邻近的合并, 合并只需要修改对应的btrfs_file_extent_item
+   - 查找返回的slot指向后面一个btrfs_file_extent_item,slot-1就是前面的.
+   > hole_mergeable(inode, extent_buffer, slot, offset, end)
+   - 对于向前合并,修改extent_num_bytes, extent_ram_bytes, offset设置为0
+   - 对于向后合并,修改btrfs_key->offset, extent_num_bytes/ram_bytes, offset为0
+   > btrfs_set_file_extent_num_bytes(extent_buffer, btrfs_file_extent_item, num_bytes)
+   > btrfs_set_file_extent_offset(extent_buffer, btrfs_file_extent_item, 0)
+   - 如果不能合并,就插入一个btrfs_file_extent_item, 除了extent_num_bytes/ram_bytes,其他都是0
+   > btrfs_insert_file_extent(btrfs_trans_handle, btrfs_root, inode_objectid, offset, 0, 0, end-offset, 0, end-offset, 0, 0, 0)
+   - 创建extent_map, block_start是EXTENT_MAP_HOLE ..
+   > alloc_extent_map()
+   - 创建创建失败,就把上面插入的撤销.
+   > btrfs_drop_extent_cache(inode, offset, end-1, 0)
+   - 填充extent_map, start/len = offset/end, orig_start=offset, orig_block_len是0, orig_*就是就是原始extent的. block_start = EXTENT_MAP_HOLE, block_len=0
+   - 插入到extent_map_tree, 首先删除重叠的部分
+   > btrfs_drop_extent_cache(inode, offset, end, 0)
+   - 插入刚创建的extent_map
+   > add_extent_mapping(extent_io_tree, extent_map)
+   - 设置btrfs_inode->runtime_flags的BTRFS_INODE_NEEDS_FULL_SYNC
+
+** btrfs_punch_hole(inode, offset, len)
+   - 在file中创建一个hole extent, 位置边界需要sectorsize对齐
+   - 首先考虑ordered extent.
+   > btrfs_wait_ordered_range(inode, offset, len)
+   > btrfs_calc_trunc_metadata_size(btrfs_root, 1)
+   - 如果(offset, len)在一个page内, 就把那段空间清0,而且写回磁盘.
+   > btrfs_truncate_page(inode, offset, len, 0)
+   - 开始处理所有的page, 如果offset < inode->i_size, 把offset对应的page清0
+   > btrfs_truncate_page(inode, offset, 0, 0)
+   - 如果范围不超过文件大小 offset + len < inode->i_size, 把最后一个page清0. 第四个参数表示清除前部分还是后部分
+   > btrfs_truncate_page(inode, offset+len, 0, 1)
+   - 清除中间的整page, 
+   > truncate_pagecache_range(inode, start, end)
+   - 锁住extent_state
+   > lock_extent_bits(btrfs_inode->extent_io_tree, start, end, 0, extent_state)
+   - 等待ordered extent
+   > btrfs_lookup_first_ordered_extent_inode(inode, end)
+   > btrfs_wait_ordered_range(inode, start, len)
+   - 这里IO操作中经常有ordered extent, 哪里使用他们??
+   - 构造btrfs_block_rsv, 类型是BTRFS_BLOCK_RSV_TEMP?? 
+   > btrfs_alloc_block_rsv(btrfs_root, BTRFS_BLOCK_RSV_TEMP)
+   - 大小为修改1个metadata
+   > btrfs_calc_trunc_metadata_size(btrfs_root, 1)
+   - 创建btrfs_trans_handle, 这里预留空间为什么? 3??
+   > btrfs_start_transaction(btrfs_root, 3)
+   - 从btrfs_fs_info->trans_block_rsv中预留空间, 大小就是上面计算的, 为何重复计算.
+   > btrfs_block_rsv_migrate(btrfs_root->btrfs_fs_info->trans_block_rsv, btrfs_block_rsv, min_size)
+   - 把上面创建的btrfs_block_rsv给btrfs_trans_handle. 
+   - 释放btrfs_file_extent_item, 为何不能全部释放,而返回drop_end???
+   > __btrfs_drop_extents(btrfs_trans_handle, btrfs_root, inode, path, offset, end, drop_end, 1)
+   - 构造hole btrfs_file_extent_item
+   > fill_holes(btrfs_trans_handle, ...)
+   - 使用delayed inode记录更新信息
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   - btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 最后释放extent_state的lock
+   > unlock_extent_cached(extent_io_tree, ...)
+
+** btrfs_fallocate(file, mode, offset, len)
+   - 只能处理FALLOC_FL_KEEP_SIZE和FALLOC_FL_PUNCH_HOLE, 第一个时分配大小,第二个时释放空间..
+   - 对于释放空间
+   > btrfs_punch_hole(inode, offset, len)
+   - 对于分配空间, 先从btrfs_space_info中分配空间给bytes_may_use
+   > btrfs_check_data_free_space(inode, end - start)
+   - end和start大小必须时sectorsize对齐的.
+   - 又是ordered extent??
+   > btrfs_wait_ordered_range(inode, start, len)
+   - 修改文件大小
+   > inode_newsize_ok(inode, end)
+   - 如果大小超过文件大小,就需要文件空洞处理..
+   > btrfs_cont_expand(inode, i_size_read(inode), start)
+   - 然后有时ordered extent处理... 开始处理extent..
+   > btrfs_get_extent(inode, NULL, 0, start, end, 0)
+   - 查找extent_map, 必须有? 如果是EXTENT_MAP_HOLE, 或者extent_map没有带有EXTENT_FLAG_PREALLOC，与分配空间..
+   > btrfs_prealloc_file_range(inode, mode, cur_offset, ..)
+   - 否则就更新文件大小??  KEEP_SIZE什么意思呢??
+   
+** find_desired_extent(inode, loff_t, whence)
+   - 在lseek中SEEK_HOLE使用， 什么意思??
+   > lock_extent_bits(btrfs_inode->extent_io_tree, lockstart, lockend, 0, extent_state)
+   > btrfs_get_extent_fiemap(inode, NULL, 0, 0, sectorsize, 0)
+   - 找到什么样的extent_map??  以后再看..
+
+** 总结
+   - defrag的实现, 在file IO中使用?? 在clean_kthread 清理snapshot?
+   - 这个文件主要实现file_operations, 大部分使用vfs接口
+     #+begin_src 
+	.llseek		= btrfs_file_llseek,
+	.read		= do_sync_read,
+	.write		= do_sync_write,
+	.aio_read       = generic_file_aio_read,
+	.splice_read	= generic_file_splice_read,
+	.aio_write	= btrfs_file_aio_write,
+	.mmap		= btrfs_file_mmap,
+	.open		= generic_file_open,
+	.release	= btrfs_release_file,
+	.fsync		= btrfs_sync_file,
+	.fallocate	= btrfs_fallocate,
+	.unlocked_ioctl	= btrfs_ioctl,
+     #+end_src
+   - 对于direct写,使用vfs结构间接使用aops或者inode_ops
+   - 对于普通的aio, 这里只是把数据写给pagecache, 而且分配延时空间,刷新操作还是使用pagecache
+   - 清除extent_map_tree中的extent_map
+   - 清楚btree中的btrfs_file_extent_item, 数据写会磁盘时,修改btrfs_file_extent_item的类型
+   - 最后最麻烦的是文件punch hole操作???
+     
+
+* inode.c 
+
+** btrfs_init_inode_security(btrfs_trans_handle, inode inode, inode dir, qstr)
+   > btrfs_init_acl(btrfs_trans_handle, inode, dir)
+   > btrfs_xattr_security_init(btrfs_trans_handle, inode, dir, qstr)
+
+** insert_inline_extent(btrfs_trans_handle, btrfs_root, inode, start, size_t size, size_t compressed_size, compress_type, page *)
+   - 使用inline的btrfs_file_extent_item保存文件数据,操作的文件范围是(start, size),如果是压缩的,实际写的长度是comprssed_size, 数据在page数组中. 否则数据在pagecache中.
+   - 处理inline file extent, btrfs_item也是btrfs_file_extent_item,不过仅使用disk_bytes之前的变量,后面的是数据..
+   - 计算btrfs_item指向的数据的长度
+   > btrfs_file_extent_calc_inline_size(data_size)
+   - 这里不是修改eof/i_size, 而是修改文件在磁盘中的数据量. i_blocks/i_bytes
+   > inode_add_bytes(inode, size)
+   - 构造btrfs_key(inode_objectid, BTRFS_EXTENT_DATA_KEY, start)
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, datasize)
+   - 填充btrfs_file_extent_item, generation, type, encryption, encoding, disk_ram_bytes, 没有其他bytenr/disk_num_bytes/extent_num_bytes/offset等
+   - 填充数据,如果是压缩的, compress_type != BTRFS_COMPRESS_NONE, 数据在参数page数组中, 数据量是compressed_size, 不用考虑page偏移,顺序操作page就行.
+   > write_extent_buffer(extent_buffer, addr, ptr, size)
+   > btrfs_set_file_extent_compression(extent_buffer, btrfs_file_extent_item, compress_type)
+   - 如果数据不是压缩的,数据在pagecache中, 范围是(start, size), 而且数据量不超过PAGESIZE,page内部偏移根据start而定. start是0
+   > find_get_page(inode->address_space, start>>PAGE_CACHE_SHIFT)
+   > write_extent_buffer(extent_buffer, offset, ptr, size)
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - 更新btrfs_inode->disk_i_size为inode->i_size. 使用delayed inode更新btrfs_inode_item
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+
+** cow_file_range_inline(btrfs_trans_handle, btrfs_root, inode, start, end, compressed_size, compressed_type, compressed_pages)
+   - 检查数据能否放到inline extent中, 如果可以使用inline的btrfs_file_extent_item保存.
+   - 写的数据的长度可能是compressed_size,或者文件长度
+   > i_size_read(inode)
+   - start > 0  必须是文件开始的位置
+   - actual_end >= PAGE_CACHE_SIZE 文件大小不超过PAGE_CACHE_SIZE
+   - data_len > BTRFS_MAX_INLINE_DATA_SIZE(btrfs_root) 使用一个btrfs_leaf能装得下写的数据
+   - data_len > btrfs_fs_info->max_inline 不能超过文件系统的限制
+   - !compressed_size && (actual_end & (sectorsize-1)) == 0 无压缩时,操作范围sector对齐也不放到inine中?
+   - end + 1 < isize 操作数据是整个文件. 如果end+1>isize也不操作多余的数据?
+   - 先删除之前的btrfs_file_extent_item, 以及extent_map
+   > btrfs_drop_extents(btrfs_trans_handle, btrfs_root, inode, start, aligned_end, 1)
+   - 插入的inline extent
+   > insert_inline_extent(btrfs_trans_handle, btrfs_root, inode, start, inline_line, compressed_size, compress_type, compressed_pages)
+   - 设置btrfs_inode->runtime_flags的BTRFS_INODE_NEEDS_FULL_SYNC.在fsync操作时使用这个标志,等待文件数据写回磁盘.
+   - 释放之前delalloc预留的metadata的数据,包括checksum,extent_item
+   > btrfs_delalloc_release_metadata(inode, end+1 - start)
+   - 为何又释放一遍?
+   > btrfs_drop_extent_cache(inode, start, ...)
+   - 开始已经做了严格的检查,后面为何不能简化!
+
+** async_extent
+   #+begin_src 
+	u64 start;
+	u64 ram_size;
+	u64 compressed_size;
+	struct page **pages;
+	unsigned long nr_pages;
+	int compress_type;
+	struct list_head list;
+   #+end_src
+
+** async_cow
+   #+begin_src 
+	struct inode *inode;
+	struct btrfs_root *root;
+	struct page *locked_page;
+	u64 start;
+	u64 end;
+	struct list_head extents;   //队列中是async_extent->list
+	struct btrfs_work work;
+   #+end_src
+
+** add_async_extent(async_cow, start, ram_size, compressed_size, page, nr_pages, compress_type)
+   - 使用参数创建一个async_extent, 把async_extent添加到async_cow队列中..
+
+** compress_file_range(inode, page, start, end, async_cow, num_added)
+   - 写回压缩数据,在ordered work中完成. 首先做压缩工作,然后提交bio. 如果无法压缩,提交非压缩数据的bio.
+   - 如果文件写的长度很小(<16k), 而且产生碎片之类的(start>0 || end < btrfs_inode->disk_i_size), 把这个inode放到defrag队列中
+   > btrfs_add_inode_defrag(NULL, inode)
+   - 在写操作时,使用这些变量: btrfs_root->sectorsize, i_size_read(inode)..
+   - 对于文件eof之前的数据,可以进行压缩,对于之后的不再压缩,因为可能会丢掉,浪费cpu资源,白压缩.
+   - btrfs_inode->flags的BTRFS_INODE_NOCOMPRESS表示不压缩. 后面在检查压缩结果时,发现压缩失败,或者压缩之后的数据没有节省空间,就考虑设置这个标志. 如果mount时没有制定,或者没有通过ioctl制定文件必须压缩,就可以设置标志,以后不再压缩数据.
+   - mount option 'compress'表示应该加密. btrfs_inode->force_compress表示必须加密, btrfs_inode->flags的BTRFS_INODE_COMPRESS表示应该加密. 后面3个有一个设置就可以.
+   - 如果必须加密,准备page保存加密结果
+   - 操作pagecache在(start,end)的每个page,清除PG_dirty. 这是为保护加密过程的.
+   - 这个函数作用其实很大,它检查page对应的PTE, 如果有dirty标志,设置PG_DIRTY, 当然是又检查一遍,同时设置pte的写保护,去掉pte的脏标志.设置PG_DIRTY标志时会设置inode/fs的脏标志. 最后清除PG_dirty标志. 这里设置了pte的写保护,mmap就不可以写page,保护IO过程.
+   > extent_range_clear_dirty_for_io(inode, start, end)
+   - 压缩page, 最大压缩数据128k, 这里处理不完会循环处理
+   > btrfs_compress_pages(btrfs_inode->compress_type, inode->address_space, start, total_compressed, pages, nr_pages, ...)
+   - 如果没有问题,需要处理压缩结果的page, 把page没有使用的部分设置为0.
+   - 如果start=0, 尝试使用inline extent存储.下面写回的时候,给inline传入(start,end),如果写成功,就直接退出.
+   - 启动transaction, 让他使用btrfs_fs_info->delalloc_block_rsv, 在分配delalloc空间时应该填充了.
+   > btrfs_join_transaction(btrfs_root)
+   - 如果压缩出错,或者压缩数据量不是全部写的数据量(start,end),就是用非压缩inline
+   > cow_file_range_inline(btrfs_trans_handle, btrfs_root, inode, start, end, 0,0,NULL)
+   - 如果压缩没问题,存储压缩数据
+   > cow_file_range_inline(btrfs_trans_handle, btrfs_root, inode, start, end, total_compressed, compress_type, pages)
+   - 最后如果没问题,写操作完成.
+   - 对于extent, 清除EXTENT_DIRTY/EXTENT_DELALLOC
+   - 对于page,清除PG_dirty/PG_writeback/PG_locked标志, 还有clear_page_dirty_for_io.
+   > extent_clear_unlock_delalloc(inode, btrfs_inode->extent_io_tree, start, end, NULL, EXTENT_CLEAR_UNLOCK_PAGE | EXTENT_CLEAR_DIRTY | EXTENT_CLEAR_DELALLOC | EXTENT_SET_WRITEBACK | EXTENT_END_WRITEBACK )
+   - btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 对于非inline的操作, 进一步检查compress结果.如果有问题,设置btrfs_inode->runtime_flags的BTRFS_INODE_NOCOMPRESS, 当然是mount没有force compress.
+   - 如果有问题,就释放上面的压缩使用的page
+   - 构造async_extent,暂存这些写的参数, 放到async_cow中队列中. 下面使用的参数是不同的
+   > add_async_extent(async_cow, start, num_bytes, total_compressed, pages, nr_pages_ret, compress_type)
+   - 非压缩的使用page/pagecache的东西, 而且把全部数据一块处理
+   > add_async_extent(async_cow, start, end-start+1, 0, NULL, 0, BTRFS_COMPRESS_NONE)
+   - 非压缩的情况, 如果locked_page在当前范围,设置它的PG_dirty/pagecache的标志.而且设置(start,end)范围内所有的page的PG_dirty标志. 因为上面压缩之前清除了.
+
+** submit_compressed_extents(inode, async_cow)
+   - 上面async_cow已经准备好了压缩的数据,或者不压缩的数据,这里开始启动IO
+   - 如果async_cow->extents队列为空,不做处理. 
+   - 遍历每个async_extent, 如果async_extent->pages无效,说明是非压缩写操作
+   - 为何在这里锁住extent_state? 还是等待什么??
+   > lock_extent(extent_io_tree, async_extent->start, len)
+   - 分配extent, 创建对应的btrfs_file_extent_item/extent_map, 添加btrfs_ordered_extent. 
+   > cow_file_range(inode, async_cow->locked_page, start, start+ram_size-1, page_started, nr_written, 0)
+   - 里面也可能会创建inline的extent, 上面page_written返回1. 
+   - 如果返回0, 需要这里处理page, 提交对应的BIO
+   > extent_write_locked_range(extent_io_tree, inode, async_extent->start, ...)
+   - 如果是压缩的写操作, 同样先锁起来
+   > lock_extent(extent_io_tree, async_extent->start, ...)
+   - 直接去创建空闲的extent, 在btrfs_key中. 使用transaction保护起来.
+   > btrfs_join_transaction(btrfs_root)
+   > btrfs_reserve_extent(btrfs_trans_handle, btrfs_root, async_extent->compressed_size, compressed_size, 0, alloc_hint, btrfs_key, 1)
+   - btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 再准备extent_map, 先清理已有没用的
+   > btrfs_drop_extent_cache(inode, ...)
+   - 分配新的extent_map, 根据async_extent填充
+   > alloc_extent_map()
+   - start/len/orig_start/mod_start/mod_len是文件偏移信息
+   - block_start/block_len/orig_block_len是磁盘位置信息,从上面分配extent的结果得来
+   - 设置压缩标志,EXTENT_FLAG_COMPRESSED, 还有EXTENT_FLAG_PINNED,刚创建的都有这个标志.
+   > add_extent_mapping(extent_io_tree, extent_map)
+   - 同时添加到extent_map_tree->modified_extents队列中.
+   > btrfs_drop_extent_cache(btrfs_inode, async_extent->start, ...)
+   - 添加到ordered extent管理中
+   > btrfs_add_ordered_extent_compress(inode, ...)
+   - 清除extent/page的状态
+   - extent会去掉EXTENT_LOCKED,EXTENT_DELALLOC,EXTENT_DIRTY,
+   - page是PG_LOCKED, PG_DIRTY, 设置PG_WRITEBACK, 开始写回.
+   > extent_clear_unlock_delalloc(inode, extent_io_tree, start, start+ram_size-1, NULL, EXTENT_CLEAR_UNLOCK_PAGE | EXTENT_CLEAR_UNLOCK | EXTENT_CLEAR_DELALLOC | EXTENT_CLEAR_DIRTY | EXTENT_SET_WRITEBACK)
+   - 发送bio
+   > btrfs_submit_compressed_write(inode, start, ...)
+   - 非压缩的extent_map不一样,而且btrfs_ordered_extent也不一样.不过都是记录标志,在创建btrfs_file_extent_item时使用.
+
+** get_extent_allocation_hint(inode, start, num_bytes)
+   - 在分配extent时使用, 就近分配. 
+   - 使用文件偏移start找一个extent_map, 获取extent_map->block_start. 去找文件已经分配的磁盘位置.
+   > search_extent_mapping(extent_io_tree, start, num_bytes)
+   - 第一次搜索可能碰到extent_map->block_start >= EXTENT_MAP_LAST_BYTE, 再使用(0,0)搜索一遍.
+
+** __cow_file_range(btrfs_trans_handle, inode, btrfs_root, page, start, end, page_started, nr_written, unlock)
+   - cow就是copy on write, 写操作不在原来的磁盘位置写,而是分配新的extent,写在新的位置
+   - 为上面的写分配磁盘空间. start,end是文件偏移,page_started用来返回结果,对于inline,返回1,不用继续发起BIO,数据已经写在btree中.对于普通的,需要去发起writeextent操作.
+   - 如果数据量不超过64k, 而且(start,end)范围没超过文件大小,启动碎片处理.
+   - 上面在准备async_cow时已经操作了,怎么又处理碎片?!
+   > btrfs_add_inode_defrag(btrfs_trans_handle, inode)
+   - 如果start=0, 尝试inline extent, 非压缩的写磁盘
+   > cow_file_range_inline(btrfs_trans_handle, btrfs_root, inode, start, end, 0, 0, NULL)
+   - 如果可以使用就设置page_started, 增加nr_written, 直接返回
+   - 否则去btrfs_block_group_cache分配空间. 
+   - 计算一个建议分配的位置,应该根据它选择btrfs_block_group_cache
+   > get_extent_allocation_hint(inode, start, num_bytes)
+   - 删除已有的extent_map
+   > btrfs_drop_extent_cache(inode, start, len, 0)
+   - 可能无法分配一个extent满足要求,下面会循环处理.
+   > btrfs_reserve_extent(btrfs_trans_handle, btrfs_root, disk_num_bytes, sectorsize, 0, alloc_hint, btrfs_key, 1)
+   - 对应的构造extent_map, 这里没有压缩, extent_map->block_start/block_len就是btrfs_key使用的
+   - 也设置extent_map->flags的EXTENT_FLAG_PINNED, 在数据写操作完成后回去掉,就看谁会用.
+   - 添加extent_map_tree
+   > add_extent_mapping(extent_io_tree, extent_map)
+   - 放到ordered extent管理中
+   > btrfs_add_ordered_extent(inode, start, btrfs_key->objectid, ram_size, ...)
+   - 处理extent/page状态,还要考虑参数unlock
+   - 如果unlock有效, 使用EXTENT_CLEAR_UNLOCK_PAGE, 释放PG_locked
+   - EXTENT_CLEAR_UNLOCK => EXTENT_LOCKED, EXTENT_CLEAR_DELALLOC=>EXTENT_DELALLOC, EXTENT_SET_PRIVATE2, 设置PG_PRIVATE2, 说明page可以writeback.
+   > extent_clear_unlock_delalloc(inode, btrfs_inode->extent_io_tree, start, end, locked_page, op)
+   - 如果循环的话,alloc_hint设置为btrfs_key->objectid+offset,从它的下一个开始. 应该不会了,如果能连续的话,就可以分配个大的extent
+   - 空间不连续也没事,因为后面处理也是以page为单位分开的,而且提交bio时又会参考extent_map.
+   - 目前分配了物理空间,建立和文件偏移的映射,等待bio写回数据.以及写回后的处理.现在的数据空间已经到了btrfs_space_info->reserved范围中.
+
+** cow_file_range(inode, page, start, end, page_started, nr_written, unlock)
+   - 这里准备btrfs_block_rsv, 它使用btrfs_fs_info->delalloc_block_rsv, 哪里为它预留的空间??
+   > btrfs_join_transaction(btrfs_root)
+   > __cow_file_range(btrfs_trans_handle, inode, btrfs_root, locked_page, start, end, ...)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+
+** async_cow_start(btrfs_work)
+   - btrfs_work是async_cow中的,开始处理压缩的写操作
+   - 它只是准备做数据压缩工作,准备好async_extent, 并没有分配磁盘.
+   > compress_file_range(async_cow->inode, async_cow->locked_page, start, ...)
+   > btrfs_add_delayed_iput(async_cow->inode)
+   - num_added表示async_extent的个数. 如果为0,表示没有数据需要IO.
+
+** async_cow_submit(btrfs_work work)
+   - btrfs_work还是async_cow.  
+   - 先计算本次操作的page数量, async_cow->end-start,从btrfs_fs_info->async_delalloc_pages减去.
+   - async_delalloc_pages表示正在分配空间的delalloc的数据,或者delalloc_workers处理的数据量,这些也会被压缩.当然已经分配但没有写回的不算.
+   - 如果btrfs_fs_info->async_delalloc_pages < 5M, 总delalloc的数据量为20G?就唤醒btrfs_fs_info->async_submit_wait队列. 那里等待它?
+   - 为这些写操作分配磁盘,发送bio请求
+   > submit_compressed_extents(async_cow->inode, async_cow)
+
+** async_cow_free(btrfs_work)
+   - 这里还是在async work中处理的. 释放inode和它自己.
+   > btrfs_add_delayed_iput(async_cow->inode)
+   - 释放async_cow..
+
+** cow_file_range_async(inode, page locked_page, start, end, page_started, nr_written)
+   - 使用async_cow实现异步写操作.这里会创建async_cow,填充范围参数,交给btrfs_workers.
+   - locked_page是什么?
+   - 先释放extent锁,在分配空间时又锁上,但分配完成又释放锁.在IO的时候呢??
+   - clear_extent_bit(btrfs_inode->extent_io_tree, start, end, EXTENT_LOCKED, 1, 0, NULL, GFP
+_NOFS)
+   - 构造async_cow提交btrfs_work, 可能不能一次提交,循环处理
+   - 如果是压缩的,每次提交的数据量不超512K, 如果不是,就无所谓..
+   - 使用参数填充async_cow, inode/root/locked_page/start, end要过滤一下
+   > igrap(inode)
+   - 设置btrfs_work, 竟然是ordered的, 回调func = async_cow_start, ordered_func是async_cow_submit, ordered_free是async_cow_free.
+   - 增加btrfs_fs_info->async_delalloc_pages数量
+   - 把async_cow->btrfs_work给相关的队列
+   > btrfs_queue_worker(btrfs_fs_info->delalloc_workers, async_cow->work)
+   - 等待两次, 首先是btrfs_fs_info->async_submit_pages > limit, 在btrfs_fs_info->async_delalloc_pages队列. 这个limit是10M,也就是40G.
+   - 第二个是当btrfs_fs_info->async_submit_draining有效时,必须等btrfs_fs_info->async_delalloc_pages都提交完了,才能继续!
+   > wait_event(btrfs_fs_info->async_submit_wait, btrfs_fs_info->async_delalloc_pages == 0)
+   - 这里基本上就是停止异步提交bio的过程. async_submit_draining表示停止异步工作,无论是写回工作,还是分配空间工作.
+
+** csum_exist_in_range(btrfs_root, bytenr, num_bytes)
+   - 去checksum tree中查询(bytenr,num_bytes)的btrfs_csum_item, 组装成btrfs_ordered_sum.
+   > btrfs_lookup_csums_range(btrfs_fs_info->csum_root bytenr, ...)
+   - 返回的btrfs_ordered_sum在一个临时队列中, 如果队列不为空,立即释放. 说明checksum存在.
+
+** run_delalloc_nocow(inode, page, start, end, page_started, force, nr_written)
+   - 这是在__extent_writepage过程中的回调函数,但不使用cow使调用.它还是会检查是否有共享,如果有返回到cow操作中.
+   - 这里查询extent是否被其他snapshot共享. 如果没有,直接写文件的extent.
+   > btrfs_alloc_path()
+   - inode可能是free space, 他们使用transaction的机制不一样. 它们竟然也会共享?!
+   > btrfs_is_free_space_inode(inode)
+   > btrfs_join_transaction_nolock(btrfs_root)
+   > btrfs_join_transaction(btrfs_root)
+   - 更换btrfs_trans_handle->block_rsv 为 btrfs_fs_info->delalloc_block_rsv. 因为这是metadata操作,在delalloc预留空间时,已经把空间给了delalloc_block_rsv
+   - 去btree中查找btrfs_file_extent_item
+   > btrfs_lookup_file_extent(btrfs_trans_handle, btrfs_root, btrfs_path, ino, offset, 0)
+   - 如果找到的btrfs_key->offset <= start,检查是否可以nocow. 非常严格.
+   - 对于REG/PREALLOC的extent, 获取extent的位置信息, disk_bytenr/disk_num_bytes/extent_offset/extent_end/extent_start=btrfs_key->offset
+   - 如果extent_end <= start, 查找下一个.
+   - 如果disk_bytenr==0, 就是hole extent, 只能cow分配空间.
+   - 如果是压缩的extent, 必须cow
+   - 对于BTRFS_FILE_EXTENT_REG, 参数force=0, 必须cow
+   - extent是只读的, 必须cow
+   - 去extent tree中精确查找对应的backref, 检查是否有共享使用底层的btrfs_extent_item.返回1,就是有共享,必须cow.
+   > btrfs_cross_ref_exist(btrfs_trans_handle, btrfs_root, ino, btrfs_key->offset-extent_offset, disk_bytenr)
+   - 如果btree中已经有checksum,也必须cow. 不能破坏已经计算的checksum
+   - csum_exist_in_range(btrfs_root, disk_bytenr, num_bytes)
+   - 最后上面检查都通过,就不需要cow, nocow=1, 就直接写在已有的磁盘extent上
+   - 如果nocow=0, 需要分配空间,这里不会分配,它会尽量分配一个大的. 检查下一个可能存在的btrfs_file_extent_item. 记录最小的文件cow的文件偏移. cow_start
+   - 如果nocow=1, 不需要cow, 但它会给前面遍历的需要cow的分配空间,这里没有使用链表保存起来cow_start. 
+   - 分配新的extent,分配也是精确分配,不会说多分配,把之前的数据copy过来.
+   > __cow_file_range(btrfs_trans_handle, inode, btrfs_root, locked_page, cow_start, btrfs_key.offset -1, page_started, nr_written, 1)
+   - 如果当前找到一个btrfs_file_extent_item, 它不需要cow
+   - extent_type=BTRFS_FILE_EXTENT_PREALLOC, 构造extent_map, 之前只是分配了磁盘extent
+   - 填充extent_map, start是当前检查的,orig_start需要去除extent_offset, block_start是btrfs_file_extent_item获取.
+   - 设置extent_map->flags的EXTENT_FLAG_PINNED和EXTENT_FLAG_FILLING, FILLING???
+   > add_extent_mapping(extent_io_tree, extent_map)
+   - 对于BTRFS_FILE_EXTENT_REG, 应该已有extent_map?!
+   - 添加到ordered extent管理中,这里有数据也有了空间extent, 上面cow分配extent的地方,也添加了对应的.
+   - type在这里出现了2种: BTRFS_ORDERED_PREALLOC/BTRFS_ORDERED_NOCOW
+   > btrfs_add_ordered_extent(inode, offset, disk_bytenr, num_bytes, type)
+   - 设置extent/page状态 EXTENT_CLEAR_UNLOCK_PAGE, EXTENT_CLEAR_UNLOCK, EXTENT_CLEAR_DELALLOC, EXTENT_SET_PRIVATE2
+   > extent_clear_unlock_delalloc(inode, extent_io_tree, offset, len, locked_page, EXTENT_CLEAR_UNLOCK_PAGE | EXTENT_CLEAR_UNLOCK | EXTENT_CLEAR_DELALLOC | EXTENT_SET_PRIVATE2)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+
+** run_delalloc_range(inode, page, start, end, page_started, nr_written)
+   - 这个才是真正的writepage回调函数,准备数据的磁盘空间.
+   - 检查btrfs_inode->flags, 如果带有BTRFS_INODE_NODATACOW, force是1, mount option设定. 在碰到BTRFS_FILE_EXTENT_REG时也要检查,争取不用COW. 碰到PREALLOC,肯定不需要用.
+   > run_delalloc_nocow(inode, locked_page, start, end, page_started, 1, ..)
+   - 如果带有BTRFS_INODE_PREALLOC, force是0, 碰到REG不必检查? 只有PREALLOC才会使用NOCOW.也就是尽量使用COW.
+   > run_delalloc_nocow(inode, locked_page, start, end, page_started, 0, ..)
+   - 对于没有标志的,如果文件不会压缩, 直接去cow?
+   > cow_file_range(inode, locked_page, start, end, page_started, nr_written, 1)
+   - 其他情况,数据压缩的情况, 设置btrfs_inode->runtime_flags的BTRFS_INODE_HAS_ASYNC_EXTENT.
+   - 提交异步的async_cow, 而且直接提交了BIO
+   > cow_file_range_async(inode, locked_page, ...)
+
+** 总结
+   - 上面实现了分配extent空间的实现,调用是在writepage阶段. 
+
+** btrfs_split_extent_hook(inode, extent_state, split)
+   - 下面的函数是extent_io_tree中的回调函数,在修改extent时使用.
+   - 如果分裂的extent_state->state有EXTENT_DELALLOC, 增加btrfs_inode->outstanding_extents
+
+** btrfs_merge_extent_hook(inode, extent_state new, extent_state other)
+   - 和上面相反,减小btrfs_inode->outstanding_extents
+
+** btrfs_set_bit_hook(inode, extent_state, bits)
+   - 设置extent_state->state的EXTENT_DELALLOC时的操作.
+   - 如果bit包括EXTENT_FIRST_DELALLOC, 不增加outstanding_extents.
+   - 根据extent_state的范围, 增加全局计数btrfs_fs_info->delalloc_bytes, btrfs_inode->delalloc_bytes
+   - btrfs_inode->runtime_flags的BTRFS_INODE_IN_DELALLOC_LIST表示btrfs_inode->delalloc_inodes在btrfs_fs_info->delalloc_inides队列中.
+   - 这里检查这个标志和队列,如果没有,入队而且设置标志
+
+** btrfs_clear_bit_hook(inode, extent_state, bits)
+   - 上面的逆操作.它还要修改释放预留空间的功能
+   - 如果bits带有EXTENT_DO_ACCOUNTING, 释放reserved的metadata空间
+   - 包含多reserved的extent使用的metadata, 以及extent_state覆盖的数据使用的checksum
+   - 从btrfs_fs_info->delalloc_block_rsv中释放
+   > btrfs_delalloc_release_metadata(inode, len)
+   - 这里另一个重要的功能是释放bytes_may_use空间.在预留空间时,把空间转移到bytes_may_use, 现在应该转移到bytes_reserved,但是在创建btrfs_extent_item时实现.这里在创建之后执行,相当于转移.
+   > btrfs_free_reserved_data_space(inode, len)
+   - 减小btrfs_fs_info->delalloc_bytes, btrfs_inode->delalloc_bytes.
+   - 如果btrfs_inode->delalloc_bytes减到0, 取消去掉它的delalloc标志
+   - btrfs_inode->runtime_flags的BTRFS_INODE_IN_DEFRAG和btrfs_inode->delalloc_inodes队列
+
+** btrfs_merge_bio_hook(rw, page, offset, size, bio, bio_flags)
+   - 如果bio_flags包含EXTENT_BIO_COMPRESSED, 不能合并
+   - 检查bio还能不能再包含size数据
+   - 这里没有为磁盘操作建立映射什么的, bio中已经有具体的信息. 从bio->bi_sector获取磁盘逻辑地址,去底层的map_lookup中,检查这个bio能一次提交的最大数量. 
+   - 对于RAID,普通读写不能超过stripe_len, 而且操作范围不能跨越stripe_len. 下面返回bio允许的长度
+   > btrfs_map_block(btrfs_fs_info, rw, logical, map_length, NULL, 0)
+   - 如果map_length < length + size, 说明bio不能再添加size
+
+** 总结
+   - EXTENT_DELALLOC的处理函数
+   
+** __btrfs_submit_bio_start(inode, rw, bio, mirror_num, bio_flags, bio_offset)
+   - 这是bio writepage提交的开始操作, wirte需要很多步骤
+   - 下面为bio的数据计算checksum, 这是数据已经被ordered extent管理起来, 计算了checksum保存到btrfs_ordered_csum中.
+   > btrfs_csum_one_bio(btrfs_root, inode, bio, 0, 0)
+   - 同时它会唤醒btrfs_ordered_extent->wait等待队列
+
+** __btrfs_submit_bio_done(inode, rw, bio, mirror_num, bio_flags, bio_offset)
+   - 在bio发射的时候,把checksum计算好,并放到btrfs_ordered_extent中.在bio完成时,把checksum数据写到btree中
+   - 这里发射bio, 创建btrfs_bio, 把bio映射成底层设备的bio
+   > btrfs_map_bio(btrfs_root, rw, bio, mirror_num, 1)
+
+** btrfs_submit_bio_hook(inode, rw, bio, mirror_num, bio_flags, bio_offset)
+   - 提交逻辑bio使用的函数,它里面的磁盘位置是逻辑地址,还没有映射为物理地址,映射之后这里就不再操作.
+   - btrfs_inode->sync_writers = 0, 表示需要使用异步, async=1. 在fsync或同步写时,设置sync_writers=1. 这个东西的作用域太深的!!
+   - btrfs_inode->flags的BTRFS_INODE_NODATASUM, 表示不用计算checksum
+   - 对于free space inode, 它提交的是metadata数据
+   > btrfs_is_free_space_inode(inode)
+   - 如果是读操作, 准备bi_end_io, io完成后的回调函数,
+   > btrfs_bio_wq_end_io(btrfs_fs_info, bio, metadata)
+   - bio_flags的EXTENT_BIO_COMPRESSED表示数据是否压缩. 如果是压缩的,使用特有的bio提交方法.
+   > btrfs_submit_compressed_read(inode, bio, mirror_num, bio_flags)
+   - 如果上面需要checksum, 准备checksum, 放到extent_state中.
+   > btrfs_lookup_bio_sums(btrfs_root, inode, bio, NULL)
+   - 后面会映射这个bio,并提交给底层的设备.
+   - 如果是异步读(非写)操作,而且要做checksum, 提交异步工作,退出
+   - 这里使用btree-io中同样的异步提交方式,使用ordered btrfs_workers, 先计算checksum,计算完成后发射bio
+   > btrfs_wq_submit_bio(btrfs_fs_info, inode, rw, bio, mirror_num, bio_flags, bio_offset, __btrfs_submit_bio_start, __btrfs_submit_bio_done)
+   - 如果是同步操作,立即计算, 不使用btrfs_work计算
+   > btrfs_csum_one_bio(btrfs_root, inode, bio, 0, 0)
+   - 最后提交bio
+   > btrfs_map_bio(btrfs_root, rw, bio, mirror_num, 0)
+
+** 总结
+   - 提交bio的回调函数
+
+** add_pending_csums(btrfs_trans_handle, inode, file_offset, list_head)
+   - list_head中是btrfs_ordered_sum,把checksum数据写回到btree中.
+   > btrfs_csum_file_blocks(btrfs_trans_handle, btrfs_fs_info->csum_root, btrfs_ordered_sum)
+
+** btrfs_set_extent_delalloc(inode, start, end, extent_state)
+   - 设置EXTENT_DELALLOC标志,附带EXTENT_UPTODATE. 它会更新统计数和btrfs_inode关于DELALLOC状态.
+   - end不能PAGESIZE对齐. 后闭区间! 这里只是增加btrfs_inode的统计数.
+   > set_extent_delalloc(extent_io_tree, start, end, extent_state, GFP_NOFS)
+
+** btrfs_writepage_fixup
+   #+begin_src 
+	struct page *page;
+	struct btrfs_work work;
+   #+end_src
+
+** btrfs_writepage_fixup_worker(btrfs_work)
+   - 上面的结构为了传递参数, btrfs_work就是btrfs_writepage_fixup. 这个btrfs_work是做什么?
+   - 首先锁住lock和extent. 
+   > lock_page(page)
+   - page的address_space无效,或没有PG_dirty或PG_checked,直接退出.
+   - 对于PG_checked, 在开始writepage时设置.给它预留空间后取消.看来是保护预留空间的.
+   > PageDirty(page)
+   > PageChecked(page)
+   - 锁住page对应的extent
+   > lock_extent_bits(btrfs_inode->extent_io_tree, page_start, page_end, 0, extent_state)
+   - 检查PG_private_2, 在分配空间,添加btrfs_ordered_extent时,设置这个标志,和删除EXTENT_DELALLOC标志一块.
+   - 然后检查ordered extent,等待数据写回.
+   > btrfs_lookup_ordered_extent(inode, page_start)
+   - 如果有相关的ordered 操作, 重新开始..
+   > btrfs_start_ordered_extent(inode, btrfs_ordered_extent, 1)
+   - 为page预留空间, 包括data/metadata
+   > btrfs_delalloc_reserve_space(inode, PAGE_CACHE_SIZE)
+   - 设置inode相关的标志,统计数. btrfs_inode->delalloc_
+   > btrfs_set_extent_delalloc(inode, page_start, page_end, extent_state)
+   - PG_dirty再设置一遍?!
+   > set_page_dirty(page)
+   > ClearPageChecked(page)
+   - 操作完成,解锁extent/page
+   > unlock_extent_cached(btrfs_inode->extent_io_tree, page_start, page_end, extent_state, GFP_NOFS)
+   > unlock_page(page)
+
+** btrfs_writepage_start_hook(page, start, end)
+   - 根据注释,ordered extent为了保护IO. 内核不经过filesystem同意,不能设置PG_DIRTY, 这样会影响数据一致性?!这里使用一个async work去检查ORDERED的属性??
+   - 看来btrfs_ordered_extent使用PG_PRIVATE2.
+   - 先检查PG_private_2, 如果设置了直接返回
+   - PG_checked只有这个地方使用? 重复了也不行?! 它的作用就是保护这个过程,预留空间.
+   > PageChecked(page)
+   - 设置标志
+   > SetPageChecked(page)
+   > page_cache_get(page)
+   - 提交上面的工作
+   > btrfs_queue_worker(btrfs_fs_info->fixup_workers, btrfs_writepage_fixup->btrfs_work)
+   - 这个过程不需要等待?!
+
+** 总结
+   - writepage的开始回调函数
+
+** insert_reserved_file_extent(btrfs_trans_handle, inode, file_pos, disk_bytenr, disk_num_bytes, num_bytes, ram_bytes, compression, encryption, other_encoding, extent_type)
+   - 参数组成了btrfs_file_extent_item, 这里向btree中插入btrfs_file_extent_item
+   - 先删除btree中已有的btrfs_item, 但没有释放extent_map
+   > btrfs_drop_extents(btrfs_trans_handle, btrfs_root, inode, file_pos, end, 0)
+   - 创建btrfs_key(inode_objectid, BTRFS_EXTENT_DATA_KEY, offset), 插入btrfs_file_extent_item, 把参数放进去
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, btrfs_file_extent_item). generation是btrfs_trans_handle->transid
+   - 修改文件的磁盘空间.
+   > inode_add_bytes(inode, num_bytes)
+   - 构造btrfs_key(disk_bytenr, BTRFS_EXTENT_ITEM_KEY, disk_num_bytes), 添加delayed ref.
+   > btrfs_alloc_reserved_file_extent(btrfs_trans_handle, btrfs_root, root_objectid, inode_objectid, file_pos, btrfs_key)
+
+** sa_defrag_extent_backref
+   #+begin_src 
+        // snapshot-aware defrag..
+	struct rb_node node;
+	struct old_sa_defrag_extent *old;
+	u64 root_id;               //root id
+	u64 inum;                  //inode id
+	u64 file_pos;              //文件offset, 对应btrfs_file_extent_item的btrfs_key->offset
+	u64 extent_offset;         //extent的内部偏移,和btrfs_file_extent_item->offset对应.
+	u64 num_bytes;             //extent的文件长度
+	u64 generation;            //为何不使用btrfs_file_extent_item???
+   #+end_src
+ 
+** old_sa_defrag_extent
+   #+begin_src 
+	struct list_head list;
+	struct new_sa_defrag_extent *new;
+	
+	//下面的参数和一个btrfs_file_extent_item对应,或者和一个extent block对应.  
+	u64 extent_offset;   //file block在extent内部offset..
+	u64 bytenr;          //disk extent位置? 不是orig的,而是做过偏移的
+	u64 offset;          // 针对btrfs_key->offset??
+	u64 len;             // file extent item的长度  btrfs_file_extent_item->num_bytes..
+	int count;     //使用计数??
+	//sa_defrag_extent_backref应该和old_sa_defrag_extent对应起来,就像下面的record_one_backref的功能. 或者old包含多个sa..
+	//它和btrfs_file_extent_item对应, 它属于某个new_sa_defrag_extent, 它好像不记录file的offset, 
+   #+end_src
+
+** new_sa_defrag_extent
+   #+begin_src 
+        //和btrfs_ordered_data对应
+	struct rb_root root;
+	struct list_head head;     //队列中是old_sa_defrag_extent->list
+	struct btrfs_path *path;
+	struct inode *inode;
+	u64 file_pos;    
+	u64 len;     
+	u64 bytenr;
+	u64 disk_len;
+	u8 compress_type;
+   #+end_src
+
+** backref_comp(sa_defrag_extent_backref b1, b2)
+   - 比较2个backref?
+   - 先比较root_id, 然后是inum, 然后是file_pos. 如果都一样,就视为相同
+
+** backref_insert(rb_root, sa_defrag_extent_backref)
+   - 把sa_defrag_extent_backref插入到rb_root中, rb_root是new_sa_defrag_extent
+	
+** record_one_backref(inum, offset, root_id, context)
+   - root_id是snapshot/subvolume的root_id, inum是文件id..  context是old_sa_defrag_extent, offset是extent在文件中的偏移
+   - old_sa_defrag_extent=>new_sa_defrag_extent, 可获取btrfs_inode,btrfs_root, 如果他们和参数一致,直接退出?!
+   - 构造btrfs_key(root_id,BTRFS_ROOT_ITEM_ROOT, -1), 根据它找到对应的btrfs_root
+   > btrfs_read_fs_root_no_name(btrfs_fs_info, btrfs_key)
+   - 构造btrfs_key(inum, BTRFS_EXTENT_DATA_KEY, offset), 找到btrfs_file_extent_item
+   - btrfs_search_slot(NULL, ...)
+   - 在找的过程中,offset不一定正好,检查的参数使用
+   - disk_bytenr和old_sa_defrag_extent->bytenr
+   - 计算orig_offset, btrfs_key->offset - extent_offset == offset
+   - old_sa_defrag_extent->offset/len/extent_offset表示文件的范围,btrfs_file_extent_item也表示文件的范围,两者必须交叉.
+   - 构造一个sa_defrag_extent_backref, 把上面的btrfs_file_extent_item的文件偏移信息放进去. 把它放到new_sa_defrag_extent->rb_root中
+
+** record_extent_backrefs(btrfs_path, new_sa_defrag_extent)
+   - 下面使用backref中的函数? 当初没看明白
+   - 遍历new_sa_defrag_extent->head中的old_sa_defrag_extent, 里面是btrfs_file_extent_item的信息.
+   > iterate_inodes_from_logical(old_sa_defrag_extent->bytenr, btrfs_fs_info, btrfs_path, record_one_backref, old_sa_defrag_extent)
+   - 这个函数找到bytenr对应的btrfs_extent_item, 找到disk extent, 同时也能找到extent_offset, 找到所有的对这个disk extent的索引, 所有的btrfs_file_extent_item, 构造一个sa_defrag_extent_backref, 给new_sa_defrag_extent.
+
+** relink_is_mergable(extent_buffer, btrfs_file_extent_item, disk_bytenr)
+   - 检查(extent_buffer, btrfs_file_extent_item)指向的btrfs_file_extent_item,
+   - 检查它的磁盘位置是否和disk_bytenr相同
+   - type是BTRFS_FILE_EXTENT_REG
+   - 没有压缩加密等
+   - 符合返回1
+
+** relink_extent_backref(btrfs_path, sa_defrag_extent_backref prev, sa_defrag_extent_backref backref)
+   - 主要是处理backref..
+   - 首先检查两个sa_defrag_extent_backref是否相邻, (root_id,inum)相同,sa_defrag_extent_backref->file_pos/num_bytes表示文件位置.. 如果相邻就可以合并.
+   - 下面处理参数的第2个sa_defrag_extent_backref
+   - 构造btrfs_key(sa_defrag_extent_backref->root_id, BTRFS_ROOT_ITEM_KEY, -1), 找到对应的btrfs_root
+   > btrfs_read_fs_root_no_name(btrfs_fs_info, btrfs_key)
+   - 检查btrfs_root->root_item, btrfs_root_item->refs计数...如果为0,就直接返回.
+   - 构造btrfs_key(sa_defrag_extent_backref->inum, BTRFS_INODE_ITEM_KEY, 0), 获取btrfs_inode
+   > btrfs_iget(btrfs_fs_info->btrfs_super_block, btrfs_key, btrfs_root, NULL)
+   - 处理的数据文件位置是sa_defrag_extent_backref->file_pos/num_bytes, 先锁住这段数据,注意这里使用的文件内部offset, 也就是下面的lock_start, lock_end..
+   > lock_extent_bits(btrfs_inode->extent_io_tree, lock_start, lock_end, 0, extent_state)
+   - 检查ordered data? 如果有,直接退出? 为何退出?
+   > btrfs_lookup_first_ordered_extent(inode, lock_end)
+   > btrfs_put_ordered_extent(btrfs_ordered_extent)
+   - 开始处理数据...
+   > btrfs_join_transaction(btrfs_root)
+   - 构造btrfs_key(sa_defrag_extent_backref->inum, BTRFS_EXTENT_DATA_KEY, sa_defrag_extent_backref->file_pos), 查找btrfs_file_extent_item
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 比较btrfs_file_extent_item->generation和sa_defrag_extent_backref->generation, 如果不同不再处理?!
+   - 找到sa_defrag_extent_backref对应的btrfs_file_extent_item, 处理的文件范围来自sa_defrag_extent_backref->file_pos,num_bytes, 但还要考虑old_sa_defrag_extent的范围, 它里面处理extent_offset, 还有offset. 文件范围(start,len)还要考虑old_sa_defrag_extent->offset. 
+   - (old_sa_defrag_extent->extent_offset+offset,len)表示extent内部的范围, (sa_defrag_extent_backref->extent_offset,num_bytes)表示范围,操作的时候取两者交叉的.
+   - 释放文件中已有的btrfs_file_extent_item/exten_map
+   > btrfs_drop_extents(btrfs_trans_handle, btrfs_root, inode, start, len, 1)
+   - 开始处理(start, len)范围的数据
+   - 如果开始检查2个sa_defrag_extent_backref可以合并,查找文件中对应的btrfs_file_extent_item
+   > btrfs_search_slot(btrfs_trans_handle, ...)
+   > btrfs_item_ptr(extent_buffer, ...)
+   - 检查它是否和new_sa_defrag_extent->bytenr使用相同的disk extent, 而且文件偏移和start挨着
+   > relink_is_mergable(extent_buffer, btrfs_file_extent_item, new_sa_defrag_extent->bytenr)
+   - 把当前处理的范围(start,len)加到前一个btrfs_file_extent_item中, 增大它的extent_num_bytes, 直接退出
+   > inode_add_bytes(inode, len)
+   - 如果找不到,就需要创建一个新的btrfs_file_extent_item, 填充相关的参数,磁盘位置的参数是new_sa_defrag_extent, 文件位置是start, len, 内部偏移是start - new_sa_defrag_extent->file_pos..
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   > inode_add_bytes(inode, len)
+   > btrfs_inc_extent_ref(btrfs_trans_handle, btrfs_root, new_sa_defrag_extent->bytenr, disk_len, 0, root_id, inum, file_pos, 0)
+   - root_id/inum都是从sa_defrag_extent_backref...
+
+** relink_file_extents(new_sa_defrag_extent)
+   - new_sa_defrag_extent的old_sa_defrag_extent队列哪里来的? 建立它的sa_defrag_extent_backref
+   > record_extent_backrefs(btrfs_path, new_sa_defrag_extent)
+   - 然后开始遍历new_sa_defrag_extent上面的sa_defrag_extent_backref, 重新整理文件中btrfs_file_extent_item, 让他们指向的disk extent指向new_sa_defrag_extent的
+   > relink_extent_backref(btrfs_path, sa_defrag_extent_backref, backref)
+   - 最后释放new_sa_defrag_extent的old_sa_defrag_extent的队列.
+   - 减小btrfs_fs_info->defrag_running, 唤醒btrfs_fs_info->transaction_wait队列?
+
+** record_old_file_extents(inode, btrfs_ordered_extent)
+   - 这里根据btrfs_ordered_extent创建一个new_sa_defrag_extent, 所有参数照搬!
+   - 找到文件中原有的btrfs_file_extent_item, 找什么?这不在btrfs_ordered_extent中?
+   - 构造btrfs_key(inode_objectid, BTRFS_EXTENT_DATA_KEY, new_sa_defrag_extent->file_pos), 去btree中遍历btrfs_file_extent_item, 文件偏移不会超过btrfs_ordered_extent->len.
+   > btrfs_search_slot(NULL, btrfs_root, ...) 
+   - 碰到hold extent跳过, btrfs_file_extent_item->disk_bytenr == 0
+   - btrfs_file_extent_item指向的文件范围和btrfs_ordered_extent相交,不一定安全相同.
+   - 构造一个old_sa_defrag_extent
+   - bytenr/extent_offset都使用btrfs_file_extent_item
+   - 如果btrfs_file_extent_item对应的btrfs_key->offset > btrfs_ordered_extent->start, 需要有一个偏移,以后处理时使用.
+   - 把它放到new_sa_defrag_extent->head队列中
+
+** 总结
+   - 上面这么多代码就为了实现snapshot中的数据转移..
+
+** btrfs_finish_ordered_io(btrfs_ordered_extent)
+   - pagewrite的bio的回调函数提交的btrfs_work.
+   - 首先检查btrfs_ordered_extent->falgs, 如果有BTRFS_ORDERED_IOERR, 直接返回-EIO
+   - 针对freespace inode, transaction处理不一样..
+   > btrfs_is_free_space_inode(inode)
+   - 检查BTRFS_ORDERED_NOCOW, 直接写回extent原来的位置, 没什么可做的. checksum在哪里写的?
+   - 使用btrfs_ordered_extent更新disk_i_size
+   > btrfs_ordered_update_i_size(inode, 0, btrfs_ordered_extent)
+   - 准备btrfs_trans_handle, 使用btrfs_fs_info->delalloc_block_rsv
+   > btrfs_join_transaction(btrfs_root)
+   - 保存btrfs_inode_item的更新, 直接跳到最后释放文件相关的资源
+   > btrfs_update_inode_fallback(btrfs_trans_handle, btrfs_root, inode)
+   - 如果使用cow, 情况就复杂了.
+   - 先把extent锁起来
+   > lock_extent_bits(extent_io_tree, btrfs_ordered_extent->file_offset, btrfs_ordered_extent->len, 0, ...)
+   - 如果有defrag操作, 应该是后面的snapshot做的. defrag可能会持续很长时间?!
+   > test_range_bit(extent_io_tree, btrfs_ordered_extent->file_offset, len, EXTENT_DEFRAG, 1 , ..)
+   - 检查btrfs_root_item->last_snapshot > btrfs_inode->generation, 说明这个文件被snapshot共享, 需要做相关的更新? 还用管之前snapshot对他的数据? 可能这里在snapshot创建过程中?
+   > btrfs_root_last_snapshot(btrfs_root->btrfs_root_item)
+   > record_old_file_extents(inode, btrfs_ordered_extent)
+   - 对应的清理EXTENT_DEFRAG标志
+   > clear_extent_bit(extent_io_tree, btrfs_ordered_extent->file_offset, len, EXTENT_DEFRAG, ...)
+   - 准备btrfs_trans_handle, 同样使用btrfs_fs_info->delalloc_block_rsv. 
+   - 如果btrfs_ordered_extent->flags包含BTRFS_ORDERED_PREALLOC, 把对应的btrfs_file_extent_item中的PREALLOC属性改成正常的.
+   - btrfs_ordered_extent太有用了!!
+   > btrfs_mark_extent_written(btrfs_trans_handle, inode, btrfs_ordered_extent->file_offset, len)
+   - 否则,创建新的btrfs_file_extent_item
+   > insert_reserved_file_extent(btrfs_trans_handle, inode, file_offset, ...)
+   - 然后开始涉及map tree, 释放EXTENT_PINNED标志,这块空间可以释放?? 还没看到哪里和这个标志冲突?!
+   > unpin_extent_cache(btrfs_inode->extent_map_tree, ....)
+   - 把checksum数据写到btree中
+   > add_pending_csums(btrfs_trans_handle, inode, offset, list)
+   - 更新文件disk_i_size
+   > btrfs_ordered_update_i_size(inode, 0, ordered_extent)
+   - 保存btrfs_inode_item
+   > btrfs_update_inode_fallback(btrfs_trans_handle, btrfs_root, btrfs_inode)
+   - 释放extent
+   - unlock_extent_cached(extent_io_tree, btrfs_ordered_extent->file_offset, ...)
+   - 最后开始清理工作..
+   - 释放metadata, 为btree操作预留的metadata空间,具体释放多少还不一定.
+   > btrfs_delalloc_release_metadata(inode, btrfs_ordered_extent->len)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 释放btrfs_ordered_extent, 它的工作完成
+   > btrfs_remove_ordered_extent(inode, btrfs_ordered_extent)
+   - 如果上面需要defrag操作,完成这些操作
+   > relink_file_extents(new_sa_defrag_extent)
+
+** finish_ordered_fn(btrfs_work)
+   - btrfs_work是btrfs_ordered_extent中的
+   > btrfs_finish_ordered_io(btrfs_ordered_extent)
+
+** btrfs_writepage_end_io_hook(page, start, end, extent_state, uptodate)
+   - 开始处理vfs的接口回调函数.应该是bio处理完成. 
+   - 启动btrfs_ordered_extent的后续清理工作,或者btree/inode的相关操作
+   > ClearPagePrivate2(page)
+   - 根据文件范围更新对应的btrfs_ordered_extent, 如果btrfs_ordered_extent->bytes_left减为0,表示它的io完成,可以处理清理工作
+   > btrfs_dec_test_ordered_pending(inode, btrfs_ordered_extent, start, end-start, uptodate)
+   - 把btrfs_ordered_extent->work放到btrfs_root->btrfs_fs_info->endio_write_workers.. 如果是free space inode, 放到btrfs_fs_info->endio_freespace_worker队列上..
+   > btrfs_queue_worker(btrfs_workers, btrfs_ordered_extent->work)
+
+** btrfs_readpage_end_io_hook(page, start, end, extent_state, mirror)
+   - 当read完成时, 检查checksum.
+   - 检查PG_checked, 说明刚写过?! 无用检查?!
+   > PageChecked 
+   > ClearPageChecked()
+   - 检查btrfs_inode->flags的BTRFS_INODE_NODATASUM, 不再检查,退出.
+   - 先获取提取的checksum, 在extent_state中,首先看参数extent_state是不是这里操作的. 如果不是去找一个
+   > get_state_private(extent_io_tree, start, private)
+   - 计算page的checksum, 比较如果没问题返回0,有问题清空page, 返回-EIO
+
+** 总结
+   - readpage/writepage的回调函数
+  
+** delayed_iput 
+   #+begin_src 
+	struct list_head list;
+	struct inode *inode;   
+   #+end_src
+
+** btrfs_add_delayed_iput(inode)
+   - 延迟释放inode??  减小inode->i_count, 如果为1, 就构造一个delayed_iput, 把inode放到btrfs_fs_info->delayed_iputs队列..
+   > atomic_add_unless(inode->i_count, -1, 1)
+
+** btrfs_run_delayed_iputs(btrfs_root)
+   - 集中释放btrfs_root->btrfs_fs_info->delayed_iputs队列上的inode..
+   > iput(inode)
+
+** btrfs_orphan_commit_root(btrfs_trans_handle, btrfs_root)
+   - 在transaction commit时执行
+   - 在没有orphan files时调用,删除orphan items, 释放block_rsv..
+   - 如果btrfs_root->orphan_inodes>0, 或者btrfs_root->orphan_cleanup_state不是ORPHAN_CLEANUP_DONE.直接退出
+   - 如果btrfs_root->orphan_item_inserted有效,才释放它的orphan item, 在tree root中.
+   > btrfs_del_orphan_item(btrfs_trans_handle, tree_root, btrfs_root->root_key.objectid)
+   - 设置btrfs_root->orphan_item_inserted为0
+   - 释放btrfs_root->orphan_block_rsv中的空间, 它里面空间应该为0?
+   > btrfs_free_block_rsv(btrfs_root, btrfs_block_rsv)
+
+** btrfs_orphan_add(btrfs_trans_handle, inode)
+   - 为inode添加orphan?? 为truncate或unlink做准备..
+   - 首先为btrfs_root创建btrfs_block_rsv
+   > btrfs_alloc_block_rsv(btrfs_root, BTRFS_BLOCK_RSV_TEMP)
+   - btrfs_inode->runtime_flags没有BTRFS_INODE_ORPHAN_ITEM,就需要添加item.增加btrfs_root->orphan_inodes
+   - 设置btrfs_inode->runtime_flags的BTRFS_INODE_ORPHAN_META_RESERVED
+   - 为这个操作预留metadata空间,从global_block_rsv中转移到orphan_block_rsv
+   > btrfs_orphan_reserve_metadata(btrfs_trans_handle, inode)
+   - 插入一个inode的orphan item, 还可能为btrfs_root插入一个root的orphan item...
+   > btrfs_insert_orphan_item(btrfs_trans_handle, btrfs_root, inode_objectid)
+   > btrfs_orphan_reserve_metadata(btrfs_trans_handle, inode)
+
+** btrfs_orphan_del(btrfs_trans_handle, inode)
+   - 和上面相关,检查btrfs_inode->runtime_flags的BTRFS_INODE_HAS_ORPHAN_ITEM和BTRFS_INODE_ORPHAN_META_RESERVED, 分别对应orphan item和reserve block. 同时清除标志
+   > btrfs_del_orphan_item(...)
+   > btrfs_orphan_release_metadata(inode)
+
+** btrfs_orphan_cleanup(btrfs_root)
+   - 在btrfs_root中查找所有的BTRFS_ORPHAN_ITEM_KEY节点,删除这些节点.
+   - 使用btrfs_root->orphan_cleanup_state的ORPHAN_CLEANUP_STARTED互斥这个过程.
+   - 构造btrfs_key(BTRFS_ORPHAN_OBJECTID, BTRFS_ORPHAN_ITEM_KEY, -1)
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 节点btrfs_item没有其他数据. 找到btrfs_key, 再找对应的btrfs_inode
+   > btrfs_iget(btrfs_fs_info->super_block, btrfs_key, btrfs_root, NULL)
+   - 如果返回结果不是0或-ESTALE, 直接退出.
+   - 对于-ESTALE, 而且btrfs_root是tree_root, 这个orphan节点是为btrfs_root的, orphan节点有2种情况,一个是free space ino, 一个是snapshot.
+   - 遍历btrfs_fs_info->dead_roots, 如果有对应的btrfs_root, 就不能删除这个orphan节点.
+   - 对于free space inode的,可以删除
+   > btrfs_del_orphan_item(btrfs_trans_handle, btrfs_root, objectid)
+   - 如果找到inode, 就标志btrfs_inode->runtime_flags的BTRFS_INODE_HAS_ORPHAN_ITEM, 增加btrfs_root->orphan_inodes.
+   - 这应该是扫描btree时的初始化操作?!
+   - 检查inode->i_nlink, 如果不是0, 这个orphan为truncate准备. 这里就不用再创建对应的orphan,但会reserve空间,给btrfs_root->orphan_block_rsv.
+   > btrfs_orphan_add(btrfs_trans_handle, inode)
+   - 这样? 不检查检查?
+   > btrfs_truncate(inode)
+   - 否则这个是为unlink准备的, 下面会删除inode??
+   > iput(inode)
+   - 遍历完成后设置btrfs_root->orphan_cleanup_state为ORPHAN_CLEANUP_DONE, 释放reserved的空间
+   > btrfs_block_rsv_release(btrfs_root, btrfs_root->orphan_block_rsv, -1)
+   - 如果btrfs_root->orphan_block_rsv有效, 提交一遍transaction??
+   
+** acls_after_inode_item(extent_buffer, slot, objectid)
+   - 处理BTRFS_XATTR_ITEM_KEY的节点..也就是在extent_buffer中的.. 这个是一个tree leaf节点,里面是btrfs_item..
+   > btrfs_header_nritems(extent_buffer)
+   - 遍历这些,找到一个BTRFS_XATTR_ITEM_KEY的为止. 
+   - 不看acl.
+
+** btrfs_read_locked_inode(inode)
+   - 从btree中读回一个inode.
+   - 先去delayed inode中找一个, 如果找到设置fill
+   > btrfs_fill_inode(inode, rdev) 
+   - 去btree中查找btrfs_inode_item, 如果找不到,就创建一个bad_inode?
+   > btrfs_lookup_inode(NULL, btrfs_root, btrfs_path, btrfs_key, 0)
+   - 如果delayed inode已经填充btrfs_inode_item, 不再操作, 否则使用上面的查找btrfs_path填充inode数据.
+   - 如果上面delayed inode获取了数据,为何还要再查找btree?? 如果没有找到,就从btree中获取数据..
+   > set_nlink(inode, ...)
+   > i_uid_write(...)
+   - 如果btrfs_inode->last_trans == btrfs_fs_info->generation, 设置btrfs_inode->runtime_flags的BTRFS_INODE_NEEDS_FULL_SYNC??
+   > acls_after_inode_item(extent_buffer, slot, inode objectid)
+   > 然后根据inode->i_mode,文件类型,填充address_space_operation, file_operations, inode_operations
+
+** btrfs_map_token 
+   #+begin_src 
+	struct extent_buffer *eb;
+	char *kaddr;
+	unsigned long offset;
+   #+end_src
+
+** fill_inode_item(btrfs_trans_handle, extent_buffer, btrfs_inode_item, inode)
+   - 把内存中inode的信息给btree. transid使用btrfs_trans_handle
+     
+** btrfs_update_inode_item(btrfs_trans_handle, btrfs_root, inode)
+   - 使用btrfs_inode的btrfs_key找到btree的extent_buffer, 怎么不用delayed inode?
+   > btrfs_lookup_inode(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, 1)
+   > fill_inode_item(btrfs_trans_handle, ...)
+   - 设置btrfs_inode->last_trans / last_sub_trans / last_log_commit.
+   > btrfs_set_inode_last_trans(btrfs_trans_handle, inode)
+
+** btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   - 对于reloc的inode特殊对待. 对于普通inode, 使用delayed inode
+   > btrfs_update_root_times(btrfs_trans_handle, btrfs_root)
+   - 更新delayed inode中的btrfs_inode_item
+   > btrfs_update_inode_item(btrfs_trans_handle, btrfs_root, inode)
+   > btrfs_set_inode_last_trans(btrfs_trans_handle, inode)
+   - 对于free space ino 或者 RELOC的,直接更新btree
+   > btrfs_update_inode_item(btrfs_trans_handle, btrfs_root, inode)
+
+** btrf_update_inode_fallback(btrfs_trans_handle, btrfs_root, inode)
+   - 先使用delayed inode, 如果失败了使用btree的方法
+   > btrfs_update_inode(...)
+   > btrfs_update_inode_item(btrfs_trans_handle, btrfs_root, inode)
+
+** __btrfs_unlink_inode(btrfs_trans_handle, btrfs_root, inode dir, inode inode, name, name_len)
+   - 删除文件
+   > btrfs_alloc_path()
+   - 去btree中查找btrfs_dir_item, 使用hash索引
+   > btrfs_lookup_dir_item(btrfs_trans_handle, btrfs_root, btrfs_path, dir_ino, name, name_len, -1)
+   - 删除btrfs_dir_item
+   > btrfs_delete_one_dir_name(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_dir_item)
+   - 删除btree中的inode backref,以及btrfs_inode_extref
+   > btrfs_del_inode_ref(btrfs_trans_handle, btrfs_root, name, name_len, ino, dir_ino, index)
+   - 删除index dir索引
+   > btrfs_delete_delayed_dir_index(btrfs_trans_handle, btrfs_root, dir, index)
+   - 删除log中的inode backref
+   > btrfs_del_inode_ref_in_log(btrfs_trans_handle, btrfs_root, name, name_len, inode, dir_ino)
+   - 然后是log的btrfs_dir_item
+   > btrfs_del_dir_entries_in_log(...)
+   - 然后是vfs的inode操作, 父目录inode的大小变小
+   > btrfs_i_size_write(dir, dir->i_size - name_len * 2)
+   - 增加两个inode的i_version?!
+   - inode->i_ctime / dir->i_mtime / dir->i_ctime 受影响
+   - 更新父目录
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, dir)
+
+** btrfs_unlink_inode(btrfs_trans_handle, btrfs_root, inode dir, inode inode, name, name_len)
+   - 先去操作btree和父目录
+   > __btrfs_unlink_inode(btrfs_trans_handle, ...)
+   - 更新子文件的nlink, 也没有删除动作
+   > btrfs_drop_nlink(inode)
+   - 保存修改. 如果删除了,这里也体现不出来?!
+   > btrfs_update_inode(...)
+
+** check_path_shared(btrfs_root, btrfs_path)
+   - 检查btrfs_path中的extent_buffer 
+   - 添建是extent_buffer是根节点, btrfs_root->ref_cows有效, 而且不是新的snapshot??
+   > btrfs_block_can_be_shared(btrfs_root, extent_buffer)
+   - 去btree和delayed_ref中查找对应的tree block extent, 检查它的refs
+   > btrfs_lookup_extent_info(NULL, ...)
+   - 如果有被共享的extent_buffer, 说明路径被share??
+
+** __unlink_start_trans(inode dir, dentry dentry)
+   - 删除dentry.. 返回的是btrfs_trans_handle??
+   - 可能有5的metadata的操作
+   > btrfs_start_transaction(btrfs_root, 5)
+   - 如果因为ENOSPC分配失败,需要释放空间
+   - 这里要做检查,是不是需要释放空间?
+   - 对于目录,inode->i_count>1, 对于文件inode->count>2不能释放
+   - 设置btrfs_fs_info->enospc_unlink为1,如果已经设置直接返回
+   - 创建orphan item节点, 为何这时创建?!
+   > btrfs_start_transaction(btrfs_root, 1)
+   - 找到父目录的btrfs_inode_item
+   > btrfs_lookup_inode(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_inode->btrfs_key, 0)
+   - 如果btrfs_path被共享,就是整个目录被其他snapshot共享! 不能释放空间
+   > check_path_shared(btrfs_root, btrfs_path)
+   - 获取子文件的btrfs_inode_item, 如果也被共享,也不能释放
+   > btrfs_lookup_file_extent(btrfs_trans_handle, btrfs_root, btrfs_path, ino, -1, 0)
+   - 检查子文件的数据, 如果它没有数据呢?? 如果数据也被共享,也不能释放.
+   > btrfs_lookup_file_extent(btrfs_trans_handle, ...)
+   - 查找btrfs_dir_item, 这个也会共享? 下面就是btrfs_inode_backref, index btrfs_dir_item.
+   > btrfs_lookup_dir_item(btrfs_trans_handle, ...)
+   > btrfs_get_inode_ref_index(btrfs_trans_handle, btrfs_root, btrfs_path, name, ino, ...)
+   > btrfs_lookup_dir_index_item(...)
+   - 上面的检查都通过,把btrfs_trans_handle->block_rsv的空间给global_block_rsv
+   > btrfs_block_rsv_migrate(btrfs_trans_handle->block_rsv, btrfs_fs_info->global_block_rsv, btrfs_trans_handle->bytes_reserved)
+   > 让btrfs_trans_handle使用global_block_rsv
+
+** __unlink_end_trans(btrfs_trans_handle, btrfs_root)
+   - 检查btrfs_trans_handle->block_rsv, 如果是global BTRFS_BLOCK_RSV_GLOBAL, 就把它的空间转移释放掉.
+   > btrfs_block_rsv_release(btrfs_root, btrfs_trans_handle->block_rsv, btrfs_trans_handle->bytes_reserved)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 设置btrfs_fs_info->enospc_unlink为0, btrfs_trans_handle->block_rsv切换会btrfs_fs_info->trans_block_rsv.
+
+** btrfs_unlink(inode dir, dentry dentry)
+   - 准备transaction
+   > __unlink_start_trans(dir, dentry)
+   - 更新各种transid??
+   > btrfs_record_unlink_dir(btrfs_trans_handle, ...)
+   - 删除操作
+   > btrfs_unlink_inode(...)
+   - 如果inode->i_nlink为0, 添加orphan item.在遍历碰到orphan节点时会处理它
+   > btrfs_orphan_add(btrfs_trans_handle, inode)
+   > __unlink_end_trans(btrfs_trans_handle, btrfs_root)
+   - 启动balance工作?!
+   > btrfs_btree_balance_dirty(btrfs_root)
+
+** btrfs_unlink_subvol(btrfs_trans_handle, btrfs_root, inode dir, objectid, name, name_len)
+   - 这是删除subvol,在dir下面,名字是name. 它有一个对应的目录
+   - 查找btrfs_dir_item
+   > btrfs_lookup_dir_item(btrfs_trans_handle, btrfs_root, btrfs_path, dir_ino, name, name_len, -1)
+   - btrfs_dir_item里面指向的btrfs_key是btrfs_root_item?! 检查btrfs_key->type
+   - 删除btrfs_dir_item
+   > btrfs_delete_one_dir_name(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_dir_item)
+   - 删除btree的root ref/backref节点
+   > btrfs_del_root_ref(btrfs_trans_handle, btrfs_fs_info->tree_root, objectid, btrfs_root->btrfs_key.objectid, dir_ino, index, name, name_len)
+   - 如果删除不成功,使用index的目录索引, 查找subvolume使用的目录的index, 这里就是为了获取一个index?
+   > btrfs_search_dir_index_item(btrfs_root, btrfs_path, dir_ino, name, name_len)
+   - 删除delayed inode中缓存的item管理
+   > btrfs_delete_delayed_dir_index(btrfs_trans_handle, btrfs_root, inode, index)
+   - 修改inode的信息
+   > btrfs_update_inode_fallback(btrfs_trans_handle, ...)
+
+** btrfs_rmdir(inode, dentry)
+   - 删除的目录必须是空目录.inode->i_size 是BTRFS_EMPTY_DIR_SIZE (0).. 文件ino不能是BTRFS_FIRST_FREE_OBJECTID,不能删除它,它可是subvolume的根目录.
+   > __unlink_start_trans(dir, dentry)
+   - 如果inode objectid是BTRFS_EMPTY_SUBVOL_DIR_OBJECTID, 就删除subvol?
+   > btrfs_unlink_subvol(btrfs_trans_handle, ...)
+   - 先添加orphan,目录不支持link等.
+   > btrfs_orphan_add(btrfs_trans_handle, inode)
+   > btrfs_unlink_inode(btrfs_trans_handle, ...)
+   - 已经被删了,还管这些?!
+   > btrfs_i_size_write(inode, 0)
+   > __unlink_end_trans(btrfs_trans_handle, btrfs_root)
+   > btrfs_btree_balance_dirty(btrfs_root)
+
+** btrfs_truncate_inode_items(btrfs_trans_handle, btrfs_root, inode, new_size, min_type)
+   - 删除extent items, csum items, directory items, 在btree中,btrfs_item的位置根据btrfs_key, objectid最优先,所以关于一个inode的所有数据都放在一块. 这里根据inode_objectid,type,定位到一个开始的,把后续的都删除
+   - 如果new_size有效,是删除文件的磁盘空间,min_type必须是BTRFS_EXTENT_DATA_KEY,把超出的空间删除
+   - 先把数据的extent_map信息删除. 对于ref_cow有效或tree_root里面的inode
+   > btrfs_drop_extent_cache(inode, sectorsize, -1, 0)
+   - 如果min_type=0,删除delayed inode.
+   > btrfs_kill_delayed_inode_items(inode)
+   - 构造btrfs_key(inode_objectid, -1, -1), 从-1开始倒叙查找.. min_type表示遍历时的停止条件, 最小是BTRFS_INODE_ITEM_KEY(1), 如果指定0,就把inode也删除.. BTRFS_EXTENT_DATA_KEY是最大的?
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, -1, 1)
+   - 对于BTRFS_EXTENT_DATA_KEY, 检查btrfs_file_extent_item的范围,如果extent_end没有超过new_size,停止遍历;如果extent_start也超过,也删除,否则截断它.
+   - 如果是截断btrfs_file_extent_item,就修改它的extent_num_bytes
+   > ALIGN(new_size - btrfs_key.offset, btrfs_root->sectorsize)
+   > btrfs_set_file_extent_num_bytes(extent_buffer, btrfs_file_extent_item, num_bytes)
+   - 修改文件大小? 检查btrfs_file_extent_item指向的不是hole extent就需要删除文件大小.
+   > inode_sub_bytes(inode, size_change)
+   - 这里不会删除btrfs_item,要一块删除连续的多个btrfs_item
+   - 对于btrfs_file_extent_item, 删除extent, 使用extent_delayed_ref
+   > btrfs_free_extent(btrfs_trans_handle, btrfs_root, extent_start, ...)
+   - 最后一块删除多个,在切换btrfs_leaf时会使用
+   > btrfs_del_items(btrfs_trans_handle, btrfs_root, btrfs_path, ...)
+
+** btrfs_truncate_page(inode, from, len, front)
+   - read,zero,write page. (from,len)表示要清空的范围,设置为0. front表示向前还是向后清空. cow这个page,把一部分写为0.
+   - (from,len)不能sectorsize对齐?
+   - 预留1个page使用的metadata空间和data空间
+   > btrfs_delalloc_reserve_space(inode, PAGE_CACHE_SIZE)
+   - 根据from找到page
+   > find_or_create_page(address_space_mapping, index, mask)
+   - 如果page数据不是最新的,就读回来..
+   > PageUptodate(page)
+   > btrfs_readpage(NULL, page)
+   - 锁住page
+   > lock_page(page)
+   - 等待PG_writeback
+   > wait_on_page_writeback(page)
+   - 锁住extent
+   > lock_extent_bits(extent_io_tree, page_start, page_end, 0, extent_state)
+   - 设置page->private为EXTENT_PAGE_PRIVATE
+   > set_page_extent_mapped(page)
+   - 等待ordered extent, 必须把extent锁起来?
+   > btrfs_lookup_ordered_extent(inode, page_start)
+   - 如果需要等待extent extent, 释放extent/page的锁,启动ordered extent
+   > btrfs_start_ordered_extent(inode, btrfs_ordered_extent, 1)
+   - 然后清除extent的标志. 主要是清除EXTENT_DIRTY
+   > clear_extent_bit(extent_io_tree, page_start, page_end, EXTENT_DIRTY|EXTENT_DELALLOC|EXTENT_DO_ACCOUNTING|EXTENT_DEFRAG, ...)
+   - 增加btrfs_inode的delalloc计数.
+   > btrfs_set_extent_delalloc(inode, page_start, page_end, ...)
+   - 最后把页内(from, len)部分清空. 
+   > ClearPageChecked(page)
+   - 设置PAGECACHE_DIRTY
+   > set_page_dirty(page)
+   - 释放extent/page的锁
+   - 数据在pagecache中,而且预留了空间. 具体分配的事情后面再说.
+
+** btrfs_cont_expand(inode, oldsize, size)
+   - 在文件打洞时使用,创建假的file extent, 范围是(oldsize,size). 在btrfs_get_extent时获取EXTENT_MAP_HOLE.
+   - 如果size<=old_size,就直接退出
+   - 处理ordered extent
+   > btrfs_wait_ordered_range(inode, hole_start, len)
+   > lock_extent_bits(extent_io_tree, hold_start, ...)
+   > btrfs_lookup_ordered_extent(...)
+   - 确认没有ordered extent操作.
+   - 查找extent_map
+   > btrfs_get_extent(inode, NULL, ...)
+   - 如果extent_map->flags没有EXTENT_FLAG_PREALLOC,要删除之前的btrfs_file_extent_item/extent_map?
+   - 使用transaction保护btree的修改?
+   > btrfs_drop_extents(btrfs_trans_handle, btrfs_root, inode, offset, ...)
+   - 创建hole使用的btrfs_file_extent_item, block_start=0
+   > btrfs_insert_file_extent(btrfs_trans_handle, btrfs_root, inode_objectid, offset, ...)
+   - 创建对应的extent_map, extent_map->block_start是EXTENT_MAP_HOLE
+   > btrfs_drop_extent_cache(inode, ...)
+   > alloc_extent_map()
+   - add_extent_mapping(extent_map_tree, extent_map)
+   - 更新文件
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   
+** btrfs_setsize(inode, iattr)
+   - 比较iattr->ia_size和inode->i_size, 如果相同,直接退出.
+   - 设置文件大小,还要检查iattr?
+   - 更新i_ctime/i_mtime
+   - 如果iattr->ia_size > old_size, 需要truncate.
+   - 先释放pagecache中的缓存
+   > truncate_pagecache(inode, oldsize, newsize)
+   - 准备hole extent
+   > btrfs_cont_expand(inode, oldsize, newsize)
+   - 更新文件大小都使用transaction
+   > btrfs_start_transaction(btrfs_root, 1)
+   > i_size_write(inode, newsize)
+   - ordered size ??
+   > btrfs_ordered_update_i_size(inode, size, ...)
+   - 更新btrfs_inode_item
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 如果文件大小变小
+   - 如果newsize=0, 设置btrfs_inode->runtime_flags的BTRFS_INODE_ORDERED_DATA_CLOSE??
+   - 需要2次btree修改?! 
+   > btrfs_start_transaction(btrfs_root, 2)
+   - 添加orphan节点
+   > btrfs_orphan_add(btrfs_trans_handle, inode)
+   > btrfs_end_transaction(btrfs_trans_handle, root)
+   - 删除pagecache中的page,即使在io中也会立刻结束?! 下面在pagecache中释放它,会等待PG_LOCKED/PG_WRITEBACK.
+   > truncate_setsize(inode, newsize)
+   - 阻止dio,它会不断的写? dio会判断这些操作?!
+   > btrfs_inode_block_unlocked_dio(inode)
+   > inode_dio_wait(inode)
+   > btrfs_inode_resume_unlocked_dio(inode)
+   - 下面解释!
+   > btrfs_truncate(inode)
+   - 最后如果有问题,会删除orphan inode
+
+** btrfs_setattr(dentry, iattr)
+   - 设置metadata数据! 最基础的metadata
+   > inode_change_ok(inode, attr)
+   - 单独处理iattr->ia_valid & ATTR_SIZE 
+   > btrfs_setsize(inode, iattr)
+   - 其他属性 iattr->ia_valid
+   > setattr_copy(inode, iattr)
+   - 保存到btree中
+   > btrfs_dirty_inode(inode)
+   
+** btrfs_evict_inode(inode)
+   - 删除文件也要预留空间??
+   > btrfs_calc_trunc_metadata_size(btrfs_root, 1)
+   - 先删除所有的数据
+   > truncate_inode_pages(address_space, 0)
+   - 检查是否需要删除文件
+   - inode->i_nlink>0, 而且btrfs_root_item->refs>0, 或者free space inode就不能删除
+   - bad inode, 在创建inode的时候,会创建inode. 删除orphan item
+   > btrfs_orphan_del(NULL, inode)
+   - 等待ordered extent
+   > btrfs_wait_ordered_range(inode, 0, -1)
+   - 又一次检查inode->i_nlink? 不再删除文件,而且btrfs_root_item->refs必须为0!
+   - 如果要删除了,为何要提交delayed inode信息?
+   > btrfs_commit_inode_delayed_inode(inode)
+   - 创建临时的btrfs_block_rsv
+   > btrfs_alloc_block_rsv(btrfs_root, BTRFS_BLOCK_RSV_TEMP)
+   > btrfs_i_size_write(inode, 0)
+   - 为这个btrfs_block_rsv预留的空间是1个btree操作
+   > btrfs_block_rsv_refill(btrfs_root, btrfs_block_rsv, min_size, BTRFS_RESERVE_FLUSH_LIMIT)
+   - 如果填空失败,使用global_block_rsv的空间
+   > btrfs_block_rsv_migrate(global_block_rsv, rsv, min_size)
+   > btrfs_join_transaction(btrfs_root)
+   - 注意这里后面的参数是0, 0, 所以删除和inode相关的所有东西..
+   > btrfs_truncate_inode_items(btrfs_trans_handle, btrfs_root, inode, 0, 0)
+   - 如果返回-ENOSPC,继续循环,为block_rsv分配空间
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 把block_rsv中的空间释放掉.
+   > btrfs_free_block_rsv(btrfs_root, btrfs_block_rsv)
+   - 如果没有问题,把orphan item删除
+   > btrfs_orphan_del(btrfs_trans_handle, inode)
+
+** btrfs_inode_by_name(inode dir, dentry, btrfs_key)
+   - 根据dentry->d_name查找子文件的btrfs_key, btrfs_key应该指向btrfs_root_item
+   > btrfs_alloc_path()
+   > btrfs_lookup_dir_item(NULL, btrfs_root, btrfs_path, dir_objectid, name, namelen, 0)
+   - 找到btrfs_dir_item,把btrfs_key给参数传回去
+
+** fixup_tree_root_location(btrfs_root, inode, dentry, btrfs_key, btrfs_root)
+   - 在遍历路径时,碰到文件夹,它可能指向subvolume,获取它的根文件夹的btrfs_key
+   - 去tree_root中根据BTRFS_ROOT_REF_ITEM,查找对应的subvolume是否存在, 找到对应的btrfs_root_ref
+   > btrfs_find_root_ref(btrfs_fs_info->tree_root, btrfs_path, dir_inode->btrfs_root->btrfs_key.objectid, btrfs_key->objectid)
+   - 获取btrfs_root_ref中dirid/name, 和参数dir/dentry是否一致
+   - 查找btrfs_root, 检查btrfs_root_item->refs, 如果是0,不再处理
+   > btrfs_read_fs_root_no_name(btrfs_fs_info, btrfs_key)
+   - 根据btrfs_root->btrfs_root_item构造btrfs_key(root_dirid, BTRFS_INODE_ITEM_KEY, 0)
+   - 根目录的objectid不是固定的么?!
+
+** inode_tree_add(inode)
+   - btrfs_root->inode_tree是rb tree, 里面是btrfs_inode->rb_node, 根据ino_objectid排序.这里把btrfs_ionde放到rb tree中.
+   - unhash是什么意思? 这样不能添加到btrfs_root中. 对于free space inode?
+   > inode_unhash(inode)
+   > rb_link_node(rb_node, ...)
+   > rb_insert_color(btrfs_inode->rb_node, btrfs_root->inode_tree)
+   
+** inode_tree_del(inode)
+   - 首先释放rb tree关系..
+   > rb_erase(btrfs_inode->rb_node, btrfs_root->inode_tree)
+   - 检查btrfs_root的rb tree是否空, 如果空了, 而且rbtrfs_root->root_item的refs为0, 同时删除这个btrfs_root??
+   > btrfs_add_dead_root(btrfs_root)
+   - 在删除subvolume时是不是删除根文件.
+
+** btrfs_invalidate_inodes(btrfs_root)
+   - 应该是遍历btrfs_root->inode_tree上面的所有btrfs_inode
+   - 这个遍历是很耗费时间的,每次处理一个inode,会让出cpu,重新查找rb tree
+   > igrab(btrfs_inode->vfs_inode)
+   - 这里会失败? 其他地方释放掉了?!
+   - 如果inode->i_count>1, 删除dentry
+   > d_prune_aliases(inode)
+   > iput(inode)
+
+** btrfs_iget_args
+   #+begin_src 
+	u64 ino;
+	struct btrfs_root *root;
+   #+end_src
+
+** btrfs_init_locked_inode(inode, p)
+   - p就是btrfs_iget_args, 把参数给inode->i_ino 和 btrfs_inode->root
+   
+** btrfs_find_actor(inode, opaque)
+   - 比较回调函数, ino和btrfs_root
+
+** btrfs_iget_locked(super_block, objectid, btrfs_root)
+   > iget5_locked(super_block, objectid, btrfs_find_actor, btrfs_init_locked_inode, p)
+   - 这么简单的初始化函数? 只是分配一个inode结构
+
+** btrfs_iget(super_block, btrfs_key, btrfs_root, new)
+   - 先获取inode
+   > btrfs_iget_locked(super_block, btrfs_key->objectid, btrfs_root)
+   - 获取的btrfs_inode可能时从磁盘上读回来的?? 根据inode->i_state的I_NEW..
+   - 从delayed inode或者btree中获取inode metadata
+   > btrfs_read_locked_inode(inode)
+   - 给btrfs_root管理
+   > inode_tree_add(inode)
+   - 释放inode->i_state的__I_NEW标志, 唤醒相关的等待
+   > unlock_new_inode(inode)
+   
+** new_simple_dir(super_block, btrfs_key, btrfs_root)
+   - 创建目录inode, 作为readonly?
+   > new_inode(super_block)
+   - 填充btrfs_key, btrfs_inode->runtime_flags的BTRFS_INODE_DUMMY, i_ino为BTRFS_EMPTY_SUBVOL_DIR_OBJECTID
+   - btrfs_root->btrfs_key是否和inode->i_ino冲突?
+
+** btrfs_lookup_dentry(inode dir, dentry dentry)
+   - 查找子文件inode.应该是dentry_operation中的操作.
+   - 先找到btrfs_key
+   > btrfs_inode_by_name(inode dir, dentry, btrfs_key)
+   - 如果btrfs_key->type是BTRFS_INODE_ITEM_KEY, 一切简单,普通文件
+   - 否则碰到subvolume,去subvolume里面获取根目录
+   > fixup_tree_root_location(btrfs_root, inode dir, dentry dentry, btrfs_key, btrfs_root)
+   - 使用新的btrfs_root, btrfs_key
+   > btrfs_iget(inode->i_sb, btrfs_key, btrfs_root, NULL)
+   - 这类毕竟刚刚打开了subvolume,检查它的orphan信息
+   > btrfs_orphan_cleanup(btrfs_root)
+   
+** btrfs_dentry_delete(dentry)
+   - BTRFS_EMPTY_SUBVOL_DIR_OBJECTID是什么东西? 或者btrfs_root->btrfs_root_item->refs==0
+   - 这时dentry_operation的回调函数,在释放dentry时,是直接删除它,还是把它放到缓存队列
+
+** btrfs_dentry_release(dentry)
+   - 在删除dentry时使用. 释放dentry->d_fsdata. 它是什么东西?
+
+** btrfs_lookup(inode, dentry, flags)
+   - 查找或创建dentry,先找到inode, 然后找一个dentry
+   > d_splice_alias(btrfs_lookup_dentry(dir, dentry), dentry)
+
+** btrfs_read_readdir(file, dirent, filldir_t)
+   - 填充dirent, 就是内存... f_pos=0是".", f_pos=1是".."
+   > filldir(dirent, name, name_len, file->f_pos, inode_objectid, DT_DIR)
+   - 首先获取delayed inode
+   > btrfs_get_delayed_items(inode, list_head, list_head)
+   - 使用btrfs_key(inode_objectid, BTRFS_DIR_INODE_KEY, f_pos), 开始遍历,查找btrfs_item, 查找之后,只要顺序向后查找..
+   - btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0) 
+   - 检查delayed inode要删除??
+   > btrfs_should_delete_dir_index(del_list, offset)
+   - 从extent_buffer中找到对应的btrfs_dir_item, 找到name, type
+   > filldir(dirent, name, ...)
+   - 最后处理delayed 的添建的inode..
+
+** btrfs_write_inode(inode, writeback_control)
+   - 竟然是super_block中的操作?! 用于刷新操作吗?
+   - 检查writeback_control->sync_mode, 如果不是WB_SYNC_ALL,直接返回.
+   - 只有transaction操作..
+   > btrfs_join_transaction(btrfs_root)
+   > btrfs_commit_transaction(btrfs_trans_action, btrfs_root)
+
+** btrfs_dirty_inode(inode)
+   - 检查btrfs_inode->runtime_flags的BTRFS_INODE_DUMMY, 跳过这种inode
+   > btrfs_join_transaction(btrfs_root)
+   - 保存btrfs_inode_item信息
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 如果btrfs_inode->delayed_node有效,它有缓存的信息,去更新一下,释放内存/存储空间
+   > btrfs_balance_delayed_items(btrfs_root)
+
+** btrfs_update_time(inode, timespec now, flags)
+   - flags表示更新那些域, S_VERSION, S_CTIME, S_MTIME, S_ATIME等等..
+   > btrfs_dirty_inode(inode)
+
+** btrfs_set_inode_index_count(inode)
+   - btrfs_inode->index_cnt是文件夹中新的文件的index
+   - 构造btrfs_key(inode objectid, BTRFS_DIR_INDEX_KEY, -1)
+   > btrfs_alloc_path()
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 如果找不到,就返回2, 前面有 "." 和 "..", 否则返回btrfs_key.offset + 1, 结果缓存到btrfs_inode->index_cnt中.
+   - 如果找到就是btrfs_key->offset + 1
+
+** btrfs_set_inode_index(inode dir, index)
+   - 返回一个可用的index.
+   - 如果btrfs_inode->index_cnt可用, 不是-1,就使用它.
+   - 如果不可用去delayed inode和btree中获取数据..
+   > btrfs_inode_delayed_dir_index_count(inode)
+   > btrfs_set_inode_index_count(inode)
+
+** btrfs_new_inode(btrfs_trans_handle, btrfs_root, inode dir, name, name_len, ref_objectid, objectid, mod, index)
+   - 创造inode??
+   > btrfs_alloc_path()
+   - 先创建vfs的inode, 设置inode->i_ino为objectid
+   > new_inode(btrfs_fs_info->super_block)
+   - dir有效,设置它的index_cnt. 
+   > btrfs_set_inode_index(inode, index)
+   - 可能会无效吗?
+   - 初始化btrfs_inode, generation为btrfs_trans_handle->transid
+   - 设置btrfs_inode->runtime_flags的BTRFS_INODE_NEEDS_FULL_SYNC.
+   - 填充btree的btrfs item, btrfs_inode_item和btrfs_inode_ref. 
+   - btrfs_key(objectid, BTRFS_INODE_ITEM_KEY, 0)和btrfs_key(objectid, BTRFS_INODE_REF_KEY, ref_objectid), ref_objectid是父目录,怎么不从dir中获取? 
+   - btrfs_insert_empty_items(...)
+   - 创建vfs中inode之间没有关系,下面设置gid/uid/mod
+   > inode_init_owner(inode, dir, mode)
+   > inode_set_bytes(inode, 0)
+   - 还有i_mtime/i_ctime/i_atime
+   - 填充btrfs_inode_item
+   > fill_inode_item(btrfs_trans_handle, extent_buffer, btrfs_inode_item, inode)
+   - 填充btrfs_inode_ref
+   > btrfs_set_inode_ref_name_len(...)
+   - 继续设置一些属性
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - inode放到vfs hash队列中和btrfs_root管理中
+   > insert_inode_hash(inode)
+   > inode_tree_add(inode)
+   > btrfs_set_inode_last_transid(btrfs_trans_handle, inode)
+   - 更新btrfs_root_item
+   > btrfs_update_root_times(btrfs_trans_handle, btrfs_root)
+   - 这里没有transaction的准备!
+
+** btrfs_inode_type(inode)
+   - 根据inode->i_mode, 返回对应的类型..
+
+** btrfs_add_link(btrfs_trans_handle, inode parent, inode, name, name_len, add_backref, index)
+   - 创建hard link,应该只需要btrfs_inode_ref/btrfs_dir_item就够了.
+   - 这里应该为btrfs_dir_item准备btrfs_key
+   - 如果子文件对应的ino是BTRFS_FIRST_FREE_OBJECTID, btrfs_key就是btrfs_root->btrfs_key,指向subvolume, 否则创建一个新的btrfs_key,它是(ino, BTRFS_INODE_ITEM_KEY,0), 指向普通的文件
+   - 如果是BTRFS_FIRST_FREE_OBJECTID, 还要插入btrfs_root_ref
+   > btrfs_add_root_ref(btrfs_trans_handle, tree_root, ...)
+   - 参数add_backref有效,添加btrfs_inode_ref信息? 在创建文件时不需要,因为创建btrfs_inode_item时已经创建.
+   > btrfs_insert_inode_ref(btrfs_trans_handle, btrfs_root, name, name_len, inode, parent_ino, index)
+   - 然后添加btrfs_dir_item
+   > btrfs_insert_dir_item(btrfs_trans_handle, btrfs_root, name, name_len, parent_inode, ...)
+   - 修改parent inode文件大小..
+   > btrfs_i_size_write(inode, ...)
+   - 保存btrfs_inode_item, 父目录的信息
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, parent_inode)
+
+** btrfs_add_nondir(btrfs_trans_handle, inode dir, dentry dentry, inode inode, backref, index)
+   - 对于创建普通文件, 非文件夹. 建立树的link,也就是目录信息
+   > btrfs_add_link(btrfs_trans_handle, dir, inode, dentry->d_name, ...)
+
+** btrfs_mknod(inode, dentry, mod, rdev)
+   - 修改btree的地方包括btrfs_inode_item, btrfs_inode_ref, 2个btrfs_item_dir, 1个xattr
+   > btrfs_start_transaction(btrfs_root, 5)
+   - 分配ino
+   > btrfs_find_free_ino(btrfs_root, objectid)
+   - 创建inode, 插入了btrfs_inode_item
+   > btrfs_new_inode(btrfs_trans_handle, ...)
+   - xattr?
+   > btrfs_init_inode_security(btrfs_trans_handle, inode, dir, name)
+   - 创建btrfs_dir_item
+   > btrfs_add_nondir(btrfs_trans_handle, dir, dentry, inode, 0, index)
+   - 初始化vfs inode
+   > init_special_inode(inode, mod, rdev)
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   - dcache
+   > d_instantiate(dentry, inode)
+   
+** btrfs_create(inode dir, dentry dentry, mod, bool excl)
+   - 创建普通文件, 创建inode item和backref item.. dir items, xattr item
+   > btrfs_start_transaction(btrfs_root, 5)
+   - 找一个空的inode objectid
+   > btrfs_find_free_ino(btrfs_root, objectid)
+   - 构造btrfs_inode_item/vfs inode
+   > btrfs_new_inode(btrfs_trans_handle, btrfs_root, inode, dentry->d_name, len, dir_objectid, objectid, mode, index)
+   > btrfs_init_inode_security(btrfs_trans_handle, inode, dir, dentry->d_name)
+   - 保存btrfs_inode_item
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   - 设置file_operations为 btrfs_file_operations, inode_operations为btrfs_file_inode_operations, address_space_operations为btrfs_aops, backing_dev_info为btrfs_fs_info->bdi.
+   - 在创建btrfs_inode_item时已经创建btrfs_inode_ref
+   > btrfs_add_nondir(btrfs_trans_handle, dir, dentry, inode, 0, index)
+   - dentry
+   > d_instantiate(dentry, inode)
+
+** btrfs_link(dentry old_dentry, inode dir, dentry dentry)
+   - btrfs支持的最大link是BTRFS_LINK_MAX 65536.
+   - 为btrfs_dir_item找空闲的index
+   > btrfs_set_inode_index(dir, index)
+   - inode修改, btrfs_inode_ref, 2个btrfs_dir_item, parent inode
+   > btrfs_start_transaction(btrfs_root, 5)
+   - 增加子文件的link
+   > btrfs_inc_nlink(inode)
+   > btrfs_inc_iversion(inode)
+   - 增加inode->i_count
+   > ihold(inode)
+   - 设置btrfs_inode->runtime_flags的BTRFS_INODE_COPY_EVERYTHING??
+   - 增加btrfs_inode_ref
+   > btrfs_add_nondir(btrfs_trans_handle, dir, dentry, inode, 1, index)
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   > d_instantiate(dentry, inode)
+   - 为何这里创建log信息?
+   > btrfs_log_new_name(btrfs_trans_handle, inode, NULL, parent)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+
+** btrfs_mkdir(inode dir, dentry dentry, mode)
+   - 这里都是5个btree操作
+   > btrfs_start_transaction(btrfs_root, 5)
+   - 分配ino
+   > btrfs_find_free_ino(btrfs_root, objectid)
+   - 创建btrfs_inode_item, 获取index
+   > btrfs_new_inode(btrfs_trans_handle, btrfs_root, dir, dentry->d_name.name, len, dir_objectid, objectid, S_IFDIR|mode, index)
+   - acl
+   > btrfs_init_inode_security(btrfs_trans_handle, inode, dir, dentry->d_name)
+   - 设置inode的file_operations是btrfs_dir_file_operations, inode_operations是btrfs_dir_inode_operations..
+   > btrfs_i_size_write(inode, 0)
+   - 保存btrfs_inode_item
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+   - 增加父目录的索引
+   > btrfs_add_link(btrfs_trans_handle, dir, inode, dentry->d_name.name, len, 0, index)
+   > d_instantiate(dentry, inode)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+
+** merge_extent_mapping(extent_map_tree, extent_map existing, extent_map em, map_start, map_len)
+   - 向extent_map_tree中添加extent_map, 修改它的start/len.
+   - 如果它不是hole extent_map->block_start < EXTENT_MAP_LAST_BYTE, 而且不是压缩的,修改它的磁盘位置  extent_map->block_start / block_len
+   > add_extent_mapping(extent_map_tree, extent_map)
+
+** uncompress_inline(btrfs_path, inode inode, page page, pg_offset, extent_offset, btrfs_file_extent_item item)
+   - 获取inline的数据,然后解压到page中.
+   - 从btrfs_path/btrfs_file_extent_item中获取数据指针
+   - 获取数据量,分配内存,读取数据
+   - 这个extent_ram_bytes没什么用?!
+   > btrfs_file_extent_ram_bytes(...)
+   > btrfs_file_extent_inline_item_len(...)
+   > read_extent_buffer(extent_buffer, ...)
+   > btrfs_file_extent_compression(extent_buffer, btrfs_file_extent_item)
+   > btrfs_file_extent_inline_item_len(extent_buffer, ptr)
+   > read_extent_buffer(extent_buffer, void *, ptr, inline_size)
+   - 解压缩数据,数据量不能超过extent_ram_bytes. 应该是直接放到page中
+   > btrfs_decompress(compress_type, tmp, page, extent_offset, inline_size, max_size)
+   - 清空page的后面一半
+
+** btrfs_get_extent(inode, page, pg_offset, start, len, create)
+   - 获取extent_map, 根据文件偏移,计算磁盘偏移.
+   - 先找内存中的extent_map. 根据start. 
+   > lookup_extent_mapping(exetnt_map_tree, start, len)
+   - 检查extent_map的文件偏移, 没要求extent_map覆盖(start,len),但要求它的包含start. 返回找到的
+   - 如果page有效,不能是EXTENT_MAP_ININE. 
+   - 如果不满足,就分配新的.
+   > alloc_extent_map()
+   - 初始化这个extent map, bdev是btrfs_fs_info->fs_devices->latest_bdev, start=EXTENT_MAP_HOLE
+   - 去btree中查找btrfs_file_extent_item
+   > btrfs_lookup_file_extent(btrfs_trans_handle, btrfs_root, btrfs_path, objectid, start, trans != NULL)
+   - 检查btrfs_file_extent_item,获取extent_start,extent_end,compress_type,type
+   - 如果start > extent_end, 检查下一个btrfs_item.
+   - 如果找到btrfs_file_extent_item, 而且范围覆盖start
+   - 找到btrfs_file_extent_item, 对于REG/PREALLOC,填充extent_map, start/len/orig_start. 
+   - 检查btrfs_file_extent_item->disk_bytenr, 如果是0,就是hole, 设置block_start为EXTENT_MAP_HOLE
+   - compress信息, 设置EXTENT_FLAG_COMPRESSED, block_start/block_len
+   - 如果不是compressed, 设置偏移的disk_bytenr, block_len
+   - 对于BTRFS_FILE_EXTENT_PREALLOC, 设置extent_map->flags的EXTENT_FLAG_PREALLOC
+   - 对于INLINE, 设置block_start为EXTENT_MAP_INLINE, 如果page无效,或者create有效,这里是创建extent, 直接退出.
+   - 读取extent的信息,读取的范围根据page/pg_offset决定, 不一定全部读回来. 保存经过偏移(extent_offset)的start/len,extent_map->orig_start/orig_block_len就是(len,start), compress_type, 设置EXTENT_FLAG_COMPRESSED标志
+   - 如果create是0,而且page没有PG_uptodate,把数据读出来
+   - 需要压缩的情况
+   - uncompress_inline(btrfs_path, inode, page, pg_offset, extent_offset, item)
+   - 不需要的情况
+   > read_extent_buffer(...)
+   - 如果create有效,page有PG_uptodate,把数据写到btrfs_file_extent_item中. 这里有问题,create有效上面已经跳出去.
+   > write_extent_buffer(extent_buffer, ...)
+   - 经过上面的处理,如果没有btrfs_file_extent_item, 设置为EXTENT_MAP_HOLE
+   - 如果没有找到extent_map, extent_map->flags的EXTENT_FLAG_VACANCY标志
+   - 添加到extent_map_tree中
+   > add_extent_mapping(extent_map_tree, extent_map)
+   - 上面如果添加失败,有重复或者别人添加了. 重新根据参数查找,使用新找到的
+   - lookup_extent_mapping(extent_map_tree, start, len)
+   - 如果找到的没法用,查找extent_map->start
+   > lookup_extent_mapping(extent_map_tree, extent_map->start, extent_map->len)
+   - 这个也有,它创建一个前一个sectorsize的,添加后去和他合并.
+   > merge_extent_mapping(extent_map_tree, extent_map, extent_map, start, sectorsize)
+   - 最后返回extent_map
+   - 这个函数就是去查找extent_map_tree, 如果没有,查找btrfs_file_extent_item. 根据查找的情况,返回extent_map. 如果都没有就构造一个hole返回.
+
+** btrfs_get_extent_fiemap(inode, page, pg_offset, start, len, create)
+   - 这里还是返回extent_map. 应该是处理一个page之内的.
+   > btrfs_get_extent(inode, page, pg_offset, start, len, create)
+   - extent_map->block_start != EXTENT_MAP_HOLE, 而且extent_map->flags没有EXTENT_FLAG_PREALLOC, 返回这个. 否则是一个hole的btrfs_file_extent_item. prealloc也不会分配空间??
+   - 看看(start,len)范围内是否有EXTENT_DELALLOC
+   > count_range_bits(btrfs_inode->extent_io_tree, range_start, end, len, EXTENT_DELALLOC, 1)
+   - 如果没有delalloc空间,返回hole extent_map
+   - 如果有,上面找到的范围是(range_start, return)
+   - 这里需要返回一个有意义的extent_map, 使用hole或创建一个
+   - 如果hole的extent_map包含delalloc的范围,就复制一个hole extent
+   - 否则创建一个delalloc的extent_map
+   - start/len是delalloc的范围,block_start为EXTENT_MAP_DELALLOC
+   - 这里比上面多了一个delalloc检查. 如果返回的范围无法涵盖参数start怎么办?
+
+** btrfs_new_extent_direct(inode, start, len)
+   - 为dio服务的.
+   > btrfs_join_transaction(btrfs_root)
+   - btrfs_trans_handle->block_rsv 使用 btrfs_fs_info->delalloc_block_rsv.
+   - 获取hint磁盘地址
+   > get_extent_allocation_hint(inode, start, len)
+   - 创建btrfs_extent_item
+   > btrfs_reserve_extent(btrfs_trans_handle, btrfs_root, len, sectorsize, 0, alloc_hint, btrfs_key, 1)
+   - 只是普通的extent_map的添加
+   > create_pinned_em(inode, start, btrfs_key.offset, start, ...)
+   - 对应的注册ordered extent
+   > btrfs_add_ordered_extent_dio(inode, start, ...)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+
+** can_nocow_odirect(btrfs_trans_handle, inode, offset, len)
+   - 检测是否可以不使用cow,就不用分配磁盘
+   - 搜索对应的btrfs_file_extent_item
+   > btrfs_lookup_file_extent(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_inode, offset, 0)
+   - 如果找不到,必须cow. 还不如说必须分配磁盘空间
+   - 获取extent type, 如果不是EXTENT_REG/EXTENT_PREALLOC, 必须cow..
+   - 获取disk_bytenr/offset/extent_start/extent_end/num_bytes
+   - 如果extent_end<offset+len, 也就是btrfs_file_extent_item没有完全包括(offset,len), 必须cow
+   - readonly,必须cow
+   > btrfs_extent_readonly(btrfs_root, disk_bytenr)
+   - 检查使用的data extent是否共享,必须cow
+   > btrfs_cross_ref_exist(btrfs_trans_handle, btrfs_inode, orig_offset, disk_bytenr)
+   - 如果有了btree里面checksum,也要cow? 如果sector对齐的话应该也没问题.
+   > csum_exist_in_range(btrfs_root, disk_bytenr, num_bytes)
+
+** lock_extent_direct(inode, lockstart, lockend, extent_state cached_extent, writing)
+   - 又是检查ordered extent, 锁住extent
+   > lock_extent_bits(btrfs_inode->extent_io_tree, lockstart, lockend, 0..)
+   > btrfs_lookup_ordered_extent(inode, ..)
+   - 这里不仅要需要没有ordered extent, 而且对于写,还要保证extent没有EXTENT_UPTODATE,也就是没有pagecache?
+   > test_range_bit(extent_io_tree, lockstart, lockend, EXTENT_UPTODATE, 0, extent_state)
+   - 如果还有ordered extent,启动它
+   > btrfs_start_ordered_extent(inode, btrfs_ordered_extent, 1)
+   - 否则,就有pagecache
+   > filemap_write_and_wait_range(inode->address_space, lockstart, lockend)
+   - 删除pagecache
+   > invalidate_inode_pages2_range(...)
+
+** creaet_pinned_em(inode, start, len, orig_start, block_start, block_len, orig_block_len, type)
+   - 使用参数创造一个extent map.. 设置extent_map->flags的EXTENT_FLAG_PINNED
+   > alloc_extent_map()
+   - 如果type是BTRFS_ORDERED_PREALLOC, 设置EXTENT_FLAG_FILLING
+   > btrfs_drop_extent_cache(inode, extent_map->start, len, 0)
+   > add_extent_mapping(extent_map_tree, extent_map)
+
+** btrfs_get_blocks_direct(inode, sector_t, buffer_head, create)
+   - 这里处理buffer_head?? 根据sector_t算出数据位置, 文件位置??
+   - 这是要锁住extent,但锁的时候保证没有pagecache和io的page
+   > lock_extent_direct(inode, lockstart, lockend, extent_state, create)
+   - 获取extent_map, 普通的
+   > btrfs_get_extent(inode, NULL, 0,  start, len, 0)
+   - 如果extent_map->block_start是EXTENT_MAP_INLINE或者extent是compress, 需要使用buffered方式读回来,这里返回 -ENOTBLK..
+   - 参数create什么意思?? 无效时,不能使用HOLE或PREALLOC的extent
+   - 对于EXTENT_FLAG_PREALLOC的extent_map,或者NODATACOW,而且extent对应的磁盘不是hole,可以使用以有的磁盘
+   - 下面要准备的type就是BTRFS_ORDERED_NOCOW/BTRFS_ORDERED_PREALLOC
+   > btrfs_join_transaction(btrfs_root)
+   - 要使用nocow,再检查一遍
+   > can_nocow_odirect(btrfs_trans_handle, inode, start, len)
+   - 如果是BTRFS_ORDERED_PREALLOC,还没有extent_map??
+   > create_pinned_em(inode, start, len, ...)
+   - 注册ordered_extent
+   > btrfs_add_ordered_extent_dio(inode, start, block_start, len, ...)
+   > btrfs_end_transaction(btrfs_trans_handle, btrfs_root)
+   - 对于使用cow的,分配新的extent,同时准备extent_map
+   > btrfs_new_extent_direct(inode, start, len)
+   - 准备好了extent_map, 设置buffer_head->b_blocknr
+   > set_extent_bit(extent_io_tree, lockstart, lockstart+len, EXTENT_DELALLOC, NULL, extent_state, GFP_NOFS)
+   > set_buffer_mapped(buffer_head)
+   - 如果create有效? 如果没有EXTENT_FLAG_PREALLOC,设置buffer_head为new?!
+   > set_buffer_new(buffer_head)
+   - 增加btrfs_inode->outstanding_extents, 设置对应的delalloc??
+   > set_extent_bit(extent_io_tree, lockstart, end, EXTENT_DELALLOC, NULL, ..)
+   - 最后清除extent标志 EXTENT_LOCK/EXTENT_DELALLOC/EXTENT_DIRTY? create折腾?
+   > clear_extent_bit(extent_io_tree, lockstart, ...)
+   > free_extent_map(extent_map)
+
+** btrfs_dio_private
+   #+begin_src 
+        //dio??
+	struct inode *inode;
+	u64 logical_offset;   //文件位置..
+	u64 disk_bytenr;      
+	u64 bytes;            //IO数据量
+	void *private;        //缓存bio->bi_private, 谁改了它???
+
+	/* number of bios pending for this dio */
+	atomic_t pending_bios;
+
+	/* IO errors */
+	int errors;
+
+	struct bio *orig_bio;
+   #+end_src
+
+** btrfs_endio_direct_read(bio, err)
+   - 这是读io完成后的回调?! 进行checksum验证, bio->bi_private是btrfs_dio_private.文件偏移是btrfs_dio_private->logical_offset,dio不使用pagecache? 所以无法计算文件偏移? 但是bio_vec中有page
+   - 检查btrfs_inode->flags没有BTRFS_CHECKSUM_NODATASUM,跳过checksum验证
+   - 从extent_state中获取checksum, 使用文件偏移
+   > get_state_private(btrfs_inode->extent_io_tree, start, private)
+   - 计算bio_vec中的数据checksum, 它使用page
+   > btrfs_csum_data(btrfs_root, ...)
+   - 这里计算使用时使用irq保护起来?因为会访问用户态的page?
+   > local_irq_save(flags)
+   > local_irq_restore(flags)
+   - 如果经过比较不一样,返回-EIO
+   - 循环处理下一个bio_vec, 这里能保证一个bio_vec就是一个sector?
+   - io完成,解锁extent的锁, page呢?
+   > unlock_extent(btrfs_inode->extent_io_tree, btrfs_dio_private->logical_offset, len..)
+   - 恢复bio->bi_private, 继续dio的回调.
+   > dio_end_io(bio, err)
+
+** btrfs_end_direct_write(bio, error)
+   - 这是读bio的回调函数,更新ordered extent的管理信息
+   - 更新时传入的参数是文件偏移和数据量,返回btrfs_ordered_extent,而且这个extent包含的范围.
+   > btrfs_dec_test_first_ordered_pending(inode, btrfs_ordered_extent, ordered_offset, ordered_bytes, err)
+   - 如果ordered extent的io都完成了,启动async work,处理下一步?
+   - btrfs_work回调函数是finish_ordered_fn
+   > btrfs_queue_worker(btrfs_fs_info->endio_write_workers, btrfs_ordered_extent->work)
+   - bio可能会覆盖多个btrfs_ordered_extent,根据上面返回的文件偏移判断.
+   > ordered_offset < dip->logical_offset + dip->bytes
+   - 恢复bio->bi_private, 继续bio..
+   > dio_end_io(bio, error)
+
+** __btrfs_submit_bio_start_direct_io(inode, rw, bio, mirror_num, bio_flags, offset)
+   - 这是ordered的btrfs_work的回调函数,在写io时使用,计算checksum,放到btrfs_ordered_extent中
+   > btrfs_csum_one_bio(btrfs_root, inode, bio, offset, 1)
+
+** btrfs_end_dio_bio(bio, err)
+   - bio的回调函数
+   - 减小btrfs_dio_private->pending_bios, 如果为0,处理btrfs_dio_private->orig_bio, 根据error设置bio->bi_flags
+   > set_bit(BIO_UPTODATE, btrfs_dio_private->orig_bio->bi_flags)
+   > bio_endio(btrfs_dio_private->orig_bio, 0)
+   - 如果没有完成,直接释放bio
+   > bio_put(bio)
+
+** btrfs_dio_bio_alloc(block_device, first_sector, gfp_flags)
+   - 创建bio.首先计算最大的vec
+   > bio_get_nr_vecs(block_device)
+   > btrfs_bio_alloc(block_device, first_sector, nr_vecs, gfp_flags)
+
+** __btrfs_submit_dio_bio(bio, inode, rw, file_offset, skip_sum, async_submit)
+   - 检查btrfs_inode->sync_writers, 如果有sync操作,就不能使用async?
+   > bio_get(bio)
+   - 如果是读操作,构造对应的end_io_wq
+   > btrfs_bio_wq_end_io(btrfs_fs_info, bio, 0)
+   - 如果不需要checksum,直接跳到最后映射bio,提交
+   - 如果是异步写，使用btrfs_work提交
+   > btrfs_wq_submit_bio(btrfs_fs_info, inode, rw, inode, ...)
+   - 如果是同步写,计算check, 然后提交bio
+   > btrfs_csum_one_bio(btrfs_root, inode, bio, file_offset, 1)
+   - 如果是读,查找checksum
+   > btrfs_lookup_bio_sums_dio(btrfs_root, ...)
+   - 映射bio并提交
+   > btrfs_map_bio(btrfs_root, ...)
+
+** btrfs_submit_direct_hook(rw, btrfs_dio_private, skip_sum)
+   - 在提交bio时使用
+   - 检查bio能支持的最大数据量,map_length
+   > btrfs_map_block(btrfs_fs_info, rw, start_sector<<9, map_length, NULL, 0)
+   - 如果map_length>bio->bi_size, 直接提交,否则要分成多个?!
+   - 如果磁盘profile是RAID5/6,不使用异步计算checksum?!
+   > btrfs_get_alloc_profile(btrfs_root, 1)
+   > btrfs_dio_bio_alloc(bio->bi_bdev, start_sector, GFP_NOFS)
+   - 创建bio, 设置bi_private为btrfs_dio_private,bi_end_io是btrfs_end_dio_bio.然后把orig_bio中的io_vec放到新的bio中.
+   > bio_add_page(bio, bio_vec->bg_page, bio_vec->bv_len, bio_vec->bv_offset)
+   - 增加的时候不能超过上面获取的磁盘空间长度..可能会多次提交..
+   > __btrfs_submit_dio_bio(bio, inode, rw, file_offset, skip_sum, async_submit)
+   - 提交bio时,增加btrfs_dio_private->pending_bios,为下次提交bio修改磁盘偏移和文件偏移
+   - 重新分配bio, 计算支持的磁盘长度
+   > btrfs_dio_bio_alloc(...)
+   > btrfs_map_block(btrfs_fs_info, rw, start_sector>>9, map_length, NULL, 0)
+
+** btrfs_submit_direct(rw, bio, inode, file_offset)
+   - 这是direct-io的回调函数
+   - 创建btrfs_dio_private, 使用bio和inode初始化,备份bio->bi_private.. btrfs_dio_private->bytes是所有的bio_vec的长度累加. 为何不是用bio->bi_size
+   - 设置bio, bio->bi_end_io设置为 btrfs_endio_direct_write / read
+   - 提交bio
+   > btrfs_submit_direct_hook(rw, btrfs_dio_private, skip_sum)
+
+** check_direct_IO(btrfs_root, rw, kiocb, iovec, offset, nr_segs)
+   - 检查这个io是否满足dio的要求. 
+   - offset应该是文件偏移,必须sectorsize对齐
+   - 检查每个iovec的地址/长度,必须sectorsize对齐
+   - 如果是读,iovec不能有重复的内存地址
+
+** btrfs_direct_IO(rw, kiocb, iovec, offset, nr_segs)
+   - dio的aops接口
+   - 先检查参数有效性
+   > check_direct_IO(btrfs_root, rw, kiocb, iovec, offset, nr_segs)
+   - 对于write,如果数据超过EOF,需要更新文件大小,这里要释放inode->i_mutex,bio里面会更新?!最后会又加锁
+   > iov_length(iovec, nr_segs)
+   - 预留data和metadata的磁盘空间
+   > btrfs_delalloc_reserve_space(inode, count)
+   - 对于读,而且btrfs_inode->runtime_flags包含BTRFS_INODE_READDIO_NEED_LOCK??
+   > inode_dio_done(inode)
+   - 提交dio,这么多回调!
+   > __blockdev_direct_IO(rw, kiocb, inode, block_device, iovec, offset, nr_segs, btrfs_get_blocks_direct, NULL, btrfs_submit_direct, flags)
+   - 如果提交成功,释放metadata的空间
+   > btrfs_delalloc_release_metadata(inode, 0)
+   - 如果提交成功,但数据量不足,也释放一部分data/metadata. 如果失败,全释放!
+   > btrfs_delalloc_release_space(inode, count - ret)
+   - 最后唤醒dio?
+   > inode_dio_done(inode)
+
+** fiemap_extent_info
+   #+begin_src 
+	unsigned int fi_flags;		/* Flags as passed from user */
+	unsigned int fi_extents_mapped;	/* Number of mapped extents */
+	unsigned int fi_extents_max;	/* Size of fiemap_extent array */
+	struct fiemap_extent __user *fi_extents_start; /* Start of
+							fiemap_extent array */
+   #+end_src
+
+** btrfs_fiemap(inode, fiemap_extent_info, start, len)
+   - 获取磁盘位置映射信息..
+   > fiemap_check_flags(fiemap_extent_info, BTRFS_FIEMAP_FLAGS)
+   > extent_fiemap(inode, fiemap_extent_info, start, len, btrfs_get_extent_fiemap)
+
+** btrfs_readpage(file, page)
+   - 包装aops结构
+   > extent_read_full_page(extent_io_tree, btrfs_get_extent, 0)
+
+** btrfs_writepage(page, writeback_control)
+   > extent_read_full_page(extent_io_tree, page, btrfs_get_extent, writeback_control)
+
+** btrfs_writepages(address_space, writeback_control)
+   > extent_writepages(extent_io_tree, address_space, btrfs_get_extent, writeback_control)
+
+** btrfd_readpages(file, address_space, list_head, nr_pages)
+   > extent_readpages(extent_io_tree, address_space, pages, nr_pages, btrfs_get_extent)
+
+** __btrfs_releasepage(page, gfp_flags)
+   - page => address_space => inode, 获取extent_io_tree和extent_map_tree.
+   - 这里肯定不能释放page,或者page和extent_map的关系,它需要释放extent_map和extent_state,达到释放page的目的.
+   > try_release_extent_mapping(extent_map_tree, extent_io_tree, page, gfp_flags)
+   - 如果释放成功,重置page->private
+   
+** btrfs_releasepage(page, gfp_flags)
+   - 检查PageWriteback(page) 和 PageDirty(page),  如果符合就不释放??!
+   > __btrfs_releasepage(page, ...)
+
+** btrfs_invalidatepage(page, offset)
+   - 现在page已经被锁住?! 这个函数目前没人使用了!
+   - 等待io以清除PagePrivate2?
+   > wait_on_page_writeback(page)
+   - 如果offset有效,直接释放page
+   > btrfs_releasepage(page, GFP_NOFS)
+   - 锁住extent, 查找ordered extents
+   > lock_extent_bits(extent_io_tree, page_start, page_end, 0, extent_state)
+   > btrfs_lookup_ordered_extent(inode, page_offset(page))
+   - 如果有ordered extent, 直接让他完成!
+   > clear_extent_bit(extent_io_tree, page_start, page_end, EXTENT_DIRTY | EXTENT_DELALLOC | EXTENT_LOCKED | EXTENT_DO_ACCOUNTING | EXTENT_DEFRAG, 1, 0, extent_state, GFP_NOFS)
+   - 如果有PagePrivate2, 它是什么??
+   > btrfs_dec_test_ordered_pending(inode, btrfs_ordered_extent, page_start, PAGE_CACHE_SIZE, 1)
+   > btrfs_finish_ordered_io(btrfs_ordered_extent)
+   - 释放extent/page
+   > lock_extent_bits(extent_io_tree, page_start, page_end, 0, extent_state)
+   > clear_extent_bit(extent_io_tree, page_start, page_end, EXTENT_LOCKED|...)
+   > __btrfs_releasepage(page, GFP_NOFS)
+   - 最后清除PagePrivate..
+
+** btrfs_page_mkwrite(vm_area_struct, vm_fault)
+   - 在pagefault中使用,但page首次被写的时候使用. 可能会改变文件大小,可能会碰到没有磁盘空间. 这里不允许锁inode->i_mutex,所以要预防truncate操作. 
+   - truncate不可能发生? vmtruncate会先改变inode->i_size,再释放page. 下面先锁住page,检查eof,这样至少page是安全访问的.
+   > sb_start_pagefault(inode->i_sb)
+   - 首先分配空间
+   > btrfs_delalloc_reserve_space(inode, PAGE_CACHE_SIZE)
+   - 更新文件的时间
+   > file_update_time(vm_area_struct->vm_file)
+   - 如果上面失败,直接返回VM_FAULT_OOM/SIGBUS,处理没有内存或者没有空间
+   - 锁住page,然后检查inode->i_size, 如果page超过EOF,直接退出. 
+   - 等待PG_WRITEBACK
+   > wait_on_page_writeback(page)
+   - 锁住extent
+   > lock_extent_bits(extent_io_tree, page_start, page_end, 0, extent_state)
+   > set_page_extent_mapped(page)
+   - 等待ordered extent
+   > btrfs_lookup_ordered_extent(inode, page_start)
+   > clear_extent_bit(extent_io_tree, page_start, page_end, ...)
+   - 清除extent的EXTENT_DIRTY/EXTENT_DELALLOC/EXTENT_DEFRAG,没有操作page
+   - 设置delalloc标志
+   > btrfs_set_extent_delalloc(inode, page_start, ...)
+   - 操作page, 这里设置了checked?!
+   > ClearPageChecked(page)
+   > set_page_dirty(page)
+   > SetPageUptodate(page)
+   - 更新btrfs_inode->last_trans / last_sub_trans / last_log_commit
+   - 解锁extent 
+   > unlock_extent_cached(extent_io_tree, page_start, ...)
+
+** btrfs_truncate(inode)
+   - 把inode的数据清空,包括内存的pagecache
+   - 清空最后一个page, inode->i_size已经改变?
+   > btrfs_truncate_page(inode, inode->i_size, 0, 0)
+   - 等待eof之后的数据io
+   > btrfs_wait_ordered_range(inode, size, -1)
+   - 更新disk_i_size?
+   > btrfs_ordered_update_i_size(inode, inode->i_size, NULL)
+   - 创建btrfs_block_rsv, 使用1个btree的操作
+   > btrfs_alloc_block_rsv(btrfs_root, BTRFS_BLOCK_RSV_TEMP)
+   - 准备transaction,使用2个btree的操作
+   > btrfs_start_transaction(btrfs_root, 2)
+   - 给tmp btrfs_block_rsv分配空间
+   > btrfs_block_rsv_migrate(btrfs_fs_info->trans_block_rsv, tmp_rsv, min_size)
+   - 如果inode->runtime_flags带有BTRFS_INODE_ORDERED_DATA_CLOSE,而且i_size为0,设置ordered extent?
+   > btrfs_add_ordered_operation(btrfs_trans_handle, btrfs_root, inode)
+   - 设置btrfs_inode->runtime_flags的BTRFS_INODE_NEEDS_FULL_SYNC.
+   - 删除btree的数据
+   > btrfs_truncate_inode_items(btrfs_trans_handle, btrfs_root, inode, inode->i_size, BTRFS_EXTENT_DATA_KEY)
+   - 如果inode->i_nlink>0, 删除orphan, btrfs_trans_handle使用orphan_block_rsv的空间
+   > btrfs_orphan_del(btrfs_trans_handle, inode)
+   - 保存btrfs_inode_item
+   > btrfs_update_inode(...)
+   - 上面使用3中btrfs_block_rsv, 删除btrfs_file_extent_item使用临时的,更新btrfs_inode_item使用btrfs_fs_info->trans_block_rsv, 释放orphan使用btrfs_root->orphan_block_rsv
+
+** btrfs_create_subvol_root(btrfs_trans_handle, btrfs_root, new_dirid)
+   - 好像就是创建一个dir inode. 创建btrfs_inode_item和btrfs_inode_ref, 索引是指向自己,而且名字是'..', 实际上是创建根目录
+   > btrfs_new_inode(btrfs_trans_handle, new_root, NULL, "..", 2, ...)
+   - 设置inode_operations / file_operations为普通的dir操作
+   > set_nlink(inode, 1)
+   > btrsf_i_size_write(inode, 0)
+   - 保存btrfs_inode_item
+   > btrfs_update_inode(...)
+
+** btrfs_alloc_inode(super_block)
+   - 创建inode,仅仅更新btrfs_inode, 没有特殊的设置,除了设置为0
+   > extent_map_tree_init(btrfs_inode->extent_map_tree)
+   > extent_io_tree_init(btrfs_inode->extent_io_tree, inode->address_space)
+   > btrfs_ordered_inode_tree_init(btrfs_inode->ordered_tree)
+
+** btrfs_i_callback(rcu_head)
+   - 释放inode对象, rcu异步释放
+
+** btrfs_destroy_inode(inode)
+   - 释放各种关系.   btrfs_inode->ordered_operations是btrfs_fs_info.. 
+   - 释放btrfs_inode的btrfs_ordered_extent..
+   > btrfs_lookup_first_ordered_extent(inode, -1)
+   > btrfs_remove_ordered_extent(inode, btrfs_ordered_extent)
+   > inode_tree_del(inode)
+   > btrfs_drop_extent_cache(inode, 0, -1, 0)
+   > btrfs_remove_delayed_node(inode)
+   > call_rcu(...)
+
+** btrfs_drop_inode(inode)
+   - 是否需要释放inode中缓存的
+   - 如果btrfs_root->btrfs_root_item->refs==0,或者free space inode, 直接释放, 返回1
+   - 否则使用vfs的方法
+   > generic_drop_inode(inode)
+
+** init_once(void*)
+   - 这是创建inode的回调初始化函数..  参数就是btrfs_inode..
+   > inode_init_once(btrfs_inode->vfs_inode)
+
+** btrfs_getattr(vfsmount, dentry, kstat)
+   - 获取mountpoint stat??
+   > generic_fillattr(inode, kstat)
+  
+** btrfs_rename(inode old_dir, dentry old_dentry, inode new_dir, dentry new_dentry)
+   - 不看了,太复杂!
+   > btrfs_insert_inode_ref(btrfs_trans_handle, btrfs_root, name, len, old_ino_objectid, new_dir, index)
+   > __btrfs_unlink_inode(btrfs_trans_handle, ...)
+
+** btrfs_delalloc_work
+   #+begin_src 
+	struct inode *inode;
+	int wait;
+	int delay_iput;
+	struct completion completion;
+	struct list_head list;
+	struct btrfs_work work;
+   #+end_src
+
+** btrfs_run_delalloc_work(btrfs_work)
+   - delalloc使用的btrfs_work
+   - 如果btrfs_delalloc_work->wait有效,等待ordered extent?!
+   > btrfs_wait_ordered_range(btrfs_delalloc_work->inode, 0, -1)
+   - 不等待就发起写操作
+   > fiemap_flush(btrfs_delalloc_work->inode->i_mapping)
+   - 这里为何要释放inode?
+   - 如果btrfs_delalloc_work->delaye_iput有效
+   > btrfs_add_delayed_iput(btrfs_delalloc_work->inode)
+   - 否则直接释放
+   > iput(btrfs_delalloc_work->inode)
+   - 谁等待?
+   > complete(btrfs_delalloc_work->completion)
+   
+** btrfs_alloc_delalloc_work(inode, wait, delay_iput)
+   - 创建btrfs_delalloc_work, 使用上面的函数设置 btrfs_delalloc_work->btrfs_work..
+   
+** btrfs_wait_and_free_delalloc_work(btrfs_delalloc_work)
+   - 等待btrfs_delalloc_work->completion, 释放btrfs_delalloc_work
+
+** btrfs_start_delalloc_inodes(btrfs_root, delay_iput)
+   - 遍历所有delalloc的inode,把数据写回去?!
+   - 处理btrfs_root->btrfs_fs_info->delalloc_inodes上的inode
+   - 首先检查inode是否要释放，那就不再处理,清楚btrfs_inode->runtime_flags的BTRFS_INODE_IN_DELALLOC_LIST, 可以释放这个btrfs_inode.
+   > igrab(btrfs_inode->vfs_inode)
+   - 否则把它放到btrfs_fs_info->delalloc_inodes队列中.而且给他创建一个btrfs_delalloc_work
+   > btrfs_alloc_delalloc_work(inode, 0, delay_iput)
+   - 添加到队列中
+   > btrfs_queue_worker(btrfs_fs_info->flush_workers, btrfs_work)
+   - 最后等待这些btrfs_delalloc_work
+   > btrfs_wait_and_free_delalloc_work(btrfs_delalloc_work)
+   - 上面创建btrfs_delalloc_work,wait为0,这里需要保证io和ordered extent已经创建?!
+   - 增加btrfs_fs_info->async_submit_draining
+   - 等待btrfs_fs_info->nr_async_submits == 0 || btrfs_fs_info->async_delalloc_pages == 0
+   - 在btrfs_fs_info->async_submit_wait上等待.
+    - 减小btrfs_fs_info->async_submit_draining
+
+** btrfs_symlink(inode, dentry, symname)
+   - 创建一个文件, 把symname作为inline data.
+
+** __btrfs_prealloc_file_range(inode, mode, start, num_bytes, min_size, actual_len, alloc_hint, btrfs_trans_handle)
+   - 给文件预分配空间
+   - 为何3个btree操作?
+   > btrfs_start_transaction(btrfs_root, 3)
+   - 分配磁盘空间
+   > btrfs_reserve_extent(btrfs_trans_handle, btrfs_root, cur_bytes, min_size, 0, alloc_hint, btrfs_key, 1)
+   - 创建btrfs_file_extent_item,还有extent data backref
+   > insert_reserved_file_extent(btrfs_trans_handle, inode, cur_offset, btrfs_key.objectid, ... BTRFS_FILE_EXTENT_PREALLOC)
+   - 创建extent_map,有必要吗?!
+   > btrfs_drop_extent_cache(inode, offset, ...)
+   - 设置extent_map->flags的EXTENT_FLAG_PREALLOC
+   > alloc_extent_map()
+   > add_extent_mapping(extent_map_tree, extent_map)
+   - 如果mode没有FALLOC_FL_KEEP_SIZE,而且数据范围超过eof, 改变文件大小
+   - 保存btrfs_inode_item
+   > btrfs_update_inode(btrfs_trans_handle, btrfs_root, inode)
+
+** btrfs_prealloc_file_range(inode, mod, start, num_bytes, min_size, actual_len, alloc_hint)
+   - 不提供btrfs_trans_handle
+   > __btrfs_prealloc_file_range(...)
+
+** btrfs_prealloc_file_range_trans(inode, btrfs_trans_handle, mode, start, num_bytes, min_size, actual_len, alloc_hint)
+   - 提供了btrfs_trans_handle
+   > __btrfs_prealloc_file_range(...)
+
+** btrfs_set_page_dirty(page)
+   - aops的接口
+   > __set_page_dirty_nobuffers(page)
+
+** 总结
+     
+* dir-item.c
+
+** btrfs_dir_item 
+   #+begin_src 
+	struct btrfs_disk_key location;
+	__le64 transid;
+	__le16 data_len;  //应该是只有xattr使用..
+	__le16 name_len;
+	u8 type;
+        //type就是文件类型:UNKNOWN/REG_FILE/DIR/CHRDEV/BLKDEV/FIFO/SOCK/XATTR
+   #+end_src
+
+** 这里的代码比较简单,没必要注释一边. dir有两层索引,但btrfs_item是一样的..

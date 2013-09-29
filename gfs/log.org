@@ -1,0 +1,531 @@
+* log.c 
+
+** gfs2_log_descriptor
+   #+begin_src 
+	struct gfs2_meta_header ld_header;
+
+	__be32 ld_type;		/* GFS2_LOG_DESC_... */
+	__be32 ld_length;	/* Number of buffers in this chunk */
+	__be32 ld_data1;	/* descriptor-specific field */
+	__be32 ld_data2;	/* descriptor-specific field */
+
+	__u8 ld_reserved[32];   
+   #+end_src
+   - ld_type有3种: GFS2_LOG_DESC_METADATA, GFS2_LOG_DESC_REVOKE, GFS2_LOG_DESC_JDATA. 它们决定ld_data1,ld_data2的意义
+
+** gfs2_log_header
+   #+begin_src 
+	struct gfs2_meta_header lh_header;
+
+	__be64 lh_sequence;	/* Sequence number of this transaction */
+	__be32 lh_flags;	/* GFS2_LOG_HEAD_... */
+	__be32 lh_tail;		/* Block number of log tail */
+	__be32 lh_blkno;
+	__be32 lh_hash;   
+   #+end_src
+
+
+** gfs2_struct2blk(gfs2_sbd, nstruct, ssize)
+   - 要保存nstruct个数据结果,每个大小是ssize, 计算需要的block
+   - 第一个block头部是gfs2_log_descriptor, 其他的头部是gfs2_meta_header
+
+** gfs2_remove_from_ail(gfs2_bufdata)
+   - gfs2_bufdata应该是buffer_head使用的
+   - 释放2个链表, gfs2_bufdata->bd_ail_st_list和gfs2_bufdata->bd_ail_gl_list
+   - 减小 gfs2_glock->gl_ail_count
+
+** gfs2_ail1_start_one(gfs2_sbd, writeback_control, gfs2_trans)
+   - 启动ail写回操作.
+   - 遍历gfs2_trans->tr_ail1_list队列的gfs2_bufdata, 这是gfs2_bufdata->bd_ail_st_list队列
+   - 检查buffer_head的BH_Busy, 如果没有,说明没有IO,把它放到gfs2_trans->tr_ails_list中
+   - 否则继续处理,需要等待IO? 如果没有BH_Dirty, 不用写回. 不再处理
+   - 如果碰到2个buffer_head的gfs2_glock不一样, 处理buffer_head->page->address_space
+   - 这里写回的是什么?
+   > generic_writepages(address_space, writeback_control)
+
+** gfs2_ail1_flush(gfs2_sbd, writeback_control)
+   - 写回一些ail1的buffer_head
+   - 遍历gfs2_sbd->sd_ail1_list中的gfs2_trans 
+   > gfs2_ail1_start_one(gfs2_sbd, writeback_control, gfs2_trans)
+
+** gfs2_ail1_start(gfs2_sbd)
+   - 构造writeback_control, 写回文件的dirty的pagecache
+   - 要写回那些,还有log什么用? 
+   - sync_mode = WB_SYNC_NONE, 异步方式, nr_to_write = LONG_MAX, 这是全部写回!!
+   > gfs2_ail1_flush(gfs2_sbd, writeback_control)
+
+** gfs2_ail1_empty_one(gfs2_sbd, gfs2_trans)
+   - 把gfs2_trans->tr_tail1_list中没有BH_Busy的buffer_head放到gfs2_trans->tr_ail_list中
+   - 遍历时检查buffer_head的BH_Uptodate, 如果没有就上报IO错误
+
+** gfs2_ail_empty(gfs2_sbd)
+   - 处理gfs2_sbd->sa_ail_list的gfs2_trans, 处理它们的tr_ail1_list
+   > gfs2_ail1_empty_one(gfs2_sbd, gfs2_ail)
+   - 如果gfs2_ail1_list为空,把他放到gfs2_sbd->sa_ail2_list中
+   - 但这些gfs2_trans还是有序的. 需要有序的放置. 即使后面的gfs2_trans->tr_ail1_list空了,但前面的没有,2个也都不能移动
+
+** gfs2_ail1_wait(gfs2_sbd)
+   - 遍历gfs2_sbd->sd_ail1_list的gfs2_trans, 遍历gfs2_trans的gfs2_bufdata
+   - 等待buffer_head的BH_Lock标志. 这是等待写??
+   > wait_on_buffer(buffer_head)
+
+** gfs2_ail2_empty_one(gfs2_sbd, gfs2_trans)
+   - 遍历gfs2_trans->tr_ail_list的gfs2_bufdata, 直接释放buffer_head.
+   - 怎么就没有用了?
+
+** ail2_empty(gfs2_sbd, new_tail)
+   - 设置gfs2_sbd->sd_log_tail, 把老的gfs2_trans的gfs2_bufdata删除
+   - 遍历gfs2_sbd->sd_ail2_list上的gfs2_trans, 检查gfs2_trans->tr_first和new_tail和old_tail的关系, old_tail = gfs2_sbd->sd_log_tail
+   - 如果gfs2_trans->tr_first在new_tail和old_tail之间,释放他
+   - 只要释放空闲的gfs2_bufdata, 没有BH_Busy
+   > gfs2_ail2_empty_one(gfs2_sbd, gfs2_sbd)
+   - 然后它自己
+   > kfree(gfs2_trans)
+
+** gfs2_log_reserve(gfs2_sbd, blks)
+   - reserve log空间
+   - 首先检查gfs2_sbd->sd_log_blks_free < blks, 需要等待log空间回收
+   - 先唤醒logd处理log 
+   > wake_up(gfs2_sbd->sd_logd_waitq)
+   - 在gfs2_sbd->sd_log_waitq上等待
+   > prepare_to_wait_exclusive(gfs2_sbd->sd_log_waitq, wait, TASK_UNINTERRUPTIBLE)
+   - 如果条件满足, 直接修改gfs2_sbd->sd_log_blks_free
+     
+** log_distance(gfs2_sbd, newer, older)
+   - 检查空闲空间? 这里使用数组作为循环队列
+   - 如果newer-older < 0, 需要处理数组边界, gfs2_jdesc->jd_blocks
+
+** calc_reserved(gfs2_sbd)
+   - 计算需要reserve的空间.包括3部分,对应gfs2_sbd->sd_log_committed_buf, gfs2_sbd->sd_log_committed_databuf, 还有gfs2_sbd->sd_log_committed_revoke
+   - 前2者需要额外的空间, revoke只需要保存指针个数
+
+** current_tail(gfs2_sbd)
+   - 获取log的尾. 如果gfs2_sbd->sd_ail1_list为空, 使用gfs2_sbd->sd_log_head
+   - 否则是链表尾的gfs2_trans->tr_first 
+
+** log_pull_tail(gfs2_sbd, new_tail)
+   - 设置新的tail, 先释放gfs2_trans
+   > ail2_empty(gfs2_sbd, new_tail)
+   - 增加gfs2_sbd->sd_log_blks_free, 根据new_tail - gfs2_sbd->sd_log_tail
+   - 设置gfs2_sbd->sd_log_tail = new_tail 
+     
+
+** log_flush_wait(gfs2_sbd)
+   - 等待gfs2_sbd->sd_log_in_flight !=0, 在gfs2_sdb->sd_log_flush_wait队列上等待
+
+** ip_cmp(priv, list_head a, list_head b)
+   - 2个队列是gfs2_inode->i_ordered, 比较gfs2_inode->i_no_addr, 也就是inum
+
+** gfs2_ordered_write(gfs2_sbd)
+   - 先对gfs2_sbd->sd_log_le_ordered队列上的gfs2_inode排序
+   > list_sort(NULL, gfs2_sbd->sd_log_le_ordered, ip_cmp)
+   - 然后遍历这些gfs2_inode, 发起写回操作
+   > filemap_fdatawrite(gfs2_inode->inode->address_space)
+  
+** gfs2_ordered_wait(gfs2_sbd)
+   - 等待上面的写操作
+   > filemap_fdatawrite(gfs2_inode->inode->i_mapping)
+
+** gfs2_ordreed_del_inode(gfs2_inode)
+   - 如果gfs2_inode->i_flags有GIF_ORDRRED标志, 他就在sd_log_le_ordered队列中
+   - 释放gfs2_inode->i_ordered链表关系
+
+** gfs2_add_revoke(gfs2_sbd, gfs2_bufdata)
+   - 这应该是释放block的操作,记录在log中
+   - 首先释放原来的gfs2_bufdata, 他的修改可能早就放到gfs2_trans中. 
+   - 这里不会释放buffer_head, 只有page才会释放buffer_head
+   > gfs2_remove_from_ail(gfs2_bufdata)
+   - 设置buffer_head->bd_ops = gfs2_revoke_lops
+   - 增加gfs2_sbd->sd_log_num_revoke, 设置gfs2_glock->GLF_LFLUSH
+   - 把gfs2_bufdata->bd_list放到gfs2_sbd->sd_log_le_revoke中.
+
+** gfs2_write_revokes(gfs2_sbd)
+   - 首先处理ail1队列, 把空闲的gfs2_bufdata放到ail2队列中
+   > gfs2_ail1_empty(gfs2_sbd)
+   - 遍历gfs2_sbd->sd_ail1_list->tr_ail2_list中的gfs2_bufdata
+   - 如果gfs2_bufdata->bd_list为空, 表示他已经被回收了??没有在revoke队列中
+   - 遍历完成后,如果所有的gfs2_bufdata都在revoke队列中,不需要在revoke?
+   - 否则需要处理它们?
+   - 遍历gfs2_sbd->sd_ail1_list的gfs2_trans->tr_ail2_list, 回收gfs2_bufdata, 为什么? 
+   > gfs2_add_revoke(gfs2_sbd, gfs2_bufdata)
+   
+** log_write_header(gfs2_sbd, flags)
+   - 分配一个page, 填充gfs2_log_header
+   - 设置gfs2_log_header->lh_tail = current_tail(gfs2_sbd)
+   - 设置gfs2_log_header->lh_blkno = gfs2_sbd->sd_log_flush_head
+   - 如果gfs2_sbd->sd_flags有SDF_NOBARRIERS, 要等待ordered的inode写完? 
+   > gfs2_ordered_wait(gfs2_sbd)
+   - 等待写回中的log 
+   > log_flush_wait(gfs2_sbd)
+   - 写回这个page?? 里面没有数据? 
+   > gfs2_log_write_page(gfs2_sbd, page)
+   - 提交gfs2_sbd->sd_log_bio 
+   > gfs2_log_flush_bio(gfs2_sbd, rw)
+   - 等待log 
+   > log_flush_wait(gfs2_sbd)
+   - 更新log的尾地址
+   > log_pull_tail(gfs2_sbd, tail)
+
+** gfs2_log_flush(gfs2_sbd, gfs2_glock)
+   - 如果gfs2_glock->gl_flags没有GLF_LFLUSH, 不需要写回
+   - 获取gfs2_sbd->sd_log_tr, 初始化2个ail链表
+   - gfs2_sbd->sd_log_num_buf 必须和gfs2_sbd->sd_log_committed_buf相同?
+   - gfs2_sbd->sd_log_num_databuf必须和gfs2_sbd->sd_log_committed_databuf相同
+   - 设置gfs2_sbd->sd_log_flush_head = gfs2_sbd->sd_log_head
+   - 写回ordered的inode 
+   > gfs2_ordered_write(gfs2_sbd)
+   - 执行gfs2_log_ops操作?
+   > lops_before_commit(gfs2_sbd)
+   - 提交bio 
+   > gfs2_log_flush_bio(gfs2_sbd, WRITE)
+   - 写一个gfs2_log_header? 
+   > log_write_headers(gfs2_sbd, 0)
+   - 又执行gfs2_log_ops操作
+   > lops_after_commit(gfs2_sbd, gfs2_trans)
+   - 设置gfs2_sbd->sd_log_head = sd_log_flush_head, sd_log_blks_reserved = 0, sd_log_committed_databuf = sd_log_committed_buf = sd_log_committed_revoke = 0
+   - 如果gfs2_trans->sd_ail1_list队列不是空, 把gfs2_trans添加到gfs2_sbd->sd_ail1_list中
+
+** log_refund(gfs2_sbd, gfs2_trans)
+   - 根据gfs2_trans更新gfs2_sbd->sd_log_committed_*
+   - 重新计算gfs2_sbd需要的空间, 给gfs2_sbd->sd_log_blks_reserved
+   - 根据它的变化,修改gfs2_sbd->sd_log_blks_free. reserve的log空间??
+   - 如果gfs2_sbd->sd_log_tr == NULL, 设置gfs2_sdb->sd_log_tr = gfs2_trans
+
+** gfs2_log_commit(gfs2_log_commit)
+   - 如果pinned的block太多,需要唤醒logd写回log
+   - 首先重新计算reserved的log空间
+   > log_refund(gfs2_sbd, gfs2_trans)
+   - gfs2_sbd->sd_log_pinned > gfs2_sbd->sd_log_thresh1, 或者gfs2_jdesc->jd_blocks - gfs2_sbd->sd_log_blks_free > gfs2_sbd->sd_log_thresh2, 唤醒gfs2_sbd->sd_logd_waitq 
+   > wake_up(gfs2_sbd->sd_logd_waitq)
+
+** gfs2_log_shutdown(gfs2_sbd)
+   - 写回一个gfs2_log_header, 带有标志GFS2_LOG_HEAD_UNMOUNT, gfs2_sbd->sd_log_flush_head = gfs2_sbd->sd_log_head
+   - 设置gfs2_sbd->sd_log_head = sd_log_flush_head
+   - sd_log_tail = sd_log_head
+
+** gfs2_meta_syncfs(gfs2_sbd)
+   - 写回所有的gfs2_trans
+   > gfs2_ail1_start(gfs2_sbd)
+   > gfs2_ail1_wait(gfs2_sbd)
+   - 直到所有的gfs2_sbd->sd_ail1_list没有gfs2_trans
+   > gfs2_ail1_empty(gfs2_sbd)
+   - flush什么东西? 
+   > gfs2_log_flush(gfs2_sbd, NULL)
+
+** gfs2_jrnl_flush_reqd(gfs2_sbd)
+   - 返回 gfs2_sbd->sd_log_pinned >= gfs2_sbd->sd_log_thresh1
+
+** gfs2_ail_flush_reqd(gfs2_sbd)
+   - 返回gfs2_jdesc->jd_blocks - gfs2_sbd->sd_log_blks_free > gfs2_sbd->sd_log_thresh2
+
+** gfs2_logd(void *data)
+   - 参数是gfs2_sbd
+   - 循环中写回log数据
+   - 如果是sd_log_pinned太多, 释放gfs2_sbd->sd_ail1_list
+   > gfs2_jrnl_flush_reqd(gfs2_sbd)
+   > gfs2_ail1_empty(gfs2_sbd)
+   > gfs2_log_flush(gfs2_sbd, NULL)
+   - 如果是第二个条件, 写回数据?? 
+   > gfs2_ail_flush_reqd(gfs2_sbd)
+   > gfs2_ail1_start(gfs2_sbd)
+   > gfs2_ail1_wait(gfs2_sbd)
+   > gfs2_ail1_empty(gfs2_sbd)
+   > gfs2_log_flush(gfs2_sbd, NULL)
+   - 在gfs2_sbd->sd_log_waitq上等待.
+   
+
+
+* lops.c
+
+** gfs2_pin(gfs2_sbd, buffer_head)
+   - 去掉BH_Dirty, 添加BH_Pinned标志
+   - 如果gfs2_bufdata->bd_tr有效,它已经在gfs2_trans的链表中, 这里把它放到gfs2_trans->tr_ail2_list队列中?? 它已经写到磁盘中,所以可以释放?
+  
+** buffer_is_rgrp(gfs2_bufdata)
+   - 检查gfs2_bufdata->gfs2_glock->gl_name.ln_type == LM_TYPE_RGRP
+   - buffer_head是什么特殊的?? 
+
+** maybe_release_space(gfs2_bufdata)
+   - gfs2_bufdata->gfs2_glock->gfs2_object是gfs2_rgrpd? 
+   - gfs2_bufdata->buffer_head->b_blocknr - gfs2_glock->gl_name->ln_number表示这个block的偏移.
+   - gfs2_rgrpd->rd_bits + index就是涉及的gfs2_bitmap
+   - 如果gfs2_bitmap->bi_clone == 0, 直接返回,没有释放block? 
+   - 否额释放空间, 先发送discard请求.
+   - 参数buffer_head是gfs2_bufdata关联的, 这个buffer_data是gfs2_bitmap里面的.
+   > gfs2_rgrp_send_discards(gfs2_sbd, gfs2_rgrpd->rd_data0, buffer_head, gfs2_bitmap, 1, NULL)
+   - 把btrfs_bitmap->clone的数据复制给buffer_head.
+   - 设置gfs2_rgrpd->rd_free_clone = gfs2_rgrpd->rd_free
+
+** gfs2_unpin(gfs2_sbd, buffer_head, gfs2_trans)
+   - 去掉buffer_head的BH_Pinned
+   - 如果gfs2_bufdata->gfs2_glock关联的是gfs2_rgrpd, 它是gfs2_bitmap使用的block, 恢复数据 
+   > buffer_is_rgrp(gfs2_bufdata)
+   > maybe_release_space(gfs2_bufdata)
+   - 如果gfs2_bufdata->bd_tr已经在gfs2_trans链表中,释放链表关系
+   - 否则把它放到gfs2_glock->gl_ail_list队列中
+   > list_add(&bd->bd_ail_gl_list, &gl->gl_ail_list)
+   - 把它放到gfs2_trans->tr_ail1_list队列中
+
+** gfs2_log_incr_head(gfs2_sbd)
+   - 增加gfs2_sbd->sd_log_flush_head.
+   - 如果gfs2_sbd->sd_log_flush_head == gfs2_jdesc->jd_blocks, 碰到边界, 设置gfs2_sbd->sd_log_flush_wrapped = 1, sd_log_flush_head = 0
+
+** gfs2_journal_extent
+   #+begin_src 
+	struct list_head extent_list;
+
+	unsigned int lblock; /* First logical block */
+	u64 dblock; /* First disk block */
+	u64 blocks;   
+   #+end_src
+
+** gfs2_log_bmap(gfs2_sbd)
+   - journal使用的空间可以是多个extent,所以把gfs2_sbd->sd_log_flush_head转换成磁盘地址
+   - 遍历gfs2_sbd->gfs2_jdesc->extent_list链表上的gfs2_journal_extent
+   - 检查sd_log_flush_head是否在gfs2_journal_extent的(lblock, blocks)范围内
+   - 如果在,返回gfs2_jdesc->dblock + offset 
+
+** gfs2_end_log_write_bh(gfs2_sbd, bio_vec, error)
+   - 在log pagewrite结束时使用?
+   - 根据bio_vec找到关联的page, 还有bio_vec->bv_offset, 找到buffer_head
+   - 释放BH_Lock标志, 唤醒等待的任务
+   > unlock_buffer(buffer_head)
+   > brelse(buffer_head)
+
+** gfs2_end_log_write(bio, error)
+   - 遍历bio管理的bio_vec, 如果关联的page使用buffer_head, 释放它们的锁
+   > page_has_buffers(page)
+   > gfs2_end_log_write_bh(gfs2_sbd, bio_vec, error)
+   - 否则仅仅释放page, 可能是仅仅有一个gfs2_log_header??
+   > bio_put(bio)
+   - 这个bio是log使用的,减小gfs2_sbd->sd_log_in_flight, 唤醒等待的任务
+   > wake_up(gfs2_sbd->sd_log_flush_wait)
+
+** gfs2_log_flush_bio(gfs2_sbd, rw)
+   - 提交gfs2_sbd->sd_log_bio
+   > submit_bio(rw, gfs2_sbd->sd_log_bio)
+
+** gfs2_log_alloc_bio(gfs2_sbd, blkno)
+   - 构造新的bio
+   > bio_alloc(GFP_NOIO, bio_get_nr_vecs(block_device))
+   - 设置bio->bi_end_io = gfs2_end_log_write, 设置bio->bi_sector = blko, 参数决定
+     
+** gfs2_log_get_bio(gfs2_sbd, blkno)
+   - 如果gfs2_sbd->sd_log_bio有效,检查是否可以使用
+   > bio_end_sector(bio)
+   - 如果参数blkno和bio的地址连续,可以使用
+   - 否则提交这个bio, 重新构造一个
+   > bio_end_sector(bio)
+   > gfs2_log_alloc_bio(gfs2_sbd, blkno)
+
+** gfs2_log_write(gfs2_sbd, page, size, offset)
+   - 把page的数据(offset)写回log,log偏移是gfs2_sbd->sd_log_flush_head
+   - 首先获取磁盘地址
+   > gfs2_log_bmap(gfs2_sbd)
+   - 构造bio 
+   > gfs2_log_get_bio(gfs2_sbd, blkno)
+   > bio_add_page(bio, page, size, offset)
+
+** gfs2_log_write_bh(gfs2_sbd, buffer_head)
+   - 写回buffer_head 
+   > gfs2_log_write(gfs2_sbd, buffer_head->page, buffer_head->b_size, offset)
+
+** gfs2_log_write_page(gfs2_sbd, page)
+   - 写回一个blocksize的数据
+   > gfs2_log_write(gfs2_sbd, page, super_block->s_blocksize, 0)
+
+** gfs2_get_log_desc(gfs2_sbd, ld_type, ld_length, ld_data1)
+   - 分配一个page, 不是pagecache, 而是专门的mempool, 里面是gfs2_log_descriptor
+   - 初始化gfs2_log_descriptor
+
+** gfs2_check_magic(buffer_head)
+   - 读回buffer_head, 里面应该是普通数据, 但log中的block如果头部是GFS2_MAGIC, 会干扰数据的查找.
+   - 检查GFS2_MAGIC, 设置BH_Escap标志.在保存的时候,使用特殊的代替.
+   - 通过buffer_head->page和offset来访问buffer_head 
+
+** blocknr_cmp(priv, list_head a, list_head b)
+   - list_head是gfs2_bufdata->bd_list, 根据gfs2_bufdata->buffer_head->b_blocknr排序
+
+** gfs2_before_commit(gfs2_sbd, limit, total, list_head blist, is_databuf)
+   - 处理list_head, 上面是gfs2_bufdata, 根据is_databuf决定block的类型
+   - 循环处理这些gfs2_bufdata
+   - 先分配一个page, 里面是gfs2_log_descriptor
+   > gfs2_get_log_desc(gfs2_sbd, GFS2_LOG_DESC_JDATA/METADATA, num+1, num)
+   - 在这个page中, gfs2_log_descriptor后面是要log的block位置, gfs2_bufdata->buffer_head->b_blocknr, 如果是databuf, 还要记录是否处理头部的GFS2_MAGIC
+   > gfs2_check_magic(buffer_head)
+   > buffer_escaped(buffer_head)
+   - 把page写回
+   > gfs2_log_write_page(gfs2_sbd, page)
+   - 再把数据gfs2_bufdata写回
+   > gfs2_log_write_bh(gfs2_sbd, gfs2_bufdata->buffer_head)
+   - 如果需要处理头GFS2_MAGIC, 原来的buffer_head不能修改, 需要使用额外的page, 把GFS2_MAGIC换成0.
+
+** buf_lo_before_commit(gfs2_sbd)
+   - 处理metadata的buffer_head, 计算limit, 里面只有block地址
+   - 相当于(blocksize - sizeof(gfs2_log_descriptor)) / 8
+   > buf_limit(gfs2_sbd)
+   > gfs2_before_commit(gfs2_sbd, limit, gfs2_sbd->sd_log_num_buf, gfs2_sbd->sd_log_le_buf, 0)
+
+** buf_lo_after_commit(gfs2_sbd, gfs2_trans)
+   - 在提交log之后的处理??  
+   - 处理gfs2_sbd->sd_log_le_buf, 也就是上面处理的list_head
+   > gfs2_unpin(gfs2_sbd, gfs2_bufdata->buffer_head, btrfs_trans)
+
+** buf_lo_before_scan(gfs2_jdesc, gfs2_log_header_host, pass)
+   - 如果pass !=0, 直接返回
+   - 设置gfs2_sbd->sd_found_blocks = sd_replayed_blocks = 0
+
+** buf_lo_scan_elements(gfs2_jdesc, start, gfs2_log_descriptor ld, ptr, pass)
+   - 如果pass !=1, 或者gfs2_log_descriptor->ld_type != GFS2_LOG_DESC_METADATA, 不处理
+   - 统计数? 
+   > gfs2_replay_incr_blk(gfs2_sbd, start)
+   - 这里好像恢复使用的?? 
+
+** buf_lo_after_scan(gfs2_jdesc, error, pass)
+   - 和上面对应
+
+** revoke_lo_before_commit(gfs2_sbd)
+   - 写回revoke log.
+   - 回收gfs2_bufdata? 
+   > gfs2_write_revokes(gfs2_sbd)
+   - 计算需要的log空间, 和上面类似,这里在gfs2_log_descriptor后面记录需要释放的block的位置??
+   > gfs2_struct2blk(gfs2_sbd, gfs2_sbd->sd_log_num_revoke, sizeof(u64))
+   - 分配page 
+   > gfs2_get_log_desc(gfs2_sbd, GFS2_LOG_DESC_REVOKE, length, gfs2_sbd->sd_log_num_revoke)
+   - 遍历gfs2_sbd->sd_log_le_revoke队列上的gfs2_bufdata
+   - 把gfs2_bufdata->bd_blkno放到page中,如果page满了, 数据量超过super_block->sb_bsize, 切换block, 当然需要重新分配page.
+   - 写回page
+   > gfs2_log_write_page(gfs2_sbd->page)
+
+** revoke_lo_after_commit(gfs2_sbd, gfs2_trans)
+   - 遍历gfs2_sbd->sd_log_le_revoke队列上的gfs2_bufdata
+   - 这里面已经没有buffer_head, 释放gfs2_bufdata本身
+   - 去掉gfs2_glock->gl_flags的GFL_LFLUSH
+
+** revoke_lo_before_scan(gfs2_jdesc, gfs2_log_header_host, pass)
+   - 应该也是recover? 
+
+** revoke_lo_after_scan(gfs2_jdesc, error, pass)
+   - 
+
+** databuf_lo_before_commit(gfs2_sbd)
+   - 计算一个gfs2_log_descriptor可以保存的gfs2_bufdata . 和metabuf相比,他还要处理GFS2_MAGIC
+   > buf_limit(gfs2_sbd) / 2
+   - 这里和metabuf相同了
+   > gfs2_before_commit(gfs2_sbd, limit, gfs2_sbd->sd_log_num_databuf, gfs2_sbd->sd_log_le_databuf, 1)
+
+** databuf_lo_scan_elements(gfs2_jdesc, start, gfs2_log_descriptor, ptr, pass)
+   - 
+
+** databuf_lo_after_scan(gfs2_jdesc, error, pass)
+   - 
+
+** databuf_lo_after_commit(gfs2_sbd, gfs2_trans)
+   - 如果gfs2_trans == NULL, 不处理
+   - 遍历gfs2_sbd->sd_log_le_databuf, 和metabuf相似
+   > gfs2_unpin(gfs2_sbd, buffer_head, gfs2_trans)
+
+** 总结
+   - 这里定义了3中gfs2_log_operations, 对应metabuf, databuf, revoke buf.
+
+
+* recovery.c 
+  - 先不看了.
+
+* trans.c
+** gfs2_trans
+   #+begin_src 
+	unsigned long tr_ip;
+
+	unsigned int tr_blocks;
+	unsigned int tr_revokes;
+	unsigned int tr_reserved;
+
+	struct gfs2_holder tr_t_gh;
+
+	int tr_touched;
+	int tr_attached;
+
+	unsigned int tr_num_buf_new;
+	unsigned int tr_num_databuf_new;
+	unsigned int tr_num_buf_rm;
+	unsigned int tr_num_databuf_rm;
+	unsigned int tr_num_revoke;
+	unsigned int tr_num_revoke_rm;
+
+	struct list_head tr_list;
+
+	unsigned int tr_first;
+	struct list_head tr_ail1_list;
+	struct list_head tr_ail2_list;   
+   #+end_src
+
+** gfs2_trans_begin(gfs2_sbd, blocks, revokes)
+   - 构造一个新的gfs2_trans, 设置tr_blocks = blocks, tr_revokes = revokes, tr_reserved = 1
+   - 不过reserved += 6 + blocks , 还有revoke使用的 
+   > gfs2_struct2blk(gfs2_sbd, revokes, ssize)
+   - 获取gfs2_sbd->sd_trans_gl
+   > gfs2_holder_init(gfs2_sbd->sd_trans_gl, LM_ST_SHARED, 0, gfs2_trans->tr_t_gh)
+   - 锁住gfs2_sbd?? 
+   > gfs2_glock_nq(gfs2_trans->tr_t_gh)
+   - 预留blocks 
+   > gfs2_log_reserve(gfs2_sbd, gfs2_trans->tr_reserved)
+   - 设置current->journal_info = gfs2_trans
+
+** gfs2_log_release(gfs2_sbd, blks)
+   - 释放blocks, 增加gfs2_sbd->sd_log_blks_free
+
+** gfs2_trans_end(gfs2_sbd)
+   - 设置current->journal_info = NULL, 操作他原来的gfs2_trans
+   - 如果gfs2_trans->tr_touched == 0, 没有log记录? 释放reserve的空间
+   > gfs2_log_release(gfs2_sbd, gfs2_trans->tr_reserved)
+   - 释放锁,还有gfs2_trans
+   - 否则需要commit? 把他的资源给gfs2_sbd
+   > gfs2_log_commit(gfs2_sbd, gfs2_trans)
+   - 释放gfs2_glock, 如果super_block->s_flags & MS_SYNCHRONOUS, 刷新log 
+   > gfs2_log_flush(gfs2_sbd, NULL)
+
+** gfs2_alloc_bufdata(gfs2_glock, buffer_head, gfs2_log_operations)
+   - 为buffer_head构造gfs2_bufdata, 设置gfs2_glock等
+
+** gfs2_trans_add_data(gfs2_glock, buffer_head)
+   - 把buffer_head添加到log中
+   - 如果不是journal操作, 直接写回磁盘 
+   > gfs2_is_jdata(gfs2_inode)
+   - gfs2_inode->i_ordered放到gfs2_sbd->sd_log_le_ordered链表中
+   > gfs2_ordered_add_inode(gfs2_inode)
+   - 否则处理buffer_head, 检查buffer_head->b_private
+   - 如果为NULL,构造gfs2_bufdata
+   > gfs2_alloc_bufdata(gfs2_glock, buffer_head, gfs2_databuf_lops)
+   - 设置gfs2_trans->tr_touched = 1
+   - 设置gfs2_bufdata->gfs2_glock->gl_flags的GLF_LFLUSH和GLF_DIRTY
+   - 设置buffer_head的BH_Pinned
+   > gfs2_pin(gfs2_sbd, buffer_head)
+   - 把gfs2_bufdata->bd_list放到gfs2_sbd->sd_log_le_databuf链表中
+   - 增加gfs2_trans->tr_num_databuf_new, gfs2_sbd->sd_log_num_databuf 
+
+** meta_lo_add(gfs2_sbd, gfs2_bufdata)
+   - 如果gfs2_bufdata->bd_list在gfs2_sbd->sd_log_le_databuf链表中,不需要再操作
+   - 设置gfs2_bufdata->gfs2_glock->gl_flags的GLF_LFLUSH和GLF_DIRTY
+   - buffer_block中头部是gfs2_meta_header, 设置gfs2_meta_header->mh_jid = gfs2_jdesc->jd_jid
+   - 和上面类似
+   > gfs2_pin(gfs2_sbd, buffer_head)
+   - 增加统计数, 把gfs2_bufdata放到gfs2_sbd->sd_log_le_buf队列
+
+** gfs2_trans_add_meta(gfs2_glock, buffer_head)
+   - 先构造gfs2_bufdata, 上面是data,这里是metadata
+   > gfs2_alloc_bufdata(gfs2_glock, buffer_head, gfs2_buf_lops)
+   - 设置gfs2_meta_header 
+   > meta_lo_add(gfs2_sbd, gfs2_bufdata)
+
+** gfs2_trans_add_revoke(gfs2_sbd, gfs2_bufdata)
+   - 添加释放block?
+   > gfs2_add_revoke(gfs2_sbd, gfs2_bufdata)
+   - 修改current->journal_info, 设置gfs2_trans->tr_touched = 1, gfs2_trans->tr_num_revoked ++ 
+
+** gfs2_trans_add_unrevoke(gfs2_sbd, blkno, len)
+   - 遍历gfs2_sbd->sd_log_le_revoke队列上的gfs2_bufdata, 释放(blkno, len)范围内的gfs2_bufdata
+   - gfs2_bufdata->bd_blkno >= blkno && gfs2_bufdata->bd_blkno < blkno + len
+   - 释放gfs2_bufdata->bd_list链表, gfs2_bufdata自己
+   - 修改gfs2_trans->tr_num_revoke_rm ++, gfs2_sbd->sd_log_num_revoke --
+   - 在分配这个block时才会在revoke中释放它.

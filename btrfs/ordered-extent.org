@@ -1,0 +1,264 @@
+* ordered-data.c
+** btrfs_sector_sum
+   #+begin_src 
+    bytenr
+    sum
+   #+end_src
+
+** btrfs_ordered_sum
+   #+begin_src 
+    bytenr
+    len
+    list_head list
+    btrfs_sector_sum sums[]
+    //管理checksum
+   #+end_src
+
+** btrfs_ordered_extent
+   #+begin_src 
+     file_offset    //文件偏移
+     sart           //磁盘逻辑偏移, 还有多大作用
+     len            //文件extent长度
+     disk_len       //磁盘extent长度
+     bytes_left     //io未完成的数量
+     csum_bytes_left //没有checksum的数据量
+     outstanding_isize  //已经完成的extent的最大文件偏移
+     flags              
+         //BTRFS_ORDERED_IO_DONE,表示data io完成,可以进行metadata操作
+	 //BTRFS_ORDERED_COMPLETE  所有操作都完成,从btrfs_ordered_inode_tree中删除
+	 //BTRFS_ORDERED_NOCOW    不是用cow,直接写磁盘
+	 //BTRFS_ORDERED_COMPRESSED  
+	 //BTRFS_ORDERED_PREALLOC   先prealloc的空间中写
+	 //BTRFS_ORDERED_DIRECT  dio
+	 //BTRFS_ORDERED_IOERR  io error
+	 //BTRFS_ORDERED_UPDATE_ISIZE    extent已经更新了文件大小
+	 //BTRFS_ORDERED_LOGGED_CSUM   log checksum?
+     compress_type
+     atomic_t refs
+     inode
+     list_head list   //队列是btrfs_ordered_sum->list
+     list_head log_list //?
+     wait_queue_head_t wait
+     rb_node rb_node  //在btrfs_ordered_inode_tree中
+     list_head root_extent_list  //队列是btrfs_fs_info->ordered_extents
+     btrfs_work work    
+   
+     completion completion
+     btrfs_work flush_work
+     list_head work_list
+   #+end_src
+
+** btrfs_ordered_inode_tree
+   #+begin_src 
+     //在btrfs_inode->ordered_tree中使用这个数据结构,每个文件都有一个, rb_root管理btrfs_ordered_extent
+     spinlock_t lock
+     rb_root tree
+     rb_node *last
+   #+end_src
+
+** entry_end(btrfs_ordered_extent)
+   - btrfs_ordered_extent相当于一个extent_buffer?? file_offset+len..
+
+** tree_insert(rb_root, file_offset, rb_node)
+   - rbtree管理,key是(file_offset,len)
+
+** __tree_search(rb_root, file_offset, rb_node)
+   - 在rb_root中找一个rb_node, 在file_offset前面..
+
+** offset_in_entry(btrfs_ordered_extent, file_offset)
+   - file_offset是否在btrfs_ordered_extent范围内, 使用btrfs_ordered_extent->file_offset
+
+** range_overlaps(btrfs_ordered_extent, file_offset, len)
+   - (a1,b1), (a2,b2)  b1<a2||b2<a1, a1<b2&&a2<b1
+
+** tree_search(btrfs_ordered_inode_tree, file_offset)
+   - 首先检查btrfs_order_inode_tree->last, 如果不覆盖file_offset,在rbtree中查找.
+   > offset_in_entry(btrfs_ordered_extent, file_offset)
+   > __tree_search(rb_root, file_offset, rb_node)
+
+** __btrfs_add_ordered_extent(inode, file_offset, start, len, disk_len, type, dio, compress_type)
+   - file_offset是文件位置, start是磁盘位置,type设置btrfs_ordered_extent->type.
+   - 创建btrfs_ordered_extent, 使用kmem_cache管理(btrfs_ordered_cache), 使用参数初始化, dio表示DIRECT_IO
+   > igrab(inode)
+   > tree_insert(btrfs_ordered_inode_tree->rb_root, file_offset, btrfs_ordered_extent->rb_node)
+   - btrfs_ordered_inode_tree是btrfs_inode->ordered_tree.. 把btrfs_ordered_extent->root_extent_list放到btrfs_inode->btrfs_root->btrfs_fs_info->ordered_extents队列中..
+   - 需要注意这里的type, 不能设置BTRFS_ORDERED_IO_DONE/BTRFS_ORDERED_COMPLETE. 
+   
+** btrfs_add_ordered_extent(inode, file_offset, start, len, disk_len, type)
+   - 普通io, 不带COMPRESS..
+   > __btrfs_add_ordered_extent(inode, ..)
+
+** btrfs_add_ordered_extent_dio(inode, ..)
+   - DIRECT-IO..
+
+** btrfs_add_ordered_extent_compress(inode, file_offset, start, len, ...)
+   - compress类型
+
+** btrfs_add_ordered_sum(inode, btrfs_ordered_extent, btrfs_ordered_sum)
+   - 把btrfs_ordered_sum->list放到btrfs_ordered_extent->list队列中
+   - btrfs_ordered_extent->csum_bytes_left -= btrfs_ordered_sum->len,如果减到0, 就唤醒btrfs_ordered_extent->wait队列
+
+** btrfs_dec_test_first_ordered_pending(inode, btrfs_ordered_extent, file_offset, io_size, uptodate)
+   - 在io完成后，根据bio结果更新btrfs_ordered_extent
+   - 根据file_offset查找对应的btrfs_ordered_extent, (file_offset,io_size)范围可能超过btrfs_ordered_extent,只更新一部分
+   > tree_search(btrfs_inode->ordered_tree, file_offset) 
+   - btrfs_ordered_extent->bytes_left -= io_size, io_size肯定是在btrfs_ordered_extent的那部分
+   - 如果btrfs_ordered_extent->bytes_left为0,设置BTRFS_ORDERED_IO_DONE
+   - 最后更新file_offset,返回找到的btrfs_ordered_extent
+
+** btrfs_dec_test_ordered_pending(inode, btrfs_ordered_extent cache, file_offset, io_size, update)
+   - 和上面没什么区别,首先考虑cache, 如果无效才在btrfs_inode->ordered_tree中搜索..
+
+** btrfs_get_logged_extents(btrfs_root log, inode)
+   - 遍历btrfs_inode->btrfs_ordered_inode_tree中的btrfs_ordered_extent, 把它放到btrfs_root->logged_list[]中..
+   - logged_list选一个, btrfs_log->log_transid % 2
+
+** btrfs_wait_logged_extents(btrfs_root log, transid)
+   - 处理btrfs_root->logged_list[index], index是transid%2, 等待那些btrfs_ordered_extent->flags的BTRFS_ORDERED_IO_DONE标志.
+   - 释放btrfs_ordered_extent->log_list队列
+   > btrfs_put_ordered_extent(btrfs_ordered_extent)
+
+** btrfs_free_logged_extents(btrfs_root log, transid)
+   - 释放btrfs_root->logged_list[index]上的所有btrfs_ordered_extent
+   > btrfs_put_ordered_extent(btrfs_ordered_extent)
+
+** btrfs_put_ordered_extent(btrfs_ordered_extent)
+   - 这里还关系到delayed inode?? 何为delayed inode??
+   > btrfs_add_delayed_iput(btrfs_ordered_extent->inode)
+   - 如果inode的计数为1,没有其他人使用inode?就把它添加到btrfs_fs_info的一个队列中,延时释放这个inode.. 
+   - 释放btrfs_ordered_extent->list中的btrfs_ordered_sum, 最后释放btrfs_ordered_extent
+
+** btrfs_remove_ordered_extent(inode, btrfs_order_extent)
+   - 释放btrfs_ordered_extent与btrfs_inode的rb tree关系
+   - 释放btrfs_ordered_extent->root_extent_list队列
+   - 设置BTRFS_ORDERED_COMPLETE标志
+   - 如果inode->btrfs_ordered_extent_tree为空,pagecache没有脏数据,释放btrfs_inode->ordered_operations队列
+   > mapping_tagged(inode->address_space, PAGECACHE_TAG_DIRTY)
+   - 唤醒等待btrfs_ordered_extent->wait的任务
+
+** btrfs_run_ordered_extent_work(btrfs_work)
+   - 启动btrfs_work, 处理一个btrfs_ordered_extent
+   > btrfs_start_ordered_extent(btrfs_ordered_extent->inode, btrfs_ordered_textent, 1)
+   - 唤醒completion上的任务
+   > completion(btrfs_ordered_extent->completion) 
+
+** btrfs_wait_ordered_extents(btrfs_root, delay_iput)
+   - 遍历btrfs_root->btrfs_fs_info->ordered_extents队列的所有btrfs_ordered_extent,提交btrfs_ordered_extent->flusn_work
+   - 检查文件是否有效
+   > igrab(btrfs_ordered_extent->inode)   
+   - 如果无效,直接释放它的extent
+   > btrfs_put_ordered_extent(btrfs_ordered_extent)
+   - btrfs_work->func是btrfs_run_ordered_extent_work
+   > btrfs_queue_worker(btrfs_root->btrfs_fs_info->flush_workers, btrfs_ordered_extent->flush_work) 
+   - 等待提交的btrfs_ordered_extent
+   - wait_for_completion(btrfs_ordered_extent->completion)
+   - 释放btrfs_ordered_extent
+   > btrfs_put_ordered_extent(btrfs_ordered_extent)
+   - 处理inode, 如果delay_iput,则把它放到全局队列中delayed inode.
+   > btrfs_add_delayed_iput(inode)
+   - 否则直接释放
+   > iput(inode)
+   - 这里有2重等待,在提交btrfs_ordered_extent之后
+   - flush_work等待btrfs_ordered_extent->wait, io完成,从rb tree中释放btrfs_ordered_extent
+   - 这里等待flush_work释放btrfs_ordered_extent->completion
+   - 这里的操作使用btrfs_ordered_extent->flush_work
+     
+** btrfs_run_ordered_operations(btrfs_root, wait)
+   - 这是事务提交中的写操作?保障所有的inode数据写到磁盘上. 
+   - 遍历btrfs_root->btrfs_fs_info->ordered_operations队列中的btrfs_inode
+   - 给每个btrfs_inode创建btrfs_delalloc_work,放到btrfs_fs_info->flush_workers中.
+   > igrab(inode)
+   - 如果wait=0,把btrfs_inode->ordered_operations放到btrfs_trans_handle->operations队列中
+   - 为inode创建btrfs_delalloc_work
+   > btrfs_alloc_delalloc_work(inode, wait, 1)
+   - 提交到btrfs_fs_info->flush_workers中,和上面一样.
+   > btrfs_queue_worker(btrfs_root->btrfs_fs_info->flush_workers, btrfs_delalloc_worker->worker)
+   - 最后等待这些提交的btrfs_delalloc_work
+   > btrfs_wait_and_free_delalloc_work(btrfs_delalloc_worker)
+   - 这里的delalloc工作是写回操作,等待对应的btrfs_ordered_extent完成
+
+** btrfs_start_ordered_extent(inode, btrfs_ordered_extent, wait)
+   - 启动一个inode的写回工作, 写回的数据范围在btrfs_ordered_extent中, file_offset/len
+   - 如果不是dio,使用pagecache的实现, BTRFS_ORDERED_DIRECT
+   > filemap_fdatawrite_range(inode->address_space, start, end)
+   - 在bio完成的回调函数中,释放btrfs_inode和btrfs_ordered_extent的关系,设置这个标志
+   > wait_event(btrfs_order_extent->wait, test_bit(BTRFS_ORDERED_COMPLETION, btrfs_order_extent->flags)
+
+** btrfs_wait_ordered_range(inode, start, len)
+   - 等待btrfs_ordered_extent的写回,使用pagecache的实现
+   > filemap_fdatawrite_range(inode->address_space, start, end)
+   > filemap_fdatawait_range(inode->address_space, start, end)
+   - 等待btrfs_ordered_extent的反馈
+   - 查找(start,len)范围内的btrfs_ordered_extent 
+   > btrfs_lookup_first_ordered_extent(inode, end)
+   - 如果btrfs_inode->btrfs_ordered_inode_tree中还有btrfs_ordered_extent,说明磁盘操作还没有完成,通过pagecache启动写操作,等待完成.
+   > btrfs_start_ordered_extent(inode, btrfs_ordered_extent, 1)
+   > btrfs_put_ordered_extent(btrfs_order_extent)
+
+** btrfs_lookup_ordered_extent(inode, file_offset)
+   - 在btrfs_inode->btrfs_ordered_inode_tree中查找一个btrfs_ordered_extent
+   > tree_search(btrfs_ordered_inode_tree, file_offset)
+
+** btrfs_lookup_ordered_range(inode, file_offset, len)
+   - 查找在这个范围内的btrfs_ordered_extent, 首先根据start查找,然后是start+len查找
+   - 遍历临近的,确保btrfs_ordered_extent和(offset,len)交叉.
+
+** btrfs_lookup_first_ordered_extent(inode, file_offset)
+   - 上面的查找,要保证file_offset在范围内部, 或返回的btrfs_ordered_extent在参数范围内部. 这里没有这个保证
+
+** btrfs_ordered_updte_i_size(inode, offset, btrfs_ordered_extent)
+   - 更新文件disk_i_size. 涉及 inode->i_size, btrfs_inode->disk_i_size,offset, btrfs_ordered_extent->file_offset + len, btrfs_ordered_extent->outstanding_isize..
+   - 如果disk_i_size大,相当于truncate操作,直接更新disk_i_size..
+   - 如果相同,直接退出..
+   - 最后要考察i_size>disk_i_size的情况,根据调用者,这里有2种情况, 一种是offset无效,一种是btrfs_ordered_extent无效.. 如果offset无效,就是用btrfs_ordered_extent的最大值..
+   - 如果offset, btrfs_ordered_extent, btrfs_ordered_extent->outstanding_isize都<disk_i_size, 无需操作.. 也就是说这3个里面得有一个超过disk_i_size, 才需要更新文件大小..
+   - 向前遍历btrfs_ordered_extent,检查btrfs_ordered_extent是否需要更新disk_i_size. 
+   - 对于BTRFS_ORDERED_UPDATE_ISIZE的btrfs_ordered_extent忽略
+   - 如果btrfs_ordered_extent的范围在disk_i_size之内,停止遍历. 
+   - 如果在i_size之外,也不再遍历.
+   - 对立2者之间的,更新它的outstanding_isize = max(offset, btrfs_ordered_extent->outstanding_isize). 这样更新disk_i_size就不是当前函数的的工作了,直接退出..等到处理这个的btrfs_ordered_extent时,让他完成后面的事情.
+   - 最后在offset, btrfs_ordered_extent->outstanding_isize, i_size中取一个最小的, 给disk_i_size
+   - 设置btrfs_ordered_extent->flags的BTRFS_ORDERED_UPDATE_ISIZE, 已经不需要它更新disk_i_size.. 所以说使用btrfs_ordered_extent维护disk_i_size..
+   - 如果btrfs_ordered_extent超过i_size,直接更新disk_i_size为i_size, 否则更新为最大的已经完成的btrfs_ordered_extent的extent_end.  disk_i_size不会超过i_size
+
+** btrfs_find_order_sum(inode, offset, disk_bytenr, sum)
+   - btrfs_ordered_extent里面有个队列,btrfs_ordered_sum队列.
+   - 先找一个btrfs_ordered_exten
+   > btrfs_lookup_ordered_extent(inode, offset)
+   - 遍历btrfs_ordered_extent->list队列的btrfs_ordered_sum, 然后是里面的btrfs_sector_sum数组. 找一个btrfs_ordered_sum->bytenr和参数disk_bytenr一致的,返回btrfs_ordered_sum->sum. 
+
+** btrfs_add_ordered_operation(btrfs_trans_handle, btrfs_root, inode)
+   - 事务提交前必须处理inode, 它的状态和数据需要写回磁盘. 
+   - 检查inode的修改时的transid, btrfs_inode->last_trans,btrfs_inode->generation, 如果他们小于btrfs_fs_info->last_trans_committed,说明inode已经被别的transaction处理,无需操作.
+   - 把btrfs_inode->ordered_operations添加到btrfs_trans_handle->btrfs_transaction->ordered_operations队列中
+
+** 总结
+   - btrfs_aops
+   #+begin_src 
+	.readpage	= btrfs_readpage,
+	.writepage	= btrfs_writepage,
+	.writepages	= btrfs_writepages,
+	.readpages	= btrfs_readpages,
+	.direct_IO	= btrfs_direct_IO,
+	.invalidatepage = btrfs_invalidatepage,
+	.releasepage	= btrfs_releasepage,
+	.set_page_dirty	= btrfs_set_page_dirty,
+	.error_remove_page = generic_error_remove_page,
+   #+end_src
+   - btrfs_ordered_extent的作用正好跨越pagecache,pagecache可以保证一个page的数据写回,这里page是不够的,因为io是以extent为单位.
+   - btrfs_ordered_extent监督底层的io结果,或者监督pagecache中的page状态,除了page的数据,还有metadata/checksum.
+   - btrfs_ordered_extent的过程包括创建,添加checksum,更新bio结果,删除.
+   - 在pagecache开始写回时,找不到对应的磁盘空间,去分配磁盘.如果有,使用已有的;创建新的extent_map,然后注册ordered extent. 是不是只有新的extent_map,才会有btrfs_ordered_extent, 应该所有的写都有btrfs_ordered_extent.
+   - 在writepage开始准备阶段,计算checksum,放到btrfs_ordered_extent中.它会唤醒btrfs_ordered_extent->wait队列,现在只有log等待它,没人等待它.
+   - 在bio的回调函数中,更新btrfs_ordered_extent->bytes_left,对应的设置BTRFS_ORDERED_IO_DONE标志
+   - 上面完成bio后,会提交btrfs_ordered_extent->btrfs_work, 它的工作是保存metadata, btrfs_file_extent_item/checksum,还有释放从btrfs_inode中btrfs_ordered_extent, 同时唤醒btrfs_ordered_extent->wait队列,设置btrfs_ordered_extent->flags的BTRFS_ORDERED_COMPLETE标志
+   - 使用btrfs_ordered_extent->flush_work刷会数据,它启动pagecache的写操作,然后等待btrfs_ordered_extent->wait队列,等待btrfs_ordered_extent->flags的BTRFS_ORDERED_COMPLETE
+   - 包装上面的等待过程,使用btrfs_ordered_extent->completion //btrfs_wait_ordered_extents
+   - 给transaction中提供刷新btrfs_ordered_extent的操作, 发送btrfs_delalloc_work, 并把它放到btrfs_transaction管理的btrfs_inode队列中. btrfs_delalloc_worker的工作也是等待btrfs_ordered_extent->flush_work   //btrfs_run_ordered_operations
+   - 启动btrfs_ordered_extent的写回,其他地方等待时同样先写回 //btrfs_wait_ordered_range
+   - 还有在修改inode之后,把它添加到btrfs_transaction的管理中,这是主动添加,关闭文件/rename/truncate. 只有添加的在transaction提交时才会处理他们.
+   - btrfs_ordered_extent->btrfs_work的作用. 在写writepage的bio完成回调函数中,根据bio结果更新btrfs_ordered_extent->bytes_left. 如果它全部完成,提交它的btrfs_work, 处理函数中finish_ordered_fn, 它处理后续metadata的工作.
+   - 如果是nocow,什么都不需要,只要更新disk_i_size,保存btrfs_inode_item
+   - 如果cow,先检查EXTENT_DEFRAG,记录碎片?!
+   - 检查BTRFS_ORDERED_PREALLOC,就把prealloc的extent改为reg,修改btrfs_file_extent_item,否则插入正常的btrfs_file_extent_item
+   - 保存btrfs_csum_item, btrfs_inode_item, 最后释放btrfs_ordered_extent.

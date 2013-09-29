@@ -1,0 +1,1179 @@
+* fs/fs-writeback.c
+
+** 总结
+   - 主要管理inode的写回工作. 每个文件系统都需要它,脏的需要写回数据的inode放在backing_dev_info->bdi_writeback的队列中.
+   - 系统的文件和page紧密联系,写回工作和page的使用情况相关,和数据的缓冲时间相关,对应2个任务background和update任务, 都是使用这里的操作向下层调用
+   - 这里还实现对super_block的sync操作. fsync是轻量级写回,一般就是操作log,但这里的sync是重量级,写回整个操作系统. 但也不好说.
+
+** bdi_state
+   #+begin_src 
+	BDI_pending,		/* On its way to being activated */
+	BDI_wb_alloc,		/* Default embedded wb allocated */
+	BDI_async_congested,	/* The async (write) queue is getting full */
+	BDI_sync_congested,	/* The sync queue is getting full */
+	BDI_registered,		/* bdi_register() was done */
+	BDI_writeback_running,	/* Writeback is in progress */ //处理bdi_writeback时设置. 处理完成后清除. bdi线程处理它.
+	BDI_unused,		/* Available bits start here */
+   #+end_src
+   - backing_dev_info->state上面的标志
+
+** bdi_state_item
+   #+begin_src 
+	BDI_RECLAIMABLE,   //表示bdi管理的page. 在设置PG_dirty时增加,在清除PG_dirty时减小. 一般在page开始IO,增加. 所以page不在bdi中了.
+	BDI_WRITEBACK,   //在修改PG_writeback时变化,表示回写中的page数量
+	BDI_DIRTIED,   //在设置PG_dirty时增加,表示脏数据的速度
+	BDI_WRITTEN,   //在清除PG_writeback时增加,表示写回的速度
+	NR_BDI_STAT_ITEMS
+   #+end_src
+
+** bdi_writeback    
+   #+begin_src 
+	struct backing_dev_info *bdi;	/* our parent bdi */
+	unsigned int nr;
+
+	unsigned long last_old_flush;	/* last old data flush */
+	unsigned long last_active;	/* last time bdi thread was active */
+
+	struct task_struct *task;	/* writeback thread */
+	struct timer_list wakeup_timer; /* used for delayed bdi thread wakeup */
+	struct list_head b_dirty;	/* dirty inodes */
+	struct list_head b_io;		/* parked for writeback */
+	struct list_head b_more_io;	/* parked for more writeback */
+	spinlock_t list_lock;		/* protects the b_* lists */   
+   #+end_src
+
+** backing_dev_info
+   #+begin_src 
+	struct list_head bdi_list;
+	unsigned long ra_pages;	/* max readahead in PAGE_CACHE_SIZE units */
+	unsigned long state;	/* Always use atomic bitops on this */
+	unsigned int capabilities; /* Device capabilities */
+	congested_fn *congested_fn; /* Function pointer if device is md/dm */
+	void *congested_data;	/* Pointer to aux data for congested func */
+
+	char *name;
+
+	struct percpu_counter bdi_stat[NR_BDI_STAT_ITEMS];
+
+	unsigned long bw_time_stamp;	/* last time write bw is updated */
+	unsigned long dirtied_stamp;
+	unsigned long written_stamp;	/* pages written at bw_time_stamp */
+	unsigned long write_bandwidth;	/* the estimated write bandwidth */
+	unsigned long avg_write_bandwidth; /* further smoothed write bw */
+
+	/*
+	 * The base dirty throttle rate, re-calculated on every 200ms.
+	 * All the bdi tasks' dirty rate will be curbed under it.
+	 * @dirty_ratelimit tracks the estimated @balanced_dirty_ratelimit
+	 * in small steps and is much more smooth/stable than the latter.
+	 */
+	unsigned long dirty_ratelimit;
+	unsigned long balanced_dirty_ratelimit;
+
+	struct fprop_local_percpu completions;
+	int dirty_exceeded;
+
+	unsigned int min_ratio;
+	unsigned int max_ratio, max_prop_frac;
+
+	struct bdi_writeback wb;  /* default writeback info for this bdi */
+	spinlock_t wb_lock;	  /* protects work_list */
+
+	struct list_head work_list;
+
+	struct device *dev;
+
+	struct timer_list laptop_mode_wb_timer;   
+        //参数都比较简单.. 和和
+   #+end_src
+   - 在filesystem和block_device种会创建对应的backing_dev_info, 对于block_device, 在request_queue->backing_dev_info
+   - 在创建inode时,默认让它的address_space指向default_backing_dev_info, 但一般会使用super_block->s_bdi, 
+   - super_block->s_bdi有2种来源,一种在mount_bdev中,他使用block_device的
+   - 另一种是文件系统提供它自己的backing_dev_info,比如nfs/cifs,btrfs也提供
+
+** writeback_sync_modes
+   #+begin_src 
+	WB_SYNC_NONE,	/* Don't wait on anything */
+	WB_SYNC_ALL,	/* Wait on every mapping */
+   #+end_src
+
+** wb_reason
+   #+begin_src 
+	WB_REASON_BACKGROUND,
+	WB_REASON_TRY_TO_FREE_PAGES,
+	WB_REASON_SYNC,
+	WB_REASON_PERIODIC,
+	WB_REASON_LAPTOP_TIMER,
+	WB_REASON_FREE_MORE_MEM,
+	WB_REASON_FS_FREE_SPACE,
+	WB_REASON_FORKER_THREAD,
+
+	WB_REASON_MAX   
+   #+end_src
+
+** writeback_control 
+   - writeback_control, 这是writepage(s)使用的参数.
+   #+begin_src 
+	long nr_to_write;		/* Write this many pages, and decrement
+					   this for each page written */
+	long pages_skipped;		/* Pages which were not written */
+
+	/*
+	 * For a_ops->writepages(): if start or end are non-zero then this is
+	 * a hint that the filesystem need only write out the pages inside that
+	 * byterange.  The byte at `end' is included in the writeout request.
+	 */
+	loff_t range_start;
+	loff_t range_end;
+
+	enum writeback_sync_modes sync_mode;
+
+	unsigned for_kupdate:1;		/* A kupdate writeback */
+	unsigned for_background:1;	/* A background writeback */
+	unsigned tagged_writepages:1;	/* tag-and-write to avoid livelock */
+	unsigned for_reclaim:1;		/* Invoked from the page allocator */
+	unsigned range_cyclic:1;	/* range_start is cyclic */ //如果为0,数据范围是(range_start,range_end), 否则(address_space->writeback_index,-1),而且写完更新writeback_index
+   #+end_src
+    
+** wb_writeback_work
+   #+begin_src 
+	long nr_pages;
+	struct super_block *sb;
+	unsigned long *older_than_this;
+	enum writeback_sync_modes sync_mode;
+	unsigned int tagged_writepages:1;
+	unsigned int for_kupdate:1;
+	unsigned int range_cyclic:1; //它给writeback_control
+	unsigned int for_background:1;
+	enum wb_reason reason;		/* why was writeback initiated? */
+
+	struct list_head list;		/* pending work list */
+	struct completion *done;	/* set if the caller waits */   
+   #+end_src
+   - wb_writeback_work是需求,具体任务转化为writeback_control, 给page的写函数
+
+
+** writeback_in_progress(backing_dev_info)
+   - 判断backing_dev_info->state的BDI_writeback_running标志
+   - 在循环处理wb_writeback_work时设置
+
+** inode_to_bdi(inode)
+   - 非block_device的inode, 使用inode->address_space->backing_dev_info
+   - 否则使用super_block->s_bdi, 但这个super_block应该是blockdev_superblock.看代码好像是noop_backing_dev_info.
+
+** wb_inode(list_head)
+   - list_head是bdi_writeback的3个队列
+   - 返回inode, inode->i_wb_list在这个队列中.
+
+** bdi_wakeup_flusher(backing_dev_info)
+   - 唤醒backing_dev_info->bdi_writeback->task线程, 它做的事情和bdi_writeback->wakeup_timer的工作一样. 
+   - backing_dev_info->bdi_writeback使用的task可能被杀掉, backing_dev_info->bdi_writeback->task = NULL,就唤醒default_backing_dev_info
+   - default_backing_dev_info的线程可能会创建线程.
+   > wake_up_process(backing_dev_info->bdi_writeback->task)
+
+** bdi_queue_work(backing_dev_info, wb_writeback_work)
+   - 把wb_writeback_work->work_list放到backing_dev_info->list中, 然后唤醒bdi任务
+   > bdi_wakeup_flusher(backing_dev_info)
+   - 对于新内核, 不再使用flusher, 而是启动bdi_writeback->delayed_work 
+   > mod_delayed_work(bdi_wq, backing_dev_info->bdi_writeback->delayed_work, 0)
+    
+** __bdi_start_writeback(backing_dev_info, nr_pages, range_cyclic, wb_reason)
+   - 使用参数创建一个wb_writeback_work
+   - 设置sync_mode = WB_SYNC_NONE, 它不会等待写完.
+   > bdi_queue_work(backing_dev_info, wb_writeback_work)
+   - 如果没有内存创建wb_writeback_work, 直接启动bdi_writeback->delayed_work
+   
+** bdi_start_writeback(backing_dev_info, nr_pages, wb_reason)
+   - 包装上面的函数,而且range_cyclic=true
+   - 在laptap什么函数使用.
+
+** bdi_start_background_writeback(backing_dev_info)
+   > bdi_wakeup_flusher 
+   - 对于新内核
+   > mod_delayed_work(bdi_wq, backing_dev_info->bdi_writeback->delayed_work, 0)
+
+** inode_wb_list_del(inode)
+   - 在释放inode时使用.把inode从inode->i_wb_list队列中删除. 
+   - 获取backing_dev_info, 锁住它.
+   > inode_to_bid(inode)
+
+** redirty_tail(inode, bdi_writeback)
+   - 这个函数是writeback_single_inode自己使用.
+   - 把inode放到bdi_writeback->b_dirty队列中.
+   - 如果bdi_writeback->b_dirty不是空,比较list_head->next的dirtied_when, 如果参数inode->dirtied_when更小,把它的dirtied_when设为jiffies. 就是最大.
+   - 把inode放到list_head->next前面,这是保持dirtied_when有序.
+   > list_move(inode->i_wb_list, bdi_writeback->b_dirty)
+
+** requeue_io(inode, bdi_writeback)
+   - 把inode放到bdi_writeback->b_more_io队列中
+
+** inode_sync_complete(inode)
+   - 去掉inode->i_state的I_SYNC标志
+   - 如果没有使用的, 放到super_block->i_lru队列中
+   > inode_add_lru(inode)
+   - 唤醒等待的任务.
+   > wake_up_bit(inode->i_state, __I_SYNC)
+     
+** inode_dirtied_after(inode, t)
+   - inode->dirtied_when > t
+
+** move_expired_inodes(list_head delaying_queue, list_head dispatch_queue, wb_writeback_work)
+   - delaying_queue是inode->i_wb_list队列, inode->i_wb_list主要在bdi_writeback的三个队列中. 
+   - 这里要把delayed_queue的一部分或全部inode给dispatch_queue队列
+   - 遍历delaying_queue队列, 如果wb_writeback_work->older_than_this != 0，只处理dirtied_when时间比bdi_writeback_work->older_than_this早的inode. 把这些放到临时队列
+   - 把临时队列中的inode放到dispatch_queue中,而且放进去时相同super_block的inode放在一块,又排序了
+
+** queue_io(bdi_writeback, wb_writeback_work)
+   - 把bdi_writeback->b_more_io上的inode给bdi_writeback->b_io,然后把bdi_writeback->b_dirty上的inode给bdi_writeback->b_io
+   > list_splice_init(bdi_writeback->b_more_io, bdi_writeback->b_io)
+   > move_expired_inodes(bdi_writeback->b_dirty, bdi_writeback->b_io)
+
+** write_inode(inode, writeback_control)
+   - 这是使用super_block_operations的写操作, 写回metadata
+   > inode->super_block->super_block_operations->write_inode(inode, writeback_control)
+   - 在后面__writeback_single_inode中使用,用于写回metadata. 只有在inode->i_state包含I_DIRTY_SYNC|I_DIRTY_DATASYNC时使用.
+
+** inode_wait_for_writeback(inode, bdi_writeback)
+   - 等待inode->i_state的I_SYNC标志. 
+   > bdi_waitqueue(inode->i_state, __I_SYNC)
+   - 这里的inode_wait仅仅是schedule()
+   > __wait_on_bit(wait_queue_head_t, wait_queue_t, inode_wait, TASK_UNINTERRUPTIBLE)
+
+** inode_sleep_on_writeback(inode)
+   - 和上面一样,等待inode->i_state的I_SYNC标志
+   - 和上面wait的区别是,这里仅仅schedule. 上面使用循环等待.
+   > prepare_to_wait()
+   > finish_wait(wait_queue_head_t, wait)
+   - 这里会考虑的问题是inode会不会在等候后被释放.
+
+** requeue_inode(inode, bdi_writeback, writeback_control)
+   - 为inode找一个bdi_writeback的合适的队列. 在写回inode完成后,如果他还有脏数据,就继续把它放到bdi队列中
+   - inode->i_state & I_FREEING, 不处理
+   - inode->i_state & I_DIRTY, 有脏数据. 而且writeback_control->sync_mode是WB_SYNC或tagged_writepages有效, 需要设置inode->dirtied_when = jiffies
+   - tagged_writepages会使用PAGECACHE_TOWRITE, 而不是直接使用PAGECACHE_DIRTY. 什么时候使用??
+   - writeback_control->pages_skipped表示写失败的page,所以跳过不处理.
+   - 如果pages_skipped>0, 直接放到b_dirty队列
+   > redirty_tail(inode, bdi_writeback)
+   - 如果inode->address_space还有PAGECACHE_TAG_DIRTY，但是writeback_control->nr_to_write <=0, 说明这个写回操作完成,把inode放到b_more_io队列
+   > requeue_io(inode, bdi_writeback)
+   - 如果还有要写的,就放到b_dirty队列
+   > redirty_tail(inode, bdi_writeback)
+   - 如果没有PAGECAHCE_TAG_DIRTY, 但inode是脏的I_DIRTY,同样放到b_dirty队列
+   > redirty_tail(inode, bdi_writeback)
+   - 否则inode不需要写回, 从i_wb_list队列上释放.
+   - I_DIRTY的标志和pagecache的脏有什么关系???
+
+** __writeback_single_inode(inode, writeback_control)
+   - 写回inode和page. 这是inode->i_state必须有I_SYNC??
+   - 先写回pagecache
+   - do_writepages(address_space, writeback_control)
+   - 如果writeback_control->sync_mode是WB_SYNC_ALL, 等待pagecache写完
+   > filemap_fdatawait(address_space)
+   - 如果pagecache都写回,清除I_DIRTY_PAGES,这里通过检查address_space的PAGECACHE_TAG_DIRTY计算是否还有脏page
+   > mapping_tagged(address_space, PAGECACHE_TAG_DIRTY)
+   - 然后清除I_DIRTY_SYNC|I_DIRTY_DATASYNC, 写回metadata数据
+   > write_inode(inode, writeback_control)
+   - 这样就把文件的所有数据都刷回去.
+   - pagecache和data/metadata还是有区别的,怎么区别??
+   
+** writeback_single_inode(inode, bdi_writeback, writeback_control)
+   - 检查如果inode->i_count为0,它应该在释放中. I_FREEING|I_WILL_FREE
+   - 如果inode->i_state & I_SYNC, 而且writeback_control->sync_mode != WB_SYNC_ALL, 等待I_SYNC标志
+   > __inode_wait_for_writeback(inode)
+   - 这个标志也是在这里使用,表示它正在同步中,
+   - 检查I_DIRTY, 如果没有脏数据要写回,就直接退出.
+   - 设置I_SYNC,阻挡其他任务
+   > __writeback_single_inode(inode, writeback_control)
+   - 写完成后,如果没有I_DIRTY, 把它从i_wb_list队列中删除
+   - 设置I_SYNC标志
+   > inode_sync_complete(inode)
+   - 这个函数是为fs服务的,bdi不使用它..
+
+** writeback_chunk_size(backing_dev_info, wb_writeback_work)
+   - 计算写回操作写多少个page
+   - 如果是WB_SYNC_ALL或wb_writeback_work->tagged_writepages有效,则写全部的page, LONG_MAX
+   - 否则这三个值的最小的
+   - bakcing_dev_info->avg_write_bandwidth/2 
+   - global_dirty_limit/DIRTY_SCOPE(8)
+   - wb_writeback_control->nr_pages
+
+** writeback_sb_inodes(super_block, bdi_writeback, wb_writeback_work)
+   - 根据wb_writeback_work构造writeback_control.控制inode写回
+   - wb_writeback_work里面没有range,但里面有nr_pages, 表示总的写回的数量, 给writeback_control->nr_to_write.
+   - wb_writeback_work->sb和参数super_block应该一样
+   - 操作bdi_writeback->b_io队列上属于super_block的inode, 碰到不同sb的, 如果wb_writeback_work->sb有效,继续处理其他的inode, 否则停止遍历
+   - 碰到I_NEW|I_FREEING|I_WILL_FREE的都忽略
+   > redirty_tail(inode, bdi_writeback)
+   - 如果writeback_control->sync_mode != WB_SYNC_ALL, 而且inode->i_state有I_SYNC,不会等待,把它放到bdi_writeback->b_more_io队列上
+   > requeue_io(inode, bdi_writeback)
+   - 如果writeback_control->sync_mode = WB_SYNC_ALL, 而且有I_SYNC, 等待inode完成. 被唤醒后重新设置检查.
+   - inode_sleep_on_writeback(inode)
+   - 开始写回,设置I_SYNC
+   - 计算需要写多少page
+   > writeback_chunk_size(bdi_writeback->backing_dev_info, wb_writeback_work)
+   - 开始写回
+   > __writeback_single_inode(inode, writeback_control, ...)
+   - writeback_control->pages_skipped,表示page被lock了,所以不能写回. 
+   - wbc->nr_to_write -= (write_chunk - writeback_controL->nr_to_write)
+   - 修改inode的队列
+   > requeue_inode(inode, bdi_writeback, writeback_control)
+   - inode_sync_complete(inode)
+   - 循环退出条件是已经写了0.1s, 或者wb_writeback_control->nr_pages<=0
+   - 这里好像不是简单的super_block操作,需要bdi_writeback配合. 
+
+** __writeback_inodes_sb(bdi_writeback, wb_writeback_work)
+   - 处理bdi_writeback->b_io上面所有的inode, 因为它是按照sb排序,相同sb的inode一块处理
+   - 遍历b_io队列,取出第一个inode->i_sb
+   > grab_super_passive(super_block)
+   - 如果sb无效
+   > redirty_tail(inode, bdi_writeback)
+   > writeback_sb_inodes(super_block, bdi_writeback, wb_writeback_work)
+   > drop_super(super_block)
+   - 循环退出条件也是0.1s或wb_writeback_work->nr_pages完成
+
+** writebacK_inode_wb(bdi_writeback, nr_pages, wb_reason)
+   - 构造一个wb_writeback_work, 要写会一定的数据量
+   - range_cyclic = 1, 而且是非同步WB_SYNC_NONE. 把wb_reason/nr_pages传进去
+   - 如果b_io队列是空的,根据wb_writeback_work补充队列
+   > queue_io(bdi_writeback, wb_writeback_work)
+   - 开始处理b_io队列上的inode
+   - __writeback_inodes_sb(bdi_writeback, wb_writeback_work)
+   - 返回写回的数量  nr_pages - wb_writeback_control->nr_pages
+
+** over_bground_thresh(backing_dev_info)
+   - 是否需要因为background/dirty比率失衡,启动写回操作
+   > global_dirty_limits(background_thresh, dirty_thresh)
+   - 如果NR_FILE_DIRTY + NR_UNSTABLE_NFS的数量超过background_thresh, 返回true
+   - 如果BDI_RECLAIMABLE超过dirty_limit?? 返回true
+   - bdi->bdi_stat[BDI_RECLAIMABLE]怎么统计?
+   > bdi_dirty_limit(bdi_writeback, background_thresh)
+
+** wb_update_bandwidth(bdi_writeback, start_time)
+   - 更新一些pagecache的参数
+   > __bdi_update_bandwith(bdi_writeback->backing_dev_info, 0, 0, 0, 0, 0, start_time)
+
+** wb_writeback(bdi_writeback, wb_writeback_work)
+   - 开始设置wb_writeback_work->older_than_this为当前jiffies, 所以只写之前的inode
+   - bdi_writeback_work->nr_pages <=0, 它的任务完成退出
+   - wb_writeback_work->for_background/for_kupdate有效,而且backing_dev_info->work_list也不为空,他们的优先级最低
+   - for_background有效,检查是否需要, 如果不需要直接退出
+   > over_bground_thresh(bdi_writeback->backing_dev_info)
+   - 如果wb_writeback_work->for_kupdate有效, 写回之前脏的inode
+   - wb_writeback_work->older_than_this -= dirty_expire_interval * 10
+   - 如果wb_writeback_work->for_background有效, 更新它
+   - wb_writeback_work->older_than_this = jiffies
+   - older_than_this优先级很高?? 在补充b_io时,使用它.如果设置了,只有b_dirty的一部分inode才会放到b_io中
+   - 如果b_io空了,补充inode
+   > queue_io(bdi_writeback, wb_writeback_work)
+   - 如果wb_writeback_work->sb有效,只写回特定sb的
+   > writeback_sb_inodes(wb_writeback_work->super_block, wb, work) 
+   - 否则写回所有的
+   > __writeback_inodes_sb(bdi_writeback, work)
+   - 更新backing_dev_info信息, start_time是函数开始执行时间.
+   > wb_update_bandwidth(bdi_writeback, start_time)
+   - 如果上面的写操作有进展,继续循环
+   - 否则bdi_writeback->b_more_io是空,直接退出. 现在b_io/b_more_io都是空的.
+   - 否则b_more_io不是空,等待b_more_io上的inode写回完成. I_SYNC. 在写回时碰到它在写回时,而且非WB_SYNC_ALL时,把它放到b_more_io队列中.
+   > inode_wait_for_writeback(inode, bdi_writeback)
+
+** get_next_work_item(backing_dev_info)
+   - backing_dev_info->work_list是一个wb_writeback_work的队列, 取出一个wb_writeback_work
+
+** get_nr_dirty_pages()
+   > global_page_state(NR_FILE_DIRTY)
+   > glboal_page_state(NR_UNSTABLE_NFS)
+   - 每次写inode的metadata,都会产生一个脏页. 不一定!!
+   > get_nr_dirty_inodes()
+
+** wb_check_background_flush(bdi_writeback)
+   - 启动background的写回操作
+   > over_bground_thresh(bdi_writeback->backing_dev_info)
+   - 构造一个wb_writeback_work, 
+   - nr_pages = LONG_MAX
+   - sync_mode = WB_SYNC_NONE
+   - reason = WB_REASON_BACKGROUND
+   - for_background / range_cyclic = 1
+   > wb_writeback(bdi_writeback, bdi_writeback_work)
+   - 上面的退出只能根据时间,或者thresh限制.
+   - 这里会执行真正的写操作, 在wb_do_writeback中使用, 他处理完所有的wb_writeback_work, 再处理它
+
+** wb_check_for_old_data_flush(bdi_writeback)
+   - 这是周期性的写回数据
+   - 系统参数dirty_wirteback_interval决定周期长度. 如果为0,直接返回. 
+   - bdi_writeback->last_old_flush表示上次flush的时间, 如果时间间隔小于dirty_writeback_interval,直接退出.
+   - nr_pages = get_nr_dirty_pages()
+   - sync_mode = WB_SYNC_NONE
+   - for_kupdate / range_cylic =1
+   - reason = WB_REASON_PERIODIC
+   > wb_writeback(bdi_writeback, bdi_writeback_work)
+   - 这里的退出会根据时间..
+
+** wb_do_writeback(bdi_writeback, force_wait)
+   - 这里是操作bdi_writeback->work_list中的wb_writeback_work的工作,还有background/update的写回工作. 应该是bdi线程使用的.
+   - 对于新内核,他是workqueue中执行的操作
+   - 首先设置backing_dev_info->state的BDI_writeback_running标志
+   - 遍历所有的backing_dev_info->work_list上的wb_writeback_work
+   > get_next_work_item(backing_dev_info)
+   - 如果force_wait有效,使用WB_SYNC_ALL 
+   > wb_writeback(bdi_writeback, wb_writeback_work)
+   - 完成后唤醒bd_writeback_work->done
+   - 循环完成后调用kupdate/background任务
+   > wb_check_old_data_flush
+   > wb_check_background_flush)
+   - 清除BDI_writeback_running标志.
+
+** bdi_writeback_workfn(work_struct)
+   - 这是workqueue中delayed_work使用的回调函数
+   - 更新worker->desc
+   > set_worker_desc("flush-%s", dev_name(bdi->dev))
+   - 如果当前worker不是rescuer, 或者bdi_list中没有wb_writeback_work, 要不就是空, 要不就是普通worker..
+   - 循环处理wb_writeback_work, 直到work_list为空
+   > wb_do_writeback(bdi_writeback)
+   - 否则说明没有足够的worker去处理wb_writeback_work
+   > writeback_inodes_sb(bdi_writeback, 1024, WB_REASON_FORKER_THREAD)
+   - 最后如果有等待的wb_writeback_work, 或者有脏的inode, 设置delayed_work 
+   > queue_delayed_work(bdi_wq, bdi_writeback->delayed_work, dirty_writeback_interval)
+
+** bdi_writeback_thread
+   - 这是bdi_writeback使用的内核线程, 他会一直执行写回动作,直到有人要销毁它.
+   - 设置bdi_writeback->last_active = jiffiest, 根据它销毁线程
+   > kthread_freezable_should_stop
+   - 开始写的时候关闭计时器,他会唤醒这个线程,但这里它在运行中,不用唤醒. 在mark_page_dirty中会启用它,埋伏的好深.
+   > del_timer(bdi_writeback->wakeup_timer) 
+   - 处理写回任务
+   > wb_do_writeback(bdi_writeback, 0) 
+   - 处理完成后再检查bdi_writeback->work_list队列, 如果有新的,继续循环.
+   - 如果bdi_writeback上还有dirty inode,只等待dirty_writeback_interval*10的时间,否则一直等待
+   > wb_has_dirty_io(bdi_writeback)
+   - 这个任务退出时，还会处理一遍? 可能是系统关闭前?
+   > wb_do_writeback(bdi_writeback, 1)
+
+** wakeup_flusher_threads(nr_pages, wb_reason)
+   - 启动写回操作,使用wb_writeback_work实现.
+   - 如果nr_pages=0, 计算dirty page
+   > global_page_state(NR_FILE_DIRTY)
+   > global_page_state(NR_UNSTABLE_NFS)
+   - 这里是为bdi_list中的每个backing_dev_info创建一个wb_writeback_work,放到bdi->work_list队列中
+   - 首先检查有dirty inode
+   > bdi_has_dirty_io(backing_dev_info)
+   - 使用WB_SYNC_NULL和nr_pages. 每个bdi都写回这么多??
+   > __bdi_start_writeback(bdi, nr_pages, false, reason)
+
+** block_dump__mark_inode_dirty(inode)
+   - 打印信息,任务名称,inode名称,还有sb名称  super_block->s_id
+
+** __mark_inode_dirty(inode, flags)
+   - 如果flags包含I_DIRTY_SYNC|I_DIRTY_DATASYNC
+   > super_block_operations->dirty_inode()
+   - 如果inode->i_state本来包含这些flags,直接退出
+   - 修改inode->i_state
+   - 如果inode之前不是dirty,把它放到bdi_writeback->b_dirty中
+   - 如果bdi_writeback中之前没有inode, 唤醒bdi线程,让他开始刷新数据
+   > bdi_wakeup_thread_delayed(backing_dev_info)
+
+** wait_sb_inodes(super_block)
+   - 这里等待的是super_block上所有inode的pagecache都写回磁盘
+   - 遍历super_block->s_inodes  (inode->i_sb_list)
+   > filemap_fdatawait(address_space)
+
+** writeback_inodes_sb_nr(super_block, nr, wb_reason)
+   - 这里只是写回super_block的dirty inode, 提交wb_writeback_work后等待它完成
+   - 构造一个wb_writeback_work
+   - super_block = 参数sb
+   - sync_mode = WB_SYNC_NONE
+   - tagged_writepages = 1 写回pagecache上的脏数据
+   - done = COMPLETION  等待使用的东西
+   - nr_pages = nr
+   - reason  = 参数
+   - 提交wb_writeback_work
+   > bdi_queue_work(super_block->backing_dev_info, work)
+   > wait_for_completion(done)
+
+** writeback_inodes_sb(super_block, wb_reason)
+   - 启动bdi写回这个super_block, 数据量根据pagecache的参数而定
+   > get_nr_dirty_pages()
+   > writeback_inodes_sb_nr(super_block, pages, reason)
+
+** try_to_writeback_inodes_sb_nr(super_block, wb_reason)
+   - 启动bdi任务写回数据. 如果本来就在运行,直接返回
+   > writeback_in_progress(super_block->backing_dev_info)
+   - 如果本来没有运行,提交wb_writeback_work工作
+   > writeback_inodes_sb(super_block , reason)
+
+** try_to_writeback_inodes_sb(super_block, wb_reason)
+   > get_nr_dirty_pages()
+   > try_to_writeback_inodes_sb_nr(sb, page_nr, wb_reason)
+
+** sync_inodes_sb(sb)
+   - 写回super_block的数据, 在sync一个filesystem时使用.
+   - 设定super_block
+   - sync_mode = WB_SYNC_ALL  同步方式写回
+   - nr_pages = LONG_MAX  写回所有的数据
+   - range_cyclic
+   - done   completion同步
+   - reason是WB_REASON_SYNC
+   > bdi_queue_work(super_block->bdi, wb_writeback_work)
+   > wait_for_completion(done)
+   - 提交工作,异步执行,当前任务等待wb_writeback_work
+   > wait_sb_inodes(super_block)
+
+** write_inode_now(inode, sync)
+   - 构造writeback_control, range是(0, -1), sync是参数. 
+   > writeback_single_inode(inode, wb, writeback_control)
+   - 这里直接调用wirtepages,  不会通过bdi线程
+   - WB_SYNC_ALL表示等待提交中的IO, 提交IO后,也会使用pagecache等待. 在__writeback_single_inode中实现.
+
+** sync_inode(inode, writeback_control)
+   - 不仅写回pagecache,还有inode的metadata
+   > writeback_single_inode(inode, bdi_writeback, writeback_control)
+
+** sync_inode_metadata(inode, wait)
+   - 构造writeback_control, nr_to_write是0, 就不调用pagecahce,但会写回metadata
+   > sync_inode(inode, writeback_control)
+
+** mark_inode_dirty(inode)
+   - 设置I_DIRTY
+
+** mark_inode_dirty_sync(inode)
+   - 设置I_DIRTY_SYNC
+ 
+** 总结
+   - I_DIRTY虽然包含3个标志，但没有很一致的用法.
+   - I_DIRTY_PAGES在设置PG_dirty时设置,在处理完成writeback_control后检查pagecache,如果没有脏页,清除I_DIRTY_PAGES
+   - I_DIRTY_DATASYNC, 表示有脏数据? 在nfs中使用它,它的pagecache/I_DIRTY_PAGES??
+   - I_DIRTY_SYNC 单独用它也不多,表示它的metadata是脏的.
+   - 给外部提供接口,启动bdi任务. 一半是构造一个wb_writeback_work.  bdi_start_writeback / wakeup_flusher_threads. 这里的操作不是同步的,都是直接返回. 
+   - wb_writeback_work转化为writeback_control是range变为(0,-1), 所以如果range_cyclic为false,就是用它.
+   - wb_writeback_work只能控制写回方式和super_block的范围, 根据它的参数遍历b_io/b_dirty/b_more_io上的inode, 然后使用writeback_control参数写回, 写回pagecache以及metadata数据.
+   - reason是WB_REASON_SYNC, sync特定的filesystem. 它提交后会等待bdi_writeback_work完成, 也分2中情况,一种是WB_SYNC_NONE,一种是WB_SYNC_ALL. 还有2者写回的数据量不同.   sync_inodes_sb / writeback_inodes_sb
+   - 设置inode的I_DIRTY, 并填加到bdi_writeback的队列中
+   - 这个文件前面是bdi_writeback处理wb_writeback_work. 但只有fs sync才会创建wb_wirteback_work. sync syscall也会提交wb_writeback_work, 通过wakeup_flusher_threads
+   - 后面处理fs sync, 和inode sync
+   - writeback_inodes_sb_nr / write_inodes_sb / try_to_writeback_inodes_sb_nr / try_to_writeback_inodes_sb, 创建wb_writeback_work. 在fs sync中使用, 只是写回一部分数据.
+   - sync_inodes_sb也是fs sync使用,提交wb_writeback_work, 而且等待pagecache
+   - write_inode_now / sync_inode / sync_inode_metadata写回inode数据, 本地执行写回操作.
+   - 普通的delayed_work是周期执行,但page-writeback中会触发groundback写回, 他立刻唤醒work_struct
+
+* mm/backing-dev.c
+
+** default_backing_dev_info  
+   - 设定ra_pages = VM_MAX_READAHEAD * 1024 / PAGE_CACHE_SIZE
+
+** noop_backing_dev_info
+   - 没有写权限 BDI_CAP_NO_ACCT_AND_WRITEBACK
+
+** bdi_set_min_ratio(backing_dev_info, min_ratio)
+   - 设置backing_dev_info->min_ratio. 所有bdi的min_ratio累计不超过100%
+
+** bdi_set_max_ratio(backing_dev_info, max_ratio)
+   - 设置backing_dev_info->max_ratio
+   - 修改backing_dev_info->max_prop_frac. 放到1000倍
+
+** default_bdi_init()
+   - 这是一个系统的初始化函数, 只注册default
+   > bdi_init(default_backing_dev_info / noop_backing_dev_info)
+   > bdi_register(default_backing_dev_info)
+   - 对于最新的内核, flush任务使用workqueue 
+   > alloc_workqueue("writeback", WQ_MEM_RECLAIM|WQ_FREEZABLE|WQ_UNBOUND|WQ_SYSFS, 0)
+   - 这是在系统初始化的时候调用
+
+** bdi_has_dirty_io(backing_dev_info)
+   - 检查bdi_writeback是否有inode在b_dirty/b_io/b_more_io队列上.
+   > wb_has_dirty_io(backing_dev_info->bdi_writeback)
+
+** wakeup_timer_fn(data)
+   - 它是bdi_writeback->wakeup_timer使用的回调函数. 
+   - data是一个backing_dev_info, 首先唤醒backing_dev_info->bdi_writeback->task
+   > wake_up_process(backing_dev_info->bdi_writeback->task)
+   - 当然bdi_writeback->task可能为NULL, 那就唤醒default_backing_dev_info->bdi_writeback->task.
+
+** bdi_wakeup_thread_delayed(backing_dev_info)
+   - 这是当一个super_block上的第一个inode变为dirty时使用. 果然在__mark_inode_dirty中使用
+   - 设置backing_dev_info->bdi_writeback->wakeup_timer, 超是timeout = dirty_writeback_interval*10
+   - 如果不断有文件变为dirty, 它的时钟会不会不断推迟???
+   - 这个时钟仅在这里唤醒,在bdi线程中关闭.
+   - 对于新的内核, 这里是修改backing_dev_info->bdi_writeback->delayed_work 
+   > mod_delayed_work(bdi_wq, delayed_work)
+
+** bdi_longest_inactive(void)
+   - 计算最大间隔?  max(dirty_writeback_interval * 10, 5m)
+
+** bdi_clear_pending(backing_dev_info)
+   - 清除backing_dev_info->state的BDI_pending标志, 并唤醒等待这一位的任务
+   > wake_up_bit(backing_dev_info->state, BDI_pending)
+
+** bdi_forker_thread(ptr)
+   - 这是default_backing_dev_info->bdi_writeback->task线程使用的函数
+   - 除非系统关闭,它应该不会退出
+   - 在执行循环中,它首先检查有没有脏数据要写回
+   > wb_has_dirty_io(bdi_writeback)
+   - 或者backing_dev_info->work_list不是空
+   - 删掉时钟,开始处理wb_writeback_work
+   > del_timer(bdi_writeback->wakeup_timer)
+   > wb_do_writeback(bdi_writeback, 0)
+   - 然后检查bdi_list队列上所有的backing_dev_info, 对于可以写回的bdi, 检查是否需要给他创建线程;对于没有写回任务的,关闭它的线程
+   - 检查backing_dev_info->work_list和dirty inode
+   > wb_has_dirty_io(backing_dev_info->bdi_writeback)
+   - 如果需要写回任务,但没有bdi_writeback->task = NULL, 给他创建一个.
+   - 对于没有写回任务, 但是bdi_writeback->task = NULL, 而且有5m没有启动线程, 关闭它.
+   - 对于关闭和创建线程的, 都设置backing_dev_info->state的BDI_pending标志.
+   > set_bit(BDI_pending, bdi_writeback->state)
+   - 创建线程执行函数bdi_writeback_thread
+   > kthread_create(bdi_writeback_thread, backing_dev_info, ...) 
+   - 对于关闭线程
+   > kthread_stop(task)
+   - 然后清除标志
+   > bdi_clear_pending(bdi_writeback)
+   - 最后等待一段时间, 如果没有脏数据,就5m, 否则是dirty_writeback_interval
+   > schedule_timeout(bdi_longest_inactive) 
+   - 对于新内核,这些都没有意义了!!
+
+** bdi_remove_from_list(backing_dev_info)
+   - 把backing_dev_info->bdi_writeback->bdi_list从全局队列bdi_list上删除. 这是当bdi_writeback关闭时使用
+
+** bdi_register(backing_dev_info, device, name string)
+   - 这个应该是在super_block创建时使用
+   - 如果backing_dev_info->dev != 0, 退出. 使用独自的实现??
+   - 先创建bdi设备,虚拟的设备, bdi_class.
+   > device_create_vargs(bdi_class, parent, MKDEV(0,0), backing_dev_info ...)
+   - 为default_backing_dev_info启动线程
+   > kthread_run(bdi_forker_thread, bdi_writeback ...) 
+   - 对于新内核,这里也不再创建.
+   - procefs, debug的东西
+   > bdi_debug_register(bdi, dev_name(dev))
+   - 设置标志
+   > set_bit(BDI_registered, backing_dev_info->state)
+   - 放到bdi_list队列中
+   > list_add_tail_rcu(backing_dev_info->bdi_list, bdi_list)
+
+** bdi_register_dev(backing_dev_info, dev_t)
+   - 对上面函数的包装
+   > bid_register(backing_dev_info, NULL, "%u:%u", MAJOR(dev), MINOR(dev))
+
+** bdi_wb_shutdown(backing_dev_info)
+   - 释放backing_dev_info使用的资源
+   > bdi_remove_from_list(backing_dev_info) 
+   - 等待BDI_pending
+   - wait_on_bit(backing_dev_info->state, BDI_pending, ...)
+   - 最后任务如果没有自动退出,杀掉
+   > kthread_stop(backing_dev_info->bdi_writeback->task)
+   - 对于新的内核,没有了BDI_pending 
+   > mod_delayed_work(bdi_wq, &bdi->wb.dwork, 0);
+   > flush_delayed_work(&bdi->wb.dwork);
+   > cancel_delayed_work_sync(&bdi->wb.dwork);
+
+** bdi_prune_sb(backing_dev_info)
+   - 这里要关闭backing_dev_info,但是它对应的super_blocks可以存活,所以让那些super_blocks使用default_backing_dev_info
+
+** bdi_unregister(backing_dev_info)
+   - 在释放bdi时使用,只有在backing_dev_info->device有意义时才有详细的操作.
+   > bdi_set_min_ratio(backing_dev_info, 0)
+   > bdi_prune_sb(backing_dev_info)
+   - 释放backing_dev_info->bdi_writeback->wakeup_timer
+   - 关闭bdi线程
+   > bdi_wb_shutdown(backing_dev_info)
+   - 释放bdi设备?
+   > device_unregister(device)
+   - 可以先释放bdi, 再释放super_block
+    
+** bdi_wb_init(bdi_writeback, backing_dev_info)
+   - 初始化bdi_writeback.
+   > setup_timer(bdi_writeback->wakeup_timer, wakeup_timer_fn, backing_dev_info)
+   - 对于新内核,初始化bdi_writeback->delayed_work
+   > INIT_DELAYED_WORK(delayed_work, bdi_writeback_workfn)
+
+** bdi_init(backing_dev_info)
+   - 初始化backing_dev_info, 没有什么特别的
+   > bdi_wb_init(backing_dev_info->bdi_writeback, backing_dev_info)
+    
+** bdi_destroy(backing_dev_info)
+   - 这里要释放backing_dev_info,还有它包含的bdi_writeback
+   - 把b_dirty,b_io,b_more_io上的inode给default_backing_dev_info的三个队列上
+   > bdi_unregister(backing_dev_info)
+   > del_timer_sync(backing_dev_info->bdi_writeback->wakeup_timer)
+   - 对于新内核 
+   > cancel_delayed_work_sync(delayed_work)
+
+** bdi_setup_and_register(backing_dev_info, name ...)
+   - 创建backing_dev_info. 文件系统基本上没有对它的控制.
+   > bdi_init(backing_dev_info)
+   > bdi_register(backing_dev_info, ...)
+
+** clear_bdi_congested(backing_dev_info, sync)
+   - 清除backing_dev_info->state的BDI_sync_congested / BDI_async_congested
+   - nr_bdi_congested[sync] -- 
+   - 唤醒congestion_wqh[sync]等待队列
+
+** set_bdi_congested(backing_dev_info, sync)
+   - 设置BDI_sync_congestd / BDI_async_congested, nr_bdi_congested[sync] ++
+
+** congested_wait(sync, timeout)
+   - 等待条件是nr_bdi_congested[sync] > 0 并且zone不是congested
+   - 在congestion_wqh[sync]队列上等待timeout时间. 
+   - 最后退出时返回提前完成等待的时间.
+   - zone是在page扫描时,如果所有dirty page都因为bdi_congested, 设置标志ZONE_CONGESTED
+
+** 总结
+   - 这里主要是backing_dev_info的构造和销毁. 
+   - 这里不再动态创建线程去执行wb_writeback_work, 而是使用workqueue
+
+* mm/page-writeback.c
+  - 这里应该是根据page的使用情况,启动bdi线程的回写任务.
+  - 这里有大量的系统参数控制page的使用情况 
+
+** global_dirtyable_memory(void)
+   - 还可以写脏的page数量, 也就是free page和可回收的page, 也就是lru队列中
+   > global_page_state(NR_FREE_PAGES)
+   > global_reclaimable_pages()  
+   - 减去dirty_balance_reserve + min_free_kbytes
+   - dirty_balance_reserve是各zone的high_wmark的之和
+   - min_free_kbytes是系统参数
+
+** global_dirty_limits(pbackground, pdirty)
+   - 获取2个阈值,一个是background, 一个是dirty
+   - vm_dirty_bytes是系统参数, 如果>0, 返回给pdirty,  否则使用page统计参数,和vm_dirty_ratio
+   > global_dirtyable_memory()  / available_memory
+   - available_memory * vm_dirty_bytes / 100
+   - dirty_background_bytes也是系统参数,如果>0, 给pbackground, 否则使用dirty_background_ratio
+   - background不能大于dirty, 否则设为dirty/2
+
+** zone_dirtyable_memory(zone)
+   - 统计一个zone的可用于dirty的page, 和上面类似. free + lru - dirty_balance_reserve / high_wmark
+
+** zone_dirty_limit(zone)
+   - 和global的也一样,如果vm_dirty_bytes > 0,  就是zone/global的比率分配
+   - 如果vm_dirty_bytes = 0, 使用vm_dirty_ratio * zone_dirtyable_memory()
+
+** zone_dirty_ok(zone)
+   - zone的dirty page数量在限制内
+   - dirty page是NR_FILE_DIRTY和NR_UNSTABLE_NFS
+
+** dirty_background_ratio_handle(ctl_table, write, buffer, lenp, ppos)
+   - 设置dirty_background_ratio
+
+** dirty_background_bytes_handle()
+   - 设置dirty_background_bytes
+
+** dirty_ratio_handle(...)
+   - 设置vm_dirty_ratio
+
+** wp_next_time(cur_time)
+   - 增加VM_COMPLETIONS_PERIOD_LEN.   3s
+ 
+** __bdi_writeout_inc(backing_dev_info)
+   - 增加BDI_WRITTEN计数
+   - max_prop_frac是FPROP_FRAC_SHIFT, 1<<10. 设置max_ratio后,更缩小一定比率.
+   - 只有bdi->completions->event在比率之内,才增加两者的event.
+   > __fprop_inc_percpu_max(writeout_completions, bdi->completions, bdi->max_prop_frac)
+   - 如果writeout_period_timer没有启动,就启动时钟,更新writeout_completions
+
+** bdi_writeout_inc(backing_dev_info)
+   > __bdi_writeout_inc(backing_dev_info)
+
+** bdi_writeout_fraction(backing_dev_info, numerator, denominator)
+   - 获取writeout_completions->events是denominator, bdi->completions->events是numerator
+   > fprop_fraction_percpu(writeout_completions, backing_dev_info->completions, numerator, denominator)
+
+** writeout_peroid(t)
+   - 计时器,统计写的速度.
+   - jiffies - writeout_period_time
+   - writeout_completions->events衰减, 系数是miss_period. 也就是它的生命期. 如果减到0,就不再开启时钟,等着BDI_WRITTEN事件的开启.
+   - 否则设置设置时钟VM_COMPLETIONS_PERIOD_LEN
+   
+** bdi_set_min_ratio(backing_dev_info, min_ratio)
+   - 设置bdi->min_ratio
+
+** bid_set_max_ratio(backing_dev_info, max_ratio)
+   - 设置bdi->max_ratio
+
+** bdi_dirty_limit(backing_dev_info, dirty)
+   - writeout_completions控制系统的BDI_WRITTEN事件的权重, backing_dev_info->completions控制一个设备的BDI_WRITTEN事件的权重.
+   - dirty是一个bdi为了写回数据使用的page的数量.如果它速度快,它就可以用的多,如果速度慢,它只能少用. 但使用它的只是计算thresh,如果dirty page的数量超过它,赶紧写回.
+   - 首先获取它对于全局的一个权重
+   > bdi_writeout_fraction(backing_dev_info, numerator, denominator)
+   - 然后计算它可以使用的dirty中的数量. 但把bdi_min_ratio预留出来.
+   - dirty * numerator / denominator
+
+** bdi_position_ratio(backing_dev_info, thresh, bg_thresh, dirty, bdi_thresh, bdi_dirty)
+   - 计算setpoint和bdi_setpoint. global的setpoint是一个三次曲线, 根据dirty/thresh, 计算一个比率.
+   - 对于gloal来说, freerun是一个下限(dirty+thresh)/2
+   - limit是上限max(thresh, global_dirty_limit)
+   - dirty理想值setpoint在两者中间. 
+   - 如果偏大, dirty > setpoint, 减小pos_ratio; 如果偏小,增大pos_ratio. 
+   - 它影响task_ratelimit
+   - dirty > limit, 直接返回0, 限制到死??
+   - 根据global的setpoint, 根据比率计算bdi占有的部分bdi_setpoint
+   - bdi_setpoint = setpoint * bg_thresh / thresh
+   - 对于bdi, 曲线斜率计算很奇怪
+   - 计算bdi的pos_ratio, 它和global的pos_ratio相乘,得到结果.
+
+** bdi_update_write_bandwidth(backing_dev_info, elapsed, written)
+   - 更新backing_dev_info->avg_write_bandwidth / write_bandwidth
+   - written是写回的总数据量 bdi->bdi_stat . 每次更新都记录在bdi->written_stamp
+   - elapsed是now - bdi-bw_time_stamp,每次更新都记录的时间戳. 每次计算带宽根据3s计算.
+   - 如果elapsed > 3s,  时间太长, bandwidth/avg_bandwidth都使用它, ( written - bdi_written_stamp) / elapsed
+   - 否则可以使用历史速度  
+   - bandwidth += (bdi->write_bandwidth * (period - elapsed))
+   - bandwidth /= elapsed
+   - avg_write_bandwidth的变化不受当前bandwidth影响,它受之前的bandwidth影响
+   - 变化幅度是 (avg_write_bandwidth - write_bandwidth) / 8
+   - 最后把计算的结果给bdi->write_bandwidth / avg_write_bandwidth
+
+** update_dirty_limit(thresh, dirty)
+   - 更新global_dirty_limit. 
+   - global_dirty_limit > thresh, global_dirty_limit = thresh
+   - 否则,减小global_dirty_limit, 但根据max(thresh,dirty)决定.
+   - 幅度是 (global_dirty_limit - thresh) / 32.
+   - thresh增大会影响global_dirty_limit,但减小不一定,需要dirty同时减小才可以.
+
+** global_update_bandwidth(thresh, dirty, now)
+   - 更新global_dirty_limit, 但更新周期必须超过200ms.  使用静态变量update_time记录上次的时间
+   > time_after_eq(now, update_time + BANDWIDTH_INTERVAL)
+   - update_dirty_limit(thresh, dirty)
+
+** bdi_update_dirty_ratelimit(backing_dev_info, thresh, bg_thresh, dirty, bdi_thresh, bdi_dirty, dirtied, elapsed)
+   - thresh是dirty_thresh, dirty的限制, bg_thresh是background_thresh background限制, dirty是nr_dirty, 系统总的dirty的页数. bdi_thresh/bdi_dirty是bdi的限制. dirtied是bdi->bdi[BDI_DIRTIED],elapsed是时间.
+   - dirty_ratio是bdi制造脏page的速度  (dirtied - bdi->dirtied_stamp ) / elapsed
+   - 计算pos_ratio
+   > bdi_position_ratio(bdi, thresh, bg_thresh, dirty, bdi_thresh, bdi_dirty)
+   - 计算任务的速率限制 task_ratelimit = dirty_ratio * pos_ratio
+   - bdi->balanced_dirty_ratelimit 近视 avg_write_bandwidth * pos_ratio
+   - 修正dirty_ratelimit, 看着很复杂的东西, 很诡异.
+   - 最后balanced_dirty_ratelimit给bdi
+   - bdi->dirty_ratelimit, 下面会用它计算等待时间.
+
+** __bdi_update_bandwith(backing_dev_info, thresh, bg_thresh, dirty, bdi_thresh, bdi_dirty, start_time)
+   - 更新global_dirty_limit / bdi dirty_ratelimit / bdi write_bandwidth
+   - 更新周期不能少于200ms  elapsed = now->bdi->bw_time_stamp
+   - dirtied/written是对应的, 在设置PG_dirty时增加BDI_DIRTIED, 在去除PG_writeback增加written. 2个值最好能一块变化. 但是不可能.
+   - 如果elapsed > HZ, 超过1s,不再计算bandwidth, 只记录统计数  dirtied_stamp/written_stamp/bw_time_stamp
+   - 如果thresh>0, 更新global_dirty_limit??
+   > global_update_bandwidth(thresh, dirty, now)
+   > bdi_update_dirty_ratelimit(bdi, thresh, bg_thresh, dirty, ...)
+   - 更新写的bandwidth
+   > bid_update_write_bandwidth(bdi, elapsed, written)
+
+** bdi_update_bandwidth(backing_dev_info, thresh, bg_thresh, dirty, bdi_thresh, bdi_dirty, start_time)
+   - 首先检查周期是否超过BANDWIDTH_INTERVAL. 重复检查, 不过这个函数很简单
+   > time_is_after_eq_jiffies(bdi->bw_time_stamp + BANDWIDTH_INTERVAL)
+   > __bdi_update_bandwith(bdi, thresh, bg_thresh, dirty, bdi_thresh, bdi_dirty, start_time)
+
+** dirty_poll_interval(dirty, thresh)
+   - 计算一个时间,给current->nr_dirtied_pause. 表示下一个计算速度的周期.
+   - thresh就是dirty_thresh, 就是可以容忍的界限. dirty表示系统中dirty的page数量. 
+   - dirty > thresh, 表示制造太多脏页, nr_dirtied_pause = 1
+   - 否则计算  1 << ( ilog2(thresh - dirty) / 2). 如果thresh/dirty不是一个量级,结果是sqrt(thresh), 还是非常大
+
+** bdi_max_pause(backing_dev_info, bdi_dirty)
+   - 计算任务需要的等待时间.
+   > bdi_dirty / (1 + bdi->avg_write_bandwidth / (1 + HZ / 8))
+
+** bdi_min_pause(backing_dev_info, max_pause, task_ratelimit, dirty_ratelimit, nr_dirtied_pause)
+   - 计算等待时间, 通过参数返回. 还计算nr_dirtied_pause返回.
+   - 首先考虑 t = HZ/100,就是10ms.  
+   - 然后考虑bdi->avg_write_bandwidth
+   - 如果bdi->avg_write_bandwidth > bdi->dirty_ratelimit, 增加一部分. 太复杂的计数
+   - ilog2(bdi->avg_write_bandwidth / bdi->dirty_ratelimit) * 10 / 1024 * HZ
+   - 然后是max_pause, 
+   - t 不能超过 max_pause / 2, t = min(t, max_pause/2)
+   - 计算nr_dirtied_pause
+   - t * dirtied_ratelimit / HZ
+   - 然后是nr_dirtied_pause 不能少于 DIRTY_POLL_THRESH
+   - 如果 nr_dirtied_pause < DIRTY_POLL_THRESH, t大一点使用max_pause
+   - 对应的重新计算nr_dirtied_pause
+   - dirty_ratelimit * t / HZ < DIRTY_POLL_THRESH
+   - 如果它大于DIRTY_POLL_THRESH,  nr_dirtied_pause = DIRTY_POLL_THRESH
+   - 对应的重新计算t
+   - t = DIRTY_POLL_THRESH * HZ / dirty_ratelimit
+   - 然后考虑task_ratelimit, 它是针对一个task的??
+   - 使用它的速率计算t, 如果t > max_pause, 它使用max_pause
+   - HZ * nr_dirtied_pause / task_ratelimit
+   - 对应的重新计算nr_dirtied_pause
+   - task_ratelimit * t / HZ
+   - 最后nr_dirtied_pause >= DIRTY_POLL_THRESH, 使用t/2
+
+** balance_dirty_pages(address_space, pages_dirtied)
+   - 产生dirtied的任务调用它. 任务可能会在这里等待.  如果脏页超过background_thresh,启动background的写回操作
+   - 循环等待,控制写的速度.
+   - 计算nr_reclaimable,他是可回收的 NR_FILE_DIRTY + NR_UNSTABLE_NFS
+   - 计算nr_dirty, 系统的脏页   nr_reclaimable + NR_WRITEBACK
+   - 获取全局的background_thresh, dirty_thresh
+   > global_dirty_limits(background_thresh, dirty_thresh)
+   - 计算freerun = (background_thresh + dirty_thresh) / 2, 他是理想的写的速度
+   - 如果nr_dirty <= freerun, 表示系统没有压力,同时清除积累的速度. nr_dirtied_pages没变.
+   - 设置current->dirty_paused_when = now, current->nr_dirtied = 0
+   - nr_dirtied_pause在计算等待时间时使用. 如果nr_dirty>dirty_thresh是1,否则是sqrt(dirty_thresh - nr_dirtied)
+   > dirty_poll_interval(nr_dirty, dirty_thresh)
+   - 直接退出.
+   - 否则nr_dirtied > freerun, 不一定非常严重,可能没超过dirty_thresh
+   - 如果bdi没有运行,唤醒bdi任务.
+   > bdi_start_background_writeback(bdi)
+   - 计算当前bdi可以使用的dirty_thresh部分  bdi_thresh
+   > bdi_dirty_limit(bdi, dirty_thresh)
+   - 获取当前bdi->bdi_stat, bdi_reclaimable, bdi_dirty
+   > bdi_stat(bdi, BDI_RECLAIMABLE)
+   - bdi_dirty = bdi_reclaimable + bdi_stat(bdi, BDI_WRITEBACK)
+   - 只有global/bdi都超过界限,设置dirty_exceeded = 1
+   - bdi_dirty > bdi_thresh && nr_dirty > dirty_thresh
+   - 更新bandwidth, 下面的参数都了解了.  global_dirty_limit / bdi write_bandwidth / bdi ratelimit
+   > bdi_update_bandwidth(bdi,dirty_thresh, background_thresh, nr_dirty, bdi_thresh, bdi_dirty, start_time)
+   - 计算pos_ratio
+   > bdi_position_ratio(bdi, dirty_thresh, background_thresh, nr_dirty, bdi_thresh, bid_dirty)
+   - 使用 bdi->dirty_ratelimit, 计算任务的速率限制
+   - task_ratelimit = bdi->dirty_ratelimit * pos_ratio / 1k
+   - 计算等待时间范围
+   - max_pause根据bdi_dirty / avg_write_bandwidth / 8， 缩小8倍.
+   > bdi_max_pause(bdi, bdi_dirty)
+   - min_pause一般是10ms, nr_dirtied_pause估计是DIRTY_POLL_THRESH, 但受task_ratelite限制.
+   > bdi_min_pause(bdi, max_pause, task_ratelimit, dirty_ratelimit, nr_dirtied_pause)
+   - 如果上面计算的task_ratelimit  == 0, 直接去睡眠 period = pause = max_pause
+   - 计算等待时间
+   - 计算peroid = HZ * pages_dirtied / task_ratelimit.  
+   - 这个pages_dirtied就是current->nr_dirtied, 在设置PG_dirty时增加.
+   - pause等待要减去 (now - current->dirty_paused_when), 表示周期开始时间是上次balance操作.
+   - 如果pause < min_pause, 这时没有必要等待. 但要更新current的参数
+   - current->dirty_paused_when balance操作时间 nr_dirtied表示任务写的脏page, nr_dirtied_pause表示启动balance操作的脏页的界限.
+   - 如果pause < -HZ, dirty_paused_when = now, nr_dirtied = 0, 释放了它之前积累的脏数据
+   - 如果period > 0, 表示它等待时间太短,可以积累到下次. dirty_paused_when += peroid
+   - nr_dirtied_pause < pages_dirtied 表示这个任务的写没有超过界限,增大nr_dirtied_pause,开始下个周期.
+   - 直接退出
+   - 如果pause > max_pause, 不能等待这么长时间,把多余的时间放到下次循环
+   - 开始等待
+   > io_schedule_timeout(pause)
+   - 等待结束后,设置dirty_pause_when = now + pause , nr_dirtied = 0, nr_dirtied_pause = nr_dirtied_pause
+   - 如果task_ratelimit > 0, 跳出循环,已经达到目的.
+   - 如果task_ratelimit = 0, 说明速度限制减为0
+   - 最后如果nr_reclaimable > background_thresh, 唤醒bdi线程.
+   > bdi_start_background_writeback(backing_dev_info)
+   
+** set_page_dirty_balance(page, page_mkwrite)
+   - 在page_fault使用. 设置了PG_dirty之后使用
+   > balance_dirty_pages_ratelimited(address_space)
+
+** bdp_ratelimits
+   - 和current->nr_dirtied一块增长. 但不会减小. 如果它增长过快,即使不是current的原因,它也得处理.
+
+** dirty_throttle_leaks
+   - 对于制造task->nr_dirtied_pause-1的任务,系统无法控件bdi的速度,把那些任务的脏页放到dirty_throttle_leaks中. 让后面的任务去处理它.
+
+** balance_dirty_pages_ratelimited(address_space)
+   - 这个函数频繁使用,在普通的写操作中就使用.
+   - 检查current->nr_dirtied_pause, 如果bdi->dirty_exceeded>0, 限制它不超过32k
+   - 如果current->nr_dirtied > ratelimit, 设置bdp_ratelimits = 0
+   - 处理bdp_ratelimits, ratelimit_pages是
+   - 如果bdp_ratelimits >= ratelimit_pages, 设置它为0, ratelimit = 0, 需要进入balance处理
+   - 处理dirty_throttle_leaks
+   - 如果current->nr_dirtied < ratelimit, 而且dirty_throttle_leaks>0, 使用它补充nr_dirtied, 但不能超过ratelimit
+   - 最后如果nr_dirtied > ratelimit, 唤醒balance操作
+   > balance_dirty_pages(address_space, current->nr_dirtied)
+
+** throttle_vm_writeout(gfp_mask)
+   - 等待bdi的BDI_CONGESTED, 循环等待
+   > glboal_dirty_limits(background_thresh, dirty_thresh)
+   - dirty_thresh 不能小于global_dirty_limit.
+   - global_dirty_limit是一个近似值,不会变化大剧烈.
+   > hard_dirty_limit(thresh)
+   - 统计NR_UNSTABLE_NFS和NR_WRITEBACK的page, 如果小于dirty_thresh,退出等待
+   - PG_writeback的page??
+   - congestion_wait(BLK_RW_ASYNC, HZ/10)
+
+** dirty_writeback_centisecs_handle(clt_table, write, ...)
+   - 设置dirty_writeback_centisecs
+
+** writeback_set_ratelimit()
+   - 先获取background/dirty的阈值
+   - global_dirty_limits(background_thresh, dirty_thresh)
+   - global_dirty_limit = dirty_thresh
+   - ratelimit_pages = dirty_thresh / (num_cpus * 32)
+   - 这里怎么设置全局参数??  ratelimit_pages不能低于16
+
+** ratelimit_handle(notifier_block, ...)
+   - 填加cpu的时间,当cpu开启或关闭时重新计算ratelimit_pages
+   > writeback_set_ratelimit()
+
+** page_writeback_init()
+   - 模块启动参数
+   - 设置global_dirty_limits / ratelimit_pages
+   > writeback_set_ratelimit()
+   - 注册cpu通知
+   > register_cpu_notifier(ratelimit_nb)
+   - 初始化writeout_completions
+   > fprop_global_init(writeout_completions)
+
+** tag_pages_for_writebacks(address_space, start, end)
+   - 扫描address_space中的page, 把PAGECACHE_TAG_DIRTY转化为PAGECACHE_TAG_TOWRITE标志
+   - radix_tree_range_tag_if_tagged(address_space->radix_tree, start, end, WRITEBACK_TAG_BATCH, PAGECACHE_TAG_DIRTY, PAGECACHE_TAG_TOWRITE)
+
+** writeback_control
+   - writeback_sync_modes sync_mode : 只有两种 WB_SYNC_NONE, WB_SYNC_ALL
+   - nr_to_write
+   - pages_skipped
+   - range_start, range_end  writepages使用,限定范围, 这个参数没有page队列.
+   - for_kupdate kupdate线程?
+   - for_background 
+   - tagged_writepages   tag-and-write to avoid livelock? 什么是livelock
+   - for_reclaim   page allocator??
+   - range_cyclic  如果设置为1,则使用address_space->writeback_index作为起始地址,否则使用writeback_control的范围
+
+** write_cache_pages(address_space, writeback_control, writepage_t, data)
+   - 这是一个辅助函数,为page writeback准备条件,然后执行回调函数. 需要检查各种PG_*标志
+   - 这里会找出address_space->radix_tree中的所有带tag的page, 这里tag有两种情况:
+   - sync_mode = WB_SYNC_ALL tag = PAGE_CACHE_TAG_TOWRITE
+   - 否则  tag = PAGE_CACHE_TAG_DIRTY
+   - 如果WB_SYNC_ALL, 则修改tag. 所以如果要WB_SYNC_ALL,如果带标志PAGECACHE_TAG_TOWRITE,则添加PAGECACHE_TAG_DIRTY
+   > tag_pages_for_writeback(address_space, index, end) 
+   - 写操作会锁住页
+   > lock_page(page)
+   - 如果page不是脏的,不写
+   > PageDirty(page)  
+   - 如果设置了PG_writeback
+   > PageWriteback(page)  
+   - 等待PG_writeback
+   > wait_on_page_writeback(page) 
+   - 如果WB_SYNC_ALL,等待,否则退出. 等待完成是PG_writeback已经清除.
+   - 开始写操作,清除PG_dirty标志,如果别人用它会触发pagefault, 然后哦等待PG_writeback
+   > clear_page_dirty_for_io 
+   - 下面的函数会设置PG_writeback
+   > writepage()
+   - 写完后更新writeback_control->nr_to_write, 如果为0,退出写操作
+
+** generic_writepages(address_space, writeback_control)
+   - __writepage就是address_space_operations->writepage
+   > blk_start_plug()
+   > write_cache_pages(address_space, writeback_control, __writepage ...)
+
+** do_writepages(address_space, writeback_control)
+   - 如果没有回调,使用上面的函数
+   > address_space_operations->writepages(address_space, wribeback_control) 
+   > generic_writepages(...)
+
+** write_one_page(page, wait)
+   - 写回一个page
+   - 先检查并等待(如果wait等待)一个PG_writeback
+   > wait_on_page_writeback(page)
+   - 然后检查PG_dirty
+   > clear_page_dirty_for_io(page)
+   - 如果有PG_dirty, 才触发写操作
+   - 构造writeback_control, 它就使用sync_mode = WB_SYNC_ALL, 所以它什么都不需要.
+   > address_space_operations->writepage(page, writeback_control)
+   - 如果wait = 1, 等待PG_writeback, 这是PG_locked应该释放了.
+   > wait_on_page_writeback(page)
+   > page_cache_release(page)
+
+** __set_page_dirty_no_writeback(page)
+   - 如果没有PG_dirty标志,设置PG_dirty. 
+   - 这里是没有writeback, 没有磁盘操作
+
+** account_page_dirtied(page, address_space)
+   - 在设置PG_dirty时,改变计数
+   - NR_FILE_DIRTY增加
+   - NR_DIRTIED增加
+   - 增加bdi->bdi_stat[BDI_RECLAIMABLE]
+   - 增加bdi->bdi_stat[BDI_DIRTIED]
+   - current->task_io_accounting
+   - current->nr_dirtied
+   - bdp_ratelimits
+
+** account_page_writeback(page)
+   - 设置PG_writeback, 增加bdi->bdi_stat[NR_WRITEBACK]
+
+** __set_page_dirty_nobuffers(page) 
+   - 设置PG_dirty
+   > TestSetPageDirty(page)
+   - 设置pagecache的PAGECACHE_TAG_DIRTY
+   > radix_tree_tag_set(radix_tree, index, PAGECACHE_TAG_DIRTY)
+   - 修改统计数据
+   > account_page_dirtied(page, address_space)
+   - 还有inode, 可能会启动bdi, 因为有了脏的inode
+   > __mark_inode_dirty(inode, I_DIRTY_PAGES)
+
+** set_page_dirty(page)
+   - 这里回调a_ops->set_page_dirty,很可能是上面的两个函数, 这个函数给外部模块使用
+
+** clear_page_dirty_for_io(page)
+   - 清除PG_dirty, 它怎么会不关联address_space?
+   > page_mapping(page)
+   - 设置pte的标志,写保护. 这样在下次写时必须等待写完.
+   > page_mkclean(page) 
+   - 如果发现又有PG_dirty, 重新填加
+   > set_page_dirty(page)
+   - 最后清除PG_dirty, 修改统计数
+   - dec_zone_page_state(page, NR_FILE_DIRTY)
+   - BDI_RECLAIMABLE就是bdi中的脏页. 也就是pagecache的脏页.
+   - dec_bdi_stat(bdi, BDI_RECLAIMABLE)
+
+** test_clear_page_writeback(page)
+   - io完成后使用,清空PG_writeback标志,同时清除PAGECACHE_TAG_WRITEBACK
+   > TestCleanPageWriteback(page)
+   > radix_tree_tag_clear(radix_tree, ...)
+   - 修改统计数
+   - bdi->bdi_stat[NR_WRITEBACK] 和 bdi->bdi_state[NR_WRITTEN]
+   - 这里还会更新bdi的写回速度
+   > __bdi_writeout_inc(bdi)
+   - 然后时zone的NR_WRITEBACK减小,增加NR_WRITTEN
+
+** test_set_page_writeback(page)
+   - 设置PG_writeback, 同时设置PAGECACHE_TAG_WRITEBACK,去掉PAGECACHE_TAG_TOWRITE
+   - TestSetPageWriteback(page)
+   > radix_tree_tag_set(radix_tree, ...)
+   - 增加bdi->bdi_stat[BDI_WRITEBACK]
+   > account_page_writeback(page)
+
+** 总结
+
+*** 全局系统参数
+   - dirty_background_ratio 对应proc参数, 控制background_thresh
+   - dirty_background_bytes 和上面一样,上面通过比率,这里控制大小
+   - vm_dirty_bytes 控制dirty_thresh, 计算后放到global_dirty_limit
+   - vm_dirty_ratio
+   - dirty_thresh分global/zone2种
+   - background和dirty是类似的,应该用于不同的目的. 都表示系统能容忍的dirty的page数量.
+   - vm_highmem_is_dirtyable highmem
+   - dirty_writeback_interval  这是flush任务的运行周期 kupdate, 它的计时器会直接唤醒bdi任务.
+   - dirty_expire_interval  在flush任务,写回的inode需要在内存中至少缓存的时间. 如果太新,不会处理它.
+   - block_dump;  打印一些调试信息.
+   - laptop_mode;  笔记本模式,尽量少些,节省电源.
+
+*** 全局状态数据
+   - 不是直接控制,根据运行状态而变
+   - global_dirty_limit, 写回时用到它, 不能少于global_dirty_limit/8. 在修改vm_dirty_*后重新计算它,变小时会缓慢变小,受nr_dirty和dirty_thresh的影响. 变大时只受dirth_thresh影响.
+   - ratelimit_pages, 初始化是32, 然后是dirty_thresh / (32 * cpus). 每次dirty_radio/bytes变化时,重新计算. 如果没有其他变化,参数应该不准确.
+   - bdp_ratelimits, 一个cpu上突然有很多任务写很多数据,立刻启动balance操作.当它超过ratelimit_pages时必须处理balance dirty.
+   - dirty_throttle_leaks  处理暂时的小的写回任务,把page压力分配后面的程序中.
+   - MAX_PAUSE   等待不能超过200ms  
+   - DIRTY_POLL_THRESH  预订的balance page控制阈值 128k
+   - BANDWIDTH_INTERVAL/200ms 时钟周期,计算global_dirty_limit,但它的更新周期不能超过1s
+   - RATELIMIT_CALC_SHIFT 10
+   - VM_COMPLETIONS_PERIOD_LEN 3s,更新一次writeout_completions
+   - writeout_completions 统计global的写回速度,根据它预测bdi的阈值,bdi_dirty.
+
+*** backing_dev_info参数
+    - min_ratio
+    - max_ratio
+
+*** bdi状态数据
+   - bdi->write_bandwidth, 根据bdi_stat[BDI_WRITTEN], 计算3s内的平均速度. 但一般都是200ms就更新,所以它应该比较均衡.
+   - bdi->avg_write_bandwidth, 它根据和write_bandwidth的差距变化,应该更加缓慢.
+   - bdi->dirty_ratelimit  渐变的脏页产生速率.
+   - bdi->balanced_dirty_ratelimit   经过调整的avg_write_bandwidth
+   - bdi的stamp
+
+
+*** 任务的状态数据
+   - current->nr_dirtied 在设置PG_dirty时增加
+   - current->nr_dirtied_pause
+   - current->dirty_paused_when, 表示balance控制的起始时间.
+
+*** 总结
+    - 这里的参数虽然多,仅仅是控制写pagecache的速度,让dirty/write速度均衡.
+    - 还要控制单个任务/单个cpu/单个bdi和global的关系.
+    - writeout_completions/bdi->completions是一个复杂的东西,表示写回磁盘的速度. 它也表示一个bdi能使用多少脏页.
+    - global_dirty_limit控制, 它控制着系统dirty_thresh上限.
+    - 还根据系统的dirty_thresh/nr_dirty等参数,控制制造脏页的速度和写回的速度均衡. setpoint之类的.
+    - 大部分参数都是自动运行,可控的不多.
+    - 这里提供的主要功能是提供proc系统参数
+    - backgound_thresh, 给background的写回任务使用
+    - writepages写回操作
+    - 操作PG_writeback标志, 开始写回时设置,写完成后清除, 修改系统计数.
+    - 操作PG_dirty标志, 它需要address_space_operation->dirty_page的支持. 在写pagecache或mmap时会设置PG_dirty, 在开始写回时清除标志.
+

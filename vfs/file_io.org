@@ -1,0 +1,415 @@
+* vfs_write
+  - 借着一个bug看看内核中write的流程. 开始都是使用file_operation->write/aio_write
+  - vfs_write(file, buf, count, pos)
+  > file_ops->write(file, buf, count, pos)
+  > do_sync_write(file, buf, count, pos)
+
+  - do_sync_write(file, ...)
+    - 这里使用异步IO，创建kiocb,把参数传进去.
+    - 这里设置kiocb->ki_key = KIOCB_SYNC_KEY, ki_obj.tsk=current.
+    > init_sync_kiocb(kiocb, file) 
+    > file_ops->aio_write(kiocb, iovec, 1, pos)
+    > wait_on_retry_sync_kiocb(kiocb)
+    > wait_on_sync_kiocb(kiocb)
+  - 对cifs来说, file_operations->write就是do_sync_write.好懒. 
+  - aio_read/write分别是generic_file_aio_read/cifs_file_aio_write. cifs_file_aio_write使用了generic_file_aio_write. 
+
+* mm/filemap.c
+
+** 总结
+   - 这里面主要的操作还是address_space->radix_tree和page的管理
+   - IO使用PG_locked/PG_writeback/PG_uptodate实现等待
+   - read时可以等待PG_Uptodate,判断是否读出来,写使用PG_Dirty和PD_Writeback
+   - 主要是mmap操作?
+
+** __delete_from_page_cache(page)
+   - cleancache是什么东西?
+   - 把page从page->address_space->page_tree中删除
+   > radix_tree_delete(address_space->page_tree, page->index)
+   - 减小address_space->nrpages, NR_FILE_PAGES, NR_SHMEM类型的page计数
+   - 检查page的map状态, page->_mapcount >=0, 这时不能是映射的??
+   > page_mapped(page)
+
+** delete_from_page_cache(page)
+   - 在truncate/shmem中使用,还有vmscan,回收page使用
+   - truncate应该就是文件操作中，修改文件大小的实现.
+   > __delete_from_page_cache(page)
+   > address_space->freepage(page)
+   > put_page(page)
+   - 释放address_space时怎么操作? 
+   
+** sleep_on_page / sleep_on_page_killable
+   - 等待睡眠使用的函数
+   > io_schedule()
+
+** __filemap_fdatawrite_range(address_space, start, end, sync_mode)
+   - 操作address_space写回文件
+   - 构造一个writeback_control, 然后使用底层函数执行IO
+   > do_writepages(address_space, writeback_control)
+   - 这个函数在bdi.org中使用
+
+** __filemap_fdatawrite(address_space, sync_mode)
+   - 包装上面函数的实现, range是  0~~LLONG_MAX
+   > __filemap_fdatawrite_range(address_space, 0, LLONG_MAX, sync_mode)
+
+** filemap_fdatawrite(address_space)
+   - 默认是同步写回
+   > __filemap_fdatawrite(address_page, WB_SYNC_ALL)
+
+** filemap_fdatawrite_range(address_page, start, end)
+   > __filemap_fdatawrite_range(address_page, start, end, WB_SYNC_ALL)
+
+** filemap_flush(address_space)
+   - flush操作只会不会等待
+   > __filemap_fdatawrite(address_page, WB_SYNC_NONE)
+
+** filemap_fdatawait_range(address_space, start, end)   
+   - 等待每个page的写回并检查结果
+   - 获取在写回的page, PAGECACHE_TAG_WRITEBACK
+   > pagevec_lookup_tag(pagevec, address_space, index, PAGECACHE_TAG_WRITEBACK, ...)
+   - 等待PG_writeback
+   > wait_on_page_writeback(page) 
+   - 检查page和address_space->flags的状态, 如果有错误直接返回EIO
+   > TestClearPageError(page)
+   > filemap_check_errors(address_page)
+
+** filemap_fdatawait(address_space)  
+   - 等待整个文件writeback
+   - 先获取文件大小
+   > i_size_read(address_space->inode)
+   > filemap_fdatawait_range(address_space, 0, i_size - 1)
+
+** filemap_write_and_wait(address_page)
+   - 在有page的情况下才操作. address_page->nrpages > 0
+   > filemap_fdatawrite(address_space)
+   > filemap_fdatawait(address_space)
+
+** filemap_write_and_wait_range(address_space, start, end)
+   - WB_SYNC_ALL会等待写回中的page, 在writepage中同样,表示是否等待之前的写回.
+   > __filemap_fdatawrite_range(address_space, start, end, WB_SYNC_ALL)
+   > filemap_fdatawait_range(...)
+
+** replace_page_cache_page(page old, new, gfp_mask)
+   - 使用new代替old,只有fuser使用它?
+   > __delete_from_page_cache(page)
+   > radix_tree_insert(address_space->page_tree, offset, page)
+   > 修改page统计
+   > page_cache_get(new) -> get_page(new)
+   > page_cache_release(old)
+
+** add_to_page_cache_locked(page, address_space, offset, mask)
+   - 功能很简单,但有许多cgroup/radix_tree操作
+   - 把page放到pagecache中,修改page->mapping. 和delete操作对应
+   - 没有修改PG_标志,这里page不能带PG_swapbacked.
+   > page_cache_get(page)
+   > radix_tree_insert(address_space->page_tree, offset, page)
+
+** add_to_page_cache_lru(page, address_space, offset, mask)
+   - 同时把page添加到lru队列中
+   > add_to_page_cache(page, address_space, offset, mask)
+   - 先去掉PG_active, 也就是不活跃状态
+   > lru_cache_add_file(page) 
+
+** __page_cache_alloc
+   - 分配page, 而且在memzone上分配page
+   > alloc_pages(gfp, 0)
+
+** page_waitqueue(page)
+** wake_up_page(page, bit) 
+** wait_on_page_bit(page, bit)
+** wait_on_page_bit_killable(page, bit)
+** add_page_wait_queue(page, wait_queue_t)
+   - 使用zone的等待队列等待和唤醒任务
+
+** unlock_page(page)
+   - 唤醒等待在PG_locked标志的任务
+
+** end_page_writeback(page)
+   - 唤醒等待PG_writeback的任务. 在filemap_wait中就等待这个标志. 这个函数一般在writepages中调用.
+   - 全局队列lru_rotate_pvecs，表示回收page时先检查这个page??
+   > rotate_reclaimable_page(page) 
+   - 清除PG_writeback, PAGECACHE_TAG_WRITEBACK, 在bdi中使用
+   > test_clear_page_writeback(page)  
+   > wake_up_page(page, PG_writeback)
+
+** __lock_page(page)
+   - 在page的PG_locked位上等待
+   > __wait_on_page_lock(waitqueue_head_t, ...)
+
+** __lock_page_killable(page)
+** __lock_page_or_retry(page, mm_struct, flags)
+
+** find_get_page(address_page, offset)
+   - 找出page,有rcu操作
+   > radix_tree_lookup_slot(page)
+   > radix_tree_deref_slot(page)
+
+** find_lock_page(address_space, offset)
+   - 包装
+   - -> find_get_page
+   - -> lock_page
+
+** find_or_create_page(address_page, index, mask)
+   - 找一个page，如果找不到就分配一个
+   > find_lock_page(address_space, index)
+   > __page_cache_alloc(mask)
+   > add_to_page_cache_lru(page, address_space, index, mask)
+
+** find_get_pages(address_space, start, nr_pages, page)
+   - 和上面类似,不过找多个page
+
+** find_get_pages_contig(address_space, index, nr_pages, page)
+   - 返回的page是位置连续的
+
+** find_get_pages_tag(address_space, index, tag, nr_pages, page)
+   > radix_tree_gang_lookup_tag_slot(address_space->radix_tree, pages, index, nr_pages, tag)
+
+** grab_cache_page_nowait(address_space, index)
+   - 找到一个page,尝试加锁,如果无法加锁,返回NULL，或者没有page，分配一个
+   > find_get_page
+   > trylock_page
+   > page_cache_release
+   > __page_cache_alloc
+   > add_to_page_cache_lru
+		
+** do_generic_file_read(file, pos, read_descriptor_t, read_actor_t)
+   - 从磁盘中读回数据到address_space的page中,但这里还有read_descriptor/read_actor_t,有了数据之后,拷贝给用户空间
+   - 从pagecache中读取数据,当然数据必须是有效的,这里各种检查,等待. 读取数据的IO使用address_space->aop->readpages()
+   - 这里的参数是file, 而不是inode,更不是dentry, file->f_mapping->host获取inode. 
+   - 这里只说了pos,读取的数据量参考read_descriptor->count. 遍历这个范围内的page,读回来的标志就是PG_uptodate.
+   > find_get_page(address_space, index)
+   - 如果找不到,触发readahead. 参数表示当前要读的数据.
+   - readahead里面同样使用readpage.
+   > page_cache_sync_readahead(address_space, readahead, file, index, nr_pages) 
+   - 再找一遍
+   > find_get_page(address_space, index) 
+   - 如果找到,检查数据有效性
+   > PageUptodate(page)
+   - 如果没有PG_uptodate, 检查是否partial update
+   > address_space_ops->readpage->is_partially_uptodate(page, read_descriptor_t, offset)
+   - 如果无效去后面读数据
+   - 如果有效还要检查page是否超过文件大小, 如果超过,不再处理. 或者部分超高,需要把多余的数据清0
+   - 修改page状态, 设置PG_referenced标志
+   > mark_page_accessed(page)
+   - 搬运数据
+   > read_actor_t(read_descriptor_t, page, offset, nr)
+   - 如果上面page的数据不是有效的
+   > address_space_ops->readpage(filp, page)
+   - 使用PG_locked等待page
+   > lock_page_killable(page)
+   - 然后检查PG_uptodate, 如果没有, 就返回-EIO, 如果有跳到上面搬运数据
+   - 如果上面没有page, readahead也没有创建page, 创建page
+   > page_cache_alloc_cold 这个是包装的page_cache_alloc...
+   > add_to_page_cache_lru(page, address_space, index, ...)
+   - 然后跳到上面读取数据
+   - 这里使用pagecache从底层读回数据,先启动readahead读操作,检查address_space中是否有page,没有的话分配一个,检查page的相关标志,主要是PG_uptodate,没有标志则启动读取，否则搬运数据.
+   - 最后修改inode的atime 
+   > file_accessed(file)
+
+** generic_file_aio_read(kiocb, iovec, nr_segs, pos)
+   - 如果是directio,需要先把已有的脏数据写回去.
+   > filemap_write_wait_range(address_space, pos, ...)
+   - 然后direct_IO
+   > address_space_ops->direct_IO(READ, kiocb, iovec ...)
+   - 上面返回的是读回的数据量,如果没有完成,会使用后面buffered的IO
+   - 构造read_descriptor_t, 搬运参数
+   > do_generic_file_read(file, pos, read_descriptor, file_read_actor)
+
+** page_cache_read(file, offset)
+   - 分配一个page,给pagecache, 读回数据，简单的读数据
+   > page_cache_alloc_cold(address_space)
+   > add_to_page_cache_lru(page, address_space, offset, ...)
+   > address_space_ops->readpage(file, page)
+
+** file_ra_state 
+   #+begin_src 
+	pgoff_t start;			/* where readahead started */
+	unsigned int size;		/* # of readahead pages */
+	unsigned int async_size;	/* do asynchronous readahead when
+					   there are only # of pages ahead */
+
+	unsigned int ra_pages;		/* Maximum readahead window */
+	unsigned int mmap_miss;		/* Cache miss stat for mmap accesses */
+	loff_t prev_pos;		/* Cache last read() position */   //在do_generic_file_read中设定
+	//async_size和PG_readahead相关, PG_readahead = PG_reclaim, 分别用于读写
+	//在readahead时,(start,size)表示读取的范围, ra_submit中使用
+	//size - async_size的位置的page设置PG_readahead
+	//在mmap和普通读操作中,都会检查PG_readahead,预读数据
+   #+end_src
+
+** do_sync_mmap_readahead(vm_area_struct, file_ra_state, file, offset)
+   - 这个在page_fault中使用, mmap的readahead有2种
+   - 一种是没有page, 需要同步读取操作? 读取当前需要的数据
+   - 另一种是有数据,启动异步读取数据, 读取的数据不是当前需要的
+   - 如果vma是随机访问，退出函数. mmap还有这个控制? 
+   > VM_RandomReadHit(vma)
+   - 如果vma是顺序访问, vm_area_struct->vm_flags & VM_SEQ_READ, 使用readahead读取数据.
+   > page_cache_sync_readahead(address_space, readahead, file, offset, ra_pages)
+   - 其他情况,处理file_ra_state
+   - 增加file_ra_state->mmap_miss, 如果超过MMAP_LOSTAMISS
+   - 重新设置file_ra_state, start = offset - ra_pages/2, size = ra_pages, 希望下次读的位置在这次附近.
+   - 或者说把这次附近的数据都读回来
+   > ra_submit(file_ra_state, address_space, file)
+   - 启动读取操作.
+
+** do_async_mmap_readahead(vm_area_struct, file_ra_state, file, page, offset)
+   - 这个和上面的对应，这是异步操作, 也就是读的数据不是当前需要的
+   - 而且只有在顺序访问时使用，读取page数据 VM_RAND_READ不操作
+   - 减小file_ra_state->mmap_miss
+   - 而且只碰到PG_readahead时处理
+   > page_cache_async_readahead(address_space, file_ra_state, file, page, offset, ra_pages)
+
+** filemap_fault(vm_area_struct, vm_fault)
+   - 这是在vma的操作中调用的. 在缺页时调用,这个和generic_file_aio_read类似
+   - 先在pagecache中找
+   > find_get_page(address_space, offset) 
+   - 如果找到,去预读数据. 在do_generic_file_read中也有类似的处理
+   > do_async_mmap_readahead(vm_area_struct, file_ra_state, file, page, offset) 
+   - 如果没找到,尝试使用readahead读取数据
+   > do_sync_mmap_readahead(vm_area_struct, file_ra_state, file, offset)
+   - 再找一遍 如果找不到，再去读数据
+   > find_get_page() 
+   - 如果找到,锁住page, 要检查有效性
+   > lock_page_or_retry(page, vm_area_struct, vm_area_struct->flags) 
+   > 最后检查PG_uptodate和文件大小，如果都符合要求vm_fault->page=page,返回. page是锁住的,PG_uptodate的..
+   - 如果readahead之后没有page, 读回数据,如果返回正确,则跳到函数开始的地方, 重新查找检查数据有效性等.
+   > page_cache_read(file, offset) 
+   - 如果上面有效行检查不正确,读取数据
+   > address_space_ops->readpage(file, page)
+   > wait_on_page_locked(page)
+   - 如果有效行检查错误, 返回VM_FAULT_SIGBUS, 同时减小file_ra_state->ra_pages
+   > shrink_readahead_size_eio(file, file_ra_state)
+
+** filemap_page_mkwrite(vm_area_struct, vm_fault)
+   - 碰到写权限错误时使用
+   > file_update_time(vm_area_struct->vm_file)
+   > lock_page(page)
+   - 设置PG_dirty
+   > set_page_dirty(page)
+
+** generic_file_mmap(file, vm_area_struct)
+   - 给vm_area_struct安装vm_operations, 在mmap中使用
+
+** generic_file_readonly_mmap(file, vm_area_struct)
+   - 检查vm_area_struct->vm_flags中的标志,不符合返回错误. 它一般作为file_operations->mmap使用
+   > generic_file_mmap(file, vm_area_struct)
+
+** __read_cache_page(address_space, index, filler, data, gfp)
+   - 这个也是相当于读回数据,但没有使用readahead
+   - 检查pagecache是否有page, 如果有不再去读.
+   > find_get_page(address_space, index)
+   - 如果没有准备好，分配一个,并启动读操作. 
+   > __page_cache_alloc(gfp)
+   > add_to_page_cache_lru(page, address_space, index, gfp)
+   - 这个filler就是读操作, 下面会传入readpage
+   > filler(data, page)
+   - 这里没有检查有效行
+
+** do_read_cache_page(address_space, index, filler, data, gfp)
+   - 先找到或读取page
+   > __read_cache_page(address_space, index, filler, data, gfp)
+   > 锁住page, 检查PG_uptodate, 如果有效直接退出
+   - 否则释放page, 重新查找page
+   > page_cache_release(page)
+   - 最后设置PG_referenced
+
+** read_cache_page_async(address_space, index, filler, data)
+   - 包装上面的实现, gfp使用mapping_gfp_mask(address_space), 在分配page时,如果可能会失败,直接返回.
+   > do_read_cache_page(address_page, index, fill, data, mapping_gfp_mask(address_space)
+
+** wait_on_page_read(page)
+   - 等待在PG_locked上,然后检查PG_uptodate
+   > wait_on_page_locked(page)
+   > PageUptodate(page)
+   - 如果不符合,返回EIO, 而且释放page
+   > page_cache_release(page)
+
+** read_cache_page_gfp(address_space, index, gfp)
+   - 封装上面的好几个函数,fill是address_space_ops->readpage..
+   - 可能若干次的调用readpage读回数据.
+   > wait_on_page_read(do_read_cache_page(address_space, index, filler, NULL, gfp)
+   - btrfs使用? 因为他不用buffer_head
+
+** read_cache_page(address_space, index, filler, data)
+   - 这里却不会等待分配page成功??
+   > wait_on_page_read(read_cache_page_async(address_space, index, filler, data))
+
+
+** pagecache_write_begin(file, address_space, pos, len, flags, page, fsdata)
+   > address_space_operations->write_begin()
+
+** pagecache_write_end(file, address_space, ...)
+   > write_end()
+
+** generic_file_direct_write(kiocb, iovec, nr_segs, pos, ppos, count, ocount)
+   - directio使用的写操作, 这个函数在__generic_file_aio_write中调用使用
+   - 等待之前的写操作
+   > filemap_write_and_wait_range(address_space, pos, ...)
+   - 先把pagecache中的对应页无效掉
+   > invalidate_inode_pages2_range(address_space, pos>>PAGE_CACHE_SHIFT, end)
+   - 写数据
+   > address_space_operations->direct_IO(WRITE, kiocb, iovec, pos, nr_segs)
+   - 再释放这些page
+   > invalidate_inode_pages2_range(address_space, pos>>PAGE_CACHE_SHIFT, end)
+   - 更新inode的文件大小
+   > i_size_write(inode, pos)
+   > mark_inode_dirty(inode)
+
+** grab_cache_page_write_begin(address_space, index, flags)
+   - 确保pagecache中有index对应的页,如果没有分配一个新的
+   - 最后如果找到会等待PG_writeback标志, 
+   > find_lock_page
+   > __page_cache_alloc
+   > add_to_page_cache_lru
+   > page_cache_release
+   - 等待写回过程
+   > wait_on_page_writeback(page)
+
+** generic_perform_write(file, iov_iter, pos)
+   - 标准的写文件操作, 遍历iov_iter,获取对应的page, 把数据放到iov_iter中.
+   > address_space_operation->write_begin(file, address_space, pos, bytes, flags, page ...)
+   > iov_iter_copy_from_user_atomic(page, i, offset, bytes)
+   > address_space_operations->write_end(...)
+   > iov_iter_advance(i, copied)
+   - 启动数据写回
+   > balance_dirty_pages_ratelimited(address_space)
+
+** generic_file_buffered_write(kiocb, iovec, nr_segs, pos, pos, count, write)
+   > iov_iter_init(i, iov, nr_segs, count ...)
+   > generic_perform_write(file, iov_iter, pos)
+
+** __generic_file_aio_write(kiocb, iovec, nr_segs, ppos)
+   - 这个包装上面的写操作实现, 这时file_operation中的接口
+   > file_remove_suid(file)
+   > file_update_time(file)
+   - 这里是O_DIRECT,所以使用direct写
+   > generic_file_direct_write(kiocb, iovec, ...) 
+   - 如果direct io没有实现, 使用普通操作
+   > generic_file_buffered_write(kiocb, iov, ...) 
+   - 触发写操作
+   > filemap_write_and_wait_range(address_space, ...) 
+   - direct io 需要无效掉page...
+   > invalidate_mapping_pages(...) 
+   - 如果不是direct io,直接使用上面的接口
+   > generic_file_buffered_write(...) 
+   - 在写的过程中设置current->backing_dev_info???
+
+** generic_file_aio_write
+   - 包装上面的实现,这是aio使用的接口
+   > __generic_file_aio_write(kiocb, iovec, ...)
+   - 文件的打开方式不是O_DSYNC而且文件系统不是sync操作,都不需要sync.
+   - 否则需要刷回范围内的数据
+   > generic_write_sync(file, pos ...)
+
+** try_to_release_page(page, mask)
+   > address_space_ops->releasepage(page, mask)
+   > try_to_free_buffers(page) 释放page中的buffer
+   - 释放page cache中的page.
+
+** 总结
+   - 从file_ops开始,io使用aio_read/write, 这两个一般使用generic_file_aio_read/write. 
+   - 对于generic_file_aio_write,它就是调用a_ops->write_begin/end, 还是搬数据，只是保证把数据都放到page cache中. 
+   - 只有在文件操作方式是sync时,才启动写回操作,写回操作一般使用generic_file_fsync
+   - 对于generic_file_aio_read则复杂一下,它貌似和写回没有任何关系,但大家都会锁page.读使用的标志只有PG_uptodate
+   - mm_struct管理kioctx,实现aio,kiocb先放到kioctx->run_list,然后work_struct从队列中取出kiocb,调用aio_read/write,完成对应的IO操作. 
+   - 虽然普通的io,也是使用aio实现,而且提交会会等待释放kiocb, 只有在direct-io中才会使用异步释放aio. 普通的io都是同步的. 读不必说,普通的写不会启动磁盘IO.

@@ -1,0 +1,1072 @@
+* volumes.c
+
+** btrfs_pending_bios
+   #+begin_src 
+    bio  head, tail 
+    // 队列的头尾, 在btrfs_device中使用,作为读缓存
+   #+end_src
+
+** btrfs_device
+   #+begin_src 
+    list_head dev_list  // 在btrfs_fs_devices->devices队列中
+    list_head dev_alloc_list  //如果btrfs_device->writeable有效,这个队列有有效, btrfs_fs_devices->alloc_list
+    btrfs_fs_devices fs_devices
+    btrfs_root  dev_root    //dev tree
+   
+    btrfs_pending_bios  pending_bios
+    btrfs_pending_bios pending_sync_bios
+    running_pending  //是否还有bio需要处理,也就是上面队列不为空
+
+    generation    //填加设备时的btrfs_trans_handle->transid
+    writeable     //是否可写,seed不可写,其他根据具体设备
+    in_fs_metadata  //开始使用设备. 打开设备之后不一定有效,去要在trunk tree中确认它在fs中使用,才设置为1
+    missing      //设备丢失
+    can_discard   //支持discard
+    is_tgtdev_for_dev_replace    //replace???
+   
+    spinlock_t io_lock
+    block_device bdev  //如果没打开就无效
+   
+    fmode_t mode  # 在blkdev_get中使用??
+   
+    rcu_string name   //设备文件的路径
+   
+    devid   # device id, 在btree中表示一个btrfs_device. 
+   
+    total_types   # size of device
+    disk_total_bytes   # size of disk  ??  diff from device?
+    bytes_used    //设备使用的空间,已经使用的会在dev tree中添加节点.
+    io_align
+    io_width
+    sector_size
+    type
+    uuid[BTRFS_UUID_SIZE]  //在设备上的btrfs_super_block中读出来,应该是创建文件系统时填充, 或填加新设备时设定
+    scrub_ctx  scrub_device   # scrub information
+   
+    btrfs_work  work   //处理上吗的pending bio
+    rcu_head rcu   
+    work_struct rcu_work  
+   
+    reada_lock, reada_in_flight
+    rada_next
+    reada_zone  * reada_curr_zone
+    radix_tree_root  reada_zones
+    radix_tree_root reada_extents
+   
+    bio flush_bio    //刷新设备
+    completion  flush_wait
+    nobarriers   #不支持barrier就不用刷新
+   
+    dev_stats_valid # disk IO结果统计
+    dev_stats_dirty # 脏数据的总数
+    dev_stat_values[BTRFS_DEV_STAT_VALUES_MAX]  # 失败结果统计, READ/WRITE/FLUSH/CORRUPTION,GENERATION....
+   #+end_src
+
+** btrfs_fs_devices
+   #+begin_src 
+    fsid[BTRFS_FSID_SIZE]  # btrfs_super_block->fsid
+    latest_devid    //最后添加的btrfs_device->devid
+    latest_trans    //最大的transid
+    num_devices     //设备的数量
+    open_devices    //打开的btrfs_devices的数量,如果btrfs_device没打开,btrfs_device->bdev是NULL
+    rw_devices      //可写的btrfs_device的数量,btrfs_device->writeable
+    missing_devices  //丢失设备的数量
+    total_rw_bytes   //总空间
+    num_can_discard  //支持discard的设备数量,对应btrfs_device->can_discard
+    total_devices   #这个数据结构是整个btrfs关联的设备数据???
+   
+    block_device *latest_bdev  
+    mutex device_list_mutex  //保护对设备的访问
+    list_head devices  //里面是btrfs_devices
+   
+    list_head alloc_list  //里面的btrfs_device是可写的
+    list_head list  #放在全局队列 fs_uuids
+   
+    btrfs_fs_devices seed
+    seeding  # 作为seed设备,不能写
+   
+    opened   # btrfs_fs_info管理的设备是否已经打开
+    rotating   # ssd设备的数量
+   #+end_src
+
+** btrfs_bio_stripe
+   #+begin_src 
+    btrfs_device  
+    physical, length
+   #+end_src
+
+** btrfs_bio
+   #+begin_src 
+    //stripe的io,向多个磁盘写数据
+    stripes_pending    //??
+    bio_end_io  end_io
+    bio  orig_bio
+    private
+    error
+    max_errors
+    num_stripes
+    mirror_num
+    btrfs_bio_stripe stripes[]
+   #+end_src
+
+** btrfs_device_info
+   #+begin_src 
+    // 设备信息,在分配chunk时挑选设备暂存的信息.
+    btrfs_device dev//设备
+    dev_offset      //空闲空间的位置
+    max_avail       //可给chunk使用的连续的空间
+    total_avail     //总空闲的空间
+   #+end_src
+
+** btrfs_raid_attr
+   #+begin_src 
+    // raid设备信息
+    sub_stripes    # 
+    dev_stripes
+    devs_max
+    devs_min
+    devs_increment
+    ncopies
+    
+    //btrfs_raid_array中是每种profile的数据
+    raid10  2 1 0 4 2 2   //至少4个设备,2份数据
+    raid1   1 1 2 2 2 2   //2个设备,2份数据
+    dup     1 2 1 1 1 2   //1个设备,2份数据
+    raid0   1 1 0 2 1 1   //至少2个设备,1份数据
+    single  1 1 1 1 1 1
+   #+end_src
+  
+
+** map_lookup
+   #+begin_src 
+    type 
+    io_align / io_width 
+    stripe_len    //对于普通RAID 64K
+    sector_size 
+    num_stripes  //ndevs*dev_stripes, 所有的物理stripe,他就是下面数组的大小,里面需要存放物理信息.
+    sub_stripes  //对于RAID10是2
+    btrfs_io_stripe []
+    //这里主要的数据结构是btrfs_fs_devices, btrfs_devices
+   #+end_src
+
+** btrfs_stripe
+   #+begin_src 
+     devid
+     offset
+     dev_uuid
+     //很简单的指定设备和偏移
+   #+end_src
+
+** btrfs_chunk
+   #+begin_src 
+     length
+     owner
+     stripe_len
+     type
+     io_align
+     io_width
+     sector_size
+     num_stripes
+     sub_stripes
+     btrfs_stripe stripe[]
+   #+end_src
+
+** free_fs_devices(btrfs_fs_devices)
+   - 先释放btrfs_device,对于btrfs_device, 只处理btrfs_device->name,然后是btrfs_fs_devices
+
+** btrfs_kobject_uevent(block_device, kobject_action)
+   - block_device有kobject,在sys文件系统中. 仅仅在删除设备是使用这个函数,发送CHANGE事件
+   > kobject_uevent((block_device->bd_disk)->kobj, action)
+   - bd_disk 应该是hd_part信息???
+
+** btrfs_cleanup_fs_uuids()
+   - 全局队列fs_uuids, 里面是btrfs_fs_devices, 使用list,索引是uuid区分.
+   > free_fs_devices(btrfs_fs_devices)
+
+** __find_device(list_head, devid, uuid)
+   - 在list_head中找一个btrfs_device, 比较btrfs_device->devid和btrfs_device->uuid
+
+** find_fsid(fsid)
+   - 在fs_uuids中找btrfs_fs_devices, btrfs_fs_devices->fsid和参数比较
+
+** btrfs_get_bdev_and_sb(device_path, flags, holder, flush, block_device, buffer_head)
+   - 读取btrfs_device中的btrfs_super_block, 就是最后一个函数. 其他对于block_device的处理纯粹把它作为一个文件处理. 它的superblock是blockdev_superblock, 非常简单的一个文件系统,使用dev_t索引文件.
+   > blkdev_get_by_path(device_path, flags, holder) 
+   - 这个path就是普通的路经名,使用对应inode->rdev dev_t去找到block inode
+   > filemap_write_and_wait(block_device->bd_inode->i_mapping)
+   - 刷回block inode的数据
+   > set_blocksize(block_device, 4096)
+   > btrfs_read_dev_super(block_device)
+
+** request_list(btrfs_pending_bios, bio head, tail)
+   - 单链表操作,(head,tail)是一个链表,把它和btrfs_pending_bios合并.. btrfs_pending_bios也是单链表.
+
+** run_scheduled_bios(btrfs_device)
+   - btrfs_device->pending_sync_bios和pending_bios两个队列里面是bio, 这类会循环处理2个队列的bio, 直到所有的bio都提交.
+   > blk_start_plug(blk_plug)
+   - 禁止设备io???
+   >  blk_get_backing_dev_info(btrfs_device->bdev)
+   - 从block_device中获取bdi, 这个是从request_queue中获取的. 一般就是block device的request queue和文件系统有.
+   > btrfs_async_submit_limit(btrfs_fs_info)
+   - 计算限额, 和worker数量或设备数量有关.. 
+   - 开始循环处理btrfs_device->pending_sync_bios和pending_bios队列, 前者是WRITE_SYNC,后者呢? 循环处理2个队列,但pending_sync_bios为空,就不再处理. 第二个也会空?
+   - 把队列中的bios取出来, 逐个遍历, 当pending_sync_bio积累处理了64个或累计处理pending_bio的32个后,重新遍历, 而且把没有处理的放到原来的列表中.
+   > request_list(pending_bios, pending, tail)
+   - 把bio从但列表中取下来, 这种是异步处理吗? 减小btrfs_fs_info->nr_async_bios, 如果小于limit, 就唤醒btrfs_fs_info->async_submit_wait队列
+   - 提交bio
+   > btrfsic_submit_bio(rw, btrfs_bio)
+   - 如果bdi阻塞了,而且有多个设备,检查是否需要退出循环.
+   - 检查当前进程的io_context, io_context->nr_batch_requests>0.. 其他条件
+   > btrfs_requeue_work(btrfs_device->work)
+   - 两个队列优先处理sync的bio
+
+** pending_bios_fn(btrfs_work)
+   - 从参数获取btrfs_device->work就是参数btrfs_work, 就是执行上面的函数
+   > run_scheduled_bios(btrfs_device)
+   - btrfs_device->btrfs_work使用的回调函数
+
+** device_list_add(char path, btrfs_super_block, devid, btrfs_fs_devices)
+   - 这个函数用于把path指向的设备添加到btrfs文件系统(btrfs_super_block)中,他对应一个btrfs_fs_devices,一个文件系统对应btrfs_fs_devices. btrfs_fs_devices->uuid是btrfs_super_block->fsid.
+   > btrfs_super_generation(btrfs_super_block)  
+   - 先找一个btrfs_fs_devices
+   > find_fsid(btrfs_super_block->fsid)
+   - 如果找不到创建一个,只需要提高fsid, generation给lastest_transid
+   - 在btrfs_fs_devices中查找btrfs_device, 根据devid和uuid, 使用btrfs_dev_item->uuid. btrfs_super_block在不同的设备中保存时,使用不同的btrfs_dev_item.
+   > __find_device(btrfs_fs_devices->devices, devid, btrfs_super_block->dev_item.uuid)
+   - 如果没有找到,创建一个, 设定btrfs_work回调函数是pending_bios_fn, 设置name/devid/uuid.增加btrfs_fs_devices->num_devices
+   - 如果找到,但btrfs_device->name和path不一样,如果btrfs_device->missing有效,说明他又回来了,减小btrfs_fs_devices->missing_devices
+   - 最后检查btrfs_fs_devices->latest_trans < btrfs_super_block->generation, 更新latest_trans/latest_devid
+   
+
+** clone_fs_devices(btrfs_fs_devices)
+   - clone这个东西, 还要clone btrfs_fs_devices->devices上的btrfs_device, 但没有把它放到uuid队列上. 深度拷贝一个队列.
+
+** btrfs_clone_extra_devices(btrfs_fs_info, btrfs_fs_devices, step)
+   - 关闭btrfs_fs_devices中多余的btrfs_device, 就是没有metadata的btrfs_device. 剩下的需要写回btrfs_super_block.
+   - 遍历btrfs_device, 检查btrfs_device->in_fs_metadata, 如果有效,还要检查btrfs_device->is_tgtdev_for_dev_replace, 它有效表示要替换?
+   - 遍历时还有检查这些btrfs_device->generation, 更新btrfs_fs_devices->latest_*
+   - 对于devid是BTRFS_DEV_REPLACE_DEVID的, 检查step?
+   - 对于普通设备关闭,并释放btrfs_device, 减小btrfs_fs_devices->open_devices
+   > blkdev_put(btrfs_device->bdev, mode) 
+   - 删除btrfs_device->dev_list, 对于可写设备,从btrfs_device->dev_alloc_list中删除, 减小btrfs_fs_devices->num_devices / rw_devices
+   > rcu_string_free(btrfs_device->name)
+   - 如果btrfs_fs_devices->seed有效,处理对应的btrfs_fs_devices
+   - 最后根据遍历中找到的lastest_bdev/*,更新btrfs_fs_devices.
+
+** __free_device(work_struct) / free_device
+   - 异步释放btrfs_device, 释放block_device和rcu_name,仅仅在btrfs_device->bdev有效时,才释放.
+   > blkdev_put(btrfs_device->bdev, btrfs_device->mode)
+
+** free_device(rcu_head)
+   - 使用rcu释放,设置rcu的回调函数,获取btrfs_device, 设置btrfs_device->rcu_work的回调函数__free_device.. 简单的work_struct操作
+   > schedule_work(btrfs_device->rcu_work)
+
+** __btrfs_close_devices(btrfs_fs_devices)
+   - 在btrfs_fs_devices->opened是什么计数??计数减为0时才释放
+   - clone btrfs_fs_devices所有的btrfs_device, 里面为空,让它代替原来的btrfs_device. 重置的参数包括bdev/writeable/in_fs_metadata/can_discard.
+   - 使用异步的方式关闭设备
+   > call_rcu(btrfs_device->rcu, free_device)
+   - 这里关闭了设备,减小btrfs_fs_devices->open_devices / rw_devices / can_discard
+   > list_replace_rcu(btrfs_device->dev_list, dev_list)
+   - 最后设置btrfs_fs_devices->opened为0, seeding = 0, 最开始的地方会检查opened
+
+** btrfs_close_devices(btrfs_fs_devices)
+   - 先尝试关闭设备文件.为什么btrfs_fs_devices会打开多次?
+   > __btrfs_close_devices(btrfs_fs_devices)
+   - 检查btrfs_fs_devices->opened, 如果不是0, 说明没有关闭,直接退出.
+   - 如果关闭了,循环处理对应的seed设备.
+   > __btrfs_close_devices(btrfs_fs_devices)
+   - 这里不检查结果就直接释放了?
+   > free_fs_devices(seed_devices)
+   - 最外层的btrfs_fs_devices不会释放.在uuids释放时处理.
+
+** __btrfs_open_devices(btrfs_fs_devices, fmode_t, void holder)
+   - 打开btrfs_fs_devices->devices队列上的btrfs_device. 如果btrfs_device->bdev有效或者name无效,就不用打开
+   - holder竟然是file_system_type.
+   - 读取出设备上的btrfs_super_block,放在buffer_head中
+   > btrfs_get_bdev_and_sb(btrfs_device->name->str, flags, holder, block_device, buffer_head)
+   - 从btrfs_super_block->btrfs_dev_item中获取设备的信息,devid, uuid,和btrfs_device比较. 使用btrfs_super_block->generation更新btrfs_device->generation
+   - 如果btrfs_super_block->flags包含BTRFS_SUPER_FLAG_SEEDING, 这个设备是只读. 
+   - 获取request_queue, 检查设备支持discard, 是否rot设备/ssd
+   > bdev_get_queue(block_device) 
+   > blk_queue_discard(request_queue)
+   > blk_queue_nonrot(request_queue)
+   - 如果可写,添加到btrfs_device->dev_alloc_list到btrfs_fs_devices->alloc_list, 增加btrfs_fs_devices->rw_devices
+   > brelse(buffer_head)
+   - 调用之前btrfs_fs_info里面已经有一串的btrfs_device,只是还没有打开. 最后设置btrfs_fs_devices->opened为1,还有seed为1, 表示设备中有seeding的btrfs_devices. 
+   - 更新latest_*
+
+** btrfs_open_devices(btrfs_fs_devices, fmode_t, holder)
+   - 检查btrfs_fs_devices->opened,如果不为0,则已经打开,只增加计数,否则打开设备
+   > __btrfs_open_devices(...)
+
+** btrfs_scan_one_device(path, flags, holder, btrfs_fs_devices)
+   - 想一个普通文件一样操作块设备文件.读取btrfs_super_block位置所在的数据,获取里面的devid, generation. 当然这个btrfs_super_block可以决定一个btrfs_fs_devices, 创建配套的btrfs_fs_devices/btrfs_device
+   - 打开设备
+   > btrfs_get_bdev_and_sb(path, flags, holder, 0, btrfs_device, buffer_head)
+   > btrfs_sb_offset(0)
+   > read_cache_page_gfp(block_device->bd_inode->address_space, index, GFP_NOFS)
+   - 使用pagecache读取数据, 获取btrfs_super_block,以及btrfs_dev_item, devid, 然后把这个设备添加到系统维护的btrfs_fs_devices链表中..
+   > device_list_add(path, btrfs_super_block, devid, btrfs_fs_devices)   
+   - 设置btrfs_fs_devices->total_devices是btrfs_super_block->num_devices
+   
+** btrfs_dev_extent
+   #+begin_src 
+     //这个数据结构是反向映射,根据设备的地址空间查找逻辑chunk
+   	__le64 chunk_tree;
+	__le64 chunk_objectid;
+	__le64 chunk_offset;
+	__le64 length;
+	u8 chunk_tree_uuid[BTRFS_UUID_SIZE];
+   #+end_src
+
+** btrfs_account_dev_extents_size(btrfs_device, start, end, length)
+   - dev tree实现物理地址向逻辑地址的映射,查找btrfs_device瓷盘中, (start,end)范围内已用多少?
+   - 构造btrfs_key(devid,BTRFS_DEV_EXTENT_KEY,start), 从btrfs_device->btrfs_root/dev_root中查找, 还没看到哪里设置btrfs_device->dev_root.  
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0,0)
+   > btrfs_previous_item(btrfs_root, btrfs_path, key.objectid, key.type)
+   - 如果上面搜的btrfs_path不满足要求换一个,要要求objectid/type一致.开始顺序遍历btree
+   > btrfs_header_nritems(l)
+   > btrfs_next_leaf(btrfs_root, btrfs_path)
+   - 获取btrfs_dev_exent, 计算chunk的位置(btrfs_key->offset, btrfs_dev_extent->length)
+   > btrfs_item_key_to_cpu(l, btrfs_key, slot)
+   > btrfs_item_ptr(l, slot, btrfs_dev_extent)
+   > btrfs_dev_extent_length(l, dev_extent)
+   - 计算已经建立映射的物理磁盘长度.
+
+** find_free_dev_extent(btrfs_device, num_bytes, start, len)
+   - device extent和extent data/tree block不一样,device extent表示物理空间,它比extent data大,而且它要先映射到逻辑空间,然后逻辑空间分成多个extent.
+   - 这里是用于分配chunk/block group使用的, 查找btrfs_device中没有映射的范围,要求不小于num_bytes
+   - 在dev_root中查找,搜索的范围是(btrfs_fs_info->alloc_start, btrfs_device->total_bytes). 遍历所有的btrfs_dev_extent, 检查相邻节点之间的范围, 如果超过num_bytes,就返回这段空间给(start,len), 如果没有找到满足要求的,就返回最大的一块空洞. 
+   - 构造btrfs_key(devid, BTRFS_DEV_EXTENT_KEY,search_start)
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0,0)
+   > btrfs_next_leaf(btrfs_root, btrfs_path)
+   - 只会处理btrfs_key->offset > search_start的,检查两者差距!
+   > btrfs_dev_exent_len(extent_buffer,  dev_extent)
+
+** btrfs_free_dev_extent(btrfs_trans_handle, btrfs_device, start)
+   - 释放btrfs_device的extent,覆盖start, 找到btrfs_dev_extent, 删除对应的btrfs_iem
+   > btrfs_search_slot(...)
+   > btrfs_del_item(...)
+   - 修改关联的统计数,获取btrfs_dev_extent->length, 减btrfs_device->bytes_used, 加btrfs_fs_info->free_chunk_space..
+
+** btrfs_alloc_dev_extent(btrfs_trans_handle, btrfs_device, chunk_tree, chunk_objectid, chunk_offset, start, num_bytes)
+   - 在dev tree中创建btrfs_dev_extent, 把参数填充进去.
+   - key是(btrfs_device->devid, BTRFS_DEV_EXTENT_KEY, start), btrfs_dev_extent数据是(chunk_tree, chunk_objectid,chunk_offset)
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, btrfs_dev_extent)
+   > btrfs_item_ptr(extent_buffer, btrfs_path->slot[0], btrfs_dev_extent)
+   - 得到节点的指针,填充这个节点, chunk_tree, chunk_objectid, chunk_offset, chunk uuid
+   - uuid是btrfs_fs_info->chunk_tree_uuid, 它就是btrfs_header里面的, btrfs_fs_devices->uuid呢?
+   > write_extent_buffer(extent_buffer, uuid...)
+   > btrfs_set_dev_extent_length(extent_buffer, btrfs_dev_extent, num_bytes)
+   > btrfs_mark_buffer_dirty(extent_buffer)
+
+** find_next_chunk(btrfs_root, objectid, offset)
+   - 在chunk tree中查找一个没有使用的逻辑磁盘地址, 查找最后一个btrfs_chunk. 在创建chunk时使用
+   - 构造btrfs_key(objectid, BTRFS_CHUNK_ITEM_KEY, -1)
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 找最后一个chunk节点,获取btrfs_key->offset+btrfs_chunk->len,给下一个chunk使用.
+
+** find_next_devid(btrfs_root, objectid)
+   - 查找下一个可用的devid, 在chunk tree中查找. 在创建device记录时使用.
+   - 构造btrfs_key(BTRFS_DEV_ITEMS_OBJECTID, BTRFS_DEV_ITEM_KEY, -1)
+   > btrfs_search_slot(NULL, btrfs_root, btrfs_key, btrfs_path, 0, 0)
+   - 最后返回btrfs_key.offset+1
+
+** btrfs_add_device(btrfs_trans_handle, btrfs_root, btrfs_device)
+   - 根据btrfs_device添加btrfs_dev_item节点,
+   - 创建btrfs_key(BTRFS_DEV_ITEMS_OBJECTID/BTRFS_DEV_ITEM_KEY/devid), 添加到chunk_root中.
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, btrfs_dev_item)
+   > btrfs_item_ptr(extent_buffer, btrfs_path->slots[0], btrfs_dev_item)
+   - 使用btrfs_device的成员填充这个btrfs_dev_item, id, generation, type, io_align 
+   > write_extent_buffer(uuid...)
+   > btrfs_mark_buffer_dirty(leaf)
+   - generation就是创建时的transid, uuid是设备的uuid, fsid是btrfs_fs_info->fsid
+
+** btrfs_rm_dev_item(btrfs_root, btrfs_device)
+   - 上面是创建，这里是删除, 构造一个同样的btrfs_key(BTRFS_DEV_ITEMS_OBJECTID, BTRFS_DEV_ITEM_KEY, devid)
+   > btrfs_start_transaction(btrfs_root, 0)
+   - 开始一次事务
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_path, ...)
+   > btrfs_del_item(btrfs_trans_handle, btrfs_root, btrfs_path)
+   > btrfs_commit_transaction(btrfs_trans_handle, btrfs_root)
+
+** btrfs_rm_device(btrfs_root, char *device_path)
+   - 删除设备,在ioctl处理btrfs命令时使用.综合上面的实现,在内存和磁盘中都删除这个设备
+   - 首先检查是否能删除,获取btrfs_root->btrfs_fs_info->btrfs_fs_devices->num_devices, 还有btrfs_fs_info->avail_*_alloc_bits综合的flags, 如果是RAID10/RAID1,都有最小要求的设备数. 如果num_devices太小,不能删除. 为何不能修改flags?
+   > btrfs_dev_replace_is_ongoing(btrfs_fs_info->dev_replace)
+   - 根据device_path过去btrfs_device, 如果device_path是missing, 需要删除丢失的设备
+   - 检查btrfs_fs_devices队列中所有btrfs_device, 查询条件是btrfs_device->in_fs_metadata而且btrfs_device->bdev无效,说明设备丢失 
+   - 如果不是,就使用device_path打开设备,读回来btrfs_super_block, 根据devid/uuid在设备队列中找一个btrfs_device
+   > btrfs_get_bdev_and_sb(device_path, FMODE_WRITE|FMODE_EXCL, ...)
+   > btrfs_find_device(btrfs_root->btrfs_fs_info, devid, uuid, ...)
+   - 释放链表关系btrfs_device->dev_alloc_list
+   - 需要把它的数据relocate到别的物理地址
+   > btrfs_shrink_device(btrfs_device, 0)
+   - 删除btree 节点..BTRFS_DEV_ITEM_KEY.. 减小btrfs_fs_info->free_chunk_space, (btrfs_device->total_bytes-btrfs_device->bytes_used)
+   > btrfs_rm_dev_item(btrfs_fs_info->chunk_root, btrfs_device)
+   - 不同再为他清理碎片?
+   > btrfs_scrub_cancel_dev(btrfs_root->btrfs_fs_info, btrfs_device)
+   > btrfs_super_num_devices(btrfs_root->btrfs_fs_info->super_copy)
+   - 修改btrfs_super_block->num_devices
+   > btrfs_set_super_num_devices(btrfs_root->btrfs_fs_info->super_copy, num_devices)
+   - 更新btrfs_fs_devices->num_devices/total_devices/latest_*/open_devices
+   - 最后释放btrfs_devices的链表关系, dev_list修改btrfs_fs_devices中的参数.  如果btrfs_fs_devices->open_devices减为0,关闭这个btrfs_fs_devices, 把它从seed队列上删除. 这个btrfs_fs_devices可能是seed链表上的.直接把他关闭释放
+   > __btrfs_close_devices(btrfs_fs_devices)
+   > free_fs_devices(btrfs_fs_devices)
+   - 更新btrfs_fs_info->num_tolerated_disk_barrier_failures
+
+** btrfs_rm_dev_replace_srcdev(btrfs_fs_info, btrfs_device)
+   - 在replace完成后,删除被替代的device?
+   - 简单的从btrfs_fs_devices中删除btrfs_device, 还有一些统计数, 包括dev_list/dev_alloc_list队列, btrfs_fs_devices->num_devices/missing_devices/num_can_discards/open_devices等参数.
+   > call_rcu(btrfs_device->rcu, free_device)
+
+** btrfs_destroy_dev_replace_tgtdev(btrfs_fs_info, btrfs_device)
+   - tgtdev和其他设备有什么区别?减小btrfs_fs_info->btrfs_fs_devices->num_devices/num_can_discard等等.还要更新super_block->s_bdev, btrfs_fs_devices->latest_*
+
+** btrfs_find_device_by_path(btrfs_root, device_path, btrfs_device)
+   > btrfs_get_bdev_and_sb(device_path, FMODE_READ, btrfs_root->btrfs_fs_info->bdev_holder, block_device, buffer_head)
+   - 查找block_device, 还有buffer_head, 获取btrfs_dev_item, 以及devid和uuid
+   > btrfs_find_device(btrfs_root->btrfs_fs_info, devid, dev_uuid, btrfs_super_block->fsid)
+   - 搜索双重循环, btrfs_fs_devices使用seed构造的列表,和btrfs_fs_devices->devices队列,首先确认btrfs_fs_devices使用正确的fsid, 然后根据(devid,uuid)查找
+
+** btrfs_find_device_missing_or_by_path(btrfs_root, device_path, btrfs_device)
+   - 如果device_path是missing, 现在btrfs_root->btrfs_fs_info->devices队列中找一个missing的设备, btrfs_device->in_fs_metadata有效,而且btrfs_device->bdev无效
+   - 否则根据设备名搜索
+   > btrfs_find_device_by_path(btrfs_root, btrfs_path, btrfs_device)
+
+** btrfs_prepare_sprout(btrfs_root)
+   - 在增加设备时使用, 修改fsid?  当前btrfs_fs_devices必须是seeding. btrfs_fs_devices->seeding是有效的
+   - clone原来的btrfs_fs_devices, 把他添加到ff_uuids中,这样重复了?
+   > clone_fs_devices(btrfs_fs_devices)
+   - 再创建一个btrfs_fs_devices, 和原来的一样,作为seed_devices. 把原来的devices/alloc_list队列复制过来.
+   list_splice_init(btrfs_fs_devices->alloc_list, seed_devices->alloc_list)
+   - 清空原来的btrfs_fs_devices, 统计数/链表
+   - 构造新的uuid给btrfs_fs_info->fsid, btrfs_super_block->fsid, 也给btrfs_fs_info->fsid和btrfs_super_block->fsid
+   > generate_random_uuid(btrfs_fs_devices->fsid)
+   - 清除btrfs_super_block->super_flags的BTRFS_SUPER_FLAG_SEEDING.
+   - 在这里没有把新创建的btrfs_fs_devices放到fs_uuids队列中,但是把他放到原来的btrfs_fs_devices->seed队列中.
+   - 原来的btrfs_fs_devices->seeding变为无效, 它已经没有了btrfs_device
+
+** btrfs_finish_sprout(btrfs_trans_handle, btrfs_root)
+   - 使用key(BTRFS_DEV_ITEMS_OBJECTID,/BTRFS_DEV_ITEM_KEY, 0)遍历所有的btrfs_dev_item, 然后取出uuid/devid, 找到(创建)btrfs_device/btrfs_fs_devices)
+   - 这个查找并不是在fs_uuid中,而是在当前btrfs_fs_devices->seed链表中.
+   > btrfs_find_device(btrfs_fs_info, devid, uuid, ..)
+   - 根据当前的btrfs_device->generation更新btrfs_dev_item->generation,谁会该它呢?
+   > btrfs_set_device_generation(extent_buffer, btrfs_dev_item, generation..)
+   > btrfs_mark_buffer_dirty(extent_buffer)
+   - 如果其使用的btrfs_device->btrfs_fs_devices是seeding, 修改它的generation, 磁盘上的数据btrfs_dev_item->generation. seeding表示这个btrfs_fs_devices可以改变?
+
+** btrfs_init_new_device(btrfs_root, device_path)
+   - 构造一个btrfs_device,打开设备block_device, 
+   > blkdev_get_by_path(device_path, FMODE_WRITE|FMODE_EXCL, holder)
+   > filemap_write_and_wait(block_device->bd_inode->address_space)
+   - 找到block_device, 然后遍历btrfs_fs_devices中的btrfs_device, 看是否有人已经使用这个block_device. 如果是就返回-EEXIST. 然后创建btrfs_device. 准备成员(name, devid,uuid) 其他的从request_queue中获取
+   > find_next_devid(btrfs_root, btrfs_device->devid)
+   > btrfs_start_transaction(btrfs_root, 0)
+   > bdev_get_queue(block_device) 
+   - 然后根据磁盘信息request_queue初始化这个block_device,还有新的uuid/generation
+   > generate_random_uuid(btrfs_fs_devices->uuid)
+   - 如果seeding_dev有效,btrfs_fs_devices->seeding有效,也就是原来的btrfs_fs_devices在做种,需要构造新的btrfs_fs_devices.
+   > btrfs_prepare_sprout(btrfs_root)
+   - 就是改变btrfs_fs_info->fsid, 但没有替换btrfs_fs_devices, 只是把新的放到seed链表中. btrfs_fs_info->btrfs_fs_devices已经清空,而且新的btrfs_device添加到btrfs_fs_info->btrfs_fs_devices,也就是旧的,所以实际上构造了一个新的空的btrfs_fs_devices,里面没有seeding的btrfs_device.
+   - 然后把它添加到btrfs_fs_devices中, devices/alloc_list队列,还有统计数.  
+   > btrfs_fs_devices->total_rw_bytes += btrfs_device->total_bytes
+   > btrfs_fs_info->free_chunk_space += btrfs_device->total_bytes
+   - 更新btrfs_super_block->total_bytes/num_devices
+   - 如果seeding_dev有效, 也就是再原来的基础上更新了fsid, 这是第一个rw的设备,分配一些chunk
+   > init_first_rw_decie(btrfs_trans_handle, btrfs_root,  btrfs_device)
+   - 下面会修改chunk root, 但它在原来的seed设备上,是没法修改的?
+   > btrfs_finish_sprout(btrfs_trans_handle, btrfs_root)
+   - 如果不是seeding, 只是普通的增加设备, 添加btrfs_dev_item节点
+   > btrfs_add_device(btrfs_trans_handle, btrfs_root, btrfs_device)
+   - 清除btrfs_fs_info->space_info队列上所有的btrfs_space->full
+   > btrfs_clear_space_info_full(btrfs_root->btrfs_fs_info)
+   - 更新btrfs_fs_info->num_tolerated_disk_barrier_failures
+   > btrfs_calc_num_tolerated_disk_barrier_failures(btrfs_fs_info)
+   > btrfs_commit_transaction(btrfs_trans_handle, btrfs_root)
+   - 如果是seeding_dev, 需要重修放置chunk tree的位置.
+   > btrfs_relocate_sys_chunks(btrfs_root)
+   > btrfs_attach_transaction(btrfs_root)
+   > btrfs_commit_transaction(btrfs_trans_handle, btrfs_root)
+
+** btrfs_init_dev_replace_tgtdev(btrfs_root, device_path, btrfs_device)
+   - 创建一个btrfs_device,使用device_path指向的设备, devid是BTRFS_DEV_REPLACE_DEVID, 把它加到btrfs_fs_devices队列中
+   > blkdev_get_by_path(device_path, FMODE_WRITE|FMODE_EXCL, btrfs_fs_info->bdev_holder)
+   > filemap_write_and_wait(block_dev->bd_inode->i_mapping)
+
+** btrfs_init_dev_replace_tgtdev_for_resume(btrfs_fs_info, btrfs_device)
+   - 修改btrfs_device的参数?? 包括io_width/io_align/dev_root等
+
+** btrfs_update_device(btrfs_trans_handle, btrfs_device)
+   - 根据btrfs_devices更新btree磁盘中的信息, 构造key(BTRFS_DEV_ITEMS_OBJECTID/btrfs_device->devid/BTRFS_DEV_ITEM_KEY), 获取btrfs_dev_item, 更新devid, type, io_align, io_width, ...
+
+** __btrfs_grow_device(btrfs_trans_handle, btrfs_device, new_size)
+   - 增大磁盘大小. 修改了btrfs_device->btrfs_fs_devices->total_rw_bytes, btrfs_device->total_bytes/disk_total_bytes.. btrfs_super_block->total_bytes
+   > btrfs_update_device(..)
+   > btrfs_clear_space_info_full(btrfs_fs_info)
+   > btrfs_update_device(btrfs_trans_handle, btrfs_device)
+
+** btrfs_free_chunk(btrfs_trans_handle, btrfs_root, chunk_tree, chunk_objectid, chunk_offset)
+   - chunk_tree就是多余的.
+   - 操作chunk tree, 构造key(chunk_objectid/BTRFS_CHUNK_ITEM_KEY/chunk_offset),删除btrfs_chunk.
+   > btrfs_search_slot(btrfs_trans_handle, btrfs_root, btrfs_key, btrfs_path, -1, 1)
+   > btrfs_del_item(btrfs_trans_handle, btrfs_root, btrfs_path)
+
+** btrfs_del_sys_chunk(btrfs_root, chunk_objectid, chunk_offset)
+   - 访问btrfs_super_block->sys_chunk_array数组,里面并排放着若干对的(btrfs_disk_key/btrfs_chunk)
+   > btrfs_super_sys_array_size(btrfs_super_block)
+   - 在这个数组中找一个btrfs_disk_key,转换成btrfs_key, 然后比较key和参数,找到后把它删除一对(btrfs_disk_key/btrfs_chunk)
+   - 简单的静态数组删除操作,修改btrfs_super_block->sys_array_size
+
+** btrfs_relocate_chunk(btrfs_root, chunk_tree, chunk_objectid, chunk_offset)
+   - 要relocate chunk(chunk_objectid,chunk_offset)? chunk_offset就是逻辑磁盘位置, chunk_tree和chunk_objectid都是没用的.
+   - 获取btrfs_fs_info, extent_root, extent_map_tree
+   - 去查询btrfs_block_group_cache,它对应一个chunk,检查它是否可以relocate
+   > btrfs_can_relocate(btrfs_root, chunk_offset)
+   - 开始重定向, 首先重定向它的所有extents, 在relocate中实现..重定向工作看来主要是extent操作
+   > btrfs_relocate_block_group(btrfs_root, chunk_root)
+   > btrfs_start_transaction(btrfs_root, 0)
+   - 然后更新映射信息?
+   > lookup_extent_mapping(extent_io_tree, chunk_offset, 1)
+   - 找到extent_map, 遍历extent_map->stripes的物理磁盘信息, 删除dev tree的映射信息.
+   > btrfs_free_dev_extent(btrfs_trans_handle, extent_map->stripes[i].dev, ...)
+   - 更新chunk tree的btrfs_dev_item
+   > btrfs_update_device(btrfs_trans_handle, extent_map->tripes[i].dev)
+   - chunk_tree没有使用,在chunk_root树中删除对应节点, 在btrfs_super_block中删除对应的节点.
+   > btrfs_free_chunk(btrfs_trans_handle, chunk_tree, ..)
+   > btrfs_del_sys_chunk(...)
+   - 检查extent_map->type和BTRFS_BLOCK_GROUP_SYSTEM..
+   - 删除对应的btrfs_block_group_cache, 工作量挺多的
+   > btrfs_remove_block_group(btrfs_trans_handle, btrfs_root, chunk_offset)
+   > remove_extent_mapping(extent_map_tree, extent_map)
+   > free_extent_map(extent_map)
+
+** btrfs_relocate_sys_chunks(btrfs_root)
+   - 这里没有具体的chunk参数, 就是relocate所有的BTRFS_GROUP_BLOCK_SYSTEM的chunk.  
+   - 使用key(BTRFS_FIRST_CHUNK_TREE_OBJECTID,BTRFS_CHUNK_ITEM_KEY, -1) 遍历所有的btree的btrfs_chunk, 如果带标志BTRFS_BLOCK_GROUP_SYSTEM,则处理这个chunk
+   > btrfs_relocate_chunk(...)
+   - chunk和block group cache一一对应??
+
+** btrfs_balance_args 
+   #+begin_src 
+     profiles
+     usage
+     pstart
+     pend
+     vstart
+     vend
+     target
+     flags
+     usused[8]
+   #+end_src
+
+** btrfs_balance_control
+   #+begin_src 
+    btrfs_fs_info  fs_info
+    btrfs_balance_args data
+    btrfs_balance_args meta
+    btrfs_balance_args sys
+    flags
+    btrfs_balance_progress stat
+    // 这个数据结构也就是btrfs_balande_item
+   #+end_src
+
+** btrfs_balance_progress
+   #+begin_src 
+     expected
+     considered
+     completed
+   #+end_src
+
+** btrfs_balance_item
+   #+begin_src 
+	/* BTRFS_BALANCE_* */
+	__le64 flags;
+
+	struct btrfs_disk_balance_args data;
+	struct btrfs_disk_balance_args meta;
+	struct btrfs_disk_balance_args sys;
+
+	__le64 unused[4];
+	//在tree root中, btrfs_key(BTRFS_BALANCE_OBJECTID, BTRFS_BALANCE_ITEM_KEY, 0)
+   #+end_src
+
+** insert_balance_item(btrfs_root, btrfs_balance_control)
+   - 控制东西也在btree中.. key(BTRFS_BALANCE_OBJECTID/BTRFS_BALANCE_ITEM_KEY/0), 使用固定的key不会重复吗?!  把btrfs_balance_control写回btree
+   > btrfs_start_transaction(btrfs_root, 0)
+   > btrfs_insert_empty_item(btrfs_trans_handle, btrfs_root, btrfs_path, btrfs_key, btrfs_balance_item)
+   - 这里会初始化btrfs_balance_item???
+   > btrfs_cpu_banalce_args_to_disk(...)
+   > btrfs_set_balance_data(...)
+   - 从参数btrfs_balance_control中拿出数据装配btree
+
+** del_balance_item(btrfs_root)
+   - 随便删除, key(BTRFS_BALANCE_OBJECTID/0/BTRFS_BALANCE_ITEM_KEY)
+
+** update_balance_args(btrfs_balance_control)
+   - 调整btrfs_balance_args.flags的标志,  BTRFS_BALANCE_ARGS_USAGE/BTRFS_BALANCE_ARGS_CONVERT/BTRFS_BALANCE_ARGS_SOFT
+
+** set_balance_control(btrfs_balance_control)  / unset_balance_control(btrfs_fs_info)
+   - 把btrfs_balance_control给btrfs_fs_info->balance_ctl.. 或者删除
+
+** chunk_profiles_filter(chunk_type, btrfs_balance_args)
+   - filter out 和 balanced out 有什么区别??	根据chunk_type获取类型,检查它和btrfs_balance_args->profiles相容.. 下面几个都是过滤器,哪里使用的回调函数? 过滤btrfs_balance_args?
+   > chunk_to_extented(chunk_type)  
+   - 检查chunk_type的RAID类型是否一致, 相交就返回0
+
+** chunk_usage_filter(btrfs_fs_info, chunk_offset, btrfs_balance_args)
+   - 先获取btrfs_block_group_cache, 计算block_group的使用率
+   > btrfs_lookup_block_group(btrfs_fs_info, chunk_offset)
+   > btrfs_block_group_used(btrfs_block_group_used->item)
+   - 获取btrfs_block_group_cache已经使用的空间, 然后计算thresh值,两者比较,chunk_used小,返回0. 不用balance? 使用率太小也会relocate
+
+** chunk_devid_filter(extent_buffer, btrfs_chunk, btrfs_balance_args)
+   - btrfs_chunk包含多个stripe, 他们是物理地址
+   - 检查stripe数量
+   > btrfs_chunk_num_stripes(extent_buffer, btrfs_chunk)
+   - 获取btrfs_stripe
+   > btrfs_stripe_nr(btrfs_chunk, i) 
+   > btrfs_strpe_devid(extent_buffer, stripe)
+   - 获取btrfs_stipe,  获取devid, 检查是否和参数btrfs_balance_args->devid一样, 一样返回0.
+
+** chunk_drange_filter(extent_buffer, btrfs_chunk, chunk_offset, btrfs_balance_args)
+   - extent_buffer/btrfs_chunk指向btrfs_chunk这个item, 是否某个stipe覆盖btrfs_balance_args->pend/pstart, 而且devid相同 
+   - 先获取stripe的数量, 去item中获取
+   > btrfs_chunk_num_stripes(extent_buffer, btrfs_chunk)
+   - 不同的RAID类型,使用不同数量的stripe,每个stripe的长度计算方法不同.
+   > btrfs_chunk_type(extent_buffer, btrfs_chunk)
+   - 获取每个btrfs_stripe, devid/stripe_offset,应该是物理偏移, stripe_length根据btrfs_chunk->length计算.
+   > btrfs_stripes_nr(btrfs_chunk, i)
+   > btrfs_stripe_devid(extent_buffer, stripe)
+   > btrfs_stripe_offset(extent_buffer,  btrfs_stripe)
+   - 比较(stripe_offset, stripe_length)和(btrfs_balance_args->pstart, pend), 如果相交就返回0.
+
+** chunk_vrange_filter(extent_buffer, btrfs_chunk, chunk_offset, btrfs_balance_args)
+   - 上面比较磁盘物理信息,这里比较逻辑位置
+   - 直接比较chunk_offset / chunk_length 和 btrfs_balance_args->vend/vstart, 两个范围是否覆盖,不一定完全包含
+   > btrfs_chunk_length(extent_buffer, btrfs_chunk)
+
+** chunk_soft_convert_filter(chunk_type, btrfs_balance_args)
+   - BTRFS_BALANCE_ARGS_CONVERT什么意思, 如果没有就返回0. 比较chunk_type和btrfs_balance_args->target, 如果相同返回1.
+   > chunk_to_extented(chunk_type)  
+   - chunk_type转换到extent_type
+
+** should_balance_chunk(btrfs_root, extent_buffer, btrfs_chunk, chunk_offset)
+   - 从btrfs_root->btrfs_fs_info->balance_ctl, btrfs_balance_control, 检查btrfs_chunk是否应该balanced?? 调用上面所有的filter函数..
+   > btrfs_chunk_type(extent_buffer, btrfs_chunk)
+   - btrfs_balance_control->flags表示它能处理那些类型的, BTRFS_BALANCE_DATA/META/SYS, 和chunk_type对比, 如果不一致,就返回.
+   - 获取chunk_type, BTRFS_BLOCK_GROUP_TYPE_MASK, 选btrfs_balance_control->data/sys/meta
+   > chunk_profile_filter(chunk_type, btrfs_balance_args)
+   - args->flags 包含 BTRFS_BALANCE_ARGS_PROFILES
+   > chunk_usage_filter(chunk_type, btrfs_balance_args)
+   - args->flags包含 BTRFS_BALANCE_ARGS_USAGE, 然后对应不用的flags,不同的检查函数.  只要有一个返回0，就返回0. 否则返回1...
+   - 最后一个是BTRFS_BALANCE_ARGS_SOFT, 必须有BTRFS_BALANCE_ARGS_CONVERT, 而且chunk_type必须和btrfs_balance_args->target一样? 就不会转化.
+   > chunk_soft_convert_filter(chunk_type, btrfs_balance_args)
+   - 返回1才会做balance,也就是说所有的都要满足.
+
+** __btrfs_balance(btrfs_fs_info)
+   - 首先减小每个btrfs_device上的空间,relocate所有的extent.  遍历btrfs_fs_info-> btrfs_fs_devices->devices上的btrfs_device
+   - 遍历btrfs_fs_info->btrfs_fs_device->devices的所有btrfs_device, 尝试释放他们的10%空间, 计算btrfs_device->bytes_used / total_bytes, 如果没有空余的,跳过不处理.
+   > btrfs_shunk_device(btrfs_device, old_size - size_to_free)
+   - 然后增长空间, 但为何需要btrfs_trans_handle?
+   > btrfs_grow_device(btrfs_trans_handle, btrfs_device, old_size) 
+   > btrfs_search_slot(NULL, ..)
+   - 构造btrfs_key(BTRFS_FIRST_CHUNK_TREE_OBJECTID/BTRFS_CHUNK_ITEM_KEY/-1), 获取btrfs_chunk, 检查chunk tree中的所有btrfs_chunk, 使用btrfs_root->btrfs_fs_info->balance_ctl检查是否需要balance操作.
+   > should_balance_chunk(btrfs_root, extent_buffer, btrfs_chunk,  offset)
+   - 检查是否需要balance, 如果返回0, 则不需要..
+   > btrfs_relocate_chunk(btrfs_root, chunk_root->objectid, objecitd, offset)
+
+** alloc_profile_is_valid(flags, extented)
+   - 检查flags是否有效. flags包含type和profile, 而且不能有其他标志. 
+   - type可以任意组合, profile必须只有1个.
+   - profile为0时,不能使用extended?  什么是extended
+
+** balance_need_close(btrfs_fs_info)
+   - btrfs_fs_info是否需要停止balance操作. btrfs_fs_info->balance_cancel_req不为0, 或者balance_pause_req和balance_cancel_req为0
+
+** __cancel_balance(btrfs_fs_info)
+   - 下面无头删除,就是删除BALANCE_OBJECTID.. 删除btrfs_fs_info->balance_ctl
+   > unset_balance_control(btrfs_fs_info)
+   - 删除balance item 从根树中.
+   > del_balance_item(btrfs_fs_info->tree_root) 
+   - 设置btrfs_fs_info->mutually_exclusive_opeartion_running为0..
+
+** btrfs_balance(btrfs_balance_control, btrfs_ioctl_balance_args)
+   - 根据btrfs_fs_devices->num_devices, 计算一个可以处理的profile, BTRFS_AVAIL_ALLOC_BIT_SINGLE/DUP/RAID0/RAID1. 
+   - 处理btrfs_balance_control->data->flags的BTRFS_BALANCE_ARGS_CONVERT,  target是转化后的profile, 先检查它是否有效. 而且满足上面计算的profile
+   > alloc_profile_is_valid(btrfs_balance_control->data->target, 1)
+   - 还有btrfs_balance_control->meta->flags, sys.flags. 
+   - BTRFS_BALANCE_ARGS_CONVERT表示改变数据的prifle?
+   - 经过大量的检查, 如果能够balance, 先创建btrfs_item
+   > insert_balance_item(...)
+   - btrfs_balance_control->flags没有BTRFS_BALANCE_RESUME, 设置当前的, 否则更新btrfs_balance_control参数..
+   > set_balance_control(btrfs_balance_control)
+   - 开始balance
+   > __btrfs_balance(btrfs_fs_info)
+   > update_ioctl_balance_args(btrfs_fs_info, 0, btrfs_balance_args)
+   - 上面是异步的? 唤醒等待的
+   > wake_up(btrfs_fs_info->balance_wait_q)
+
+** balance_kthread(void) / btrfs_resume_balance_async(btrfs_fs_info)
+   - 参数是btrfs_fs_info, 根据btrfs_fs_info->btrfs_balance_control,检查是否启动了balance线程..
+   > btrfs_balance(btrfs_fs_info->btrfs_balance_control, ...)
+
+** btrfs_recover_balance(btrfs_fs_info)
+   - 从磁盘中找出来balance这个节点btrfs_balance_item,读取数据,建立一个btrfs_balance_control
+   > set_balance_control(btrfs_balance_control)
+
+** btrfs_pause_balance(btrfs_fs_info)
+   - 如果btrfs_fs_info->balance_running有效,说明balance正在执行, 才能执行pause, 先增加btrfs_fs_info->balance_pause_req
+   > wait_event(btrfs_fs_info->balance_wait_q, btrfs_fs_info->balance_running == 0)
+   - 减小btrfs_fs_info->balance_pause_req,为何较小?? 因为balance过程中会检查这个参数? 这里需要等待过程.
+
+** btrfs_cancel_balance(btrfs_fs_info)
+   - 增加btrfs_fs_info->balance_cancel_req, 然后开始具体操作,最后再减去btrfs_fs_info->balance_cancel_req.  如果btrfs_fs_info->balance_running有效, balance操作在进行着,等待完成.
+   > wait_event(btrfs_fs_info->balance_wait_q, ...)
+   - 否则如果btrfs_fs_info->balance_ctl有效,执行暂停操作,仅仅清除btrfs_fs_info->btrfs_balance_control, 删除节点等..
+   > __cancel_balance(btrfs_fs_info)
+
+** btrfs_shrink_device(btrfs_device, new_size)
+   - 处理超过范围的btrfs_dev_item, 找到对应的btrfs_chunk/btrfs_block_group_cache, 读他们relocate? 
+   - 即使是释放再分配,也很复杂,因为要找到backref?
+   - 修改btrfs_device的大小为new_size, btrfs_fs_devices->total_rw_bytes/btrfs_device->total_bytes/btrfs_fs_info->free_chunk_space. 
+   - 遍历dev_tree, 构造btrfs_key(devid,BTRFS_DEV_EXTENT_KEY, -1),获取btrfs_dev_extent, 如果它的位置超过new_size, 移动他的位置??
+   > btrfs_search_slot / btrfs_previous_item
+   > btrfs_dev_extent_length  ..
+   - 得到btrfs_dev_extent,可获取chunk_tree, chunk_objectid, chunk_offset, 这里有用的应该只有chunk_offset
+   > btrfs_relocate_chunk(btrfs_root, btrfs_chunk, objectid, offset)
+   - 使用transaction,修改btrfs_device影响的btrfs_dev_item
+   > btrfs_update_device(btrfs_trans_handle, btrfs_device)
+   > btrfs_set_super_total_bytes(btrfs_super_block, new_size)
+   - 最后是btrfs_super_block->total_bytes
+
+** btrfs_add_system_chunk(btrfs_root, btrfs_key, btrfs_chunk, item_size)
+   - 把btrfs_key添加到btrfs_root->btrfs_fs_info->btrfs_super_block->sys_chunk_array的队列中..  BTRFS_SYSTEM_CHUNK_ARRAY_SIZE 是限制..
+
+*** 上面很杂,包括balance, chunk的属性等
+
+** btrfs_cmp_device_info(void a, b)
+   - 比较btrfs_device_info 。。。
+
+** __btrfs_alloc_chunk(btrfs_trans_handle, btrfs_root, map_lookup, num_bytes_out, stripe_size_out, start, type)
+   - 先总结一下chunk创建过程,先确定逻辑地址,不确定大小,然后去每个btrfs_device中分配物理空间
+   - 根据对磁盘的查找,创建map_lookup, 然后是btrfs_block_group_cache
+   - 添建extent_tree的btrfs_block_group_item和dev tree的btrfs_dev_item
+   - 填加trunk tree的btrfs_chunk, 更新btrfs_dev_item/btrfs_super_block等
+   - 解释参数, btrfs_root是extent_root, map_lookup/num_bytes_out/stripe_size_out保存查找结果,start是逻辑磁盘位置, type是flags.
+   - type里面包括了profile和type, 检查type有效性
+   > alloc_profile_is_valid(type, 0)
+   - 如果btrfs_fs_devices->alloc_list为空,就不用分配了,直接退出
+   > __get_raid_index(type)
+   - 获取分配的物理特性 btrfs_raid_attr
+   - 计算max_stripe_size/max_chunk_size, data是1G/10G, metadata是1G/1G, system是32M/64M. 
+   - 创建btrfs_device_info数组,遍历btrfs_fs_devices->alloc_list上的btrfs_device, 如果可以分配,把它的分配信息放到btrfs_device_info中. 遍历次数限于btrfs_fs_devices->rw_devices.
+   - 检查btrfs_device->in_fs_metadata/is_tgtdev_for_dev_replace, 说明设备没有在fs中,或在替换中,也不能使用
+   - 检查btrfs_device可用的空间, btrfs_device->total_bytes - btrfs_device->bytes_used, 如果空闲空间足够,就在dev树中找空闲空间.
+   > find_free_dev_extent(btrfs_device, max_stripe_size* dev_stripes, ...)
+   - 原来对于dup,一个设备上有2份相同的数据.  这里找到了不一定满足要求,而且不满足要求也可以,但不能低于64k
+   - 把这些信息填充到btrfs_device_info中, dev_offset是物理偏移, max_avail是空余空间, total_avail是设备大小. 
+   - 遍历完成后排序,按照max_avail/total_avail排序
+   - 根据btrfs_raid_attr->devs_increment/devs_max/sub_stripes选择设备数量. ndevs, 它必须是devs_increment的倍数,而且在(devs_max/devs_min范围内), 而且不小于devs_increment * sub_stripes. 对于raid0/raid10, 可使用任意多的设备.
+   - 在已排序的btrfs_device_info中,使用第ndevs设备的max_avail作为stripe_size, 一个设备上的空间大小
+   - num_stripes = ndevs * dev_stripes, 总的stripe数量, 非DUP,设备数就是stripe数量,但DUP番倍.
+   - data_stripes表示去除冗余之后的stripe数量, 它表示逻辑的stripe数量, num_stripes / ncopies
+   - 总的数据逻辑长度就是stripe_size * data_stripes, 如果超过max_chunk_size, 就减小分配长度. max_chunk_size < data_stripes.  这里stripe_size还是物理长度, 对于DUP,也是番倍的
+   - stripe_size /= dev_stripes, 计算逻辑的长度
+   - 这里是理解profile/raid的地方,raid就是把数据分块,不同的块放到不同的设备上,或者一个块在不同的设备上备份. 还有dup, 一个设备上放2个块. dev_stripes表示一个设备上的数据块数,只有dup使用(2, 分配后空间要分成2份), stripe_size表示块大小, ndevs表示涉及的设备数, ncopies表示数据备份数量,最后分配的空间不能超过max_chunk_size*ncopies, 总数据块是ndevs*dev_stripes
+   - 创建map_lookup, 内嵌btrfs_bio_stripe, 把btrfs_device_info数组中的数据导进去. dup的确把数据挨着放.. map_lookup->stripe_len不是上面的块大小,而是BTRFS_STRIPE_LEN, map_lookup->num_stripes是块数. num_bytes_out表示总分配空间,不包括备份的, stripe_size*num_stripes/ncopies, 
+   - stripe_size_out表示每个stripe的逻辑长度 stripe_size, num_bytes_out表示逻辑总长度 stripe_size*data_stripes
+   - 分配extent_map->bdev是map_lookup. 把它添加到btrfs_fs_info->mapping_tree(extent_map_tree)
+   > alloc_extent_map()
+   > add_extent_mapping(extent_map_tree, extent_map)
+   - 对map_lookup中的每个btrfs_bio_stripe, 创建btrfs_dev_extent, 建立反向映射信息
+   > btrfs_make_block_group(btrfs_trans_handle, btrfs_root, 0, type, BTRFS_FIRST_CHUNK_TREE_OBJECTID, start, num_bytes_out)
+   - 创建一个block_group, btrfs_block_group_cache, 创建了btrfs_block_group_item, 但它仅仅把btrfs_block_group_cache->new_bg_list放到btrfs_trans_handle, 可能等到事务提交时,再进行树操作.
+
+** __finish_chunk_alloc(btrfs_trans_handle, btrfs_root, map_lookup, chunk_offset, chunk_size, stripe_size)
+   - 创建chunk的后半部分.map_lookup里面是分配的物理地址信息, chunk_offset/chunk_size是逻辑地址信息,stripe_size是每个stripe的大小. 
+   - 创建btrfs_chunk, 先处理map_lookup, 更新每个btrfs_device->bytes_used += stripe_size
+   > btrfs_update_device(btrfs_trans_handle, btrfs_device)
+   - 更新btrfs_fs_info->free_chunk_space -= stripe_size * num_stripes, 物理空间更新,而不是逻辑空间,考虑数据备份.
+   - 创建btrfs_chunk, 这个数据结构同样内嵌btrfs_stripe, 这是磁盘上的数据结构. 把map_lookup的信息放进去.
+   - 创建btrfs_key(BTRFS_FIRST_CHUNK_TREE_OBJECTID, BTRFS_CHUNK_ITEM_KEY, chunk_offset), 插入chunk tree
+   > btrfs_insert_item(btrfs_trans_handle, btrfs_root, key, btrfs_chunk, item_size
+   - 如果type是BTRFS_BLOCK_GROUP_SYSTEM, 把相关信息添加到btrfs_super_block的数组中..
+   > btrfs_add_system_chunk(...)
+
+** btrfs_alloc_chunk(btrfs_trans_handle, btrfs_root, type)
+   - 创建chunk, 只有type,没有任何其他信息..先找到起始地址, 在创建过程中得到大小, 然后更新磁盘树. 起始地址也是查找最后面的,没有循环利用.
+   > find_next_chunk(btrfs_root, BTRFS_FIRST_CHUNK_TREE_OBJECTID, chunk_offset)
+   > __btrfs_alloc_chunk(btrfs_trans_handle, extent_root, map_lookup, chunk_size, stripe_size, chunk_offset, type)
+   > __finish_chunk_alloc(btrfs_trans_handle, extent_root, map_lookup, chunk_offset, chunk_size, stripe_size)
+   - chunk_size就是逻辑空间大小.. stripe_size*num_stripes/sub_stripes = chunk_size ..
+
+** init_first_rw_device(btrfs_trans_handle, btrfs_root, btrfs_device)
+   - 在添加设备时使用,表示添加的设备是第一个可写的,它是在seed文件系统上的,所以要先分配chunk,相当于创建文件系统.
+   - 初始化btrfs_device设备. 先找一个逻辑地址, 创建一个chunk.
+   > find_next_chunk(btrfs_fs_info->chunk_root, BTRFS_FIRST_CHUNK_TREE_OBJECTID, chunk_offset)
+   - 要分配一个metadata使用的chunk? 用于extent_root
+   > btrfs_reduce_alloc_profile(btrfs_root, alloc_profile)
+   > __btrfs_alloc_chunk(btrfs_trans_handle, btrfs_root, map, chunk_size, striep_size, chunk_offset, alloc_profile)
+   - 这里会调用两次,不同的alloc_profile, 第一个是meta, 第二次是system, 两次使用挨着的逻辑地址..
+   - 把设备添加到dev tree中, 这里是trans操作,因为还没有可写的trunk,trunk tree
+   > btrfs_add_device(btrfs_trans_handle, btrfs_fs_info->chunk_root, btrfs_device)
+   > __finish_chunk_alloc(...)
+   - 同样也是2次,但不同的参数意义.. 添加设备后,分配chunk来使用他们的空间?!
+
+** btrfs_chunk_readonly(btrfs_root, chunk_offset)
+   - 检查chunk是否readonly?? 从chun_offset获取extent_map, map_lookup, 遍历里面的btrfs_stripe_attr, btrfs_device->writeable.
+   > lookup_extent_mapping(btrfs_root->btrfs_fs_info->btrfs_mapping_tree, chunk_offset, 1)
+   - 找到extent_map, extent_map->bdev是map_lookup, 检查map_lookup中的btrfs_bio_stripe. 如果有一个不可写,这个chunk可设为ro
+
+** btrfs_mapping_tree_free(btrfs_mapping_tree)
+   - 遍历btrfs_mapping_tree中的extent_map, 释放他们的空间
+   > lookup_extent_mapping(btrfs_mapping_tree->map_tree, 0, -1)
+   > remove_extent_mapping(btrfs_mapping_tree->map_tree, extent_map)
+   - 释放extent_map->bdev/map_lookup
+   > free_extent_map(extent_map)
+
+** btrfs_num_copies(btrfs_fs_info, logical, len)
+   - 检查btrfs中logical,len范围的数据多少个备份. 根据logical找一个extent_map
+   > lookup_extent_mapping(btrfs_fs_info->btrfs_mapping_tree, logical, len)
+   - 获取extent_map->map_lookup, 从map_lookup->type获取BTRFS_BLOCK_GROUP_属性, DUP/RAID1  => map_lookup->num_stripes, RAID10 => map_lookup->sub_stripes... 经过计算raid1和dup应该就是2..
+  
+** btrfs_full_stripe_len(btrfs_root, btrfs_mapping_tree, logical)
+   - 返回btrfs_root->sectorsize?
+
+** btrfs_is_parity_mirror(btrfs_mapping_tree, logical, len, mirror_num)
+   - RAID5/6使用
+
+** find_live_mirror(btrfs_fs_info, map_lookup, first, num, optimal, dev_replace_is_ongoing)
+   - 在map_lookup->btrfs_stripe_attr中找一个btrfs_device,遍历(first,num), 跳过replace的设备. map_lookup->btrfs_bio_stripe->bdev有效,就是有用的mirror
+
+*** 上面就是分配chunk
+
+** __btrfs_map_block(btrfs_fs_info, rw, logical, lenth, btrfs_bio, mirror_num, raid_map_ret)
+   - 创纪录, 400多行的代码, 发送bio请求
+   - (logical,length)是数据逻辑磁盘位置,它属于某个trunk,肯定不是整个trunk. mirror_num表示使用第几份mirror. 
+   - 根据btrfs_fs_info获取btrfs_mapping_tree/extent_map_tree, extent_map/map_lookup
+   > lookup_extent_mapping(btrfs_fs_info->btrfs_mapping_tree, logical, length)
+   - 提交bio时,以stripe_len为单位, 也就是map_lookup->stripe_len, 对于普通raid就是64k. 一次提交读写不能超过stripe_len. 计算各种位置,修改length, 
+   - chunk内部偏移offset
+   > offset = logical - extent_map->start
+   - 对齐到stripe_len  
+   > stripe_nr = offset / extent_map->stripe_len
+   > stripe_len是一个stripe的长度? 对于raid0有效?
+   - 计算stripe内部偏移
+   > stripe_offset = offset - stripe_len * stripe_nr
+   - 如果REQ_DISCARD, length不能超过extent_map的范围, length < extent_map->len - offset, 下面都会单独处理这种情况
+   - 如果是RAID/DUP,普通读写(非DISCARD), 数据必须在一个stripe内部. length < stripe_len - stripe_offset
+   - 其他情况, DISCARD或者非RAID,数据范围在一个chunk内. length < extent_map->len - offset
+   - 如果btrfs_bio无效,直接退出,这次调用用来修改length.
+   - 计算需要stripe的数量? stripe_len的数据对于raid0,是1个设备的数据块.
+   - 起始stripe是  stripe_nr_orig = stripe_nr
+   - 结束stripe是  stripe_nr_end = ( offset + length + stripe_len -1 ) / stripe_len
+   - stripe内部偏移, 开始是 stripe_offset, 结束是stripe_end_offset 
+   > stripe_end_offset = stripe_nr_end * stripe_len - (offset + length)
+   - 不同的RAID,读写的stripe数量不同(num_stripes),操作哪个stripe也不相同(stripe_index),下面会计算,对于读写,操作的数据不能超过1个stripe,当然可能写多份. 
+   - 对于RAID0, 如果是REQ_DISCARD, 可能会操作stripe, 这里也有限制, 不能超过map_lookup->num_stripes, 也就是每个设备只能DISCARD一次.  num_stripes = min(stripe_nr_end - stripe_nr_orig, map_lookup->num_stripes)
+   - 如果不是DISCARD, num_stripes肯定是1
+   - stripe_index = stripe_nr % map_lookup->num_stripes, stripe_nr /= num_stripes， 根据stripe_index,可以找到操作的设备, stripe_nr找到物理地址偏移
+   - 对于RAID1, 如果REQ_WRITE/REQ_DISCARD需要操作的stripe数量num_stripes = extent_map->num_stripes = 2, stripe_index=0, stripe_nr找到物理地址偏移
+   - 对于REQ_READ可以随便挑一个, num_stripes = 1, stripe_index = random()
+   - 对于DUP, 和RAID1相同
+   - 对于RADD10, 先把数据分成多个stripe, 每个stripe保存2份,先计算stripe_index = stripe_nr % (num_stripes / sub_stripes), 不知道他先分成多少stripe, 然后备份. stripe_index *= 2 
+   - 对于REQ_WRITE/REG_GET_READ_MIRRORS, 写2分  num_stripes = map_lookup->sub_stripes = 2
+   - 对于REQ_DISCARD, 不能超过map_lookup->num_stripes: min(sub_stripes * (stripe_nr_end - stripe_nr_orig), num_stripes)
+   - 对于REQ_READ, num_stripes = 1, stripe_index需要根据景象修改
+   - 对于普通的,还需要计算?
+   - map_lookup里面只有物理设备地址信息,它没有逻辑地址信息, stripe_len也是固定的.
+   - 上面计算了需要操作多少stripe, num_stripes, 根据他创建btrfs_bio
+   > btrfs_bio_size(num_stripes)
+   - 对于非DISCARD, 使用map_lookup->stripes[stripe_index]填充btrfs_bio->stripes[i], 都不需要考虑循环检查, 物理地址偏移是stripe_offset + stripe_nr * stripe_len, 物理地址偏移都是一样的,因为不会超过一个stripe.
+   - 对于DISCARD情况很复杂,它会操作多个stripe, 而且他需要长度
+   - 对于replace情况,更是复杂
+   - 这里只是创建btrfs_bio, 而且出时候btrfs_bio->btrfs_bio_stripe数组
+
+** btrfs_map_block(btrfs_fs_info, ...)
+   - 包装__btrfs_map_block(...)
+
+** btrfs_rmap_block(btrfs_mapping_tree, chunk_start, physical, devid, logical, naddr, stripe_len)
+   - chunk_start对应逻辑磁盘地址, physical/devid是物理地址, 返回对应的逻辑地址?
+   - 根据chunk_start找到extent_map, chunk_start必须是extent_map->start
+   > lookup_extent_mapping(extent_map_tree, chunk_start, 1)
+   - 计算chunk每个物理块的长度和chunk大小的比例data_stripe, DUP是1,RAID10是num_stripes/sub_strpes, RAID1是1,RAID0是num_stripes
+   > length /= data_stripes
+   - 遍历map_lookup里面的btrfs_bio_stripe, 如果参数devid有效,只考虑btrfs_bio_stripe->btrfs_device->devid和参数一样的. 然后比较btrfs_bio_stripe的范围是否覆盖参数phisical, (btrfs_bio_stripe->physical, length).
+   - 如果覆盖的话,计算对应的逻辑偏移, 物理块偏移是offset = physical - btrfs_bio_stripe->physical
+   - 对应的stripes数量是 offset / stripe_len, 直接忽略stripe内部偏移
+   - 对于RAID10/RAID0, 逻辑偏移需要改变,对于RAID0,偏移不需要改变. 
+   - 最后把逻辑地址放到数组中,而且去除重复的.
+
+** merge_stripe_index_into_bio_private(bi_private, stripe_index)
+   - bi_private是btrfs_bio指针,在指针后2为放入stripe_index.
+
+** extrace_stripe_index_from_bio_private(bi_private)
+   - 在指针的后2位放入stripe_index信息,最大是3吗??
+
+** btrfs_end_bio(bio, err)
+   - btrfs_bio是bio->bi_private, 同时屏蔽低2位
+   - 如果err有问题,增加btrfs_bio->error, 下面会处理.
+   - 减小btrfs_bio->stripes_pending, 如果减为0,应该是每个设备的bio都处理完成. 处理btrfs_bio->orig_bio
+   - 检查btrfs_bio->error, 如果超过btrfs_bio->max_errors, bio失败了.
+   - 恢复bio的信息, bi_private/bi_end_io/bi_bdev, 释放btrfs_bio, 完成这个bio   
+   > bio_endbio(bio, error)
+   > bio_put(...)
+
+*** 上面处理bio的映射
+
+** async_sched
+   #+begin_src 
+     bio bio
+     rw
+     btrfs_fs_info
+     btrfs_work   //这才是主要的
+   #+end_src
+
+** btrfs_schedule_bio(btrfs_root, btrfs_device, rw, bio)
+   - 如果rw不是写REQ_WRITE,就直接提交bio
+   > btrfsic_submit_bio(rw, bio)
+   - 对于写bio, 把它添加到btrfs_device->pending_sync_bios/pending_bios, 根据bio->bi_rw&REQ_SYNC.
+   - btrfs_queue_worker(btrfs_root->btrfs_fs_info->submit_workers, btrfs_device->work)
+
+** bio_size_ok(block_device, bio, sector_t)
+   - 使用request_queue的合并函数,检查bio的大小?
+   - 使用bvec_merge_data?
+   > request_queue->merge_bvec_fn(request_queue, bvec_merge_data, bio_vec)
+
+** submit_stripe_bio(btrfs_root, btrfs_bio, bio, phsical, dev_nr, rw, async)
+   - async和REQ_SYNC有什么区别?
+   - 包装bio, bi_private是btrfs_bio, bi_end_io是btrfs_end_bio
+   - bi_sector使用physical, bi_bdev是btrfs_device->block_device
+   - 如果是异步,REQ_WRITE给btrfs_fs_info的队列
+   > btrfs_schedule_bio(btrfs_root, btrfs_device, rw, bio)
+   - 如果是同步操作,就直接提交..
+   > btrfsic_submit_bio(rw, bio)
+
+** breakup_stripe_bio(btrfs_root, btrfs_bio, bio, btrfs_device, dev_nr, rw, async)
+   - bio中有内存数据, 把数据写回btrfs_device, 物理地址在btrfs_bio->btrfs_bio_stripe[dev_nr]中,为何不使用它的btrfs_device?
+   - 构造bio,获取可用的nr_vecs..最大支持..
+   > bio_get_nr_vecs(btrfs_device->block_device)
+   > btrfs_bio_alloc(btrfs_device, physical>>9, nr_vecs, GFP_NOFS)
+   - 把bio中的内存数据给新的bio, 每次处理一个bio_vec
+   > bio_add_page(bio, bio_vec->bv_page, bio_vec->bv_len, ..)
+   - 如果添加成功,继续添加,如果不成功就提交,再创建一个bio
+   > submit_stripe_bio(btrfs_root, btrfs_bio, bio, pyhsical, dev_nr, rw, async)
+   - 每次提交一个bio, 增加btrfs_bio->strings_pending, 在bio完成时,使用它判断原始的bio是否完成.
+
+** bbio_error(btrfs_bio, bio, logical)
+   - 处理btrfs_bio ...
+   > bio_endio(bio, -EIO)
+
+** btrfs_map_bio(btrfs_root, rw, bio, mirror_num, async_submit)
+   - 对于读写,每次只提交一个stripe,即使操作多个设备,对于每个设备也是连续的物理空间,只需知道其实物理偏移,操作的数据长度根据bio的内存数据而定.
+   - 对于DISCARD,bio中没有内存数据的长度,需要map_lookup->btrfs_bio_stripe里面记录操作长度.
+   - 创建btrfs_bio, 里面填充map_lookup, 逻辑地址映射之后的磁盘地址信息.
+   > btrfs_map_block(btrfs_fs_info, rw, logical, map_length, btrfs_bio, mirror_num, raid_map)
+   - map_length返回这次bio的数据长度, btrfs_bio里面只有物理地址信息. raid_map是raid5/raid6使用的. map_length不能小于bio->bi_size, 在提交bio时就过滤了?
+   - 下面处理具体的btrfs_bio->num_stripes, btrfs_bio_stripe, 这里每个stripe都要提交一边这个bio的内存数据..
+   - 首见检查每个设备的request_queue是否容纳一个bio?  这个bio是参数传进来的,针对这个设备的bio还没有创建.
+   > bio_size_ok(btrfs_device, bio, physical)
+   - 如果不能一次提交,就使用多次
+   > breakup_stripe_bio(btrfs_root, btrfs_bio, bio, btrfs_device, dev_nr, rw, async_submit)
+   > 如果能一次提交,就clone一个,但最有一个btrfs_bio_stripe就不clone了,省了一个.
+   > bio_clone(bio, GFP_NOFS)
+   > submit_stripe_bio(btrfs_root, btrfs_bio, bio, physical, dev_nr, rw, async_submit)
+   - 这里对最后一次的处理做了优化,如果能够一次提交,就不再clone, 只给使用原来的
+
+** btrfs_find_device(btrfs_fs_info, devid, uuid, fsid)
+   - 在btrfs_fs_devices->seed单链表中的btrfs_fs_devices->devices中,查找一个btrfs_device. 这里指定了具体的btrfs文件系统 btrfs_fs_info.
+   > __find_device(btrfs_fs_devices->devices, devid, uuid)
+
+** add_missing_dev(btrfs_root, devid, dev_uuid)
+   - 创建btrfs_device, 添加到btrfs_fs_devices->devices队列中,但设置btrfs_device->missing为1
+   - btrfs_device->bdev无效,增加btrfs_fs_devices->missing_devices
+
+** read_one_chunk(btrfs_root, btrfs_key, extent_buffer, btrfs_chunk)
+   - 这个函数是在mount的时候使用的,根据chunk tree的btrfs_chunk填充btrfs_fs_info->btrfs_mapping_tree. 读取一个btrfs_chunk, 
+   - extent_buffer/btrfs_chunk执行一个item, 它是btrfs_key执行的btrfs_chunk.
+   - btrfs_key->offset对应logical, btrfs_chunk->length是长度.
+   > btrfs_chunk_length(extent_buffer, btrfs_chunk)
+   - 现在extent_map_tree中找对应的extent_map
+   > lookup_extent_mapping(extent_map_tree, logical, -1)
+   - 如果找到extent_map已经函盖btrfs_chunk, 返回0. 否则创建一个
+   > alloc_extent_map()
+   - 获取btrfs_chunk->num_stripes, 创建map_lookup,给extent_map
+   > btrfs_chunk_num_stripes(extent_buffer, btrfs_chunk)
+   > map_lookup_size(num_stripes)
+   - 填充extent_map, (start,len)是逻辑地址, (block_start, block_len)是(0, len), 然后填充map_lookup, 从btrfs_chunk中获取数据. 遍历btrfs_chunk->btrfs_io_stripe数组, 获取物理地址,devid,uuid, 这里创建了btrfs_device, 从设备中读取信息,填加到btrfs_fs_devices管理中.
+   > btrfs_find_device(btrfs_fs_info, devid, uuid, NULL)
+   - 如果没找到,就麻烦了. 它不会创建或打开对应的设备. 如果mount不支持degraded,退出,返回-EIO..  如果支持degrade, 但没有找到,就添加一个missing设备
+   > add_missing_dev(btrfs_root, devid, uuid)
+   > add_extent_mapping(extent_map_tree, extent_map)
+   - 设置btrfs_device->in_fs_metadata, 它在当前处理的btrfs_fs_info中.
+   - 在遍历btrfs_chunk之前,处理chunk tree时,应该先处理了btrfs_dev_item, 先创建btrfs_fs_info使用的设备信息. 所以这里找不到,不再处理.
+
+** fille_device_from_item(extent_buffer, btrfs_dev_item, btrfs_device)
+   - 从btrfs_dev_item中获取数据填充btrfs_device
+   
+** open_seed_devices(btrfs_root, fsid)
+   - seed是把一个文件系统作为原型,在它的基础上进行修改,修改时不会使用它的设备,只能填加新的设备,把改动放写到新的设备上.
+   - 在什么时候创建btrfs_fs_devices->seed队列? 
+   - 为btrfs_root->btrfs_fs_info打开一个seed设备,什么是seed设备?? seed设备就像是一个文件系统中只读的几块设备,可以递归seed. 而且在mount时seed设备不可缺少. 用法很简单[[https://btrfs.wiki.kernel.org/index.php/Talk:Seed-device][usage]],[[http://kerneltrap.org/mailarchive/git-commits-head/2009/1/9/4676924/thread][patch]]. 打开一个btrfs_fs_devices, 不仅仅是一个设备, 把它放到btrfs_root->btrfs_fs_info的seed队列中
+   - 首先遍历btrfs_fs_devices->seed队列,查找fsid对应的btrfs_fs_devices
+   > find_fsid(fsid)
+   - clone一个,记录设备的uuid/devid/fsid等信息. clone是深度复制,新的btrfs_fs_devices和原来的没有任何关系,只有有相同的静态信息.
+   > clone_fs_devices(btrfs_fs_devices)
+   - 打开设备,获取btrfs_device->block_device, 检查设备中的btrfs_super_block, 但是不会初始化btrfs_device的空间信息.
+   > __btrfs_open_devices(btrfs_fs_devices, FMODE_READ, btrfs_fs_info->bdev_holder)
+   - 在打开每个设备的btrfs_super_block时,会检查btrfs_super_block->flags的BTRFS_SUPER_FLAG_SEEDING, 如果有一个设备没有seed, 则整个btrfs_fs_devices就不是seed设备.
+   - 如果btrfs_fs_devices->seeding无效,操作失败,这里要处理的是seed设备.
+   - 把btrfs_fs_devices添加到btrfs_fs_info->btrfs_fs_devices->seed队列中. btrfs_fs_info->btrfs_devices没有改变,只是加大了seed链表长度.
+   - 在向seed文件系统中添加设备,构造新的文件系统时,是把原文件系统(seed系统)添加到seed链表中,把btrfs_fs_info->btrfs_fs_devices重值,管理新的设备.
+   - 所以btrfs_fs_info->btrfs_fs_devices管理可读写磁盘,seed链表管理seed设备.
+   - btrfs_fs_devices可能存在于某个seed队列中,但是它已经不能写数据. seed设备怎么使用?
+
+** read_one_dev(btrfs_root, extent_buffer, btrfs_dev_item)
+   - 处理chunk tree的btrfs_dev_item, 填充btrfs_devices的空间系统, reada,设置btrfs_device->in_fs_metadata, 表示改设备在当前文件系统中.
+   - 从chunk tree中读出了btrfs_dev_item,根据uuid/fsid,devid找到btrfs_device
+   > btrfs_find_device(btrfs_root->btrfs_fs_info, devid, uuid, fsid) 
+   - 如果找不到,而且支持degrade, 添加missing设备..
+   - add_missing_dev(btrfs_root, devid, dev_uuid)
+   - 这里没有设备的路径信息,也无法通过uuid去找设备,只能添加missing设备.
+   - 如果btrfs_device->btrfs_fs_devices不是btrfs_fs_info->btrfs_fs_devices, 这个设备应该是一个seed设备, btrfs_device->writeable必须为0, 没定其他成员表示它是seed设备!
+   > btrfs_device_generation(extent_buffer, btrfs_dev_item)
+   - btrfs_dev_item的generation必须是btrfs_device->generation, 表示设备没有变化? 否则失败返回.
+   - 从btree中获取设备信息,填充btrfs_device
+   > fill_device_from_item(extent_buffer, btrfs_dev_item, btrfs_device)
+   - 设置btrfs_device->btrfs_root为btrfs_fs_info->dev_root, (为何不是chunk tree), 如果它是可写,更新空间属性, btrfs_fs_device->total_rw_bytes/btrfs_fs_info->free_chunk_space
+
+** btrfs_read_sys_array(btrfs_root)
+   - 创建一个extent_buffer, 逻辑空间是固定的(BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE), 这是btrfs_super_block的逻辑地址, 它和磁盘上的物理地址不一样? 使用btrfs_fs_info->btrfs_inode的address_space.. 而且分配page.
+   > btrfs_find_create_tree_block(btrfs_root, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE) 
+   - 把btrfs_fs_info->btrfs_super_block数据写进去
+   > write_extent_buffer(extent_buffer, btrfs_fs_info->btrfs_super_block, 0, BTRFS_SUPER_INFO_SIZE)
+   - 遍历btrfs_super_block->sys_chunk_array
+   > read_one_chunk(btrfs_root, btrfs_key, btrfs_suepr_block, btrfs_chunk)
+   - 根据chunk array中的btrfs_chunk创建对应的extent_map, 这里没有创建btrfs_block_group_cache
+   - 最后直接释放上面的extent_buffer?
+
+** btrfs_read_chunk_tree(btrfs_root)
+   - 读取btrfs_root->btrfs_fs_info->chunk_root的信息, 遍历所有的dev_item和chunk_item节点..构造btrfs_key(BTRFS_DEV_ITEMS_OBJECTID, 0, 0)
+   > btrfs_search_slot(NULL, chunk_root, btrfs_key, btrfs_path, 0, 0)
+   - 读取每个节点,如果btrfs_key->objectid是BTRFS_DEV_ITEMS_OBJECTID, 处理dev_item
+   - 操作已经打开的设备, 怎么找到这些设备?
+   > read_one_dev(btrfs_root, extent_buffer, btrfs_dev_item)
+   - 创建btrfs_mapping_tree
+   > read_one_chunk(btrfs_root, btrfs_key, extent_buffer, btrfs_chunk)
+
+** btrfs_init_dev_stats(btrfs_fs_info)
+   - 处理dev tree中的state节点(0, BTRFS_DEV_STATS_KEY, devid), btrfs_dev_stats_item
+
+** stat相关
+
+** 总结
+   - 这个文件对外的导出的功能并不多
+   - 根据设备路径打开块设备,创建fs_uuid队列, 在mount时通过device option指定设备名称
+   - 打开fs_uuid中的设备,仅仅初始化btrfs_device的设备信息, seed/writeable/discard
+   - 操作chunk tree, 读取btrfs_dev_item和btrfs_chunk, 填充btrfs_device的空间信息,建立btrfs_mapping_tree. 这里没有操作btrfs_block_group_cache, 在后面的文件系统初始化中去extent_tree中获取信息建立btrfs_block_group_cache.
+   - balance操作, 使用relocate实现, 为文件系统添加新设备.
+   - 分配chunk, 这是最重要的, 建立btrfs_chunk, btrfs_dev_extent,以及btrfs_block_group_cache信息.
+   - 为bio建立映射信息,并为每个映射的磁盘发送单独的bio请求.

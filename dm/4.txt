@@ -1,0 +1,720 @@
+dm-log
+
+dm_dirty_log
+  dm_dirty_log_type *type
+  flush_callback_fn(dm_target)
+  context
+
+dm_dirty_log_type
+  char name
+  module module
+
+  list_head  list
+  ctr(dm_dirty_log, dm_target, argc, argv)
+  dtr(dm_dirty_log )
+
+  presuspend(dm_dirty_log)
+  postsuspend(dm_dirty_log)
+  resume(dm_dirty_log)
+
+  #获取region的大小???
+  get_region_size(dm_dirty_log)
+
+  is_clean(dm_dirty_log, region_t)
+
+
+
+* __find_dirty_log_type(name)
+  # 所有的dm_dirty_log_type都在_log_types队列中,以模块形式存在.
+
+* get_type(name)
+  #获取dm_dirty_log_type
+
+log_header_disk
+  magic # MiRr
+  version  #只增
+  nr_regions
+
+log_c
+  dm_target
+  touched_dirtied
+  touched_cleaned
+  flush_failed
+  region_size
+  region_count
+  sync_count
+
+  bitset_uint32_count
+  clean_bits
+  sync_bits
+  recovering_bits
+
+  int sync_search
+
+  enum sync
+    DEFAULTSYNC
+    NOSYNC,
+    FORCESYNC
+
+  dm_io_request
+
+  log_dev_failed
+  log_dev_flush_failed
+  dm_dev log_dev
+  log_header_core  header
+
+  #disk log
+  dm_io_region header_location
+  log_header_disk disk_header
+
+
+* rw_header(log_c, rw)
+  > dm_io(log_c->dm_io_request, 1, log_c->dm_io_region, NULL)
+
+* flush_header(log_c)
+  #这里的io完全使用dm-io..创建一个dm_io_region,仅仅表示某个设备.   dm_io_region.block_device = log_c->dm_io_region.block_device, sector=0.. 为何不直接使用log_c->dm_io_region?? 设置log_c->dm_io_request.bi_rw = WRITE_FLUSH.. 因为dm_io_region有位置??所以不能使用..
+  > dm_io(...
+
+* read_header(log_c)
+  > header_from_disk(log_c->log_header_core, log_c->log_header_disk
+
+* create_log_context(dm_dirty_log, dm_target, int argc, argv, dm_dev)
+  # argv好像是用户态传进来的参数..使用dm_dev作为log设备?? 计算region_size, region_count,它们的乘积是dm_target->len.  dm_dev是否有效决定了log是基于disk,还是基于mem.  clean_bits是bitmap,每一位表示一个region.  如果是基于disk,需要计算位图能否在disk中存储,存储位置.. 需要向磁盘存储的数据是log_header_disk,还有bitmap,这些信息使用vmalloc存储,创建dm_io_request, 类型是DM_IO_VMA, 还有dm_io_region, 位置是0.  然后是sync_bits,代表sync_bits?? sync和clean什么区别?? recovering_bits, 那些和clean_bits同样大..
+
+* disk_ctr(dm_dirty_log, dm_target, argc, argv)
+  > dm_get_device(dm_target, argv[0], dm_table_get_mode(dm_target->dm_table), dm_dev)
+  > create_log_context(log_c, dm_target, ...)
+
+
+log太简单了,而且只有raid1/mirror使用它..下面看看snapshot
+
+dm_exception_table
+  hash_mask
+  hash_shift
+  list_head  table
+
+dm_snapshot
+  rw_semaphore  lock
+  dm_dev origin
+  dm_dev cow
+  dm_target ti
+
+  list_head  list
+  valid
+
+  active
+
+  pending_exceptions_count
+
+  pending_pool
+
+  dm_exception_table  pending
+  dm_exception_table  complete
+
+  pe_lock
+
+  tracked_chunk_lock
+  hlist_head tracked_chunk_hash[DM_TRACED_CHUNK_HASH_SIZE]
+
+  dm_exception_store  store
+
+  dm_kcopyd_client kcopyd_client
+
+  state_bits
+
+  first_merging_chunk
+  num_merging_chunks
+
+  merge_failed
+
+  bio_list  bios_queued_during_merge
+
+chunks of disk of size: 32k-512k
+
+下面数据结构用于old_chunk代替new_chunk, COW device
+dm_exception
+  list_head hash_list
+  old_chunk, new_chunk
+
+dm_exception_store_typ
+  name
+  module
+
+  ctr(dm_exception_store, argc, argv)
+  dtr(dm_exception_store)
+
+  read_metadata(dm_exception_store, callback, callback_context)
+
+  prepare_exception(dm_exception_store, dm_exception)
+
+  commit_exception(dm_exception_store, dm_exception, callback, callback_context)
+
+  prepare_merge(dm_exception_store, last_old_chunk, last_new_chunk)
+
+  commit_merge(dm_exception_store, nr_merge)
+
+  drop_snapshot(dm_exception_store)
+  status(dm_exception_store, status, result, maxlen)
+
+  usage(dm_exception_store, total_sectors, sectors_allocated, metadata_sectors)
+
+dm_exception_store
+  dm_exception_store_type type
+  dm_snapshot snap
+  chunk_size, chunk_mask, chunk_shift
+  context
+
+dm_snap_pending_exception
+  dm_exception e  #嵌套
+
+  bio_list origin_bios
+  bio_list snapshot_bios
+
+  dm_snapshot snap
+
+  started
+
+  bio  full_bio  #指针..
+  bio_end_io_t full_bio_end_io
+  void * full_bio_private
+
+
+#上面已经有太多的数据结构. 这里先看exception
+
+* __find_exception_store_type / get
+  #所有的dm_exception_store_type都放在_exception_store_types队列中
+
+* set_chunk_size(dm_exception_store, char chunk_size, error)
+  # 通过参数设置dm_exception_store->chunk_size, 调用下面的函数
+  > dm_exception_store_set_chunk_size(dm_exception_store, chunk_size, error)
+
+* dm_exception_store_set_chunk_size(dm_exception_store, chunk_size, error)
+  > dm_snap_cow(dm_exception_store->snap)
+    #获取cow??
+  > bdev_logic_block_size(bock_device)
+    #获取request_queue->queue_limits.logical_block_size.
+  > dm_snap_origin(dm_exception_store->snap)
+    # 还要检测origin bdev, chunk_size需要是两个dev的logic_block_size的倍数..  设置chunk_size, chunk_mask是chunk_size-1, chunk_shift是log(chunk_size)
+
+* dm_exception_store_create(dm_target, argc, argv, dm_snapshot, args_usued, dm_exception_store)
+  # 创建dm_exception_store., argv[0]是"P"或"N", 对应persistent/transient
+  > get_type("P")
+    #哪里注册的这种类型?? 什么意义?? 设置dm_exception_store_type/dm_snapshot
+  > set_chunk_size(dm_exception_store, argv[1], dm_target)
+  > dm_exception_store_type->ctr(dm_exception_store, 0, NULL)
+
+* dm_exception_store_init()
+  # 这个模块就完成了,这里注册两种dm_exception_store_type
+  > dm_transient_snapshot_init()
+  > dm_persistent_snapshot_init()
+
+还是得看看相关的实现文件
+dm-snap-persistent.c
+COW设备的第一chunk保存header,然后是exception metadata..
+
+disk_header
+  magic #SnAp
+  valid
+  version
+  chunk_size
+
+disk_exception
+  old_chunk
+  new_chunk
+
+commit_callback
+  callback(void, success)
+  context
+
+
+pstore
+  dm_exception_store  store
+  version, valid
+  exceptions_per_area
+
+  area  #什么内存
+
+  zero_area  #zero area??
+
+  header_area  #header_area??
+
+  chunk_t current_area  ?
+
+  next_free
+
+  current_committed  #index
+
+  pending_count
+  callback_count
+  commit_callback
+  dm_io_client io_client
+
+  workqueue_struct  metadata_wq
+
+* alloc_area(pstore)
+  #准备pstore的内存,包括area/zero_area/header_area,长度都一样, pstore->dm_exception_store->chunk_size
+
+
+mdata_req
+  dm_io_region  where #磁盘位置
+  dm_io_request  io_req #io内存数据
+  work_struct  work  #异步工作
+  int result
+
+* do_metadata(work_struct)
+  上面的work_struct的回调函数, 从work_struct获取mdata_req
+  > dm_io(mdata_req->dm_io_request, 1, mdata_req->dm_io_region, NULL)
+
+* chunk_io(pstore, area, chunk_t, rw, metadata)
+  #操作area数据?? 构造dm_io_region, block_dev是cow设备, 位置是chunk_t个dm_exception_store->chunk_size,大小是chunk_size,就一个chunk??
+  > dm_snap_cow(pstore->dm_exception_store->snap / dm_dev)->block_device
+  #io数据是area, 使用DM_IO_VMA方式. dm_io_client..
+  > dm_io(dm_io_request, 1, dm_io_region, NULL)
+    #如果不是metadata数据,使用当前进程操作,否则使用work_queue,构造mdata_req, 工作函数do_metadata
+  > queue_work(pstore->metadata_wq, mdata_req->work_struct)
+  > flush_work(mdata_req->work_struct)
+    #也是同步的操作..
+
+* area_location(pstore, area)
+  # 把area索引映射到chunk索引?? 包括NUM_SNAPSHOT_HDR_CHUNKS,也就是1个chunk, (pstore->exceptions_per_area+1) * area
+
+* area_io(pstore, rw)
+  #操作pstore->current_area数据?? 但是内存数据是pstore->area
+  > area_location(pstore, pstore->current_area)
+  > chunk_io(pstore, pstore->area, chunk, rw, 0)
+
+* zero_memory_area(pstore)
+  #清空pstore->area
+
+* zero_disk_area(pstore, chunk_t)
+  # 清空磁盘中的一个chunk
+  > chunk_io(pstore, pstore->zero_area, area_location(pstore, area), WRITE, 0)
+
+* read_header(pstore, new_snapshot)
+  #读回snapshot设备的header?? 如果pstore->dm_exception_store->chunk_size没有设置,先设置一个, 这里取一个最大值,不超过16k,
+  > bdev_logic_block_size(block_device)
+  # 创造dm_io_client
+  > dm_io_client_create()
+  > alloc_area(pstore)
+    #读回header数据,就是disk_header
+  > chunk_io(pstore, pstore->header_area, 0, READ,1)
+    #如果chunk_size不一样,必须重新设置所有的area..
+  > free_area(pstore)
+  > dm_exception_store_set_chunk_size(pstore->dm_exception_store, chunk_size, chunk_err)
+  > alloc_area(pstore)
+
+* write_header(pstore)
+  # 写回pstore->header_area, 但这里的确没有什么东西..主要是chunk_size
+  > chunk_io(..)
+
+* get_exception(pstore, index)
+  # area是一些disk_exception, 这里返回第index个, 这个area中包含exceptions_per_area个..
+  > pstore->area + index
+
+core_exception
+  old_chunk, new_chunk
+
+* read_exception(pstore, index, core_exception)
+  # 从pstore管理的area中获取第index个core_excpetion给core_exception.. 在上面的函数中是disk_exception,这里要进行转换..
+
+* write_exception(pstore, index, core_exception)
+  # 把core_exception给disk_exception
+
+* clear_exception(pstore, index)
+
+* insert_exceptions(pstore, callback, callback_context, full)
+  # 遍历pstore->area上的所有core_exception, 检查core_exception->new_chunk. 如果disk_exception->new_chun = 0,特殊情况.. 同时更新pstore->next_free 为最大的core_exception->new_chunk
+  > callback(callback_context, core_exception->old_chunk, core_exception->new_chunk)
+  # 如果遇到new_chunk为0,说明这个core_exception为空先,对应的area也就没有使用完..
+
+* read_exceptions(pstore, callback, callback_context)
+  #在pstore底层的读回一系列area,直到遇到没有使用的core_exception. 根据pstore->current_area表示当前处理的area
+  > area_io(pstore, READ)
+  > insert_exceptions(pstore, callback, callback_context, full)
+
+* get_info(dm_exception_store)
+  # 返回dm_exception_store->context, 这是pstore
+
+* persistent_read_metadata(dm_exception_store, callback, callback_context)
+  # 某个回调函数, 读回header,获取chunk_size, 计算exceptions_per_area,
+  > read_header(pstore, new_snapshot)
+  > dm_vcalloc(pstore->exceptions_per_area, sizeof(pstore->callbacks))
+    # 每个disk_exception有一个commit_callback??? 准备好header,写回去,初始化current_area, 而且把对应的chunk清空??
+  > write_header(pstore)
+  > zero_disk_area(pstore, 0)
+  > read_exceptions(pstore, callback, callback_context)
+    #如果设备不是新的,读回已有的core_exception
+
+* persistent_prepare_exception(dm_exception_store, dm_exception)
+  # disk_exception的索引是以chunk为单位的... 这里应该是要建立一个新的dm_exception, new_chunk使用pstore->next_free, pstore->pending_count??
+
+* persistent_commit_exception(dm_exception_store, dm_exception, callback, callback_context)
+  # 提交dm_exception, 把它写到area中..callback数据放到pstore->callbacks队列中.  检查pstore->current_committed是exceptions_per_area, area已经满了,先清空下一个area..
+  > zero_disk_area(pstore, pstrore->current_area+1)
+  > area_io(pstore, WRITE_FLUSH_FUA)
+    #最后调用每个disk_exception的callback
+  > pstore->callbacks[](...)
+
+* persistent_prepare_merge(dm_exception_store, last_old_chunk, last_new_chunk)
+  # 如果current_area没有可用的dm_exception,current_committed=0, 使用前一个area..
+  > area_io(pstore, READ)
+  > read_exception(pstore, pstore->current_committed-1, core_exception)
+    #读回最后一个dm_exception,然后倒序遍历area上面所有dm_exception,检查是否和最后一个dm_exception的old/new_chunk连续..
+
+* persistent_commit_merge(dm_exception_store, nr_merged)
+  # 上面函数merge了nr_merged的chunk,这里先把他们在area中清空, 然后刷新metadata, 最后更新pstore->next_free.
+  > clear_exception(pstore, index)
+  > area_io(pstore, WIRTE_FULSH_FUA)
+
+* persistent_drop_snapshot(dm_exception_store)
+  # 删除snap, 设置pstore->valid为0.., 写回到snap_header中..
+  > write_header(pstore)
+
+* persistent_ctr(dm_exception_store, argc, argv)
+  # 创建pstore?? 实现太懒了，直接把参数传递到这里..  初始化pstore,创建workqueue, 把它给dm_exception_store->context
+
+上面这些函数就是一种dm_exception_store_type
+
+
+================================
+dm-snap.c
+
+dm_snap_tracked_chunk
+  hlist_node node
+  chunk_t chunk
+
+* init_tracked_chunk(bio)
+  # 新型的bio??  dm_snap_tracked_chunk嵌套了dm_target_io, 嵌套了bio..,  初始化dm_snap_tracked_chunk->hlist_node
+  > dm_per_bio_data(bio, sizeof(dm_snap_tracked_chunk))
+
+  --->+----------------------------------+
+      | dm_snap_traced_chunk             |
+      |                                  |
+      +----------------------------------+
+      | dm_target_io                     |
+      |                                  |
+      |                                  |
+      |                                  |
+      |                                  |
+      |+--------------------------------+|
+      || bio                            ||
+      |+--------------------------------+|
+      +----------------------------------+
+
+* is_bio_tracked(bio)
+  #通过hlist_node检查,如果他在hlist队列中就是tracked..
+
+* track_chunk(dm_snapshot, bio, chunk)
+  #把bio添加到dm_snpashot的hash队列中,奇怪直接使用bio管理dm_excpetion?? 设置dm_snap_tracked_chunk->chunk, 把它加到dm_snapshot->tracked_chunk_hash队列中..
+
+* stop_tracking_chunk(dm_snapshot, bio)
+  # 从hash队列中删除..
+
+* __chunk_is_tracked(dm_snapshot, chunk_t)
+  # 检查这个chunk是否在hash队列中, 遍历对应的hash链表,检查是否有一个dm_snap_tracked_chunk,使用对应的chunk_t..  dm_snapshot->tracked_chunk_hash
+
+origin
+  block_device bdev 
+  list_head hash_list  
+  list_head snapshots   #origin还有多个snapshot..
+
+origin是什么东西,所有的对象在_origins hash表中,根据dev_t计算hash值..
+
+* __find_snapshots_sharing_cow(dm_snapshot snap, dm_snapshot snap_src, dm_snapshot snap_dest, dm_snapshot snap_merge)
+  # 在参数1 dm_snapshot的src,dest,merge等snapshot??
+  > __lookup_origin(dm_snapshot->origin->bdev)  
+    # 根据block_device->dev_t查找对应的origin, origin->snapshots队列上面是dm_snapshot, dm_target->target_type->name是snapshot-merge的snapshot就是merge snapshot?? 这个target_type是哪里注册的??
+  > dm_target_is_snapshot_merge(dm_snapshot->dm_target)
+    # 这里要找的dm_snapshot->cow->bdev和dm_snapshot->cow->bdev..  这里的dm_snapshot->active / src / dest是什么意义??
+
+* __validate_exception_handover(dm_snapshot)
+  # 验证是什么??
+  > __find_snapshots_sharing_cow(dm_snapshot, ...)
+  
+* __insert_snapshot(origin, dm_snapshot)
+  # 在origin->snapshots队列中dm_snapshot根据chunk_size排序.
+
+* register_snapshot(dm_snapshot)
+  # 先创建一个origin
+  > __validate_exception_handover(dm_snapshot)
+  > __lookup_origin(dm_snapshot->origin->block_device)
+  > __insert_snapshot(origin, dm_snapshot)
+
+* dm_exception_table_init(dm_exception_table, size, hash_size)
+  # 初始化dm_exception_table, hash_shift/hash_mask应该是用于计算hash key. dm_exception_table->table就是hash表, 但是hash链使用list_head
+
+* dm_exception_table_exit(dm_exception_table, kmem_cache)
+  # dm_exception_table->table的每个链表上面是dm_exception, 释放这些dm_exception. dm_exception就是disk_exception,但是包含list_head
+  
+* exception_hash(dm_exception_table, chunk)
+  # 计算hash key..  chunk>>dm_exception_table->hash_shift & dm_exception_table->hash_mask..  使用中间几位..
+
+* dm_lookup_exception(dm_exception_table, chunk)
+  # 在dm_exception_table中找一个dm_exception, 它的chunk_old满足一定的条件,不一定等于chunk.  chunk高8位表示dm_exceptio的大小,所以需要chunk在(old_chunk, old_chunk+chunk_size)范围中.
+  > dm_consective_chunk_count(dm_exception)
+
+* alloc_completed_exception(void)
+  # 分配一个dm_exception, 使用exception_cache这个内存管理的东西..
+
+* alloc_pending_exception(dm_snapshot)
+  # 这个代表一个dm_exception?  使用dm_snapshot->pending_pool管理内存..
+
+* free_pending_exception(dm_snap_pending_exception)
+
+* dm_insert_exception(dm_exception_table, dm_exception)
+  # 把dm_exception插入到dm_exception_table中对应的hahs链中. hash链根据dm_exception->old_chunk排序,而且插入时碰到挨着的要合并. 函数中合并的地方没有处理好前和并的情况.. 合并还是很简单,判断是根据new_chunk/old_chunk/chunk_size, 合并也是修改这3个值.
+
+* dm_add_exception(context, old, new)
+  # 构造一个新的dm_exception, context是dm_snapshot, 把它插入到dm_snapshot->complete中
+  > dm_insert_exception(dm_snapshot->complete, dm_exception) 
+
+* __mininum_chunk_size(origin)
+  # origin->snapshots是一些dm_snapshot,  返回它们其中chunk_
+size最小的..   dm_snapshot->pstore->chunk_size
+
+* init_hash_tables(dm_snapshot)
+  # 初始化dm_snapshot->complete / dm_exception_table 的hash队列. 首先计算hash_size, 也就是hash数组的长度, 然后是dm_snapshot->pending
+
+* merge_shutdown(dm_snapshot)
+  # 等待dm_snapshot->state_bits的RUNNING_MERGE位
+
+* __release_queued_bios_after_merge(dm_snapshot)
+  # 清除dm_snapshot的相关属性, first_merging_chunk / num_merging_chunks, 然后返沪一个bio??  merge是使用bio完成的..
+  > bio_list_get(dm_snapshot->bios_queued_during_merge)
+
+* __remove_single_exception_chunk(dm_snapshot, old_chunk)
+  # 找到一个dm_exception, 检查dm_exception中chunk数量,如果只包含一个chunk,直接删除它
+  > dm_lookup_exception(dm_snapshot->complete, old_chunk)
+  > dm_consecutive_chunk_count(dm_exception)
+  > dm_remove_exception(dm_exception)
+    #如果chunk数量不是1,就需要修改dm_exception,这个过程在合并,是有顺序的,chunk不可能在中间..
+
+* remove_single_exception_chunk(dm_snapshot)
+  # 释放一些chunk的dm_exception, 起始位置dm_snapshot->first_merging_chunk, 数量是dm_snapshot->num_merging_chunks
+  > __remove_single_exception_chunk(dm_snapshot, old_chunk)
+  > __release_queued_bios_after_merge(dm_snapshot)
+  > flush_bios(bio)
+    # 看来这3个参数是对应的..
+
+* snapshot_merge_next_chunks(dm_snapshot)
+  > dm_snapshot->dm_exception_store->dm_exception_store_type->prepare_merge(dm_snapshot->dm_exception_store, old_chunk, new_chunk)
+    # 获取一个chunk, 返回的是什么??长度? old_chunk需要偏移?? 构造两个dm_io_region,分别对应origin和cow磁盘
+  > read_pending_exceptions_done_count()
+  > origin_write_extent(dm_snapshot, dm_io_region->sector, iosize)
+    # 实现在下面,写回到origin磁盘??  设置dm_snapshot->first_merging_chunk / num_merging_chunks, 最后等待track??
+  > __check_for_conflicting_io(dm_snapshot, old_chunk+i)
+  > dm_kcopyd_copy(dm_snapshot->kcopyd_client, dm_io_region, 1, dm_io_region, 0, merge_callback, dm_snapshot)
+
+* merge_callback(read_err, write_err, context)
+  # context是dm_snapshot,数据搬运完后的回调函数
+  > dm_snapshot->dm_exception_store->dm_exception_store_type->commit_merge(dm_snapshot->dm_exception_store, dm_exception->num_merging_chunks)
+  > remove_single_exception_chunk(dm_snapshot)
+
+* start_merge(dm_snapshot)
+  # 检查dm_snapshot->state_bits中的RUNNING_MERGE标志,表示merge过程
+  > snapshot_merge_next_chunks(dm_snapshot)
+
+* stop_merge(dm_snapshot)
+  * 设置dm_snapshot->state_bits的SHUTDOWN_MERGE, 等待RUNNING_MERGE
+
+#真的东西, 创建一个snapshot设备.  origin_dev, cow_DEV, P/N, chunk_size
+* snapshot_ctr(dm_target, argc, argv)
+  # dm_target已经创建,为何不是mapped_device?? 它的target_type是snapshot, 下面的判断是dm_target->target_type->name = "snapshot..." 难道还有其他的snapshot的target_type??
+  > dm_target_is_snapshot_merge(dm_target)
+    # 创建dm_snapshot, 参数队列中第一个参数是origin_path,
+  > dm_get_device(dm_target, origin_path, origin_mode, dm_snapshot->dm_dev)
+    # 第二个参数是cow路径..
+  > dm_get_device(dm_target, cow_path, dm_table_get_mode(dm_target->dm_table), dm_snapshot->cow)
+  > dm_exception_store_create(dm_target, argc, argv, dm_snapshot, args_used, dm_snapshot->dm_exception_store)
+    #上面是创建dm_exception_store, 然后初始化dm_snapshot, complete/pending两个dm_exception的队列
+  > init_hash_tables(dm_snapshot)
+    #kcopyd属性,和pending_pool, 这是什么对象?? bio?
+  > dm_kcopyd_client_create()
+    # tracked_chunk_hash是内嵌的数组
+  > INIT_HLIST_HEAD(dm_snapshot->tracked_chunk_hash[])
+  > register_snapshot(dm_snapshot)
+    # 全局使用origin管理所有的snapshot. 下面是把已有的dm_exception放到complete队列中
+  > dm_snapshot->dm_exception_store->dm_exception_store_type->read_metadata(dm_snapshot->dm_exception_store, dm_add_exception, dm_snapshot)
+  > dm_set_target_max_io_len(dm_target, chunk_size)
+
+* __handover_exceptions(dm_snapshot src, dm_snapshot dest)
+  # 交换两个dm_snapshot的 complete / dm_exception_table, store / dm_exception_store, 
+
+* snapshot_dtr(dm_target)
+  # 释放dm_target中的dm_snapshot, dm_target->private
+
+* flush_bios(bio)
+  # bio是链表
+  > generic_make_request(bio)
+
+* retry_origin_bios(dm_snapshot, bio)
+  # 还是写origin设备??
+  > do_origin(dm_snapshot->origin, bio)
+  > generic_make_request(bio)
+
+* __invalidate_snapshot(dm_snapshot, err)
+  > dm_snapshot->dm_exception_store->dm_exception_store_type->drop_snapshot(dm_snapshot->dm_exception_store)
+  > dm_table_event(dm_snapshot->dm_target->dm_table)
+
+* pending_complete(dm_snap_pending_exception, success)
+  # 创建dm_exception,  这就是一个回调函数,处理dm_snap_pending_exception
+  > alloc_completed_exception()
+  > __check_for_conflicting_io(dm_snapshot, dm_snap_pending_exception->dm_exception->old_chunk)
+  > dm_insert_exception(dm_snapshot->dm_exception_table / complete, dm_exception)
+  > dm_remove_exception(dm_snap_pending_exception->dm_exception->old_chunk)
+    # 最后处理dm_snap_pending_exception的snapshot_bios, origin_bios, full_bio, 最后一个是什么??
+  > bio_endio(full_bio, 0)
+  > flush_bios(snapshot_bios)
+  > retry_origin_bios(dm_snapshot, origin_bios)
+
+* commit_callback(context, success)
+  > pending_complete(dm_snap_pending_exception, success)
+
+* copy_callback(readerr, writeerr, context)
+  # 如果有错,直接返回错误,否则使用回调方式
+  > pending_complete(dm_snap_pending_exception, 0)
+  > dm_snapshot->dm_exception_store->dm_exception_store_type->commit_exception(dm_snapshot->dm_exception_store, dm_exception, commit_callback, dm_snap_pending_exception)
+
+* start_copy(dm_snap_pending_exception)
+  # 开始kcopyd任务,建立两个dm_io_region ..
+  > dm_kcopyd_copy(dm_snapshot->kcopyd_client, dm_io_region, ...)
+
+* full_bio_end_io(bio, error)
+  # 原来full_bio是搬运的..  bio->bi_private是kcopyd对象..
+  > dm_kcopyd_do_callback(callback_data, 0, erro)
+
+* start_full_bio(dm_snap_pending_exception, bio)
+  #bio给dm_snap_pending_exception->full_bio, 保存bio->bi_end_io/bi_private, callback_data是kcopyd准备的工具
+  > dm_kcopyd_prepare_callback(dm_snapshot->kcopyd_client, copy_callback, dm_snap_pending_exception)
+    # 再修改bio, bi_end_io是full_bio_end_io,出发kcopyd任务..
+  > generic_make_request(bio)
+    #这里应该是bio出发kcopyd, kcopy回调处理dm_snap_pending_exception, 然后处理dm_exception
+
+* __lookup_pending_exception(dm_snapshot, chunk_t)
+  # 在dm_snapshot->pending中找一个dm_exception, 这个dm_exception是dm_exception.. 经过bio处理,他会移动到dm_snapshot->complete队列上..
+  > dm_lookup_exception(dm_snapshot->pending, chunk)
+
+* __find_pending_exception(dm_snapshot, dm_snap_pending_exception, chunk)
+  # 这个函数应该是为创建dm_snap_pending_exception准备的, 如果找到就返回找到的
+  > __lookup_pending_exception(dm_snapshot, chunk)
+  > dm_snapshot->dm_exception_store->dm_exception_store_type->prepare_exception(dm_snapshot->dm_exception_store, dm_exception)
+  > dm_insert_exception(dm_snapshot->dm_exception_store, dm_snap_pending_exception->dm_exception)
+
+* remap_exception(dm_snapshot, dm_exception, bio, chunk_t)
+  # 映射bio, 这里修改bdev为dm_snapshot->dm_dev / cow -> block_device, 写到cow里面, 位置也修改到新的chunk中, chunk从origin设备到cow设备, chunk内部sector_t偏移不变..
+  > dm_chunk_number(dm_exception->new_chunk)
+  > chunk_to_sector(dm_exception_store, chunk)
+
+这里的bio是dm_snap_tracked_chunk类型包含的bio
+
+* snapshot_map(dm_target, bio)
+  # 这个应该是dm_target->table_type中的某个映射
+  > init_tracked_chunk(bio)
+  > sector_to_chunk(dm_snapshot->dm_exception_store, bio->bi_sector)
+  > dm_lookup_exception(dm_snapshot->complete, chunk)
+    # 检查对应的chunk是否已经映射了,也就是可以直接写在对应的cow的chunk位置, 使用dm_exception映射过去就可以..
+  > remap_exception(dm_snapshot, dm_exception, bio, chunk)
+    # 如果没找到,而且是写io, 先创建一个dm_snap_pending_exception, 填充相关属性
+  > __lookup_pending_exception(dm_snapshot, chunk)
+  > alloc_pending_exception(dm_snapshot)
+  > remap_exception(dm_snapshot, dm_snap_pending_exception->dm_exception, bio, chunk)
+    # 写操作映射完成后,如果大小就是一个chunk,直接发送请求
+  > start_full_bio(dm_snap_pending_exception, bio)
+    # 否则,把它加到dm_snap_pending_exception->snapshot_bios中, 同时启动copy任务,需要把origin中对应的数据copy过来, 使用dm_snap_pending_exception->started表示kcopyd任务
+  > bio_list_add(bio_list, bio)
+  > start_copy(dm_snap_pending_exception)
+    # 如果是读任务,就不需要建立新的chunk?? 把它放到dm_snapshot->tracked_chunk_hash队列中??? 映射只需要把block_dev修改掉,看来位置没有变..
+  > track_chunk(dm_snap_pending_exception, bio, chunk)
+
+* snapshot_merge_map(dm_target, bio)
+  # 这个和上面的区别是什么???
+  > init_tracked_chunk(bio)
+  > dm_lookup_exception(dm_snapshot->complete / dm_exception_table, chunk)
+    # 如果找到,说明已经对应的chunk映射,检查dm_snapshot->first_merging_chunk/num_merging_chunks,如果在这个范围内,把它添加到dm_snapshot->bios_queued_during_merge队列中..
+    #否则映射它,也不发送io请求
+  > remap_exception(dm_snapshot, dm_exception, bio, chunk)
+    # 如果是WRITE操作,chunk它..
+  > track_chunk(dm_snapshot, bio, chunk)
+    # 如果没有找到映射的,那就直接写回原来的设备, 这叫merge??
+  > do_origin(dm_snapshot->dm_dev / origin, bio)
+    # 下面的do_origin好像很复杂..
+
+* snapshot_end_io(dm_target, bio, error)
+  # 在bio完成后的回调函数,取消trunk??
+  > stop_tracking_chunk(dm_snapshot, bio)
+
+* snapshot_merge_persuspend(dm_target)
+  > stop_merge(dm_target)
+
+* snapshot_preresume(dm_target)
+  # 检查是否能resume... 这里src/dest的关系还没搞清楚..
+  > __find_snapshots_sharing_cow(dm_snapshot, ...)
+
+* snapshot_resume(dm_target)
+  # 这个和exception handover有关, 只有在重贴的时候才使用
+  > __find_snapshots_sharing_cow(dm_snapshot, ...)
+  > __handover_exceptions(dm_snapshot, ..)
+    # 修改dm_snapshot->active为1
+  > reregister_snapshot(dm_snapshot)
+
+* get_origin_mininum_chunksize(block_device)
+  # 找一个chunksize
+  > __lookup_origin(block_device)
+  > __mininum_chunk_size(origin)
+
+* snapshot_merge_resume(dm_target)
+  > snapshot_resume(dm_target)
+    #设置dm_target->max_io_len
+  > get_origin_mininum_chunksize(dm_snapshot->origin->block_device)
+    # merge是在后台自动完成的???
+  > start_merge(dm_snapshot)
+
+* snapshot_status(dm_target, status_type_t, ...)
+
+* snapshot_iterate_devices(dm_target, iterate_devices_callout_fn, data)
+  # 这里要遍历两个设备..
+  > fn(dm_target, dm_snapshot->origin, 0, dm_target->len, data)
+  > fn(....dm_snapshot->cow, ...)
+
+* __origin_write(list_head, sector_t, bio)
+  # 写函数??  遍历所有的list_head上的dm_snapshot??
+  > dm_target_is_snapshot_merge(dm_snapshot->dm_target)
+  > dm_lookup_exception(dm_snapshot->complete/dm_exception_table, chunk)
+  > __lookup_pending_exception(dm_snapshot, chunk)
+    # 这个和上面的映射操作很像, 分配dm_snap_pending_exception, 把bio添加到dm_snap_pending_exception->origin_bios队列中..启动kcopyd任务..
+  > start_copy(dm_snap_pending_exception)
+  
+* do_origin(dm_dev, bio)
+  # 写回原来的设备.., 因为混杂snap? 所以原来的设备中也可能会cow..
+  > __lookup_origin(dm_dev->block_device)
+  > __origin_write(origin->snapshots, bio->bi_sector, bio)
+
+* origin_write_extent(dm_snapshot, sector, size)
+  # 先找到origin, 然后写这个设备,也就是使用这个设备的所有相关dm_snapshot..
+  > __lookup_origin(dm_snapshot->origin->block_device)
+  > __origin_write(origin->snapshots, sector+n, NULL)
+    
+
+#这个是什么回调?? 第一个参数是设备..
+* origin_ctr(dm_target, argc, argv)
+  #创建一个简单的snapshot设备??
+  > dm_get_device(dm_target, argv[0], dm_table_get_mode(dm_target->dm_table, dm_dev)
+    # dm_tareget->private是dm_dev, num_flush_requests=1..
+
+* origin_dtr(dm_target)
+  # 释放dm_dev..
+  > dm_put_device(dm_target, dm_dev)
+
+* origin_map(dm_target, bio)
+  # dm_target代笔的是普通设备, dm_dev,
+  > do_origin(dm_dev, bio)
+
+#最后有三种target_type: snapshot-origin, snapshot, snapshot_merge_target_name
+# 第一种就是简单的映射,不知道在写的时候写到哪里?? 也不算简单,应该是写到cow中,merge也是..
+
+
+
+
+
+
+

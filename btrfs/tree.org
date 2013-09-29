@@ -1,0 +1,792 @@
+* 各种btree
+
+** root tree
+    - 树根之树, 在super_block中指定这棵树的root btrfs_node位置, 通过它获取其他tree的root btrfs_node位置
+
+*** root item
+    - btrfs_key(objectid, BTRFS_ROOT_ITEM_KEY, generation)
+    - btrfs_item指向btrfs_root_item
+
+*** free space inode of block group
+    - btrfs_key(BTRFS_FREE_SPACE_OBJECTID, start, 0)
+    - btrfs_item指向btrfs_free_space_header(btrfs_key, generation, num_entries, num_bitmaps)
+    - btrfs_key指向inode, 里面是free space数据..
+
+*** balance item
+    - btrfs_key(BTRFS_BALANCE_OBJECTID, BTRFS_BALANCE_ITEM_KEY, 0)
+    - btrfs_item指向btrfs_balance_item
+
+*** free space items
+    - btrfs_key(BTRFS_FREE_SPACE_OBJECTID, 0, offset)  offset是btrfs_block_group_cache的起始位置.
+    - btrfs_item指向btrfs_free_space_header
+    - 指向一个inode(inode_objectid, BTRFS_INODE_ITEM_KEY, 0)
+
+*** free space inode
+    - btrfs_key(inode_objectid, BTRFS_INODE_ITEM_KEY, 0)
+    - 和reg文件一样
+
+*** free space inode file extent
+    - btrfs_key(inode_objectid, BTRFS_EXTENT_DATA_KEY, offset)
+    - 和reg文件一样
+
+*** orphan item
+    - btrfs_key(BTRFS_ORPHAN_OBJECTID, BTRFS_ORPHAN_ITEM_KEY, offset)
+    - btrfs_item没有对应的数据, offset是某个btrfs_root->btrfs_key->objectid
+
+*** root backref
+    - btrfs_key(root_objectid, BTRFS_BACKREF_KEY, ref_id)
+    - btrfs_item指向btrfs_root_ref
+    - 上面ref_id是subvolume所在的目录的所在的btrfs_root
+
+*** root ref
+    - btrfs_key(ref_id, BTRFS_ROOT_REF_KEY, root_id)
+    - btrfs_item指向btrfs_root_ref
+    - 和上面backref正好相反
+
+** extent tree
+    - 这棵树跟踪磁盘空间的使用, 一个btree root块,就会有一个4096字节的extent,每个chunk空间块有一个block_group,每块文件数据也有一个extent... 这样随着树的增长,树会不会变多呢?? 每个item追踪谁使用它.
+
+*** block group cache
+    - btrfs_key(logical address, c0/BTRFS_BLOCK_GROUP_ITEM_KEY, size)
+    - btrfs_item指向btrfs_block_group_item(used, chunk_objectid, flags)
+
+*** tree block
+    - btrfs_key(bytenr, BTRFS_TREE_BLOCK_REF_KEY, root_objectid)
+    - btrfs_item没有索引数据
+    - level信息在对应的btrfs_extent_item中,root_objectid指向它所在的btrfs_root,可以根据bytenr读取btrfs_key,根据level找到索引它的btrfs_node
+
+*** share tree block
+    - btrfs_key(bytenr, BTRFS_SHARED_BLOCK_REF_KEY, parent)
+    - btrfs_item没有索引数据
+    - parent指向索引它的btrfs_node
+
+*** share extent data
+    - btrfs_key(bytenr, BTRFS_SHARED_DATA_REF_KEY, parent)
+    - btrfs_item指向btrfs_shared_data_ref, 里面只有count
+    - 这种backref有什么用?count表示索引计数. parent指向btrfs_leaf
+
+*** extent data
+    - btrfs_key(bytenr, BTRFS_EXTENT_DATA_REF_KEY, hash)
+    - btrfs_item指向btrfs_extent_data_ref
+    - 根据btrfs_extent_data_ref可找到对应的btrfs_file_extent_item所在的btrfs_leaf. hash会有解决碰撞检测.
+
+*** extent
+    - btrfs_key(logical address, a8/BTRFS_EXTENT_ITEM_KEY, size)
+    - btrfs_item指向btrfs_extent_item
+    - 如果extent是tree block,btrfs_extent_item后面是有btrfs_tree_block_info
+    - btrfs_extent_item最后是btrfs_extent_inline_ref数组.对应上面四种方向索引
+
+** fs tree
+    - 树是一个文件系统,每个subvolume使用一个.
+
+*** inode 
+    - btrfs_key(inode_objectid, BTRFS_INODE_ITEM_KEY, 0)
+    - btrfs_item指向btrfs_inode_item
+    - BTRFS_FIRST_FREE_OBJECTID是第一个可用的inode_objectid, 是subvolume根目录. btrfs_inode_item里面没有文件名,文件名不是文件的属性,名字都是虚的.想要知道名字,使用btrfs_inode_ref/btrfs_dir_item.
+
+*** file backref name index
+    - btrfs_key(sub_inode_objectid, BTRFS_INODE_REF_KEY, parent_inode_objectid)
+    - btrfs_item指向btrfs_inode_ref数组..
+    - 可能存在同一个目录下的 hard link, 
+
+*** file backref hash index
+    - btrfs_key(sub_inode_objectid, BTRFS_INODE_EXTREF_KEY, hash)
+    - btrfs_item指向btrfs_inode_extref数组
+    - 不同目录的hard link可能干扰..  hash是parent ino和name的hash
+
+*** dir item
+    - btrfs_key(inode, BTRFS_DIR_ITEM_KEY, 0)
+    - btrfs_item指向btrfs_dir_item.
+    - 对于子文件, btrfs_dir_item指向的btrfs_key对应btrfs_inode_item, 对于subvolume, btrfs_dir_item指向的btrfs_key对应btrfs_root_item
+
+*** dir hash index 
+    - btrfs_key(inode, BTRFS_DIR_INDEX_KEY, 0)
+    - btrfs_item指向btrfs_dir_item
+
+*** free inode objectid
+    - btrfs_key(BTRFS_FREE_SPACE_OBJECTID, 0, offset)
+    - btrfs_item指向btrfs_free_space_header, 里面指定了一个inode的信息,inode数据是inode map objectid free 数据..
+    - BTRFS_FREE_SPACE_OBJECTID是 -11
+
+*** extents
+    - btrfs_key(objectid, BTRFS_EXTENT_DATA_KEY, offset)
+    - btrfs_item指向btrfs_file_extent_item
+    - inline的extent也使用这种方式?
+
+*** free ino items
+    - btrfs_key(BTRFS_FREE_SPACE_OBJECTID, 0, 0)
+    - btrfs_item指向btrfs_free_space_header
+    - 指向一个inode(BTRFS_FREE_INO_OBJECTID, BTRFS_INODE_ITEM_KEY, 0),和reg文件一样.
+
+*** orphan item
+    - btrfs_key(BTRFS_ORPHAN_OBJECTID, BTRFS_ORPHAN_ITEM_KEY, offset)
+    - btrfs_item没有对应的数据, offset是某个btrfs_inode->btrfs_key->objectid, 和tree root中对应
+
+*** log 
+    - btrfs_key(BTRFS_TREE_LOG_FIXUP_OBJECTID, BTRFS_ORPHAN_ITEM_KEY, offset)
+    - btrfs_item没有对应的数据, 在用log tree修复btrfs_root时,处理它,表示要重新计算这个inode的nlink.
+    - offset是inode_objectid
+
+
+** chunk tree
+    - 这棵树没有在root tree, 它的作用是逻辑地址映射到物理地址.还有设备信息dev_item. 为了支持bootstripe, 在super_block中有一些chunk信息.
+    - 它里面有DEV_ITEM:表示设备信息, CHUNK_ITEM: 一块专用的逻辑地址空间,它的信息中说明它的物理地址.
+
+*** chunk
+    - btrfs_key(BTRFS_FIRST_FREE_OBJECTID/100, BTRFS_CHUNK_ITEM_KEY/e4, logical_address) 
+    - btrfs_item指向btrfs_chunk
+    - 为何btrfs_key->objectid是固定的?!
+
+*** device
+    - dev_item(BTRFS_DEV_ITEMS_OBJECTID/1, BTRFS_DEV_ITEM_KEY/d8, devid) 
+    - btrfs_item指向btrfs_dev_item
+
+** device tree
+    - 这里是把物理地址想逻辑地址的映射，对应chunk tree中每个物理地址空间.
+*** dev
+    - btrfs_key(devid, BTRFS_DEV_EXTENT_KEY, physical address) 
+    - btrfs_item指向btrfs_dev_extent
+    - btrfs_key是物理地址,索引磁盘和物理偏移,物理地址指向chunk,和它的内部偏移.
+
+*** stat
+    - btrfs_key(0, BTRFS_DEV_STATS_KEY, devid) 
+    - btrfs_item指向btrfs_dev_stats
+
+** checksum tree
+    - btrfs_key(BTRFS_EXTENT_CSUM_OBJECT, BTRFS_EXTENT_CSUM_KEY, bytenr)
+    - btrfs_item指向的是btrfs_csum_item数组
+    - 虽然btrfs_csum_item的定义是u8, 但它的大小取决于btrfs_super_block->csum_type(BTRFS_CSUM_TYPE_CRC32), 但这里只有1中,它对应的csum_size是4
+
+** log tree 
+    - btrfs_key(dir_objectid, BTRFS_DIR_LOG_ITEM_KEY/BTRFS_DIR_LOG_INDEX_KEY, start_range)
+    - btrfs_item指向btrfs_dir_log_item, 里面只有一个end_range. 表示(start_range,end_range)里面的btrfs_dir_item是创建的还是删除的???
+    - 2中key_type对应BTRFS_DIR_ITEM_KEY/BTRFS_DIR_INDEX_KEY
+
+** reloc tree
+
+* btrfs数据结构:
+   在btrfs design(https://btrfs.wiki.kernel.org/index.php/Btrfs_design)中,btrfs使用b+树数据结构，树的内部节点和页节点使用3种数据类型:btrfs_header, btrfs_disk_key, btrfs_item. 每个节点都是一个extent, 内部节点和页节点大小可以不一样. 每个节点都以btrfs_header开头,内部节点就是{key,value}数组,key是btrfs_disk_key, value就是指针,逻辑磁盘位置. 页节点同样包括相通的key,value,不过位置是key一块,value一块..而且key是btrfs_item..
+
+** btrfs_header 
+   #+begin_src 
+    u8 csum[32];  # extent的校验码
+    u8 fsid[16];  #文件系统的uuid
+    __le64 blocknr;  #此节点的逻辑磁盘位置
+    __le64 flags;    #
+
+    u8 chunk_tree_uid[16];  #chunk tree的uuid,可能是dev的uuid
+    __le64 generation;  #transaction id
+    __le64 owner;    # 节点有多个父节点
+    __le32 nritems;  #
+    u8 level;        # 在树中的层数,0表示leaf
+   #+end_src
+
+
+** btrfs_disk_key 
+   #+begin_src 
+    #对于不同的树结构,这3个成员有不同的意义,反正他们代表一个节点的key
+    __le64 objectid;
+    u8 type;
+    __le64 offset;
+   #+end_src
+
+** btrfs_item
+   #+begin_src 
+    #叶子节点使用的(key, item) item可能是具体的数据结构,可能是无结构数据..
+    struct btrfs_disk_key key;
+    __le32 offset;
+    __le32 size;
+   #+end_src
+
+** btrfs_leaf 
+   #+begin_src 
+        #叶子使用的extent
+	struct btrfs_header header;
+	struct btrfs_item items[];
+	value[]
+   #+end_src
+
+
+** btrfs_key_ptr
+   #+begin_src 
+        #非叶子节点使用的数据结构
+	struct btrfs_disk_key key;
+	__le64 blockptr;
+	__le64 generation;
+   #+end_src
+
+** btrfs_node
+   #+begin_src 
+        #非叶子节点的extent
+	struct btrfs_header header;
+	struct btrfs_key_ptr ptrs[];
+   #+end_src
+
+
+** 图示
+
+#+begin_src 
+   +--------+------+------+------+------+------+-------------+------+------+------+------+
+   | header |item 0|item 1|item  |item N|free space          |data N|data  |data 1|data 0|
+   |        |      |      | ...  |      |                    |      |...   |      |      |
+   +--------+------+------+------+------+------+-------------+------+------+------+------+
+			        /-      -\	       	     |<---->|
+     header is              /---          --\             /-->	 ^
+     btrfs_header       /--- 	 	     --\   /------     	 |
+	             /--       	       	     /----\           /--+
+       	         /---  	       	       	 /---  	   --\/-------
+	       +---------------------+--/-----+------/-+
+	       |  btrfs_key          |_le32   |_le32   |        btrfs_item
+	       |                     |offset  |size    |
+	       +---------------------+--------+--------+
+	       ^       	    	     <-\
+	       |	    	        ---\
+	       |       	    	            ----\
+	       |		     	         ---\
+	       +------------+------+------------------->
+	       |_le64       |u8    |_le64              |       btrfs_key
+	       |objectid    |type  |offset             |
+	       +------------+------+-------------------+
+
+
+#+end_src
+
+
+** btrfs_super_block
+   #+begin_src 
+        //磁盘中的super block
+	u8 csum[BTRFS_CSUM_SIZE];
+	/* the first 4 fields must match struct btrfs_header */
+	u8 fsid[BTRFS_FSID_SIZE];    /* FS specific uuid */
+	__le64 bytenr; /* this block number */
+	__le64 flags;
+
+	/* allowed to be different from the btrfs_header from here own down */
+	__le64 magic;
+	__le64 generation;
+	__le64 root;      #root树的根节点位置
+	__le64 chunk_root; #chunk树的根节点位置
+	__le64 log_root;  #log数的根节点位置
+
+	/* this will help find the new super based on the log root */
+	__le64 log_root_transid;  #
+	__le64 total_bytes;  #
+	__le64 bytes_used;   #
+	__le64 root_dir_objectid;  #
+	__le64 num_devices;  # 设备数量??
+	__le32 sectorsize;   # 块大小??
+	__le32 nodesize;     # 内部节点大小
+	__le32 leafsize;     # 叶子节点大小
+	__le32 stripesize;   # raid0使用的stripe 大小??
+	__le32 sys_chunk_array_size;
+	__le64 chunk_root_generation;
+	__le64 compat_flags;
+	__le64 compat_ro_flags;
+	__le64 incompat_flags;
+	__le16 csum_type;
+	u8 root_level;       # root树的层数??
+	u8 chunk_root_level; # chunk数的层数?
+	u8 log_root_level;
+	struct btrfs_dev_item dev_item;  #什么设备?
+
+	char label[BTRFS_LABEL_SIZE];
+
+	__le64 cache_generation;
+
+	/* future expansion */
+	__le64 reserved[31];
+	u8 sys_chunk_array[BTRFS_SYSTEM_CHUNK_ARRAY_SIZE]; #缓存的chunk信息,为bootstripe支持
+	struct btrfs_root_backup super_roots[BTRFS_NUM_BACKUP_ROOTS];
+   #+end_src
+
+** btrfs_root_item
+   #+begin_src 
+	struct btrfs_inode_item inode;
+	__le64 generation;
+	__le64 root_dirid;
+	__le64 bytenr;
+	__le64 byte_limit;
+	__le64 bytes_used;
+	__le64 last_snapshot;
+	__le64 flags;
+	__le32 refs;
+	struct btrfs_disk_key drop_progress;
+	u8 drop_level;
+	u8 level;
+
+	/*
+	 * The following fields appear after subvol_uuids+subvol_times
+	 * were introduced.
+	 */
+
+	/*
+	 * This generation number is used to test if the new fields are valid
+	 * and up to date while reading the root item. Everytime the root item
+	 * is written out, the "generation" field is copied into this field. If
+	 * anyone ever mounted the fs with an older kernel, we will have
+	 * mismatching generation values here and thus must invalidate the
+	 * new fields. See btrfs_update_root and btrfs_find_last_root for
+	 * details.
+	 * the offset of generation_v2 is also used as the start for the memset
+	 * when invalidating the fields.
+	 */
+	__le64 generation_v2;
+	u8 uuid[BTRFS_UUID_SIZE];
+	u8 parent_uuid[BTRFS_UUID_SIZE];
+	u8 received_uuid[BTRFS_UUID_SIZE];
+	__le64 ctransid; /* updated when an inode changes */
+	__le64 otransid; /* trans when created */
+	__le64 stransid; /* trans when sent. non-zero for received subvol */
+	__le64 rtransid; /* trans when received. non-zero for received subvol */
+	struct btrfs_timespec ctime;
+	struct btrfs_timespec otime;
+	struct btrfs_timespec stime;
+	struct btrfs_timespec rtime;
+	__le64 reserved[8]; /* for future */
+   #+end_src
+
+** btrfs_root
+   #+begin_src 
+      #一个b tree使用的数据结构..
+      extent_buffer node #磁盘中的节点块对应的extent_buffer
+      extent_buffer commit_root  #上面这个,不过增加了计数
+      btrfs_root log_root    #log 数
+      btrfs_root reloc_root   #??
+      btrfs_root_item root_item # 根树(tree_root)中的索引item
+      
+      btrfs_key root_key   # 跟数中的索引key
+      btrfs_fs_info fs_info  #super block??
+      extent_io_tree dirty_log_pages  
+    
+      kobject root_kobj
+      completion kobj_unregister 
+      mutext objectid_mutex 
+    
+      accounting_lock 
+      btrfs_block_rsv block_rsv
+    
+      mutex fs_commit_mutex
+      btrfs_free_space_ctl  free_ino_ctl
+      btrfs_caching_type cached
+      wait_queue_head_t  cache_wait
+      btrfs_free_space_ctl free_ino_pinned
+      cache_progress
+      inode cache_inode
+    
+      mutex log_mutex
+      wait_queue_head_t log_writer_wait
+      wait_queue_head_t log_commit_wait[2]
+      log_writers, log_commit[2], log_batch, log_transid
+      last_log_commit  log_start_pid 
+      log_multiple_pids
+    
+      objectid
+      last_trans
+      
+      sectorsize	
+      nodesize	#这些值一般和btrfs_fs_info一样
+      leafsize
+      stripesize
+    
+      type
+      highest_objectid
+    
+      in_trans_setup
+      ref_cows    #非log tree, 默认是1..
+      track_dirty
+      in_radix
+    
+      defrag_trans_start
+      btrfs_key defrag_progress
+      btrfs_key defrag_max
+      defrag_running
+      name
+    
+      list_head dirty_list  #非计数root
+      list_head root_list
+    
+      orphan_lock
+      orphan_inodes
+    
+      btrfs_block_rsv orphan_block_rsv
+      int orphan_item_inserted
+      int orphan_cleanup_state
+    
+      inode_lock
+      rb_root  inode_tree  #in-memory inodes
+    
+      radix_tree_root  #delayed_nodes_tree
+      dev_t anon_dev   # stat使用
+      int froce_cow
+      root_item_lock
+       
+   #+end_src
+
+** btrfs_fs_info 
+   #+begin_src 
+	u8 fsid[BTRFS_FSID_SIZE];
+	u8 chunk_tree_uuid[BTRFS_UUID_SIZE];
+	struct btrfs_root *extent_root;  #extent树
+	struct btrfs_root *tree_root;    #root树?
+	struct btrfs_root *chunk_root;   # chunk树
+	struct btrfs_root *dev_root;     # 设备数,反向映射
+	struct btrfs_root *fs_root;      # 文件系统树
+	struct btrfs_root *csum_root;    # csum树
+	struct btrfs_root *quota_root;   # ??
+
+	/* the log root tree is a directory of all the other log roots */
+	struct btrfs_root *log_root_tree;  #??
+
+	spinlock_t fs_roots_radix_lock;  
+	struct radix_tree_root fs_roots_radix;  #里面是btrfs_root指针..根据btrfs_root->btrfs_key.objectid索引
+
+	/* block group cache stuff */
+	spinlock_t block_group_cache_lock;
+	struct rb_root block_group_cache_tree; #缓存的block_group, 使用btrfs_block_group_cache->key.objectid索引..
+
+	/* keep track of unallocated space */
+	spinlock_t free_chunk_lock;
+	u64 free_chunk_space;
+
+	struct extent_io_tree freed_extents[2];  #应该是把磁盘的一些数据项放到内存中缓存起来..
+	struct extent_io_tree *pinned_extents;
+
+	/* logical->physical extent mapping */
+	struct btrfs_mapping_tree mapping_tree;  #exent_map_tree, 缓存extent树的item??
+
+	/*
+	 * block reservation for extent, checksum, root tree and
+	 * delayed dir index item
+	 */
+	 # block预留??
+	struct btrfs_block_rsv global_block_rsv;
+	/* block reservation for delay allocation */
+	struct btrfs_block_rsv delalloc_block_rsv;
+	/* block reservation for metadata operations */
+	struct btrfs_block_rsv trans_block_rsv;
+	/* block reservation for chunk tree */
+	struct btrfs_block_rsv chunk_block_rsv;
+	/* block reservation for delayed operations */
+	struct btrfs_block_rsv delayed_block_rsv;
+
+	struct btrfs_block_rsv empty_block_rsv;
+
+	u64 generation;
+	u64 last_trans_committed;
+
+	/*
+	 * this is updated to the current trans every time a full commit
+	 * is required instead of the faster short fsync log commits
+	 */
+	u64 last_trans_log_full_commit;
+	unsigned long mount_opt;
+	unsigned long compress_type:4;
+	u64 max_inline;
+	u64 alloc_start;
+	struct btrfs_transaction *running_transaction;
+	wait_queue_head_t transaction_throttle;
+	wait_queue_head_t transaction_wait;
+	wait_queue_head_t transaction_blocked_wait;
+	wait_queue_head_t async_submit_wait;
+
+	struct btrfs_super_block *super_copy;
+	struct btrfs_super_block *super_for_commit;
+	struct block_device *__bdev;
+	struct super_block *sb;
+	struct inode *btree_inode;
+	struct backing_dev_info bdi;
+	struct mutex tree_log_mutex;
+	struct mutex transaction_kthread_mutex;
+	struct mutex cleaner_mutex;
+	struct mutex chunk_mutex;
+	struct mutex volume_mutex;
+	/*
+	 * this protects the ordered operations list only while we are
+	 * processing all of the entries on it.  This way we make
+	 * sure the commit code doesn't find the list temporarily empty
+	 * because another function happens to be doing non-waiting preflush
+	 * before jumping into the main commit.
+	 */
+	struct mutex ordered_operations_mutex;
+	struct rw_semaphore extent_commit_sem;
+
+	struct rw_semaphore cleanup_work_sem;
+
+	struct rw_semaphore subvol_sem;
+	struct srcu_struct subvol_srcu;
+
+	spinlock_t trans_lock;
+	/*
+	 * the reloc mutex goes with the trans lock, it is taken
+	 * during commit to protect us from the relocation code
+	 */
+	struct mutex reloc_mutex;
+
+	struct list_head trans_list;
+	struct list_head dead_roots;  #队列上是没有计数索引的文件系统的root item, 在btree cow更新时创建的, 需要任务去删除它..
+	struct list_head caching_block_groups;
+
+	spinlock_t delayed_iput_lock;
+	struct list_head delayed_iputs;
+
+	/* this protects tree_mod_seq_list */
+	spinlock_t tree_mod_seq_lock;
+	atomic_t tree_mod_seq;
+	struct list_head tree_mod_seq_list;
+	struct seq_list tree_mod_seq_elem;
+
+	/* this protects tree_mod_log */
+	rwlock_t tree_mod_log_lock;
+	struct rb_root tree_mod_log;
+
+	atomic_t nr_async_submits;
+	atomic_t async_submit_draining;
+	atomic_t nr_async_bios;
+	atomic_t async_delalloc_pages;
+	atomic_t open_ioctl_trans;
+
+	/*
+	 * this is used by the balancing code to wait for all the pending
+	 * ordered extents
+	 */
+	spinlock_t ordered_extent_lock;
+
+	/*
+	 * all of the data=ordered extents pending writeback
+	 * these can span multiple transactions and basically include
+	 * every dirty data page that isn't from nodatacow
+	 */
+	struct list_head ordered_extents;
+
+	/*
+	 * all of the inodes that have delalloc bytes.  It is possible for
+	 * this list to be empty even when there is still dirty data=ordered
+	 * extents waiting to finish IO.
+	 */
+	struct list_head delalloc_inodes;
+
+	/*
+	 * special rename and truncate targets that must be on disk before
+	 * we're allowed to commit.  This is basically the ext3 style
+	 * data=ordered list.
+	 */
+	struct list_head ordered_operations;
+
+	/*
+	 * there is a pool of worker threads for checksumming during writes
+	 * and a pool for checksumming after reads.  This is because readers
+	 * can run with FS locks held, and the writers may be waiting for
+	 * those locks.  We don't want ordering in the pending list to cause
+	 * deadlocks, and so the two are serviced separately.
+	 *
+	 * A third pool does submit_bio to avoid deadlocking with the other
+	 * two
+	 */
+	struct btrfs_workers generic_worker;
+	struct btrfs_workers workers;
+	struct btrfs_workers delalloc_workers;
+	struct btrfs_workers flush_workers;
+	struct btrfs_workers endio_workers;
+	struct btrfs_workers endio_meta_workers;
+	struct btrfs_workers endio_meta_write_workers;
+	struct btrfs_workers endio_write_workers;
+	struct btrfs_workers endio_freespace_worker;
+	struct btrfs_workers submit_workers;
+	struct btrfs_workers caching_workers;
+	struct btrfs_workers readahead_workers;
+
+	/*
+	 * fixup workers take dirty pages that didn't properly go through
+	 * the cow mechanism and make them safe to write.  It happens
+	 * for the sys_munmap function call path
+	 */
+	struct btrfs_workers fixup_workers;
+	struct btrfs_workers delayed_workers;
+	struct task_struct *transaction_kthread;
+	struct task_struct *cleaner_kthread;
+	int thread_pool_size;
+
+	struct kobject super_kobj;
+	struct completion kobj_unregister;
+	int do_barriers;
+	int closing;  #正在关闭??
+	int log_root_recovering;
+	int enospc_unlink;
+	int trans_no_join;
+
+	u64 total_pinned;
+
+	/* protected by the delalloc lock, used to keep from writing
+	 * metadata until there is a nice batch
+	 */
+	u64 dirty_metadata_bytes;
+	struct list_head dirty_cowonly_roots;
+
+	struct btrfs_fs_devices *fs_devices;
+
+	/*
+	 * the space_info list is almost entirely read only.  It only changes
+	 * when we add a new raid type to the FS, and that happens
+	 * very rarely.  RCU is used to protect it.
+	 */
+	struct list_head space_info;
+
+	struct btrfs_space_info *data_sinfo;
+
+	struct reloc_control *reloc_ctl;
+
+	spinlock_t delalloc_lock;
+	u64 delalloc_bytes;
+
+	/* data_alloc_cluster is only used in ssd mode */
+	struct btrfs_free_cluster data_alloc_cluster;
+
+	/* all metadata allocations go through this cluster */
+	struct btrfs_free_cluster meta_alloc_cluster;
+
+	/* auto defrag inodes go here */
+	spinlock_t defrag_inodes_lock;
+	struct rb_root defrag_inodes;
+	atomic_t defrag_running;
+
+	/*
+	 * these three are in extended format (availability of single
+	 * chunks is denoted by BTRFS_AVAIL_ALLOC_BIT_SINGLE bit, other
+	 * types are denoted by corresponding BTRFS_BLOCK_GROUP_* bits)
+	 */
+	u64 avail_data_alloc_bits;
+	u64 avail_metadata_alloc_bits;
+	u64 avail_system_alloc_bits;
+
+	/* restriper state */
+	spinlock_t balance_lock;
+	struct mutex balance_mutex;
+	atomic_t balance_running;
+	atomic_t balance_pause_req;
+	atomic_t balance_cancel_req;
+	struct btrfs_balance_control *balance_ctl;
+	wait_queue_head_t balance_wait_q;
+
+	unsigned data_chunk_allocations;
+	unsigned metadata_ratio;
+
+	void *bdev_holder;
+
+	/* private scrub information */
+	struct mutex scrub_lock;
+	atomic_t scrubs_running;
+	atomic_t scrub_pause_req;
+	atomic_t scrubs_paused;
+	atomic_t scrub_cancel_req;
+	wait_queue_head_t scrub_pause_wait;
+	struct rw_semaphore scrub_super_lock;
+	int scrub_workers_refcnt;
+	struct btrfs_workers scrub_workers;
+	struct btrfs_workers scrub_wr_completion_workers;
+	struct btrfs_workers scrub_nocow_workers;
+
+#ifdef CONFIG_BTRFS_FS_CHECK_INTEGRITY
+	u32 check_integrity_print_mask;
+#endif
+	/*
+	 * quota information
+	 */
+	unsigned int quota_enabled:1;
+
+	/*
+	 * quota_enabled only changes state after a commit. This holds the
+	 * next state.
+	 */
+	unsigned int pending_quota_state:1;
+
+	/* is qgroup tracking in a consistent state? */
+	u64 qgroup_flags;
+
+	/* holds configuration and tracking. Protected by qgroup_lock */
+	struct rb_root qgroup_tree;
+	spinlock_t qgroup_lock;
+
+	/* list of dirty qgroups to be written at next commit */
+	struct list_head dirty_qgroups;
+
+	/* used by btrfs_qgroup_record_ref for an efficient tree traversal */
+	u64 qgroup_seq;
+
+	/* filesystem state */
+	u64 fs_state;
+
+	struct btrfs_delayed_root *delayed_root;
+
+	/* readahead tree */
+	spinlock_t reada_lock;
+	struct radix_tree_root reada_tree;
+
+	/* next backup root to be overwritten */
+	int backup_root_index;
+
+	int num_tolerated_disk_barrier_failures;
+
+	/* device replace state */
+	struct btrfs_dev_replace dev_replace;
+
+	atomic_t mutually_exclusive_operation_running;
+   
+   #+end_src
+
+** btrfs_inode_item
+   #+begin_src 
+	/* nfs style generation number */
+	__le64 generation;
+	/* transid that last touched this inode */
+	__le64 transid;
+	__le64 size;
+	__le64 nbytes;
+	__le64 block_group;
+	__le32 nlink;
+	__le32 uid;
+	__le32 gid;
+	__le32 mode;
+	__le64 rdev;
+	__le64 flags;
+
+	/* modification sequence number for NFS */
+	__le64 sequence;
+
+	/*
+	 * a little future expansion, for more than this we can
+	 * just grow the inode item and version it
+	 */
+	__le64 reserved[4];
+	struct btrfs_timespec atime;
+	struct btrfs_timespec ctime;
+	struct btrfs_timespec mtime;
+	struct btrfs_timespec otime;
+   #+end_src
+
+** btrfs_inode
+   #+begin_src 
+        # 不仅文件使用这个数据结构, 还有其他, subvolume/snapshot, free space, free inode..
+        btrfs_root  root #subvolume 
+        btrfs_key  location 
+        lock   log_mutex   delalloc_mutex
+        extent_map_tree extent_tree #管理文件所有的data extent 
+        extent_io_tree  io_tree  #管理extent_state等,io过程中的状态.
+        extent_io_tree io_failure_tree # mirror
+        btrfs_ordered_inode_tree ordered_tree  #write metadata?
+        list_head delalloc_inodes  #delalloc??
+        list_head ordered_operations  # ordered ??
+        runtime_flags, sync_writers, generation
+        last_trans, last_sub_trans, logged_trans, delalloc_bytes
+        disk_i_size 
+        index_cnt #dir使用,给新的子文件使用的计数.
+        last_unlink_trans
+        csum_bytes
+        flags
+        last_log_commit
+        outstanding_extents
+        reserved_extents
+      
+        force_compress
+        btrfs_delayed_node delayed_node 
+        inode vfs_inode
+   #+end_src

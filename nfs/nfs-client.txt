@@ -1,0 +1,424 @@
+1. 数据结构
+    nfs_client 这里包括一个nfs server相关的信息, 简单的列一下
+    * cl_count, cl_cons_state, cl_res_state
+    * sockaddr_storage cl_addr, cl_hostname  两端的地址
+    * cl_share_link  这个list_head在nfs_client_list队列中
+    * cl_superblocks 这个是nfs_client关联的所有nfs_server->superblock
+    * rpc_clnt cl_rpcclient  珍贵的nfs_client资源, 但这个里面制定了program/version号
+    * cl_proto
+    * nfs_rpc_ops rpc_ops 这个很重要了
+    * cl_minorversion  看来nfs_client是区分版本的,而且每次mount时也制定了version
+    * rpc_cred  这个一直是盲区
+    * cl_clientid / nfs_verifier / cl_state  / cl_boot_time
+    * cl_lease_time / cl_last_renewal / delayed_work cl_renewed   renew任务相关
+    * rpc_wait_queue  cl_rpcwaitq
+    * idmap  
+    * cl_ipaddr / cl_id_uniquifier / cl_cb_ident   callback使用的地址信息
+    * nfs4_minor_version_ops  cl_mvops
+    * cl_seqid    CREATE_SESSION使用的信息??
+    * cl_exchange_flags  EXCHANGE_ID中使用的信息
+    * nfs_session  nfs_client竟然会共享session??
+    * fscache_cookie 
+    * net / server_scope
+
+    nfs_server
+    * nfs_client / list_head  client_list
+    * list_head master_link  nfs_volume_list链表
+    * rpc_clnt client, client_acl  为何这里有两个rpc_clnt? 
+    * nlm_host 
+    * nfs_iostats
+    * backing_dev_info  这里直接包装了
+    * writeback 
+    * flags / caps
+    * rsize / rpages / wsize / wpagesa /wtmult / dtsize / port / bsize / acregmin ..
+    * nfs_fsid fsid
+    * nfs_fscache_key / fscache_cookie
+    * pnfs_blksize / attr_bitmask / cache_consistency_bitmask   这些...
+    * pnfs_layoutdriver_type   / pnfs_ld_data
+    * rpc_wait_queue   这个是哪里使用?
+    * rb_root state_owners     state管理,为何是针对每个nfs_server的?
+    * ida openowner_id, lockowner_id  这里做索引操作
+    * state_owenrs_lru / layouts / delegations
+    * mountd_address mountd相关信息
+
+    nfs4_slot_table  整个不清楚
+    * nfs4_slot  这只是一个计数
+    * used_slots[SLOT_TABLE_SZ]   / slot_tbl_lock
+    * rpc_wait_queue slot_tbl_waitq
+    * max_slots / highest_used_slotid / target_max_slots 
+    * completion 
+
+    nfs4_session
+    * nfs4_sessionid sess_id  字符串,server分配的
+    * flags / session_state / ssv_len
+    * nfs4_channel_attrs fc_attrs  session的属性，需要看看rfc对session的定义
+    * nfs4_slot_table fc_slot_table
+    * nfs4_channel_attrs bc_attrs
+    * nfs4_slot_table bc_slot_table
+    * nfs_client  它又属于某个nfs_client?
+
+nfs使用的数据结构还不算多,挺清晰的
+client.c 
+
+    1. nfs_get_cb_ident_idr(nfs_client, minorversion)
+        把nfs_client->cl_cb_ident放到cb_ident_idr中,但这里只支持nfs4.0？
+
+    2. 下面定义了nfs_version, nfs_program, nfs_procedure
+
+    3. nfs_client_initdata  这里应该是创建nfs_client使用的数据
+        * hostname
+        * sockaddr addr / addrlen
+        * nfs_rpc_ops rpc_ops
+        * proto / minorversion / net
+
+    4. nfs_alloc_client(nfs_client_initdata)
+        创建nfs_client, 这里是创建数据结构后的初始化,主要有地址,nfs_rpc_ops,其他的初始化包括
+        -> nfs_get_cb_ident_idr(nfs_client, minorversion)
+        -> nfs_init_wait_queue(nfs_client->cl_rpc_waitq, 这是一个rpc的等待队列?谁使用? rpc_task释放时使用?
+        -> INIT_DELAYED_WORK(nfs_client->cl_renewd, nfs4_renew_state)
+        -> nfs_client->cl_mvops 这个数据结构里面的成员函数有些奇怪
+        -> rpc_lookup_machine_cred("*")  为何是*?
+        
+    5. nfs4_shutdown_session(nfs_client)
+        -> nfs4_has_session(nfs_client)
+        -> nfs4_destroy_session(nfs_client->nfs_session) 这些是在nfs4proc.c中实现
+
+    6. nfs4_destroy_callback(nfs_client)
+        这是销毁什么东西?  检查nfs_client->cl_res_state的NFS_CS_CALLBACK标志
+        -> nfs_callback_down(nfs_client->cl_mvops->minor_version)
+
+    7. nfs4_shutdown_client(nfs_client)
+        要关闭nfs_client,需要处理renew,session,callback,idmap等等
+        -> nfs4_kill_renewd(nfs_client)  检查nfs_client->cl_res_state的NFS_CS_RENEWD标志
+        -> nfs4_shutdown_session(nfs_client)
+        -> nfs4_desctroy_callback(nfs_client)
+        检查nfs4_client->cl_res_state的NFS_CS_IDMAP标志
+        -> nfs_idmap_delete(nfs_client)
+        -> rpc_destroy_wait_queue(nfs_client->cl_rpcwaitq)
+
+    8. nfs_cleanup_cb_ident_idr()
+        -> idr_destroy(cb_ident_idr) 销毁cb_ident_idr这个数
+
+    9. nfs_cb_idr_remove_locked(nfs_client)
+        销毁callback使用的id??
+        -> idr_remove(cb_ident_idr, nfs_client->cl_cb_ident)
+
+下面开始创建nfs_server
+    1. pnfs_init_server(nfs_server)
+        -> rpc_nit_wait_queue(nfs_server->roc_rpcwaitq, "pNFS ROC") 这个东西谁用?
+
+    2. nfs4_destroy_server(nfs_server)
+        -> nfs4_purge_state_owners(nfs_server) 这是state的东西
+
+    3. nfs_free_client(nfs_client)
+        -> nfs4_shutdown_client(nfs_client)
+        -> rpc_shutdown_client(nfs_client->rpc_clnt)
+        -> put_rpccred(nfs_client->cl_machine_cred)
+        -> nfs4_deviceid_purge_client(nfs_client) pnfs的东西
+        释放nfs_client->cl_hostname / server_scope / nfs_client
+        
+    4. nfs_put_client(nfs_client)
+        通过nfs_client->cl_count计数,决定是否需要释放nfs_client
+        -> nfs_cb_idr_remove_locked(nfs_client)
+        -> nfs_free_client(nfs_client)
+
+    5. nfs_match_client(nfs_client_initdata)
+        根据nfs_client_initdata找到一个nfs_client. 在nfs_client_list队列中,遍历nfs_client,把他和nfs_client_initdata比较.
+
+    5. nfs_get_client(nfs_client_initdata, rpc_timeout, ipaddr, authflavour, noresvport)
+        创建一个nfs_client
+        -> nfs_match_client(nfs_client_initdata)
+        -> nfs_alloc_client(nfs_client_initdata)
+        -> nfs_client->rpc_ops->init_client(nfs_client, rpc_timeout, ipaddr, authflavour, noresvport)
+        如果是找到已有的nfs_client,需要保证它的状态为NFS_CS_INITING
+        -> wait_event_killable(nfs_client_active_wq, nfs_client->cl_cons_state < NFS_CS_INITING)
+        
+    6. nfs4_check_client_ready(nfs_client)
+        nfs_client->cl_cons_state使用的值包括NFS_CS_READY / NFS_CS_INITING / NFS_CS_SESSION_INITING, 这里要保证它是合适的值
+
+    7. nfs_init_timeout_values(rpc_timeout, proto, timeo, retrans)
+        使用参数初始化rpc_timeout
+
+    8. nfs_create_rpc_client(nfs_client, rpc_timeout, rpc_authflavor_t, discrtry, noresvport)
+        使用参数创建rpc_clnt,给nfs_client
+        -> rpc_create(rpc_create_args)
+
+    9. nfs_destroy_server(nfs_server)
+        -> nlmclnt_done(nfs_server->nlm_host)
+
+    10. nfs_start_lockd(nfs_server)
+        创建nlmclnt_initdata,使用它启动nlm服务. 首先要保证nfs版本是4以下的
+        -> nlmclnt_init(nlmclnt_initdata)
+
+    11. nfs_init_server_rpcclient(nfs_server, rpc_timeout, rpc_authflavor)
+        这里是创建一个nfs_server
+        -> rpc_clone_client(rpc_client->cl_rpcclient)  创建rpc_clnt给nfs_server
+        -> rpcauth_create(rpc_authflavor, nfs_client) 如果auth不一样,也需要创建新的
+
+nfs2/3使用的创建nfs_client
+    1. nfs_init_client(nfs_client, rpc_timeout, ipaddr, rpc_authflavor_t, noresvport)
+        根据NFS_CS_READY决定nfs_client是否可用,这里使用的rpc都干了什么?
+        -> nfs_create_rpc_client(nfs_client, timeparms, RPC_AUTH_UNIX, 0, noresvport)
+        -> nfs_mark_client_ready(nfs_client, NFS_CS_READY)
+
+    2. nfs_init_server(nfs_server, nfs_parsed_mount_data)
+        这里是构造nfs_server, 首先创建nfs_client, 这里nfs_server没有实质的创建工作.  构造一个nfs_client_initdata
+        -> nfs_init_timeout_values(rpc_timeout, proto, timeo, retrans)
+        -> nfs_get_client(nfs_client_initdata, ...) 查找或创建一个
+        然后使用参数和nfs_client初始化nfs_server
+        -> nfs_start_lockd(nfs_server)  只有nfsv2/3使用
+        -> nfs_init_server_rpcclient(nfs_server, rpc_timeout, authflavor)
+        -> nfs_init_server_aclclient(nfs_server)
+
+    3. nfs_server_set_fsinfo(nfs_server, nfs_fh, nfs_fsinfo)
+        这里还是根据参数,初始化nfs_server
+        -> set_pnfs_layoutdriver(nfs_server, mntfh, nfs_fsinfo->layouttype) 就是这个看不懂,mntfh是什么东西?
+
+    4. nfs_probe_fsinfo(nfs_server, nfs_fh, nfs_fattr)
+        得到了nfs_fh(rootfh), 然后获取它的fattr,
+        -> nfs_client->rpc_ops->fsinfo(nfs_server, nfs_fh, nfs_fsinfo)
+        -> nfs_server_set_fsinfo(nfs_server, nfs_fh, nfs_fsinfo) 
+        -> nfs_client->rpc_ops->pathconf(nfs_server, nfs_fh, nfs_fattr) 获取nfs_fh对应的目录信息,返回
+    
+    5. nfs_server_copy_userdata(nfs_server, nfs_server)
+        拷贝信息,为何还说user??包括flags, rsize, wsize, options, acregmin/max等等
+
+    6. nfs_server_insert_lists(nfs_server)
+        把nfs_server->client_link放到nfs_client->cl_superblocks队列,把nfs_client->master_link放到nfs_volume_list队列中
+
+    7. nfs_server_remove_list(nfs_server)
+        同样是上面的两个队列操作,当nfs_client->cl_superblock为空时,设置nfs_client->cl_res_state的NFS_CS_STOP_RENEW标志
+
+    8. nfs_alloc_server()
+        创建一个nfs_server,还有它使用的bdi,初始化它使用的队列等成员变量,它管两的nfs对象包括delegation,layout,state_owner等
+        -> bdi_init(nfs_server->backing_dev_info)
+        -> pnfs_init_server(nfs_server)
+
+    9. nfs_free_server(nfs_server)
+        关闭时动作也够多的,nfs_client管理链接,nfs_server管理对象?
+        -> nfs_server_remove_list(nfs_server)
+        -> unset_pnfs_layoutdriver(nfs_server)
+        -> nfs_server->destroy(nfs_server)
+        ...
+
+    10. nfs_create_server(nfs_parsed_mount_data, nfs_fh)
+        nfs_fh是mount提供的,这里就是包装上面的实现
+        -> nfs_alloc_server()
+        -> nfs_alloc_fattr()
+        -> nfs_init_server(nfs_server, nfs_parsed_mount_data)
+        -> nfs_probe_fsinfo(nfs_server, nfs_fh, nfs_fattr) 把nfs_fattr->fsid给nfs_server
+        -> nfs_server->nfs_client->rpc_ops->getattr(nfs_server, nfs_fh, nfs_fattr)
+        -> nfs_server_insert_lists(nfs_server)
+
+下面是nfs4使用的
+    1. nfs4_find_client_ident(cb_ident)
+        这里从cb_ident_idr中找一个nfs_client, 每个nfs_client使用多个,还是一个?
+
+    2. nfs4_find_client_sessionid(sockaddr, nfs4_sessionid)
+        根据sockaddr和nfs4_sessionid找一个nfs_client, 遍历nfs_client_list,使用下面的比较函数
+        -> nfs4_cb_match_client(sockaddr, nfs_client, 1)
+        -> nfs4_has_session()   nfs_client->nfs4_session->nfs4_sessionid.data和nfs4_sessionid
+
+    3. nfs4_init_callback(nfs_client)
+        对nfs4.1来说,session还有backchannel的创建? 不知道啥东西
+        -> xprt_setup_backchannel(nfs_client->rpc_client->rpc_xprt, NFS41_BC_MIN_CALLBACKS)
+        -> nfs_callback_up(nfs_client->cl_mvops->minor_version, ...)
+        如果一切顺利,设置nfs_client->cl_res_state的NFS_CS_CALLBACK标志
+
+    4. nfs4_init_client_minor_version(nfs_client)
+        这里应该是兼容nfs4.1,创建session,还有callback
+        -> nfs4_alloc_session(nfs_client)
+        -> nfs4_init_callback(nfs_client)
+
+    5. nfs4_init_client(nfs_client, rpc_timeout, ipaddr, rpc_authflavor_t, noresvport)
+        和上面使用类似的接口,这里多了callback/idmapd的初始化
+        -> nfs_create_rpc_client(nfs_client, ...)
+        -> nfs_idmap_new(nfs_client
+        -> nfs4_init_client_minor_version(nfs_client)
+        创建完成后,修改nfs4_client->cl_cons_state为NFS_CS_READY,还要添加nfs_client->cl_res_state的NFS_CS_IDMAP标志
+
+    6. nfs4_set_client(nfs_server, hostname, sockaddr, ...)
+        设置nfs_server的nfs_client, 先创建nfs_client_initdata,找一个nfs_client
+        -> nfs_get_client(nfs_client_initdata, timeout, ...) 给nfs_server
+
+    7. nfs4_set_ds_client(nfs_client, sockaddr, addrlen, proto)
+        这个和上面有和区别? 这是和metadata建立链接
+        -> nfs_get_client(nfs_client_initdata, rpc_timeout, 
+
+    8. nfs4_server_common_setup(nfs_server, nfs_fh)
+        好像是通用的初始化nfs_server, 这里没有nfs_client相关操作, 这里会获取server上导出目录的信息
+        -> is_ds_only_client(nfs_server->nfs_client)检查nfs server只是data server, 不能用
+        -> nfs4_init_session(nfs_server) 在下面
+        -> nfs4_get_rootfh(nfs_server, nfs_fh) 把rootfh取回来
+        -> nfs4_session_get_rwsize(nfs_server)
+        -> nfs_probe_fsinfo(nfs_server, nfs_fh, nfs_fattr) 获取rootfs对应的nfs_fattr
+        -> nfs_server_insert_lists(nfs_server)
+    
+    9. nfs4_init_server(nfs_server, nfs_parsed_mount_data)
+        先给nfs_server找一个合适的nfs_client,然后给它克隆一个nfs_client
+        -> nfs_init_timeout_values(rpc_timeout, protocol, timeout, retrans)
+        -> nfs4_set_client(nfs_server, hostname, ...) 获取nfs_client信息
+        -> nfs_init_server_rpcclient(nfs_server, rpc_timeout, ...)
+
+    10. nfs4_create_server(nfs_parsed_mount_data, nfs_fh)
+        创建nfs_server,建立链接, 然后获取nfs_fh的信息, 但这里好像和mount的目录信息没有关系
+        -> nfs_alloc_server()
+        -> nfs4_init_server()
+        -> nfs4_server_common_setup(nfs_server, nfs_fh)
+
+    11. nfs4_create_referral_server(nfs_clone_mount, nfs_fh)
+        这个也是创建一个nfs_server,  从nfs_clone_mount中可以获取nfs_server, nfs_client,但这里没有直接使用,而是使用它们的ip地址等,重新找nfs_client(可能结果找回来的一样)
+        -> nfs_alloc_server
+        -> nfs_server_copy_userdata(nfs_server, nfs_clone_mount)
+        -> nfs4_set_client(nfs_server, hostname ...)
+        -> nfs_init_server_rpcclient(nfs_server, ...)
+        -> nfs4_server_common_setup(nfs_server, nfs_fh)
+
+    12. nfs4_clone_server(nfs_server, nfs_fh)  
+        这里传入参数nfs_fh什么意义呢?
+
+    13. nfs4_clients_init(net)
+        初始化nfs_client用到的链表
+
+好了，以后就不再捋代码了，之后做一些总结性的工作
+既然上面提到了nfs_server管理,那下面的就是看看super_block，从mount操作开始看起
+superblocks对应某一个server,它包含多个root?  这里有很多个file_system_type:
+1. nfs_fs_type
+2. nfs_xdev_fs_type 前者的mount使用nfs_fs_mount,后者使用nfs_xdev_mount, 
+* super_operations
+3. nfs4_fs_type  -> nfs4_mount 下面的kill_sb使用nfs4_kill_super
+4. nfs4_remote_fs_type -> nfs4_remote_mount 
+5. nfs4_xdev_fs_type -> nfs4_xdev_mount
+6. nfs4_referral_fs_type -> nfs4_referral_mount
+* super_operation  nfs4_sops
+
+忽然发现namespace.c比较重要
+
+super_operation nfs_sops
+    * alloc_inode = nfs_alloc_inode
+    * destroy_inode = nfs_destroy_inode
+    * write_inode = nfs_write_inode
+    * put_super = nfs_put_super
+    * statfs = nfs_statfs   
+    * evict_inode = nfs_evict_inode
+    * umount_begin = nfs_umount_begin  关闭rpc_client使用的rpc_task
+    * show_options / show_devname / show_path / show_stats 
+    * remount_fs
+
+super_operation nfs4_sops
+    * evict_inode = nfs4_evict_inode
+    其他都差不多
+
+这里传递mount option信息的是nfs_parsed_mount_data数据结构, 还有nfs_mount_data,给谁用的?  有个函数把nfs_mount_data转换为nfs_parsed_mount_data
+
+只看一下nfs4的操作,它貌似在mount操作上比其他的简单
+1. nfs4_mount 它是在在nfs4_fs_type中作为mount的回调函数
+    dentry * nfs4_mount(file_system_type, flags, dev_name, raw_data)
+    先创建nfs_parsed_mount_data结构,把raw_data和dev_name给nfs_parsed_mount_data
+    -> nfs4_validate_mount_data(raw_data, nfs_parsed_mount_data, dev_name)不知为何这里的raw_data是nfs4_mount_data结构,应该是nfs-utils传进去的. 使用nfs4_mount_data的host_addr, hostname, export_path, client_addr, 然后分析其他的options,dev_name.
+    -> nfs4_try_mount(flags, dev_name, nfs_parsed_mount_data)这里返回dentry, 奇怪吧，而且把它给nfs4_mount调用者
+
+2. nfs4_try_mount(flags, dev_name, nfs_parsed_mount_data)
+    首先修改nfs_parsed_mount_data,使用nfs_server->export_path="/"
+    -> nfs_do_root_mount(nfs4_remote_fs_type, flags, nfs_parsed_mount_data, hostname) 为何又出现nfs4_remote_fs_type?? 这里返回的是vfsmount, 所以这个vfsmount在哪里维护呢? 好像没人维护它?
+    恢复nfs_parsed_mount_data->nfs_server->export_path
+    -> nfs_follow_remote_path(vfsmount, export_path)
+
+3. nfs_do_root_mount(file_system_type, flag, data, hostname)
+    这里在内核态做了一次挂载
+    -> vfs_kern_mount(fs_type, flags, root_devname, data) 这里使用的nfs_devname是hostname:/, 实际上这个函数只是包装了file_system_types->mount, 也就是nfs4_remote_mount
+
+4. nfs_follow_remote_path(vfsmount, export_path)
+    这里面还比较复杂，设计到referral
+    -> nfs_referral_loop_protect()  一个task_struct不能refer超过2个??
+    -> mount_subtree(vfsmount, export_path)  namespace.c干的事情
+    -> nfs_referral_loop_unprotect()
+
+5. nfs4_remote_mount
+    这个和nfs4_mount都是file_system_type->mount函数. 但这里有nfs_server的操作,它做的事情就是给super_block一个索引，然后初始化化super_block
+    -> nfs_alloc_fhandle() 给mntfh
+    -> nfs4_create_server(nfs_parsed_mount_data, mntfh)  找到nfs_parsed_mount_data挂载返回的nfs_fh??
+    -> sget(nfs4_fs_type ...) 这里会创建super_block,给它nfs_server, 初始化其他东西
+    -> nfs4_get_root(super_block, nfs_fh, dev_name) dev_name是挂载路径,这里应该是hostname:/, 这是getroot.c干的事情..., 这里返回dentry,好乱!
+
+6. nfs4_xdev_mount
+    它好像只在namespace.c中的clone mount时使用,也看一下吧. 这里有nfs_clone_mount, 它包含一些东西,列一下，后面知道其意义后，填充
+    * super_block
+    * dentry
+    * nfs_fh
+    * nfs_fattr
+    * hostname
+    * mnt_path
+    * sockaddr / addrlen
+    * rpc_authflavor_t
+    -> nfs_clone_server(nfs_clone_data->super_block=>nfs_server, nfs_clone_data->nfs_fh, nfs_fattr) 这里得到一个nfs_server
+    准备一个nfs_sb_mountdata,就是nfs_server和mount flags, 给super_block
+    -> sget(nfs4_fs_type, compare_super, ...)   奇怪这里和nfs4_remote_mount使用相通的nfs4_fs_type...
+    ->  nfs4_get_root(super_block, nfs_clone_data->nfs_fh, dev_name) 这个需要看吧, 返回它得到的dentry
+
+7. nfs4_remote_referral_mount(file_system_type, flags, dev_name, raw_data)
+    这里又是一种,无非是先创建nfs_server,然后是super_block
+    -> nfs_alloc_fhandle()
+    -> nfs4_create_referral_server(nfs_clone_mount, nfs_fh)
+    -> sget(nfs4_fs_type ...)
+    -> nfs4_get_root(super_block, nfs_fh, dev_name)
+
+8. nfs4_referral_mount(file_system_type, flags, dev_name, raw_data)
+    这里又是一种，但它使用上面的的功能,估计和nfs4_mount类似,先找到/，然后在找子目录. 这个也是在namespace.c中
+    -> nfs_do_root_mount(nfs4_remote_referral_fs_type, flags, data, nfs_clone_data->hostname)  这里的 nfs_clone_mount->mnt_path="/", 这里的data直接给nfs4_remote_referral_mount
+    -> nfs_follow_remote_path(vfsmount, export_path)
+
+
+下面需要看两个getroot.c和namespace.c, nfs4namespace.c
+1. 在client,作为root的dentry,dentry->d_fsdata是一段路径名,文件夹在server上的位
+置
+
+2. 看了好多的mount操作都是返回vfsmount/mount,但如果不把他们放到dcache,那有什么用呢?
+namespace.c 主要处理dentry向路径字符串的转换, 这里作为root的dentry,它的d_fsdata是字符串表示它在server的地址. 这里有好多anonymous mount,好像跨越server的共享目录就会使用新的rpc_client重新挂载,不同的导出项使用不同的sec=**, 而且nfs对每个object(file/directory)使用不同的secure flavor. SECINFO实现查询功能 (nfs_negotiate_security). 这里还有lookup的实现,
+
+nfs client包转了一层文件的操作nfs_rpc_ops,还有dentry_operation/dir_inode_ops/file_inode_ops, 对nfs4是nfs_v4_clientops
+
+这里还有nfs_d_automount,这是dentry_operations->d_automount,什么时候调用呢？ 还需要看看dcache的操作. 这里会使用super.c中的实现,创建vfsmount,返回给上层. 这里根据参数path的name和parent, 获取服务器上的信息,通过执行一般mount操作. 这里在mount操作，同时出发mountpoint的expire操作.
+自动mount有两中情况，一个是referral mount,另一种是submount, 分别使用不同的机制. nfs4_xdev_fs_type和nfs4_referral_fs_type. referral mount 在nfs4namespace.c中实现，两者究竟区别多少? 有区别，就好说了.
+
+在nfs4namespace.c中实现nfs_do_refmount,调用过程如下. 这里是在dentry上发现服务器无效，使用referral信息,使用新的服务器数据. 它就是依靠super.c中的函数实现切换服务器的功能.
+    1. nfs_do_refmount(dentry)  获取nfs4_fs_locations,使用nfs4_proc_fs_locations, 返回vfsmount,或者说新的super_block
+
+    2. nfs_follow_referral(dentry, nfs4_fs_locations)  这里使用nfs4_validate_fspath确认nfs4_fs_locations->fs_path和dentry的路径(server路径)相同. 遍历nfs4_fs_locations->locations
+
+    3. try_location(nfs_clone_mount, page, page, nfs4_fs_location) nfs_clone_mount中有super_block/dentry信息,表示挂载的位置. 然后这里准备以下信息
+        * 把nfs4_fs_location->rootpath给nfs_clone_mount->mnt_path, 这是服务器上共享文件夹位置.
+        * 然后遍历nfs4_fs_location->servers中所有的服务器地址，使用这些地址构造sockaddr给nfs_clone_mount->addr/hostname, 还有根据hostname和mnt_path构造mount.nfs使用的地址
+
+    4. vfs_kern_mount(nfs4_referral_fs_type, 0, hostname:mnt_path, nfs_clone_mount) 这里会创建一个mount, 当然它只依赖下面函数返回的dentry,从dentry可获取super_block/inode. 好可怜vfsmount仅有dentry,super_block信息, 这里它属于mount的一部分,估计automount会把它挂载在某个地方. 但这里还注意dentry不是super_block->s_root,好奇怪!
+
+    5. nfs4_referral_fs_type->mount: nfs4_referral_mount(file_system_type, flags, dev_name, nfs_clone_mount) 这里为何先挂载root目录,然后再follow?
+
+    6. nfs_do_root_mount(nfs4_remote_referral_fs_type, flags, nfs_clone_mount, hostname) 这里nfs_clone_mount->mnt_path="/", 所以先挂载root目录. 它还是使用了vfs_kern_mount,而且构造dev_name是"hostname:/"
+      7. nfs4_remote_referral_fs_type->mount = nfs4_remote_referral_mount(file_system_type, flags, dev_name, raw_data)
+        8. nfs4_create_referral_server(nfs_clone_mount, nfs_fh) 这里获取nfs_fh和nfs_server. 会根据nfs4_clone_mount->super_block=>nfs_server->nfs_client创建一个新的nfs_server, 当然还可能会创建新的nfs_client,rpc链接之类的.
+        9. sget(nfs4_fs_type, ..., nfs_set_super, nfs_sb_mountdata) nfs_sb_mountdata就是nfs_server和mntlfags. 创建super_block
+        10. nfs4_get_root(super_block, nfs_fh, dev_name) 创建一个root inode(nfs_fhget),还有对应的dentry,给super_block使用. 这里的dev_name会给dentry->d_fsdata,这里就是hostname:/,有什么意义吗?
+          11. nfs_superblock_set_dummy_root(super_block, inode) 这是getroot.c的东西,根据inode创建dentry给super_block->s_root
+          12. d_obtain_alias(inode) 获取inode对应的dentry(或者创建)
+
+    13. nfs_follow_remote_path(vfsmount, export_path) 这里是顺着6的步骤,挂载了root目录,这是super.c中的实现. 这里返回dentry给5. nfs4_referral_mount, 这是什么意思? dcache里面就这么跳过这一级目录查找了?
+      14. mount_subtree(vfsmount, export_path) 这个上面肯定有说明, 他就是使用了vfs_path_lookup(vfsmount->mnt_root, vfsmount, export_path, flags, path), 这里看来是根据export_path创建dcache中的目录，然后把dentry给path??那创建的时候是否考虑inode?  这里还是返回dentry, 那应该考虑以下root的inode是否使用不同的inode_operations?   这里没有dcache,是看不懂这些东西的！！
+上面为了创建一个vfs_mount,使用模块函数vfs_kern_mount,这里使用了两次. 低层次的是根据hostname:/创建一个super_block,活对应的rpc/nfs_client等. 创建完成后，没法使用他们，vfsmount没有添加到dcache中. 高层次没有创建super_block,它使用低层次的信息，或目录树中的一个子目录,构造一个mount.
+
+
+这里需要获取fs_location的信息,而对于nfs来说，它把获取fs_location的实现成为一个单独的操作，是nfs4_procedures[NFSPROC4_CLNT_FS_LOCATIONS], 这是一个nfs的客户端调用(nfs4_proc_fs_locations)，对于RPC来说,客户端仅需提供函数号(NFS4_COMPOUNT),函数参数,结果位置. 而对于nfs4来说,一个nfs_compound请求可包含任何请求,因此把具体的请求放到了NFS4_COMPOUND的参数中, 这样一个fs_location的功能包含putfh,lookup,getattr三个请求(参考nfs4_xdr_enc_fs_location). 那现在nfs请求的包装都已固定了.
+
+上面的函数是nfs_d_automount,一种情况使用referral_mount,另一种是nfs_do_submount
+这里使用lookup请求获取dentry（理应）对应的nfs_fh/nfs_fattr. 这里为何调用automount?
+
+1. nfs_do_submount(dentry, nfs_fh, fattr, flavor) 这里也需要返回vfsmount. 这里构造nfs_clone_mount, 使用函数参数. 这里会获取dentry使用的服务器文件夹路径, 这个有什么用? 这里的nfs_clone_mount中的nfs_fh什么意义呢? server共享的某个文件夹?
+
+  2. nfs_do_clone_mount(nfs_server, devname, nfs_clone_mount) 不用重新创建nfs_server,估计是flavor不能用. 它使用vfs_kernel_mount(nfs4_xdev_fs_type, 0, devname, nfs_clone_mount), 
+
+    3. nfs4_xdev_mount(file_system_type, flags, dev_name, nfs_clone_mount) 这里是在mount_fs中使用file_system_type->mount(file_system_type, ...)创建, dev_name还是nfs_do_submount使用的, 这有什么意义?给mount->s_root->d_fsdata? 创建新的nfs_server, 使用新的nfs_fh/nfs_fattr. 这里会使用fsinfo/pathconf这些rpc请求，给新的nfs_server使用, 然后使用sget创建新的super_block.
+      4. nfs4_get_root(super_block, nfs_fh, dev_name)  这里会创建inode/dentry
+
+上面的过程就完成了，这里只创建了一层的mount/super_block/nfs_server,然后给nfs_d_automount, 的确应该看看dcache。 再看看getroot.c, 这里只有nfs4_get_root(super_block, nfs_fh, devname), 这里会根据nfs_fh创建inode,然后是dentry给super_block->s_mount, 这里的devname给这个dentry.
+
+

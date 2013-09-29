@@ -1,0 +1,476 @@
+* aops.c 
+
+** gfs2_inode 
+   #+begin_src 
+   	struct inode i_inode;
+	u64 i_no_addr;
+	u64 i_no_formal_ino;
+	u64 i_generation;
+	u64 i_eattr;
+	unsigned long i_flags;		/* GIF_... */
+	struct gfs2_glock *i_gl; /* Move into i_gh? */
+	struct gfs2_holder i_iopen_gh;
+	struct gfs2_holder i_gh; /* for prepare/commit_write only */
+	struct gfs2_blkreserv *i_res; /* rgrp multi-block reservation */
+	struct gfs2_rgrpd *i_rgd;
+	u64 i_goal;	/* goal block for allocations */
+	struct rw_semaphore i_rw_mutex;
+	struct list_head i_ordered;
+	struct list_head i_trunc_list;
+	__be64 *i_hash_cache;
+	u32 i_entries;
+	u32 i_diskflags;
+	u8 i_height;
+	u8 i_depth;
+   #+end_src
+
+** gfs2_page_add_databufs(gfs2_inode, page, from, to)
+   - 处理page中的buffer_head, 把在(from,to)中的一部分添加到gfs2_glock管理的gfs2_trans中. (from,to)是page内部偏移
+   - gfs2_inode->i_diskflags的GFS2_DIF_JDATA表示什么? 
+   > gfs2_is_jdata(gfs2_inode)
+   - 如果是GFS2_DIF_JDATA, 设置BH_Uptodate
+   > set_buffer_uptodate(buffer_head)
+   - 创建buffer_head的管理数据gfs2_bufdata,把它放到gfs2_sbd->sd_log_le_databuf链表中
+   > gfs2_trans_add_data(gfs2_inode->gfs2_glock, buffer_head)
+
+** gfs2_get_block_noalloc(inode , sector_t, buffer_head, create)
+   - sector_t是文件偏移, 获取磁盘位置
+   > gfs2_block_map(inode, lblock, buffer_head, 0)
+   - 检查BH_Mapped标志
+
+** gfs2_get_block_direct(inode, sector_t, buffer_head, create)
+   - 和上面什么区别? 
+   > gfs2_block_map(inode, lblock, buffer_head, 0)
+
+** gfs2_writepage_common(page, writeback_control)
+   - 检查gfs2_inode->gfs2_glock是否有效? 
+   > gfs2_glock_is_held_excl(gfs2_inode->gfs2_glock)
+   - 检查current->journal_info?? 这是什么时候设置的?
+   - 如果有效,只是重新设置PG_Dirty 
+   > redirty_page_for_writeback(writeback_control, page)
+   - 否则, 检查page的文件偏移是否超过文件大小 page->index,如果超过,删除page 
+   > address_space_operations->invalidatepage(page, 0, PAGE_CACHE_SIZE)
+   - 没有IO??
+
+** gfs2_writeback_writepage(page, writeback_control)
+   - 首先检查是否要写回?
+   > gfs2_writepage_common(page, writeback)
+   - 参考上面,不处理时,使用page写回
+   > nobh_writepage(page, gfs2_get_block_noalloc, writeback_control)
+
+** gfs2_ordered_writepage(page, writeback_control)
+   - ordered写回数据? 
+   > gfs2_writepage_common(page, writeback_control)
+   - 如果page没有buffer_head, 先构造
+   > create_empty_buffers(page, super_block->s_blocksize, BH_Dirty | BH_Uptodate)
+   - 创建gfs2_bufdata, 添加到log管理中. blocksize是什么?
+   > gfs2_page_add_databufs(gfs2_inode, page, 0, super_block->s_blocksize - 1)
+   - 使用buffer_head写回数据?? 
+   > block_write_full_page(page, gfs2_get_block_noalloc, writeback_control)
+
+** __gfs2_jdata_writepage(page, writeback_control)
+   - jdata是什么? journal? PG_Checked和transaction相关
+   - 检查PG_Checked, 如果设置了,准备page的buffer_head
+   > create_empty_buffers(page, super_block->s_blocksize, BH_Dirty|BH_Uptodate)
+   - 同时去掉PG_Checked, 把他添加到log中
+   > gfs2_page_add_databufs(gfs2_inode, page, 0, blocksize)
+   - 最后使用buffer_head写回
+   > block_write_full_page(page, gfs2_get_block_noalloc, writeback_control)
+
+** gfs2_jdata_writepage(page, writeback_control)
+   - 这是write之后的函数??
+   - 如果设置PG_Checked, 说明需要trans
+   - 如果writeback_control->sync_mode != WB_SYNC_ALL, 只需要设置PG_Dirty, 直接退出. 只有在同步方式才开始写回?
+   - 如果同步写回, 启动transaction 
+   > gfs2_trans_begin(gfs2_sbd, RES_DINODE + 1, 0)
+   - 如果无法启动,也是设置PG_Dirty, 退出
+   > redirty_page_for_writeback(writeback_control, page)
+   - 开始写回, 检查gfs2_glock
+   > gfs2_writepage_common(page, writeback)
+   - transaction和current->journal_info应该是相关的
+   - 如果没有journal, 写回数据? 
+   > __gfs2_jdata_writepage(page, writeback_control)
+   - 如果上面启动transaction, 结束trans
+   > gfs2_trans_end(gfs2_sbd)
+
+** gfs2_writepages(address_space, writeback_control)
+   - 使用mpage
+   > mpage_writepages(address_space, writeback_control, gfs2_get_block_noalloc)
+
+** gfs2_write_jdata_pagevec(address_space, writeback_control, pagevec, nr_pages, end)
+   - 启动transaction 
+   > gfs2_trans_begin(gfs2_sbd, nrblocks, nrblocks)
+   - 然后遍历page, 锁住page, 检查PG_Writeback, 同时检查文件范围,可能会释放page
+   > address_space_ops->invalidatepage(page, 0, PAGE_CACHE_SIZE)
+   - 写回数据?? 
+   > __gfs2_jdata_writepage(page, writeback_control)
+   - 最后结束transaction 
+   > gfs2_trans_end(gfs2_sbd)
+
+** gfs2_write_cache_jdata(address_space, writeback_control)
+   - 这个函数参考write_cache_pages实现,应该就是writepages函数
+   - ordered是通过transaction保证的
+   - 首先根据writeback_control确定page的扫描范围, 如果是cycli,就没有范围
+   - 找到PAGECACHE_TAG_DIRTY的page指针数组
+   > pagevec_lookup_tag(page[], address_space, index, PAGECACHE_TAG_DIRTY, count)
+   - 使用上面的函数写回
+   > gfs2_write_jdata_pagevec(address_page, writeback_control, page*, nr_pages, end)
+   
+** gfs2_jdata_writepage(address_space, writeback_control)
+   - 提交bio??
+   > gfs2_write_cache_jdata(address_space, writeback_control)
+   - 如果是同步操作,写回log? 
+   > gfs2_log_flush(gfs2_sbd, gfs2_glock)
+   - 为什么有写一遍??
+   > gfs2_write_cache_jdata(address_space, writeback_control)
+
+** stuffed_readpage(gfs2_inode, page)
+   - 如果文件数据很少,就把它和gfs2_dinode放在一块. 这里是读取这些数据
+   - 如果page->index !=0, 不处理, 使用0清空page, 设置PG_Uptodate, 直接返回.
+   - 获取inode metadata
+   > gfs2_meta_inode_buffer(gfs2_inode, buffer_head)
+   - 建立page映射,复制数据,释放buffer_head 
+
+** __gfs2_readpage(file, page)
+   - 首先检查小文件 stuffed 
+   > gfs2_is_stuffed(gfs2_inode)
+   > stuffed_readpage(gfs2_inode, page)
+   - 否则使用mpage? 
+   > mpage_readpage(page, gfs2_block_map)
+
+** gfs2_readpage(file, page)
+   - 这应该是readpage首先
+   - 这里首先解锁page ? 
+   > unlock_page(page)
+   - 获取gfs2_inode->gfs2_glock, LM_ST_SHARED锁
+   > gfs2_holder_init(gfs2_inode->gfs2_glock, LM_ST_SHARED, 0, gfs2_holder)
+   > gfs2_glock_nq(gfs2_holder)
+   - 再锁住page 
+   > lock_page(page)
+   - 检查PG_Uptodate, 读page 
+   > __gfs2_readpage(file, page)
+   
+** gfs2_internal_read(gfs2_inode, buf, pos, size)
+   - internal file?
+   - 首先读取pagecache的数据,然后放到buf指向的内存中.
+   - pos是文件偏移,用来索引page 
+   > read_cache_page(address_space, index, __gfss_readpage, NULL)
+   - 上面获取page, 建立映射,把数据放到buf中
+
+** gfs2_readpages(file, address_space, list_head, nr_pages)
+   - readahead使用的读取函数,也需要gfs2_glock
+   - 获取gfs2_inode的锁
+   > gfs2_holder_init(gfs2_inode->gfs2_glock, LM_ST_SHARED, 0, gfs2_holder)
+   > gfs2_glock_nq(gfs2_holder)
+   - 使用mpage读取
+   > mpage_readpages(address_space, page, nr_pages, gfs2_block_map)
+   - 最后释放gfs2_glock 
+
+** gfs2_write_begin(file, address_space, pos, len, flags, page, fsdata)
+   - 首先获取gfs2_inode->gfs2_glock的LM_ST_EXCLUSIVE锁.
+   - 这里使用的是gfs2_inode->gfs2_holder
+   > gfs2_holder_init(gfs2_inode->gfs2_glock, LM_ST_EXCLUSIVE, 0, gfs2_glock->gfs2_holder)
+   > gfs2_glock_nq(gfs2_holder)
+   - 检查是否需要分配磁盘空间
+   > gfs2_write_alloc_required(gfs2_inode, pos, len)
+   - 如果需要,而且是journal数据? 
+   > gfs2_is_jdata(gfs2_inode)
+   - 计算需要分配的block, requested
+   > gfs2_write_calc_reserv(gfs2_inode, len, data_blocks, ind_blocks)
+   - 分配block 
+   > gfs2_inplace_reserve(gfs2_inode, requested, 0)
+   - 启动transaction, 写回metadata? 
+   > gfs2_trans_begin(gfs2_sbd, rblocks, PAGE_CACHE_SIZE / gfs2_sb->sb_bsize)
+   - 分配page, 可能会分配page
+   > grab_cache_page_write_begin(address_space, index, flags)
+   - 处理stuffed的inode
+   - 如果原来是stuffed, 限制size超过blocksize - sizeof(gfs2_dinode) 
+   > gfs2_unstuff_dinode(gfs2_inode, page)
+   - 创建buffer_head, 映射磁盘位置
+   > __block_write_begin(page, from, len, gfs2_block_map)
+
+** adjust_fs_space(inode)
+   - 调整磁盘空间
+   - 根据rindex文件计算总空间大小
+   > gfs2_ri_total(gfs2_sbd)
+   - 找到statfs? 
+   > gfs2_meta_inode_buffer(gfs2_sbd->sd_statfs_inode, buffer_head)
+   - 修改statfs?  在statfs_inode的数据取,是stat数据?
+   > gfs2_statfs_change_in(gfs2_sbd->sd_statfs_master, buf)
+   - 只有空间变大时,更新statfs? 
+   - new_free = fs_total - (gfs2_statfs_change_host->sc_total + gfs2_statfs_change_host->sc_total)
+   > gfs2_statfs_change(gfs2_sbd, new_free, new_free, 0)
+   - 获取rindex的gfs2_dinode
+   > gfs2_meta_inode_buffer(gfs2_inode, buffer_head)
+   - stat信息在gfs2_dinode后面? 
+   > update_statfs(gfs2_sbd, buffer_head, buffer_head)
+
+** gfs2_stuffed_write_end(inode, buffer_head, pos, len, copied, page)
+   - 对应上面的写开始
+   - page中是数据,这里会把数据写到buffer_head中的gfs2_dinode后面
+   - 设置page的PG_Uptodate??  还是使用了pagecache
+   > unlock_page(page)
+   - 设置inode 
+   > i_size_write(inode, to)
+   > mark_inode_dirty(inode)
+   - 如果写的是rindex文件, 这是turnfs操作? 
+   > adjust_fs_space(inode)
+   - 最后结束transaction 
+   > gfs2_trans_end(gfs2_sbd)
+   - 释放inode的锁
+   > gfs2_glock_dq(gfs2_inode->gfs2_holder)
+   > gfs2_holder_uninit(gfs2_inode->gfs2_holder)
+
+** gfs2_write_end(file, address_space, pos, len, copied, page, void *fsdata)
+   - 写数据时也需要检查gfs2_glock 
+   > gfs2_glock_is_locked_by_me(gfs2_inode->gfs2_glock)
+   - 获取inode的metadata? 
+   > gfs2_meta_inode_buffer(gfs2_inode, buffer_head)
+   - meta修改后,把这个buffer_head放到transaction中 
+   > gfs2_trans_add_meta(gfs2_glock, buffer_head)
+   - 如果不是writeback, 构造gfs2_databuf? 用于journal?
+   > gfs2_is_writeback(gfs2_inode) 
+   > gfs2_page_add_databufs(gfs2_inode, page, from, to)
+   - 使用buffer的标准操作, 修改文件大小, 设置inode dirty等
+   > generic_write_end(file, address_space, pos, len, copied, page, fsdata)
+   - 结束transaction, 其他的和stuffed操作类似
+   > gfs2_trans_end(gfs2_sbd)
+   > gfs2_inplace_release(gfs2_inode)
+
+** gfs2_set_page_dirty(page)
+   - 设置PG_Checked标志, 后面会用来启动journal
+   > SetPageChecked(page)
+   > __set_page_dirty_buffer(page)
+
+** gfs2_bmap(address_page, lblock)
+   - 获取lblock对应的磁盘位置? 
+   - 先获取锁
+   > gfs2_glock_nq_init(gfs2_inode->gfs2_glock, LM_ST_SHARED, LM_FLAG_ANY, gfs2_holder)
+   - 使用标准操作, 就是构造一个假的buffer_head, 保存lblock对应的磁盘信息
+   > generic_block_bmap(address_page, lblock, gfs2_block_map)
+   > gfs2_glock_dq_uninit(gfs2_holder)
+
+** gfs2_discard(gfs2_sbd, buffer_head)
+   - 锁住buffer_head,去掉BH_Dirtied
+   > lock_buffer(buffer_head)
+   - 操作gfs2_bufdata, 如果不是pinned状态, 仅仅释放gfs2_bufdata->bd_list链表
+   - 否则从journal中删除
+   > gfs2_remove_from_journal(buffer_head, current->journal_info, 0)
+   - 最后清除他的状态 BH_Mapped, req相关, BH_New
+
+** gfs2_invalidatepage(page, offset, length)
+   - 在释放page时的操作,释放buffer_head信息
+   > page_has_buffers(page)
+   - 如果没有buffer_head信息,不再操作
+   - 遍历所有的buffer_head
+   > gfs2_discard(gfs2_sbd, buffer_head)
+   - 如果释放整个page 
+   > try_to_release_page(page, 0)
+
+** gfs2_ok_for_dio(gfs2_inode, rw, offset)
+   - dio的检查? 如果超过文件大小,不能使用dio. 
+   - offset > i_size_read(inode)
+   - 返回0,会变为使用buffered io
+
+** gfs2_direct_IO(rw, kiocb, iovec, offset, nr_segs)
+   - 后先获取inode的锁, 使用LM_ST_DEFERRED, 让别的node写回数据
+   > gfs2_holder_init(gfs2_glock, LM_ST_DEFERRED, 0, gfs2_holder)
+   > gfs2_glock_nq(gfs2_holder)
+   - 检查dio是否合适
+   > gfs2_ok_for_dio(gfs2_inode, rw, offset)
+   - 如果不合适返回0, 表示IO没有操作数据,使用buffered的方式
+   - 如果合适,使用标准的实现
+   > __blockdev_direct_IO(rw, kiocb, inode, inode->i_sb->s_bdev, iov, offset, nr_segs, gfs2_get_block_direct, NULL, NULL, 0)
+   - 最后释放锁
+
+** gfs2_releasepage(page, mask)
+   - 释放page的buffer_head
+   - 如果没有直接返回
+   > page_has_buffers(page)
+   - 遍历buffer_head, 还要锁住gfs2_sbd->sd_ail_lock??
+   - 先检查buffer_head不能释放
+   > buffer_head->b_count > 0, 或者BH_Pinned|BH_Dirtied有效
+   - 再次遍历释放,直接回收gfs2_bufdata
+   - 最后释放buffer_head 
+   > try_to_free_buffers(page)
+
+** gfs2_set_aops(inode)
+   - 这里实现3套address_space_operations, 分别是writeback, ordered, journal方式.
+   - 根据gfs2_inode,决定IO方式
+   - 检查gfs2_arg->ar_data == GFS2_DATA_WRITEBACK, 或者GFS2_DATA_ORDERED
+   > gfs2_is_writeback(gfs2_inode)
+   > gfs2_is_ordered(gfs2_inode)
+   - gfs2_inode->i_diskflags的GFS2_DIF_JDATA
+   > gfs2_is_jdata(gfs2_inode)
+
+
+* bmap.c
+  
+** metapath
+   #+begin_src 
+	//保存block指针信息, 最深10层
+	struct buffer_head *mp_bh[GFS2_MAX_META_HEIGHT];
+	__u16 mp_list[GFS2_MAX_META_HEIGHT];   
+   #+end_src
+
+** strip_mine 
+   #+begin_src 
+	int sm_first;
+	unsigned int sm_height;   
+   #+end_src
+
+** gfs2_unstuffer_page(gfs2_inode, buffer_head, block, page)
+   - 把原来stuffed的inode变为使用数据block的
+   - 找到偏移为0的page, 可能是参数page, 也可能不是, 根据page->index决定
+   > find_or_create_page(address_space, 0, GFP_NOFS)
+   - 如果没有PG_Uptodate, 把数据从gfs2_dinode中复制到page中
+   > SetPageUptodate(page)
+   - 构造page的buffer_head 
+   > create_empty_buffers(page, blkbits, BH_Uptodate)
+   - 参数block是磁盘位置,建立buffer_head的磁盘映射信息
+   > buffer_mapped(buffer_head)
+   > map_bh(buffer_head, inode->i_sb, block)
+   - 最后设置BH_Uptodate
+   > set_buffer_uptodate(buffer_head)
+   - 如果不是journal, 设置BH_Dirtied?  同时会设置page, inode等
+   > mark_buffer_dirty(buffer_head)
+   - 如果不是writeback的操作,把数据记录到transaction中
+   > gfs2_trans_add_data(gfs2_glock, buffer_head)
+
+** gfs2_unstuffer_dinode(gfs2_inode, page)
+   - 获取metadata
+   > gfs2_meta_inode_buffer(gfs2_inode, buffer_head)
+   - 分配空间, 这里要分配1个block
+   > gfs2_alloc_blocks(gfs2_inode, block, 1, 0, NULL)
+   - 如果是dir文件,把文件数据放到metadata中, unrevoke是什么?
+   > gfs2_trans_and_unrevoke(gfs2_sbd, blkno, len)
+   - 构造block中的gfs2_meta_header
+   > gfs2_dir_get_new_buffer(gfs2_inode, block, buffer_head)
+   - 复制数据, 把gfs2_dinode后面的数据放到新的block中
+   > gfs2_buffer_copy_tail(buffer_head, offset, buffer_head, offset)
+   - 如果是普通文件,移动数据
+   > gfs2_unstuffer_page(gfs2_inode, buffer_head, block, page)
+   - 把gfs2_dinode放到transaction中
+   > gfs2_trans_add_meta(gfs2_glock, buffer_head)
+   - 清空gfs2_dinode后面的数据
+   > gfs2_buffer_clear_tail(buffer_head, offset)
+   - gfs2_dinode后面是直接的指针?
+   - 通过修改inode->i_blocks, 修改gfs2_dinode->di_blocks. i_blocks是以512为单位,di_blocks是以super_block->si_bsize为单位!
+   > gfs2_add_inode_blocks(gfs2_inode->inode, 1)
+   > gfs2_inode->di_blocks = gfs2_get_inode_blocks(inode)
+   - 最后设置gfs2_dinode->di_height = gfs2_inode->i_height = 1
+
+** find_metapath(gfs2_sbd, block, metapath, height)
+   - 文件的block使用使用树的形式保存
+   - 最上层指针在gfs2_dinode后面,一个指针指向下一个block. 
+   - 其他层的指针占用一个block, 每个block中有512个. 如果blocksize = 4096. 实际的指针个数是gfs2_sbd->sd_inptrs
+   - 这里根据height和block计算每一个层的指针偏移
+   > do_div(block, gfs2_sbd->sd_inptrs)
+
+** metapath_branch_start(metapath)
+   - 如果metapath->mp_list[0] == 0, 返回2??  否则返回1
+
+** metapointer(height, metapath)
+   - 获取指针在block中的偏移. 对于最上层的,偏移从sizeof(gfs2_dinode)开始, 对于下层指针,偏移从sizeof(gfs2_meta_header)开始
+
+** gfs2_metapath_ra(gfs2_glock, buffer_head, pos)
+   - readahead下层的指针. buffer_head->b_size是固定的?
+   - 遍历buffer_head中的指针, 读取它们指向的block
+   - 构造一个buffer_head, 通过pagecache获取
+   > gfs2_getbuf(gfs2_glock, p, CREATE)
+   - 设置buffer_head->b_end_io = end_buffer_read_sync, 发送bio
+   > submit_bh(READA | REQ_META, buffer_head)
+
+** lookup_metapath(gfs2_inode, metapath)
+   - 从上层往下遍历metapath, 如果发现NULL指针, 返回height+1? 
+   > metapointer(x, metapath)
+   - 否则读取相关的block, 把buffer_head指针给metapath->mp_bh[height]中, 返回gfs2_inode->i_height
+
+** release_metapath(metapath)
+   - 释放metapath->mp_bh中的buffer_head指针
+   > brelse(buffer_head)
+
+** gfs2_extent_length(void *start, len, ptr, limit, int *eob)
+   - 计算extent的长度?
+   - (start,len)中间是数组指针,指向连续的block.
+   - ptr是其中的指针, 向前遍历直到(start+len)
+   - 检查连续的指针个数, *ptr = ++d
+
+** bmap_lock(gfs2_inode, create)
+   - 如果create !=0, 写锁gfs2_inode->i_rw_mutex
+   - 否则读锁gfs2_inode->i_rw_mutex
+
+** bmap_unlock(gfs2_inode, create)
+   - 解锁gfs2_inode->i_rw_mutex
+
+** gfs2_indirect_init(metapath, gfs2_glock, i, offset, bn)
+   - 让metapath->mp_bh[i-1]的offset处的指针指向bn
+   - 初始化metapath->mp_bh[i]指向的buffer_head
+   > gfs2_trans_add_meta(gfs2_glock, buffer_head)
+   > gfs2_metatype_set(buffer_head, GFS2_METATYPE_IN, GFS2_FORMAT_IN)
+   > gfs2_buffer_clear_tail(buffer_head, sizeof(gfs2_meta_header))
+
+** gfs2_bmap_alloc(inode, sector_t, buffer_head, metapath, sheight, height, maxlen)
+   - sheight表示什么? 
+   - 在分配block放到meta的树指针中,可能要创建树节点
+   - metapath中是树跟节点到叶子节点的指针,已经涉及的buffer_head
+   - 获取metapath->mp_bh[0], 这个应该是gfs2_dinode使用的buffer_head
+   > gfs2_trans_add_meta(gfs2_glock, buffer_head)
+   - 如果height == sheight, 只需要分配数据使用的block, 设置state = ALLOC_DATA
+   > gfs2_extent_length(buf, end, ptr, maxlen, eob)
+   - 否则,需要先构造树的节点. 有2中情况,一种是树高度不变,分配底层节点; 另一种是树高度增加,分配对应的叶子节点
+   - 如果height == gfs2_inode->i_height, 只分配叶子节点, 设置state = ALLOC_GROW_DEPTH, 需要分配的block是height - sheight. 
+   - 否则是height > gfs2_inode->i_height? 需要分配的block是height - gfs2_inode->i_height. 设置state = ALLOC_GROW_HEIGHT
+   - 开始根据state分配block, 组装tree
+   > gfs2_alloc_blocks(gfs2_inode, bn, n, 0, NULL)
+   - 如果是树节点或journal的方式
+   > gfs2_trans_add_unrevoke(gfs2_sbd, bn, n)
+   - 如果state == ALLOC_GROW_HEIGHT, 需要增长高度
+   - 使用metapath初始化高层的树节点, 每一层都使用第一个指针. 因为原来的文件偏移小.
+   > gfs2_indirect_init(metapath, gfs2_inode->gfs2_glock, i, 0, bn++)
+   - 把原来的gfs2_dinode后面的指针,复制到对应的树节点中
+   > gfs2_buffer_copy_tail(buffer_head, off, buffer_head, off)
+   - 清除gfs2_dinode使用的buffer_head 
+   > gfs2_buffer_clear_tail(buffer_head, offset)
+   - 把刚创建的第一个block给gfs2_dinode后面的第一个指针
+   - 然后转到ALLOC_GROW_DEPTH阶段
+   - 首先设置metapath->mp_bh[i-1]的buffer_head
+   > gfs2_trans_add_meta(gfs2_glock, buffer_head)
+   - 然后修改底层的节点指针
+   > gfs2_indirect_init(metapath, gfs2_glock, i, metapath->mp_list[i-1], bn)
+   - 然后转到ALLOC_DATA
+   - 首先修改指针的buffer_head放到transaction中
+   > gfs2_trans_add_meta(gfs2_glock, buffer_head)
+   - 直接修改指针指向的block位置
+   - 然后修改inode的block数量
+   > gfs2_add_inode_blocks(inode, alloced)
+   - 写回gfs2_dinode
+   > gfs2_dinode_out(gfs2_inode, buf)
+
+** gfs2_block_map(inode, lblock, buffer_head, create)
+   - 映射buffer_head的磁盘地址,他对应的文件偏移是lblock
+   - 锁住gfs2_inode 
+   > bmap_lock(gfs2_inode, create)
+   - 清除buffer_head的标志BH_Mapped, BH_New, BH_Boundary
+   - 获取第一个block, 也就是gfs2_dinode使用的
+   > gfs2_meta_inode_buffer(gfs2_inode, metapath->mp_bh[0])
+   - 计算metapath的偏移
+   > find_metapath(gfs2_sbd, lblock, metapath, height)
+   - 如果height > gfs2_inode->i_height, 需要分配block
+   - 否则读取树的节点block, 可能有HOLE, 去分配block
+   > lookup_metapath(gfs2_inode, metapath)
+   - 根据metapath的gfs2_dinode->i_height-1的指针,获取buffer_head的磁盘位置
+   - 计算连续的buffer_head的个数,因为super_block的blocksize可能不是512, 所以buffer_head可能不完全有磁盘空间
+   > gfs2_extent_length(buf, end, ptr, maxlen, eob)
+   - 如果需要分配磁盘空间, 他会把分配的block的最后一块给buffer_head映射
+   > gfs2_bmap_alloc(inode, lblock, bh_map, metapath, ret, height, maxlen)
+     
+** gfs2_extent_map(inode, lblock, new, dblock, extlen)
+   - 使用buffer_head获取lblock对应的磁盘信息
+   > gfs2_block_map(inode, lblock, buffer_head, create)
+
+** do_strip(gfs2_inode, buffer_head *dibh, buffer_head *bh, top, bottom, height, strip_mine)
+
+** 总结
+   - 下面是一系列释放block的操作,一般在修改文件大小时使用,需要释放tree结构.
+   - 释放block时,会批处理,而每一个block可能来自不同的gfs2_rgrp, 所以需要把涉及的gfs2_rgrp锁起来. 这里已经优化释放过程,尽量少锁gfs2_rgrp

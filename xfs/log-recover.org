@@ -1,0 +1,737 @@
+* xfs_log_recover.c 
+
+** xlog_buf_bbcount_valid(xlog, bbcount)
+   - 检查bbcount是否有效, 表示要访问的xlog数据的block数量
+   - bbcount > 0 && bbcount <= xlog->l_logBBsize
+
+** xlog_get_bp(xlog, nbblks)
+   - 创建xfs_buf读取数据
+   - 要读的数据量是nbblks, 使用xlog->l_sectBBsize对齐. 
+   > nbblks = round_up(nbblks + xlog->l_sectBBsize -1, xlog->l_sectBBsize)
+   - 如果nbblks>1, 它多分配l_secBBsize的空间, 在读的时候可能开始地址不是l_secBBsize对齐的,xfs_buf空间可能不够用.
+   - 下面创建xfs_buf时提供了假的xfs_buf_map
+   > xfs_buf_get_uncached(xlog->xfs_mount->m_logdev_targp, nbblks, 0)
+
+** xlog_put_bp(xfs_buf)
+   - 释放xfs_buf 
+   > xfs_buf_free(xfs_buf)
+
+** xlog_align(xlog, xfs_daddr_t, nbblks, xfs_buf)
+   - 返回xfs_buf在内存中的指针,根据xfs_daddr_t计算xfs_buf内部偏移
+   - offset = xfs_daddr_t & (xlog->l_sectBBsize - 1)
+   - 返回xfs_buf->b_addr + offset
+
+** xlog_bread_noalign(xlog, xfs_addr_t blk_no, nbblks, xfs_buf)
+   - blk_no是xlog数据区的内部偏移, nbblks要读取的block数量
+   - blk_no向下对齐l_sectBBsize, nbblks向上对齐.
+   - 这里就有问题, 可能只读一部分!!
+   - 设置xfs_buf的磁盘偏移 xfs_buf->xfs_buf_map[0]->bm_bn = xlog->l_logBBstart + xfs_addr_t
+   - 为何不设置xfs_buf->b_bn??
+   > XFS_BUF_SET_ADDR(xfs_buf, xlog->l_logBBsize + xfs_addr_t)
+   - 读标志 xfs_buf->b_flags的XBF_READ, xfs_buf->b_io_length = nbblks
+   > XFS_BUF_READ(xfs_buf)
+   - 发起bio
+   > xfsbdstrat(xlog->xfs_mount, xfs_buf)
+   - 等待io完成, 使用xfs_buf->b_iowait， 这里没有使用xfs_buf->b_ops
+   > xfs_buf_iowait(xfs_buf)
+
+** xlog_bread(xlog, xfs_addr_t, nbblks, xfs_buf, xfs_caddr_t)
+   - 先读回数据
+   > xlog_bread_noalign(xlog, blk_no, nbblks, xfs_buf)
+   - 处理sectorsize内部偏移, 返回内存指针.
+   > xlog_align(xlog, xfs_daddr_t, nbblks, xfs_buf)
+
+** xlog_bread_offset(xlog, xfs_addr_t blk_no, nbblks, xfs_buf, xfs_caddr_t offset)
+   - 把(blk_no, nbblks)中的数据读到offset指向的内存
+   - 把xfs_buf使用的内存指针保存起来  xfs_buf->b_addr / xfs_buf->b_length
+   - 然后把offset指向的内存给xfs_buf, 需要分配page指针数组, 处理页内偏移
+   > xfs_buf_associate_memory(xfs_buf, offset, nbblks)
+   - 读回数据, 使用一个xfs_buf_map
+   > xlog_bread_noalign(xlog, xfs_addr_t, nbblks, xfs_buf)
+   - 然后回复xfs_buf之前的内存指针
+   > xfs_buf_associate_memory(xfs_buf, orig_offset, orig_len)
+
+** xlog_bwrite(xlog, xfs_daddr_t, nbblks, xfs_buf)
+   - 和上面的读类似
+   - 使用第一个xfs_buf_map, 设定磁盘地址
+   > XFS_BUF_SET_ADDR(xfs_buf, xlog->l_logBBstart + xfs_daddr_t)
+   - 清除xfs_buf->b_flags的标志, READ/WRITE,ASYNC,SYNCIO,FUA,FLUSH等..
+   - xfs_buf->b_hold ++,  
+   - xfs_buf->b_io_length = nbblks, 为何不设置xfs_buf_map->bm_len
+   - 读回数据, 同步操作, bio完成后才返回.  和read完全一样!
+   > xfs_bwrite(xfs_buf)
+   - 释放xfs_buf 
+   > xfs_buf_relse(xfs_buf)
+
+** xlog_header_check_recover(xfs_mount, xlog_rec_header)
+   - 检查xlog_rec_header是否有效
+   - xlog_rec_header->h_magicno = 0xFEEDbabe
+   - xlog_rec_header->h_fmt == XLOG_FMT
+   - xlog_rec_header->h_fs_uuid == xfs_mount->xfs_super->sb_uuid
+
+** xlog_header_check_mount(xfs_mount, xfs_rec_header)
+   - 检查xfs_rec_header是否有效
+   - 只检查xfs_rec_header->h_fs_uuid == xfs_sb->sb_uuid
+   - 为何之类只检查uuid/magic??
+
+** xfs_recover_iodone(xfs_buf)
+   - 如果xfs_buf->b_error !=0, 有错误,关闭文件系统,但它也不能卸载?!
+   > xfs_buf_ioerror_alert(xfs_buf, __func__)
+   > xfs_force_shutdown(xfs_mount, SHUTDOWN_META_IO_ERROR)
+   - 如果没问题,完成回调函数
+   > xfs_buf_ioend(xfs_buf, 0)
+   - 在xfs_buf->b_iodone中使用, 仅仅检查错误,然后使用xfs_buf的通用回调??!!
+
+** xlog_find_cycle_start(xlog, xfs_buf, xfs_daddr_t first_blk, xfs_daddr_t last_blk, cycle)
+   - 使用2分查找去磁盘中查找, 范围是(first_blk, last_blk), 找到使用cycle的第一个block
+   - 读取一个block的数据
+   > xlog_bread(xlog, mid_blk, 1, xfs_buf, offset)
+   - xlog_in_core对应一个xlog_rec_header??  一个xlog_rec_header包含多个block??
+   - 在第一个block的开头是XLOG_HEADER_MAGIC_NUM/xlog_rec_header), 其他的block是cycle/block的xfs_lsn_t
+   > xlog_get_cycle(xfs_lsn_t)
+   - 最后last_blk指向的block是第一使用cycle的. 这里要保证block的cycle是有序的
+
+** xlog_find_verify_cycle(xlog, xfs_daddr_t start_blk, nbblks, stop_on_cycle_no, xfs_daddr_t new_blk)
+   - 检查(start_blk,nbblks)范围内的block, 如果发现cycle==stop_on_cycle_no, 返回它的位置给new_blk, 如果找不到返回-1
+   - 首先创建一个xfs_buf, 首先设定大小是fsb, 如果失败,减半. 
+   - 这个值不能超过xlog->l_logBBsize, 不能低于xlog->l_sectBBsize
+   > xlog_get_bp(xlog, bufblks)
+   - 从start_blk开始扫描xlog设备, 每次读取xfs_buf能容纳的数据
+   > xlog_bread(xlog, i, bcount, xfs_buf, xfs_caddr_t)
+   - 遍历这些block, 找到cycle 
+   > xlog_get_cycle(xfs_caddr_t) 
+   - 比较cycle  = stop_on_cycle_no, 返回对应的blk地址
+
+** xlog_find_verify_log_record(xlog, xfs_daddr_t start_blk, xfs_addr_t last_blk, extra_bblks)
+   - 这里应该是找到一个xlog_rec_header, 检查它是否有效. 首先找到第一个block, 验证xlog_rec_header, 检查xlog的大小.
+   - 从last_blk向前遍历, 找到XLOG_HEADER_MAGIC_NUM的block
+   - 准备一个xfs_buf, 大小是last_blk - start_blk
+   > xlog_get_bp(xlog, num_blks)
+   - 如果失败,大小改为1个block, 每次读取一个block, 处理一个
+   - 读取数据
+   > xlog_bread(xlog, start_blk, num_blks, xfs_buf, xfs_caddr_t)
+   - 检查block的开头, 如果是XLOG_HEADER_MAGIC_NUM, 这就是xlog_rec_header
+   - 如果找不到,可能碰到队列边界, 直接退出.
+   - 检查xlog_rec_header是否有效, 它可能仅仅是一部分,所以只检查uuid
+   > xlog_header_check_mount(xlog->xfs_mount, xlog_rec_header)
+   - 最后需要检查这个xlog的大小
+   - xlog_rec_header->h_size / XLOG_HEADER_CYCLE_SIZE + xlog_rec_header->h_len = last_blk - head_blk
+   - 如果不相同, 修改last_blk = head_blk, 也就是丢弃当前的xlog_rec_header
+
+** xlog_find_head(xlog, xfs_addr_t return_head_blk)
+   - 找xlog数据区的头
+   - 检查xlog中是否仅仅使用一部分,也就是还有一部分cycle=0. 
+   - xlog数据不会删除,所以如果用过cycle肯定变为 !=0
+   > xlog_find_zeroed(xlog, first_blk)
+   - 上面找到first_blk不应该是0, 因为mkfs会写入一个假的xlog
+   - 如果找到了,直接返回它,也就是head_blk, tail_blk也就是0. 可以从head_blk开始写数据.
+   - 如果上面找不到,需要遍历xlog数据区
+   - 先找到第一个block, 准备xfs_buf 
+   > xlog_get_bp(xlog, 1)
+   - 读回数据, 获取内存指针offset
+   > xlog_bread(xlog, 0, 1, xfs_buf, offset)
+   - 还有first_half_cycle 
+   > xlog_get_cycle(offset) 
+   - 准备最后一个block, 使用同一个xfs_buf??
+   > xlog_bread(xlog, last_blk, 1, xfs_buf, offset)
+   - 还有last_half_cycle
+   > xlog_get_cycle(offset)
+   - 队列中的cycle理想情况最多只有2种,每次写数据循环到数组头部,cycle增加.在cycle不一样的地方,就是队列的头尾
+   - 但是xlog写的时候没有保证order,可能后面写进去,但系统崩溃,导致cycle错误. 但这种错误情况不会太多,在一个xlog_in_core范围内.
+   - 这里先找到cycle的变化处,然后向前搜索一个范围, 如果搜索不到乱序的,就使用cycle断开的地方.
+   - 如果first_half_cycle == last_half_cycle, 说明队列没有循环使用. 如果有错误,也是发生在数组头尾. 要是错误发生在中间,数组头尾肯定会差1
+   - 否则first_half_cycle == last_half_cycle+1, 因为2者是挨着的. 需要先找到cycle变化的地方
+   - 先找到last_half_cycle的第一个block, 下面的范围是(0, logBBsize)
+   > xlog_find_cycle_start(xlog, xfs_buf, first_blk, head_blk, last_half_cycle)
+   - 这是找到队列的头尾,再向前遍历一个范围, 大小由xlog_in_core决定.
+   > XLOG_TOTAL_REC_SHIFT(xlog_rec_header)
+   - 顺序遍历,找到使用stop_on_cycle的第一个block
+   > xlog_find_verify_cycle(xlog, start_block, num_scan_bblks, stop_on_cycle, new_blk)
+   - 如果8个超过xlog区域的头,需要转到尾部.
+   - 找到head_blk, 检查前一个xlog_rec_header
+   > xlog_find_verify_log_record(xlog, start_blk, head_blk, 0)
+
+** xlog_find_tail(xlog, xfs_daddr_t head_blk, xfs_daddr_t tail_blk)
+   - 查找xlog队列的头和尾.
+   - 一般情况,应该只恢复一个xlog_in_core?? 所以队列分成2部分,一部分是有效数据,就是xlog_in_core的数据,另一部分是无效数据,就是其余的数据.
+   - 也不能这么说, 这样log数据区只需要2个xlog_in_core就够了???
+   - 这里找的头尾是无效数据使用的.
+   - 先找到头
+   > xlog_find_head(xlog, head_blk)
+   - 前一个xlog_rec_header就是有效数据
+   - 准备一个xfs_buf, 装一个block,向前遍历block
+   > xlog_get_bp(xlog, 1)
+   - 读block
+   > xlog_bread(xlog, i, 1, xfs_buf, offset)
+   - 如果上面head_blk ==0, 这里可能xlog还没有使用,第一个block的cycle==0, tail_blk = 0
+   - 检查它的cycle == 0
+   > xlog_get_cycle(offset)
+   - 如果不是初始化的情况,查找前面一个xlog_rec_header
+   - 从上面找到的head_blk向后遍历
+   > xlog_bread(xlog, i, 1, xfs_buf, offset)
+   - 找到xlog_rec_header, xlog_rec_header->h_tail_lsn表示xlog的尾
+   - 这个h_tail_lsn根据ail决定????
+   - 设置xlog->l_prev_block,指向前一个xlog_rec_header
+   - l_curr_block 指向当前xlog_rec_header, head_blk,也就是可以写数据的空间.
+   - xlog->l_curr_cycle表示当前cycle, 也就是队列每次经过数组边界都要加1. 它使用的是前面有效数据的cycle
+   - xlog->l_tail_lsn = xlog_rec_header->h_tail_lsn, 也就是空闲空间的尾
+   - xlog->l_last_sync_lsn = xlog_rec_header->h_lsn, 这个应该是最后一个有效块
+   - 设置xlog->l_reserve_head->grant (xlog_grant_head), 指向当前的位置(xlog->l_curr_cycle, xlog->l_curr_block), 同样xlog->l_write_head->grant
+   - 检查head xlog_rec_header中的xlog数据, 如果是umount操作,就不用recover?
+   - xlog_rec_header->h_num_logops == 1, 而且是XLOG_UMOUNT_TRANS
+   - 设置xlog->l_tail_lsn = (xlog->l_curr_cycle, head_blk), xlog->l_last_sync_lsn, 也就是(l_curr_cycle,l_curr_block)
+   - 最后如果有umount的xlog, head_blk和tail_blk一样.
+   - 设置xlog->xfs_mount->m_flags的XFS_MOUNT_WAS_CLEAN
+
+** xlog_find_zeroed(xlog, xfs_daddr_t)
+   - 检查xlog里面是cycle=0的block, 也就是没有使用的.
+
+** xlog_add_record(xlog, xfs_caddr_t, cycle, block, tail_cycle, tail_block)
+   - xfs_caddr_t指向的内存是一个block?? 
+   - 初始化xlog_rec_header
+   - magicno, cycle, version=2
+   - h_lsn是(cycle, block), h_tail_lsn是(tail_lsn, tail_block)
+
+** xlog_write_log_records(xlog, cycle, start_block, blocks, tail_cycle, tail_block)
+   - 写到xlog中数据
+   - 准备一个xfs_buf, 大小是blocks. 如果分配失败或者> xlog->l_logBBsize, 减半,但不能< xlog->l_sectBBsize
+   > xlog_get_bp(xlog, blocks)
+   - 遍历(start_block, blocks), 其中每个block头部都是xlog_rec_header
+   - 使用xlog_buf先读取出block? 需要吗??
+   > xlog_bread_offset(xlog, align, sectbb, xfs_buf, offset)
+   - 初始化每个block的xlog_rec_header, 只有当前的block是变的,其他都不变.
+   > xlog_add_record(xlog, offset, cycle, i+j, tail_cycle, tail_block)
+   - 写回磁盘
+   > xlog_bwrite(xlog, start_block, endcount, xfs_buf)
+   - 遍历这些block, 每个头部都是xlog_rec_header, 设置cycle, xfs_lsn_t
+   > xlog_add_record(xlog, offset, cycle, i+j, tail_cycle, tail_block)
+
+** xlog_clear_stale_blocks(xlog, xfs_lsn_t tail_lsn)
+   - 在写xlog数据时,不能保证完全有序.所以在发生crash时,要清除乱序的磁盘空间.
+   - 获取xlog的头和尾的地址 head_cycle/head_block, tail_cycle/tail_block
+   - head是根据xlog->l_curr_cycle, l_curr_block
+   - 首先计算xlog的空闲空间长度, head_block和tail_block之间的无效数据的距离
+   - 如果head_cycle == tail_cycle, head_blk > tail_block
+   - head_blk表示需要写数据的开头, 可以说它指向空闲空间, 或者没有有效数据的空间,它前面都是有效数据, head_blk可以说是有效数据的尾,有效数据的头,也就是空间空间的尾,在xlog_rec_header->h_tail_lsn中.
+   - tail_distance = tail_block + l_logBBsize - head_block
+   - 否则 tail_distance = tail_block - head_block
+   - 当然不能把整个xlog空间都写了,只写一个xlog_in_core的范围??
+   > XLOG_TOTAL_REC_SHIFT(xlog)
+   - XLOG_TOTAL_REC_SHIFT是256k*8, 这是在内存中的log数据长度?? 它和xlog->l_logBBsize什么关系?
+   - 设置(head_block, max_distance)之间的block
+   - 如果(head_block, max_distance)没有超过xlog->l_logBBsize, 直接设置, 使用head_cycle-1, 下次查找队列边界时,肯定找到这个地方.
+   > xlog_write_log_records(xlog, head_cycle-1, head_block, max_distance, tail_cycle, tail_block)
+   - 如果超过,分成2部分,
+   - 对于尾部的部分使用head_cycle-1, 对于头部部分使用head_cycle.
+   > xlog_write_log_records(xlog, head_cycle, 0, distance, tail_cycle, tail_block)
+   - 对于l_tail_lsn都是使用参数tail_lsn,这是有效数据的尾/头
+
+** xfs_trans_header
+   #+begin_src 
+	uint		th_magic;		/* magic number */
+	uint		th_type;		/* transaction type */
+	__int32_t	th_tid;			/* transaction id (unused) */
+	uint		th_num_items;		/* num items logged by trans */
+	//在transaction的log的最前头,说明它后面的信息.
+   #+end_src
+
+** xlog_recover_item
+   #+begin_src 
+	struct list_head	ri_list;
+	int			ri_type;
+	int			ri_cnt;	/* count of regions found */
+	int			ri_total;	/* total regions */
+	xfs_log_iovec_t		*ri_buf;	/* ptr to regions buffer */   
+   #+end_src
+
+** xlog_recover 
+   #+begin_src 
+	struct hlist_node	r_list;
+	xlog_tid_t		r_log_tid;	/* log's transaction id */
+	xfs_trans_header_t	r_theader;	/* trans header for partial */
+	int			r_state;	/* not needed */
+	xfs_lsn_t		r_lsn;		/* xact lsn */
+	struct list_head	r_itemq;	/* q for items */   
+   #+end_src
+
+** xlog_recover_find_tid(hlist_head, xlog_tid)
+   - hlist_head队列是xlog_recover->r_list队列
+   - 找一个xlog_recover->r_log_tid == xlog_tid
+   - xlog_tid属于一个xlog_op_header, hlist_head只是一个暂时的数据结构.
+
+** xlog_recover_new_tid(hlist_head, xlog_tid, xfs_lsn_t)
+   - 创建一个xlog_recover, 设置tid/xfs_lsn_t
+   - 把xlog_recover放到hlist_head中
+
+** xlog_recover_add_item(list_head)
+   - 创建一个xlog_recover_item
+   - 把它xlog_recover_item->ri_list放到参数list_head中
+
+** xlog_recover_add_to_cont_trans(xlog, xlog_recover, xfs_caddr_t, int len)
+   - 一个trans的xlog数据可能分成多份,使用xlog_recover_item缓存起来,一块处理.
+   - 这里要把(xfs_caddr_t,len)的数据给xlog_recover_item
+   - 但一个trans数据包包括2部分,头部是xfs_trans_header,后面是数据.每一份数据都使用xlog_op_header包装.
+   - 如果xlog_recover->r_itemq是空,给它补充xlog_recover_item
+   > xlog_recover_add_item(xlog_recover->r_itemq)
+   - 数据是xlog_trans_header, 给xlog_recover->xlog_trans_header
+   - 否则把数据给xlog_recover->r_itemq队列上最后一个xlog_recover_item
+   - xlog_recover_item->xfs_log_iovec保存数据,这里使用xlog_recover_item->xfs_log_iovec[xlog_recover_item->ri_cnt-1]
+   - 重新给它分配内存,扩大它的长度
+
+** xlog_recover_add_to_trans(xlog, xlog_recover, xfs_caddr_t, len)
+   - 这个函数和上面有什么差别?? 
+   - 如果xlog_recover->r_itemq是空, 需要新的xlog_recover_item索引数据
+   - 这里len不能超过sizeof(xfs_trans_header), xfs_trans_header会单独包装??
+   - 如果len == sizeof(xfs_trans_header),需要为后面分配xlog_recover_item
+   > xlog_recover_add_item(xlog_recover->r_itemq)
+   - 把数据复制给xlog_recover->xfs_trans_header. 可能len不够,下次复制.
+   - 如果xlog_recover->r_itemq不是空,已经有xfs_trans_header
+   - 先检查是否需要创建新的xlog_recover_item
+   - 最后一个xlog_recover_item->ri_total !=0, 而且ri_cnt == ri_total, 最后一个正在使用.
+   - 如果最后一个在使用,创建新的xlog_recover_item
+   > xlog_recover_add_item(xlog_recover->r_itemq)
+   - 如果新创建xlog_recover_item, 分配xfs_log_iovec指针数组
+   - 参数指向的数据头部是xlog_inode_log_format, 为什么出来这个???
+   - xlog_recover_item->ri_total = xfs_inode_log_format->ilf_size, 创建xfs_log_iovec数组
+   - 使用xfs_log_iovec索引参数(xfs_caddr_t, len)
+   - 这里和上一个函数区别是它不会重复使用xfs_log_iovec,而且创建新的xlog_recover_item
+
+** xlog_recover_reorder_trans(xlog, xlog_recover, int pass)
+   - 排序xlog_recover->r_itemq上的xlog_recover_item. 
+   - 把非cancelled的buf的xlog_recover_item放到最前面
+   - xlog_recover_item的第一个xfs_log_iovec中说明这个xlog_recover_item中数据的格式, 但没有一个公共的头部. 应该是所有的数据结构都有共同的数据成员, 也就是第一个type
+   > ITEM_TYPE(xlog_recover_item)
+   - 如果是XFS_LI_BFS, 它是xfs_buf_log_format, 如果xfs_buf_log_format->blf_flags & XFS_BLF_CANCEL ==0, 把它放到链表头
+   - 其他的XFS_LI_INODE/XFS_LI_DQUOT/XFS_LI_EFD/XFS_EFI都放到最后.
+   - 因为在第2阶段处理xfs_buf_log_format时,对于非cancelled的,先检查它是否有对应的cancelled的,就不用处理. 对于cancelled的, 只要删除它在hash表中的项. 所以先处理非cancel的
+
+** xfs_buf_cancel
+   #+begin_src 
+	xfs_daddr_t		bc_blkno;
+	uint			bc_len;
+	int			bc_refcount;
+	struct list_head	bc_list;
+	//在log recover过程中,管理xfs_buf_log_item??
+   #+end_src
+   
+** xlog_recover_buffer_pass1(xlog, xlog_recover_item)
+   - 处理xlog_recover_item, 它里面是xfs_buf_log_format, 只处理XFS_BLF_CANCEL类型的
+   - xlog_recover_item->xfs_log_iovec[0]的数据是xfs_buf_log_format
+   - xfs_buf_log_format->blf_flags & XFS_BLF_CANCEL ==0, 直接返回
+   - xlog->l_buf_cancel_table是hash表,根据xlog_recover_item创建xfs_buf_cancel, 添加到hash表中
+   - 首先查找是否已经存在,比较xfs_buf_cancel->bc_blkno 和 xfs_buf_log_format->blf_blkno, bc_len
+   - 如果有, xfs_buf_cancel->bc_refcount ++
+   - 如果没有,创建一个xfs_buf_cancel, 添加到队列中
+
+** xlog_check_buffer_cancelled(xlog, xfs_daddr_t, uint len, ushort flags)
+   - 根据(xfs_daddr_t, len)查找xfs_buf_cancel.
+   - 如果找到,而且参数flags & XFS_BLF_CANCEL !=0), --xfs_buf_cancel->bc_refcount,  如果减为0,释放它.
+   - 如果找到返回1, 否则返回0
+   - 在处理xfs_buf_log_format是,会检查它是否需要删除. 如果要删除,就不再继续. 对于要cancelled buf log, 就释放它在hash列表中的索引,保证最后数据的一致性.
+
+** xfs_buf_log_format 
+   #+begin_src 
+	unsigned short	blf_type;	/* buf log item type indicator */
+	unsigned short	blf_size;	/* size of this item */
+	ushort		blf_flags;	/* misc state */
+	ushort		blf_len;	/* number of blocks in this buf */
+	__int64_t	blf_blkno;	/* starting blkno of this buf */
+	unsigned int	blf_map_size;	/* used size of data bitmap in words */
+	unsigned int	blf_data_map[XFS_BLF_DATAMAP_SIZE]; /* dirty bitmap */
+        //这个数据结构表示一个buf的修改方式,具体修改数据在后面. (blf_blkno, blf_len)表示buf的磁盘位置??
+        //blf_data_map是一个位图,每一位表示128byte.
+        //bitmap中连续的设置区域,对应一个xfs_log_iovec, 数据一块存放.
+   #+end_src
+
+** xlog_recover_do_inode_buffer(xfs_mount, xlog_recover_item, xfs_buf, xfs_buf_log_format)
+   - recovery的block里面是inode,这里仅仅recover di_next_unlinked
+   - 设置xfs_buf->b_ops = xfs_inode_buf_ops
+   - xfs_buf中inode的数量 inodes_per_buf = xfs_buf->b_io_length >> xfs_mount->sb_inodelog (xfs_mount->sb_inodesize)
+   - 遍历xfs_buf中的xfs_inode, 检查xfs_inode->di_next_unlinked的位置是否在位图中标记出来
+   - 如果它在buf中的偏移被位图设置,去对应的xfs_log_iovec中取出数据
+   - 使用它更新xfs_buf中对应的数据
+   - 这里有2份这样的数据, xfs_buf是完整连续的,对应磁盘数据. xlog_recover_item对应xlog的数据,离散的.
+
+** xfs_da_blkinfo
+   #+begin_src 
+	__be32		forw;			/* previous block in list */
+	__be32		back;			/* following block in list */
+	__be16		magic;			/* validity check on block */
+	__be16		pad;			/* unused */   
+   #+end_src
+
+** xlog_recover_do_reg_buffer(xfs_mount, xlog_recover_item, xfs_buf, xfs_buf_log_format)
+   - 把xlog_reciver_item中的数据给xfs_buf. xlog_recover_item中是数据, xfs_buf_log_format里面说明数据的对应关系
+   - 查找xlog_buf_log_format->blf_data_map中连续有效的bit位, 它对应一个计算xlog_recover_item->xfs_log_iovec
+   - 把数据复制给xfs_buf.
+   - xfs_buf的偏移是xfs_buf_log_format->blf_blkno + 位图偏移
+
+** xlog_recover_buffer_pass2(xlog, list_head buffer_list, xlog_recover_item item)
+   - xlog中有2中buffer, 一种是普通的,一种是inode使用的.
+   - XFS_BLF_CANCEL表示buffer删除, 不需要recover他们,因为它可能被用于其他用途.
+   - xlog的recover过程分成2步,第一步是统计cancel的buf, 第二步recover数据时, 跳过cancel的buf.
+   - 处理xlog_recover_item的数据, 首先检查它要recover的数据是否在cancel中.
+   - 获取xfs_buf_log_format, 它是xlog_recover_item->xfs_log_iovec[0]中, 它决定了recover的地址空间
+   > xlog_check_buffer_cancelled(xlog, xfs_buf_log_format->blf_blkno, xfs_buf_log_format->blk_len, xfs_buf_log_format->blf_flags)
+   - 如果没有覆盖,继续recover
+   - 如果xfs_buf_log_format->blf_flags有XFS_BLF_INODE_BUF标志, 下面构造的xfs_buf使用XBF_UNMAPPED标志, 分配xfs_buf以及page后不用建立映射关系.
+   - 先把原始数据读上来, 这里使用的xfs_buf是在xfs_perag中缓存的,没有使用buf_head或address_space
+   > xfs_buf_read(xfs_mount->m_ddev_targp, xfs_buf_log_format->blf_blkno, xfs_buf_log_format->blk_len, buf_flags, NULL)
+   - 检查xfs_buf_log_format->blf_flags, 不同的log使用不同的方式
+   - 如果是XFS_BLF_INODE_BUF, 只处理unlink??
+   > xlog_recover_do_inode_buffer(xfs_mount, xlog_recover_item, xfs_buf, xfs_buf_log_format)
+   - 对应普通的
+   > xlog_recover_do_reg_buffer(xfs_mount, xlog_recover_item, xfs_buf, xfs_buf_log_format)
+   - 把修改后的xfs_buf写回磁盘, 尽量使用delayed write
+   - 对于inode使用的buffer, 如果大小不是标准的,必须写回磁盘
+   - xfs_buf开头是XFS_DINODE_MAGIC, xfs_buf->b_io_length != xfs_sb->sb_blocksize
+   > MAX(xlog->xfs_mount->xfs_super->sb_blocksize, XFS_INODE_CLUSTER_SIZE(xlog->xfs_mount))
+   - 为什么设为stale?? 应该是把它从lru队列中删除!
+   > xfs_buf_stale(xfs_buf)
+   - 写回数据
+   > xfs_bwrite(xfs_buf)
+   - 否则可以延时写回, 缓存在内存中.
+   - 设置回调函数 xfs_buf->b_iodone = xlog_recover_iodone 
+   - 提交到参数提供的队列, 设置_XBF_DELWRI_Q
+   > xfs_buf_delwri_submit_nowait(xfs_buf, buffer_list)
+
+** xlog_recover_inode_pass2(xlog, list_head, xlog_recover_item)
+   - xlog_recover_item是inode的xlog, 它不使用xfs_log_buf_format, 而是xfs_inode_log_format
+   - 如果xlog_recover_item->xfs_log_iovec[0]->i_len == sizeof(xfs_inode_log_format), 他就可以直接使用, 否则需要包装一下?? 
+   - 创建一个xfs_inode_log_format, 是不是有32/64的区别??
+   > xfs_inode_item_format_convert(xfs_log_iovec, xfs_inode_log_format)
+   - 检查inode使用的buffer是否要释放
+   > xlog_check_buffer_cancelled(xlog, xfs_inode_log_format->ilf_blkno, ilf_len, 0)
+   - 如果不释放,修改数据
+   - 先读数据, 直接设定xfs_buf->b_ops???
+   > xfs_buf_read(xfs_mount->m_ddev_targp, xfs_inode_log_format->ilf_blkno, ilf_len, 0, xfs_inode_buf_ops)
+   - xfs_inode_log_format->ilf_boffset是buffer的内部偏移,它是相对于ilf_blkno的偏移
+   - 获取xfs_buf中的xfs_dinode位置
+   > xfs_buf_offset(xfs_buf, xfs_inode_log_format->ilf_boffset)
+   - 检查xfs_dinode->di_magic == XFS_DINODE_MAGIC
+   - 从xlog_recover_item中取出xfs_icdinode, 它就是xlog_recover_item->xfs_log_iovec[1], 0是xfs_inode_log_format
+   - 比较xfs_dinode->di_flushiter和xfs_icdinode->di_flushiter,如果xfs_buf的大,不用再更新
+   - 检查xfs_icdinode的有效性, di_mode/di_format
+   - 最后计算xfs_icdinode的数据长度
+   > xfs_icdinode_size(xfs_icdinode->di_version)
+   - 把xfs_icdinode给xfs_dinode
+   > xfs_dinode_to_disk(xfs_dinode, xfs_icdinode)
+   - 后面是ifork数据
+   - 第3个xfs_log_iovec是attr数据
+   - 把xfs_buf写回磁盘, 设置xfs_buf->b_iodone是xlog_recover_iodone
+   - 这个回调函数只会检查结果,继续xfs_buf其他的回调函数.
+   > xfs_buf_delwri_queue(xfs_buf, buffer_list)
+
+** xlog_recover_quotaoff_pass1(xlog, xlog_recover_item)
+
+** xfs_efi_log_format
+   #+begin_src 
+	__uint16_t		efi_type;	/* efi log item type */XFS_LI_EFI
+	__uint16_t		efi_size;	/* size of this item */ 一直为1
+	__uint32_t		efi_nextents;	/* # extents to free */
+	__uint64_t		efi_id;		/* efi identifier */ //就是外层xfs_efi_log_item指针
+	xfs_extent_t		efi_extents[1];	/* array of extents to free */        //里面包括extent的信息. 
+   #+end_src
+
+** xfs_efi_log_item
+   #+begin_src 
+	xfs_log_item_t		efi_item;
+	atomic_t		efi_next_extent;
+	unsigned long		efi_flags;	/* misc flags */
+	xfs_efi_log_format_t	efi_format;   
+        //xfs_efi_log_format保存efi的信息,就是一个简单的数组. 在xlog中被xlog_record_header包装, 在recovery中,使用xfs_log_iovec包装,在ail中,被xfs_efi_log_item包装.
+   #+end_src
+
+** xlog_recover_efi_pass2(xlog, xlog_recover_item, xfs_lsn_t)
+   - 处理extent free intent item, efi, 从xlog_recover_item放到xfs_efi_log_item中.
+   - xlog_recover_item->xfs_log_iovec[0]是xfs_efi_log_format
+   - 创建xfs_efi_log_item
+   > xfs_efi_init(xfs_mount, xfs_efi_log_format->efi_nextents)
+   - 把xfs_efi_log_format的数据给xfs_efi_log_item->efi_format, 可能会转换32/64数据
+   > xfs_efi_copy_format(xfs_log_iovec, xfs_efi_log_item->xfs_efi_log_format)
+   - 把xfs_efi_log_item->xfs_log_item给xfs_trans.
+   - 如果xfs_log_item已经在xfs_ail中,只有xfs_lsn_t大,才会填加.
+   > xfs_trans_ail_update(xlog->xfs_ail, xfs_efi_log_item->xfs_log_item, xfs_lsn_t)
+
+** xlog_recover_efd_pass2(xlog, xlog_recover_item)
+   - efd是extent free done, 和efi对应.
+   - 在efi中查找对应的efi, 删除对应的xfs_efi_log_item
+   - 获取xfs_efd_log_format, xlog_recover_item->xfs_log_iovec[0]
+   - 先找到它对应xfs_efi_log_item, 根据id, xfs_efd_log_format->efd_efi_id.
+   - 遍历xfs_ail, 查找对应的xfs_log_item
+   - 找一个最小的xfs_log_item
+   - xfs_trans_ail_cursor_first(xfs_ail, xfs_ail_cursor, 0)
+   - 挑选xfs_log_item
+   - xfs_log_item->li_type == XFS_LI_EFI , xfs_efi_log_item->xfs_efi_log_format->efi_id == efi_id
+   - 找到之后,删除它
+   > xfs_trans_ail_delete(xfs_ail, xfs_efi_log_item, SHUTDOWN_CORRUPT_INCORE)
+   - 释放xfs_efi_log_item
+   > xfs_efi_item_free(xfs_efi_log_item)
+
+** xlog_recover_free_trans(xlog_recover)
+   - 释放xlog_recover, 以及它管理的xlog_recover_item
+   - 首先遍历xlog_recover->r_itemq, 对每个xlog_recover_item
+   - 释放它的xfs_log_iovec使用的内存
+   
+** xlog_recover_commit_pass1(xlog, xlog_recover, xlog_recover_item)
+   - 处理xlog中的数据, commit表示把它提交到文件系统的数据区.
+   - 检查xlog_recover_item的类型
+   > ITEM_TYPE(xlog_recover_item)
+   - 如果是XFS_LI_BUF, 只处理XFS_BLF_CANCEL的xfs_buf_log_format
+   - 建立xlog->l_buf_cancel_table中的hash表
+   > xlog_recover_buffer_pass1（xlog, xlog_recover_item)
+   - 对于其他的XFS_LI_INODE/EFI/EFD/DQUOT什么也不做
+
+** xfs_buf_log_format
+   #+begin_src 
+	unsigned short	blf_type;	/* buf log item type indicator */
+	unsigned short	blf_size;	/* size of this item */ //表示xfs_log_iovec的数量
+	ushort		blf_flags;	/* misc state */ //普通的buf,还是inode使用的
+	ushort		blf_len;	/* number of blocks in this buf */
+	__int64_t	blf_blkno;	/* starting blkno of this buf */
+	unsigned int	blf_map_size;	/* used size of data bitmap in words */
+	unsigned int	blf_data_map[XFS_BLF_DATAMAP_SIZE]; /* dirty bitmap */   
+   #+end_src
+
+** xlog_recover_commit_pass2(xlog, xlog_recover, list_head, xlog_recover_item)
+   - 和上面一样,不同的类型使用上面不同的函数
+   - xlog_recover_item的区别使用第一个xfs_log_iovec中的数据. 为何不用xlog_recover_item->ri_type?
+   - 当然里面有各种xfs_*_log_format, 但第一个成员表示类型
+   > ITEM_TYPE(xlog_recover_item)
+   - 如果是XFS_LI_BUF, buf log有2中,一种是inode使用的buffer,另一种是普通的.
+   - 对于inode使用的buf, 仅仅恢复unlink链表.
+   - xlog_recover_buffer_pass2(xlog, list_head, xlog_recover_item)
+   - 如果是XFS_LI_INODE, 恢复inode数据
+   > xlog_recover_inode_pass2(xlog, buffer_list, xlog_recover_item)
+   - 对于上面2中,都需要写回xfs_buf, 使用buffer_list缓存写会.
+   - 如果是XFS_LI_EFI, 建立对应的ail的xfs_efi_log_item
+   > xlog_recover_efi_pass2(xlog, xlog_recover_item, xfs_lsn_t)
+   - 如果是XFS_LI_EFD, 释放对应的ail中的xfs_efi_log_item
+   > xlog_recover_efd_pass2(xlog, xlog_recover_item)
+   - 不看quota相关的东西.
+
+** xlog_recover_commit_trans(xlog, xlog_recover, pass)
+   - 处理xfs_trans->r_itemq中的xlog_recover_item.  pass有2中情况,对应recover的2个阶段
+   - 首先调整顺序, 2次都调整?? 把不是cancelled的xfs_buf_log_format放到前面,其他放到后面.
+   > xlog_recover_reorder_trans(xlog, xfs_trans, pass)
+   - 如果pass是XLOG_RECOVER_PASS1, 建立xlog的cancelled xfs_buf的hash表.
+   > xlog_recover_commit_trans_pass1(xlog, xlog_trans, xlog_recover_item)
+   - 最后释放trans, 每次调用都会重新创建??
+   > xlog_recover_free_trans(xfs_trans)
+   - 写回list_head,里面是xfs_buf, 里面会检查pin???
+   > xfs_buf_delwri_submit(list_head)
+
+** xlog_recover_unmount_trans(xlog, xlog_recover)
+   - 什么都不做
+
+** xlog_recover_process_data(xlog, hlist_head, xlog_rec_header, xfs_caddr_t dp, int pass)
+   - 处理一个xlog_rec_header, 数据范围是(dp, xlog_rec_header->h_len)
+   - 里面有若干个xlog_op_header, xlog_rec_header->h_num_logops
+   - 检查xlog_rec_header是否有效, uuid/magic/h_fmt
+   > xlog_header_check_recover(xfs_mount, xlog_rec_header)
+   - dp指向xlog数据, 数据长度是xlog_rec_header->l_len, xlog单位是xlog_op_header, xlog数量是xlog_rec_header->h_num_logops
+   - 遍历这些xlog_op_header
+   - 验证xlog_op_header->oh_clientid必须是XFS_TRANSACTION或XFS_LOG
+   - xlog_op_header->oh_tid表示什么?? 对应xlog->recover->r_log_tid
+   - 使用它查找xlog_op_header对应的xlog_recover. 
+   > xlog_recover_find_tid(hlist_head, tid)
+   - 参数hlist_head是hash表,hash索引根据oh_tid计算
+   - 如果找不到, 而且xlog_op_header->oh_flags & XLOG_START_TRANS !=0, 创建一个新的. 开始trans.
+   > xlog_recover_new_tid(hlist_head, xlog_oh_header->oh_tid, xfs_lsn_t)
+   - 如果找到, 可能需要结束这个transaction,也可能合并数据
+   - 检查xlog_op_header->oh_flags & ~ XLOG_END_TRANS
+   - 对于XLOG_COMMIT_TRANS, 说明这个log已经提交, 可以完全recover xlog_recover..
+   > xlog_recover_commit_trans(xlog, xfs_trans, pass)
+   - 对于XLOG_UNMOUNT_TRANS
+   > xlog_recover_unmount_trans(xlog, xfs_trans)
+   - 对于XLOG_WAS_CONT_TRANS, xlog_op_header指向的log数据分成多份,集中到一个xlog_recover
+   > xlog_recover_add_to_cont_trans(xlog, xlog_recover, xfs_caddr_t, xlog_op_header->oh_len)
+   - 对于XLOG_START_TRANS, 这是错误的处理!!因为它应该是找不到对应的xlog_recover.
+   - 对于XLOG_CONTINUE_TRANS/XLOG_END_TRANS, 同样合并
+   > xlog_recover_add_to_trans(xlog, xfs_trans, xfs_caddr_t, xlog_op_header->oh_len)
+   - 对于一个xlog, XLOG_START_TRANS和XLOG_COMMIT_TRANS应该是对应的
+   - XLOG_CONTINUE_TRANS和XLOG_WAS_CONT_TRANS类似,但后者会合并数据到同一个xfs_log_iovec, 前者不会,但可能会创建新的xlog_recover_item.
+   
+** xfs_extent 
+   #+begin_src 
+	xfs_dfsbno_t	ext_start;
+	xfs_extlen_t	ext_len;   
+   #+end_src
+
+** xlog_recover_process_efi(xfs_mount, xfs_efi_log_item)
+   - recover xfs_efi_log_item, 在recover结束时,清除没有释放完成的efi. 释放extent必须有对应的efd, 这里需要创建对应的efd, 写到xlog中.
+   - 首先检查xfs_efi_log_item的数据是否正确, 也就是xfs_efi_log_item->xfs_efi_log_format->efi_nextents数组里面的xfs_extent
+   - 检查xfs_extent
+   - xfs_extent->ext_start是组合地址,(agno,agbno), 转化为绝对地址, 检查是否超过文件系统大小
+   > XFS_BB_TO_FSB(xfs_mount, XFS_FSB_TO_DADDR(xfs_mount, xfs_extent->ext_start))
+   - startblock_fsb == 0, xfs_extent->ext_len == 0, xfs_extent->ext_len >= xfs_sb->sb_agblocks
+   - 如果上面条件满足, 设置xfs_efi_log_item->efi_flags的XFS_EFI_RECOVERED, 释放释放它
+   > xfs_efi_release(xfs_efi_log_item, xfs_extent)
+   - 而且返回错误EIO
+   - 如果没有问题, 创建xfs_trans 
+   > xfs_trans_alloc(xfs_mount, 0)
+   - 预留空间, 为何使用一个truncate? 现在为何要预留log空间?? 
+   - logcount =0, 表示只用1个 xlog_ticket->t_cnt
+   - xlog的预留空间使用xlog->l_tail_lsn和xlog->l_reserve_head.但这个分配同样增长xlog->l_write_head?
+   > xfs_trans_reserve(xfs_trans, 0, XFS_ITRUNCATE_LOG_RES(xfs_mount), 0, 0, 0)
+   - 构造对应的xfs_efd_log_item
+   > xfs_trans_get_efd(xfs_trans, xfs_efi_log_item, xfs_efi_log_item->xfs_efi_log_format->efi_nextents)
+   - 遍历这些xfs_extent,释放空间
+   > xfs_free_extent(xfs_trans, xfs_extent->ext_start, xfs_extent->ext_len)
+   - 填充xfs_efd_log_item->xfs_efd_log_format->xfs_extent数组
+   > xfs_trans_log_efd_extent(xfs_trans, xfs_efd_log_item, xfs_extent->ext_start, xfs_extent->ext_)
+   - 设置xfs_efi_log_item->efi_flags的XFS_EFI_RECOVERED, 
+   - 提交transacton, 把这些信息写到xlog中,表示extent free item操作完成.
+   > xfs_trans_commit(xfs_trans, 0)
+
+** xlog_recover_process_efis(xlog)
+   - 遍历xlog->xfs_ail里面的xfs_log_item
+   > xfs_trans_ail_cursor_first(xfs_ail, xfs_ail_cursor, 0)
+   > xfs_trans_ail_cursor_next(xfs_ail, xfs_ail_cursor)
+   - 处理xfs_log_item, 检查li_type != XFS_LI_EFI, 直接退出.
+   - 如果xfs_efi_log_item->efi_flags包含XFS_EFI_RECOVERED, 跳过
+   > xlog_recover_process_efi(xfs_mount, xfs_efi_log_item)
+   - 一个efi使用一个transaction..
+
+** xlog_recover_clear_agi_bucket(xfs_mount, xfs_agnumber_t, bucket)
+   - 处理xfs_agi->agi_unlinked[bucket]指针. 这是unlink链表已经清空,所以设置这个hash链表头为NULLAGINO
+   - 创建xfs_trans, recovery操作也使用xfs_trans包装起来.
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_CLEAR_AGI_BUCKET)
+   - 预留空间
+   > xfs_trans_reserve(xfs_trans, 0, XFS_CLEAR_AGI_BUCKET_LOG_RES(xfs_mount), 0, 0, 0)
+   - 读取xfs_ag的xfs_agi
+   > xfs_read_agi(xfs_mount, xfs_trans, agno, xfs_buf)
+   - XFS_BUF_TO_AGI(xfs_buf)
+   - 设置xfs_agi->agi_unlinked[bucket] = NULLAGINO
+   - 虽然修改了磁盘,但这里没有直接写回去, 操作xfs_buf->b_fspriv, 也就是xfs_buf_log_item
+   - 在xfs_buf_log_format的位图中标注出来
+   > xfs_trans_log_buf(xfs_trans, xfs_agi, offset, offset + sizeof(xfs_agino_t)-1)
+   - 提交transaction
+   > xfs_trans_commit(xfs_trans, 0)
+
+** xlog_recover_process_one_iunlink(xfs_mount, xfs_agnumber_t, xfs_agino_t, int bucket)
+   - 处理unlink操作, 但这里仅仅获取xfs_dinode->di_next_unlinked
+   - 使用xfs_agnumber/xfs_agino计算ino
+   > XFS_AGINO_TO_INO(xfs_mount, agno, agino)
+   - 根据ino获取xfs_inode
+   > xfs_iget(xfs_mount, NULL, ino, 0, 0, xfs_inode)
+   - 获取它在磁盘上的xfs_buf
+   > xfs_imap_to_bp(xfs_mount, NULL, xfs_inode->i_imap, xfs_dinode, xfs_buf, 0, 0)
+   - xfs_dinode->di_nlink必须 ==0 
+   - 释放xfs_buf
+   > xfs_buf_relse(xfs_buf)
+   - 释放xfs_inode, 这里只释放inode使用计数  iput(inode)
+   > IRELE(xfs_inode)
+   - 返回xfs_dinode->di_next_unlinked
+   - 这里没看到任务inode的删除动作???
+
+** xlog_recover_process_iunlinks(xlog)
+   - 遍历所有的xfs_ag, 处理它的unlink列表
+   - xfs_mount->xfs_sb->sb_agcount表示ag数量
+   - 首先获取对应的ag对应的xfs_buf
+   > xfs_read_agi(xfs_mount, NULL, agno, xfs_buf)
+   - 然后是xfs_agi
+   > XFS_BUF_TO_AGI(xfs_buf)
+   - 遍历xfs_agi->agi_unlinked队列, 一共有XFS_AGI_UNLINKED_BUCKETS个
+   - xlog_recover_process_one_iunlink(agno, agino, bucket)
+
+** xlog_unpack_data_crc(xlog_rec_header, xfs_caddr_t, xlog)
+   - 验证xlog的crc
+   > xlog_cksum(xlog, xlog_rec_header, xfs_caddr_t, xlog_rec_header->h_len)
+   - 结果和xlog_rec_header->h_crc比较
+
+** xlog_unpack_data(xlog_rec_header, xfs_caddr_t, xlog)
+   - 首先验证crc
+   > xlog_unpack_data_crc(xlog_rec_header, xfs_caddr_t, xlog)
+   - dp指向xlog中的buf, 而且是block对齐的.
+   - 设置每个block开头的cycle, 为xlog_rec_header->h_cycle_data[i]
+   - 对于扩展的情况, xlog_in_core2[i]->xlog_rec_ext_header->xh_cycle_data[k]
+   - 对于扩展情况,就是2维数组,低维是XLOG_HEADER_CYCLE_SIZE/BBSIZE=64
+   - 高维是xlog_rec_header->h_len / 64
+
+** xlog_valid_rec_header(xlog, xlog_rec_header, xfs_daddr_t blkno)
+   - 验证xlog_rec_header->h_magicno 必须是XLOG_HEADER_MAGIC_NUM
+   - 检查xlog_rec_header->h_len 不能超过INT_MAX
+   - xfs_daddr_t不能超过xlog->l_logBBsize, 它应该是xlog的内部偏移
+
+** xlog_do_recovery_pass(xlog, xfs_daddr_t head_blk, xfs_daddr_t tail_blk, pass)
+   - 处理(tail_blk, head_blk)之间的xlog_rec_header
+   - 如果xlog_in_core大小是固定的,每次读回的数据就是XLOG_BIG_RECORD_BSIZE
+   - 对于logv2, 每个xlog_rec_header的大小由xlog_in_core决定, 先使用一个xfs_buf读取xlog_rec_header, 获取一个xlog_rec_header
+   - xlog_rec_header->h_size就是xlog_in_core的大小.
+   - 准备一个block的xfs_buf 
+   > xlog_get_bp(xlog, 1)
+   - 读回tail_blk对应的xlog_rec_header
+   > xlog_valid_rec_header(xlog, xlog_rec_header, tail_blk)
+   - 获取xlog_rec_header->h_size, 计算每次读回的数量是  xlog_rec_header->h_size / XLOG_HEADER_CYCLE_SIZE.. 
+   - 貌似一部分头,后面是数据. 这里只是计算合理的xfs_buf的大小, 或者一个xlog_rec_header的header的block数量
+   - 准备xfs_buf 
+   > xlog_get_bp(xlog, BTOBB(h_size))
+   - 准备一个hash队列,保存xlog_recover, 一个xlog_recover对应一个xlog_op_header, 或许也是一个transaction
+   - 如果tail_blk <= head_blk, 没有跨循环队列的边界, 开始循环扫描
+   - 先读头部, hblks表示头部的block
+   > xlog_bread(xlog, blk_no, hblks, xfs_buf, offset)
+   - 验证数据头xlog_rec_header 
+   > xlog_valid_rec_header(xlog, xlog_rec_header, blk_no)
+   - 根据xlog_rec_header->h_len读取xlog的block
+   > xlog_bread(xlog, blk_no + hblks, xlog_rec_header->h_len, xfs_buf, offset)
+   - 解数据包, 设置cycle
+   > xlog_unpack_data(xlog_rec_header, offset, xlog)
+   - 处理这个xlog_rec_header
+   > xlog_recover_process_data(xlog, hlist_head, xlog_rec_header, offset, pass)
+   - 每个xlog_rec_header有分成多个xlog_op_header. xlog_op_header只是包装了数据流,这些数据包是根据transaction包装的, 没有和xlog_recovery_item一一对应.
+   - 数据流又分成xfs_*_log_format, 这些是连续的.
+   - 可能会有多个transaction同时向xlog中写数据?? 但一个transaction的数据流分成多个xfs_*_log_format. 每个的格式或大小都是确定的
+   - 如果blk_tail > blk_head, 要分成2部分,先处理队列尾部,再拐回来.
+
+** xlog_do_log_recovery(xlog, xfs_daddr_t head_blk, xfs_daddr_t tail_blk)
+   - xlog recover分2个过程,首先找出concel的log, 放到xlog->l_buf_cancel_table中 
+   - 构造hash列表, 大小是XLOG_BC_TABLE_SIZE
+   - 收集cancelled buf信息
+   > xlog_do_recovery_pass(xlog, head_blk, tail_blk, XLOG_RECOVER_PASS1)
+   - 然后第2个过程
+   > xlog_do_recovery_pass(xlog, head_blk, tail_blk, XLOG_RECOVER_PASS2)
+
+** xlog_do_recover(xlog, xfs_daddr_t head_blk, tail_blk)
+   - recover xlog, 然后更新xfs_sb
+   > xlog_do_log_recovery(xlog, head_blk, tail_blk)
+   - 设置xlog->l_tail_lsn
+   - 它会根据ail设置, 但这时可能没有,使用xlog->l_last_sync_lsn.
+   - 它是在查找时发现的最后一个正确的xlog_rec_header的.
+   > xlog_assign_tail_lsn(xfs_mount)
+   - 更新xfs_sb
+   - 读取第一个xfs_sb
+   > xfs_getsb(xfs_mount, 0)
+   - 去掉XFS_DONE标志
+   > XFS_BUF_UNDONE(xfs_buf)
+   - 设置XFS_READ, 去掉XFS_SYNC??
+   > xfsbdstrat(xfs_mount, xfs_buf)
+   - 等待读完成
+   > xfs_buf_iowait(xfs_buf)
+   - 把磁盘的xfs_sb, 给xfs_mount->xfs_sb
+   > xfs_sb_from_disk(xfs_sb, xfs_dsb)
+   - 重新设置一些percpu参数
+   > xlog_recover_check_summary(xlog)
+   - 去掉xlog->l_flags的XLOG_ACTIVE_RECOVEY
+   - xfs_sb的buf可能会修改??? 所以重新读出来.
+
+** xlog_recover(xlog)
+   - 包装上面的函数,主要是找到头和尾
+   > xlog_find_tail(xlog, head_blk, tail_blk)
+   - 如果head_blk == tail_blk, 不用recover
+   - 否则执行recover操作
+   > xlog_do_recover(xlog, head_blk, tail_blk)
+   - 最后添加xlog->l_flags的XLOG_RECOVERY_NEEDED标志, 在mount操作完成后清除recover中用的信息.
+
+** xlog_recover_finish(xlog)
+   - 这里处理extent free item和unlink inode
+   - 首先xlog->l_flags & XLOG_RECOVER_NEEDED !=0, 才做这些操作
+   - 首先efi
+   > xlog_recover_process_efis(xlog)
+   - 写回数据
+   > xfs_log_force(xlog_mount, XFS_LOG_SYNC)
+   - 然后是unlink
+   > xlog_recover_process_unlinks(xlog)
+   - 最后检查xfs_agl和xfs_agi
+   > xlog_recover_check_summary(xlog)
+   - 最后清除xlog->l_flags的XLOG_RECOVER_NEEDED标致

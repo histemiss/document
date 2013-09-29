@@ -1,0 +1,21 @@
+dm-log 
+
+dm_dirty_log
+  dm_dirty_log_type *type
+  flush_callback_fn(dm_target)
+  context
+
+dm_dirty_log_type
+  char name 
+  module module 
+  
+  list_head  list 
+  ctr(dm_dirty_log, dm_target, argc, argv)
+  dtr(dm_dirty_log )
+  
+  presuspend(dm_dirty_log) 
+  postsuspend(dm_dirty_log)
+  resume(dm_dirty_log)
+
+  get_region_size(dm_dirty_log)
+ 

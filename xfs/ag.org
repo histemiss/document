@@ -1,0 +1,650 @@
+* alloc group
+
+** xfs_buf
+   #+begin_src 
+	struct rb_node		b_rbnode;	/* rbtree node */
+	xfs_daddr_t		b_bn;		/* block number of buffer */
+	int			b_length;	/* size of buffer in BBs */
+	atomic_t		b_hold;		/* reference count */
+	atomic_t		b_lru_ref;	/* lru reclaim ref count */
+	xfs_buf_flags_t		b_flags;	/* status flags */
+	struct semaphore	b_sema;		/* semaphore for lockables */
+
+	/*
+	 * concurrent access to b_lru and b_lru_flags are protected by
+	 * bt_lru_lock and not by b_sema
+	 */
+	struct list_head	b_lru;		/* lru list */
+	xfs_buf_flags_t		b_lru_flags;	/* internal lru status flags */
+	wait_queue_head_t	b_waiters;	/* unpin waiters */
+	struct list_head	b_list;
+	struct xfs_perag	*b_pag;		/* contains rbtree root */
+	xfs_buftarg_t		*b_target;	/* buffer target (device) */
+	void			*b_addr;	/* virtual address of buffer */
+	struct work_struct	b_iodone_work;
+	xfs_buf_iodone_t	b_iodone;	/* I/O completion function */
+	struct completion	b_iowait;	/* queue for I/O waiters */
+	void			*b_fspriv;
+	struct xfs_trans	*b_transp;
+	struct page		**b_pages;	/* array of page pointers */
+	struct page		*b_page_array[XB_PAGES]; /* inline pages */
+	struct xfs_buf_map	*b_maps;	/* compound buffer map */
+	struct xfs_buf_map	__b_map;	/* inline compound buffer map */
+	int			b_map_count;
+	int			b_io_length;	/* IO size in BBs */
+	atomic_t		b_pin_count;	/* pin count */
+	atomic_t		b_io_remaining;	/* #outstanding I/O requests */
+	unsigned int		b_page_count;	/* size of page array */
+	unsigned int		b_offset;	/* page offset in first page */
+	unsigned short		b_error;	/* error code on I/O */
+	const struct xfs_buf_ops	*b_ops;
+   
+   #+end_src
+   - 管理一块磁盘,大小不固定.
+
+** xfs_mount
+   - 非常大的数据结构
+   #+begin_src 
+	struct super_block	*m_super;
+	xfs_tid_t		m_tid;		/* next unused tid for fs */ //transaction
+	struct xfs_ail		*m_ail;		/* fs active log item list */
+	xfs_sb_t		m_sb;		/* copy of fs superblock */
+	spinlock_t		m_sb_lock;	/* sb counter lock */
+	struct xfs_buf		*m_sb_bp;	/* buffer for superblock */
+	char			*m_fsname;	/* filesystem name */
+	int			m_fsname_len;	/* strlen of fs name */
+	char			*m_rtname;	/* realtime device name */
+	char			*m_logname;	/* external log device name */
+	int			m_bsize;	/* fs logical block size */
+	xfs_agnumber_t		m_agfrotor;	/* last ag where space found */
+	xfs_agnumber_t		m_agirotor;	/* last ag dir inode alloced */
+	spinlock_t		m_agirotor_lock;/* .. and lock protecting it */
+	xfs_agnumber_t		m_maxagi;	/* highest inode alloc group */
+	uint			m_readio_log;	/* min read size log bytes */
+	uint			m_readio_blocks; /* min read size blocks */
+	uint			m_writeio_log;	/* min write size log bytes */
+	uint			m_writeio_blocks; /* min write size blocks */
+	struct xlog		*m_log;		/* log specific stuff */
+	int			m_logbufs;	/* number of log buffers */
+	int			m_logbsize;	/* size of each log buffer */
+	uint			m_rsumlevels;	/* rt summary levels */
+	uint			m_rsumsize;	/* size of rt summary, bytes */
+	struct xfs_inode	*m_rbmip;	/* pointer to bitmap inode */
+	struct xfs_inode	*m_rsumip;	/* pointer to summary inode */
+	struct xfs_inode	*m_rootip;	/* pointer to root directory */
+	struct xfs_quotainfo	*m_quotainfo;	/* disk quota information */
+	xfs_buftarg_t		*m_ddev_targp;	/* saves taking the address */
+	xfs_buftarg_t		*m_logdev_targp;/* ptr to log device */
+	xfs_buftarg_t		*m_rtdev_targp;	/* ptr to rt device */
+	__uint8_t		m_blkbit_log;	/* blocklog + NBBY */
+	__uint8_t		m_blkbb_log;	/* blocklog - BBSHIFT */
+	__uint8_t		m_agno_log;	/* log #ag's */
+	__uint8_t		m_agino_log;	/* #bits for agino in inum */
+	__uint16_t		m_inode_cluster_size;/* min inode buf size */
+	uint			m_blockmask;	/* sb_blocksize-1 */
+	uint			m_blockwsize;	/* sb_blocksize in words */
+	uint			m_blockwmask;	/* blockwsize-1 */
+	uint			m_alloc_mxr[2];	/* max alloc btree records */
+	uint			m_alloc_mnr[2];	/* min alloc btree records */
+	uint			m_bmap_dmxr[2];	/* max bmap btree records */
+	uint			m_bmap_dmnr[2];	/* min bmap btree records */
+	uint			m_inobt_mxr[2];	/* max inobt btree records */
+	uint			m_inobt_mnr[2];	/* min inobt btree records */
+	uint			m_ag_maxlevels;	/* XFS_AG_MAXLEVELS */
+	uint			m_bm_maxlevels[2]; /* XFS_BM_MAXLEVELS */
+	uint			m_in_maxlevels;	/* max inobt btree levels. */
+	struct radix_tree_root	m_perag_tree;	/* per-ag accounting info */
+	spinlock_t		m_perag_lock;	/* lock for m_perag_tree */
+	struct mutex		m_growlock;	/* growfs mutex */
+	int			m_fixedfsid[2];	/* unchanged for life of FS */
+	uint			m_dmevmask;	/* DMI events for this FS */
+	__uint64_t		m_flags;	/* global mount flags */
+	uint			m_dir_node_ents; /* #entries in a dir danode */
+	uint			m_attr_node_ents; /* #entries in attr danode */
+	int			m_ialloc_inos;	/* inodes in inode allocation */
+	int			m_ialloc_blks;	/* blocks in inode allocation */
+	int			m_inoalign_mask;/* mask sb_inoalignmt if used */
+	uint			m_qflags;	/* quota status flags */
+	xfs_trans_reservations_t m_reservations;/* precomputed res values */
+	__uint64_t		m_maxicount;	/* maximum inode count */
+	__uint64_t		m_resblks;	/* total reserved blocks */
+	__uint64_t		m_resblks_avail;/* available reserved blocks */
+	__uint64_t		m_resblks_save;	/* reserved blks @ remount,ro */
+	int			m_dalign;	/* stripe unit */
+	int			m_swidth;	/* stripe width */
+	int			m_sinoalign;	/* stripe unit inode alignment */
+	int			m_attr_magicpct;/* 37% of the blocksize */
+	int			m_dir_magicpct;	/* 37% of the dir blocksize */
+	__uint8_t		m_sectbb_log;	/* sectlog - BBSHIFT */   //log(xfs_sb->sb_sectorsize) - 9
+	const struct xfs_nameops *m_dirnameops;	/* vector of dir name ops */
+	int			m_dirblksize;	/* directory block sz--bytes */
+	int			m_dirblkfsbs;	/* directory block sz--fsbs */
+	xfs_dablk_t		m_dirdatablk;	/* blockno of dir data v2 */
+	xfs_dablk_t		m_dirleafblk;	/* blockno of dir non-data v2 */
+	xfs_dablk_t		m_dirfreeblk;	/* blockno of dirfreeindex v2 */
+	uint			m_chsize;	/* size of next field */
+	struct xfs_chash	*m_chash;	/* fs private inode per-cluster
+						 * hash table */
+	atomic_t		m_active_trans;	/* number trans frozen */
+#ifdef HAVE_PERCPU_SB
+	xfs_icsb_cnts_t __percpu *m_sb_cnts;	/* per-cpu superblock counters */
+	unsigned long		m_icsb_counters; /* disabled per-cpu counters */
+	struct notifier_block	m_icsb_notifier; /* hotplug cpu notifier */
+	struct mutex		m_icsb_mutex;	/* balancer sync lock */
+#endif
+	struct xfs_mru_cache	*m_filestream;  /* per-mount filestream data */
+	struct delayed_work	m_reclaim_work;	/* background inode reclaim */
+	struct delayed_work	m_eofblocks_work; /* background eof blocks
+						     trimming */
+	__int64_t		m_update_flags;	/* sb flags we need to update
+						   on the next remount,rw */
+	int64_t			m_low_space[XFS_LOWSP_MAX];
+						/* low free space thresholds */
+
+	struct workqueue_struct	*m_data_workqueue;
+	struct workqueue_struct	*m_unwritten_workqueue;
+	struct workqueue_struct	*m_cil_workqueue;
+	struct workqueue_struct	*m_reclaim_workqueue;
+	struct workqueue_struct	*m_log_workqueue;
+	struct workqueue_struct *m_eofblocks_workqueue;
+   
+   #+end_src
+
+** xfs_btree_cur 
+   #+begin_src 
+	struct xfs_trans	*bc_tp;	/* transaction we're in, if any */
+	struct xfs_mount	*bc_mp;	/* file system mount struct */
+	const struct xfs_btree_ops *bc_ops;
+	uint			bc_flags; /* btree features - below */
+	union {
+		xfs_alloc_rec_incore_t	a;
+		xfs_bmbt_irec_t		b;
+		xfs_inobt_rec_incore_t	i;
+	}		bc_rec;		/* current insert/search record value */
+	struct xfs_buf	*bc_bufs[XFS_BTREE_MAXLEVELS];	/* buf ptr per level */
+	int		bc_ptrs[XFS_BTREE_MAXLEVELS];	/* key/record # */
+	__uint8_t	bc_ra[XFS_BTREE_MAXLEVELS];	/* readahead bits */
+#define	XFS_BTCUR_LEFTRA	1	/* left sibling has been read-ahead */
+#define	XFS_BTCUR_RIGHTRA	2	/* right sibling has been read-ahead */
+	__uint8_t	bc_nlevels;	/* number of levels in the tree */
+	__uint8_t	bc_blocklog;	/* log2(blocksize) of btree blocks */
+	xfs_btnum_t	bc_btnum;	/* identifies which btree type */
+	union {
+		struct {			/* needed for BNO, CNT, INO */
+			struct xfs_buf	*agbp;	/* agf/agi buffer pointer */
+			xfs_agnumber_t	agno;	/* ag number */
+		} a;
+		struct {			/* needed for BMAP */
+			struct xfs_inode *ip;	/* pointer to our inode */
+			struct xfs_bmap_free *flist;	/* list to free after */
+			xfs_fsblock_t	firstblock;	/* 1st blk allocated */
+			int		allocated;	/* count of alloced */
+			short		forksize;	/* fork's inode space */
+			char		whichfork;	/* data or attr fork */
+			char		flags;		/* flags */
+#define	XFS_BTCUR_BPRV_WASDEL	1			/* was delayed */
+		} b;
+	}		bc_private;	/* per-btree type data */
+   
+   #+end_src
+
+** xfs_btree_rec 
+   #+begin_src 
+	xfs_bmbt_rec_t		bmbt;
+	xfs_bmdr_rec_t		bmbr;	/* bmbt root block */
+	xfs_alloc_rec_t		alloc;
+	xfs_inobt_rec_t		inobt;
+   #+end_src
+   - 这是btree中的记录,也就是叶节点中的数据
+
+** xfs_btree_key
+   #+begin_src 
+	xfs_bmbt_key_t		bmbt;
+	xfs_bmdr_key_t		bmbr;	/* bmbt root block */
+	xfs_alloc_key_t		alloc;
+	xfs_inobt_key_t		inobt;
+   #+end_src
+   - 对应上面的btree中的值
+
+** 总结
+   - xfs使用的数据结构少,但没有btrfs一致,它的xfs_btree_cur用来操作btree,它只有3中:inode分配,free space管理,dir item管理.
+
+** xfs_alloc_lookup_eq(xfs_btree_cur, xfs_agblock_t, xfsextlen_t, int stat)
+   - xfs_extlen_t表示block的数量,xfs_agblock_t表示ag内部block的索引.
+   - 设置xfs_btree_cur->bc_rec->a->ar_startblock/ar_blockcount
+   > xfs_btree_lookup(xfs_btree_cur, XFS_LOOKUP_EQ, stat)
+
+** xfs_alloc_lookup_ge(xfs_btree_cur, xfs_agblock_t, xfs_extlen_t, int stat)
+   - 和上面相同,btree查找还会ge/le比较? 已经有了横向的链表,找到eq再找ge/le的应该很简单.
+   > xfs_btree_lookup(xfs_btree_cur, XFS_LOOKUP_GE, stat)
+
+** xfs_alloc_lookup_le(xfs_btree_cur, xfs_agblock_t, xfs_extlen_t, int stat)
+   > xfs_btree_lookup(xfs_btree_cur, XFS_LOOKUP_LE, stat)
+
+
+** xfs_alloc_update(xfs_btree_cur, xfs_agblock_t, xfs_extlen_t)
+   - 这次构造xfs_btree_rec, 填充xfs_btree_rec->xfs_alloc_rec_t
+   > xfs_btree_update(xfs_btree_cur, xfs_btree_rec)
+
+** xfs_alloc_get_rec(xfs_btree_cur, xfs_agblock_t, xfs_extlen_t, int stat)
+   - stat是做什么的? 是返回操作结果
+   > xfs_btree_get_rec(xfs_btree_cur, xfs_btree_rec, stat)
+   - 获取xfs_btree_cur指向的btree数据,不是xfs_btree_cur->bc_rec. 然后获取xfs_agblock_t/xfs_extlen_t
+
+** xfs_alloc_arg 
+   #+begin_src 
+	struct xfs_trans *tp;		/* transaction pointer */
+	struct xfs_mount *mp;		/* file system mount point */
+	struct xfs_buf	*agbp;		/* buffer for a.g. freelist header */ //xfs_agf
+	struct xfs_perag *pag;		/* per-ag struct for this agno */
+	xfs_fsblock_t	fsbno;		/* file system block number */
+	xfs_agnumber_t	agno;		/* allocation group number */
+	xfs_agblock_t	agbno;		/* allocation group-relative block # */
+	xfs_extlen_t	minlen;		/* minimum size of extent */
+	xfs_extlen_t	maxlen;		/* maximum size of extent */
+	xfs_extlen_t	mod;		/* mod value for extent size */
+	xfs_extlen_t	prod;		/* prod value for extent size */
+	xfs_extlen_t	minleft;	/* min blocks must be left after us */
+	xfs_extlen_t	total;		/* total blocks needed in xaction */
+	xfs_extlen_t	alignment;	/* align answer to multiple of this */
+	xfs_extlen_t	minalignslop;	/* slop for minlen+alignment calcs */
+	xfs_extlen_t	len;		/* output: actual size of extent */
+	xfs_alloctype_t	type;		/* allocation type XFS_ALLOCTYPE_... */
+	xfs_alloctype_t	otype;		/* original allocation type */
+	char		wasdel;		/* set if allocation was prev delayed */
+	char		wasfromfl;	/* set if allocation is from freelist */
+	char		isfl;		/* set if is freelist blocks - !acctg */
+	char		userdata;	/* set if this is user data */
+	xfs_fsblock_t	firstblock;	/* io first block allocated */
+   #+end_src
+   - 分配需要20多个参数?
+
+** xfs_alloc_compute_aligned(xfs_alloc_arg, xfs_agblock_t foundbno, xfs_extlen_t foundlen, xfs_agblock_t resbno, xfs_extlen_t reslen)
+   - 有2对agblock_t/extlen_t, 对应ext的位置,前面是xfs_agblock_t是开始查找的位置
+   > xfs_extent_busy_trim(xfs_alloc_arg, foundbno, foundlen, xfs_agblock_t, xfs_extlen_t)
+   - 使用extent busy信息分配空间?
+   - 如果xfs_alloc_arg->alignment>1,而且len超过xfs_alloc_arg->minlen, 可以在分配的空间中挑一块对齐的
+   > roundup(xfs_agblock_t, xfs_alloc_arg->alignment)
+   
+** xfs_alloc_compute_diff(xfs_agblock_t wantbno, xfs_extlen_t wantlen, xfs_extlen_t alignment, xfs_agblock_t freebno, xfs_extlen_t free len, xfs_agblock_t newbnop)
+   - 参数包括target, 希望的分配地址, free, 现有的freespace, 还有alignment, 计算一个最好的分配地址newbnop, 情况复杂阿.
+   - 如果freebno >= wantbno, 直接计算freebno开始的对齐地址,对齐地址超过freeend, 返回NULLAGBLOCK, 0. 如果有这个结果,什么情况都没法分配. 
+   > roundup(freebno, alignment)
+   - 如果freeend>=wantedend, alignment>1, free覆盖wanted(freebno<wantbno), 对wanted地址对齐.获取2个对齐的地址,一个在wanted后面,一个在前面. 
+   > roundup(wantbno, alignment)
+   - 计算2个对应的len, 不能超过freeend. 如果对应的len超过freeend, 对齐地址也无效. 在2个中选一个最好的,也么是len大的,也就是len1<wanted<len2, 或者长度相同,对齐地址离wanted近. wanted <= len1 = len2
+   > XFS_EXTENT_MIN(wantlen, freeend-newbno1)
+   - 当然如果无效的,肯定放弃掉
+   - 如果没有alignment, 而且覆盖, freeend>wantend, 直接使用wantbno
+   - 如果没有覆盖,但有对齐, 而且freebno在wantbno前面, 检查freeend-wantlen, 也就是反向查找,检查对齐的2个地址.
+   > roundup(freeend - wantlen, alignment)
+   - 如果没有对齐,就直接使用freeend - wantlen地址.
+   - 最后返回的是分配地址和wantbno的距离
+   > XFS_ABSDIFF(newbno, wantbno)
+
+** xfs_alloc_fix_len(xfs_alloc_arg)
+   - 让xfs_alloc_arg->len是 k * xfs_alloc_arg->prod + xfs_alloc_arg->mod, 修改他, 但没有看明白.
+
+** xfs_agf
+   #+begin_src 
+	/*
+	 * Common allocation group header information
+	 */
+	__be32		agf_magicnum;	/* magic number == XFS_AGF_MAGIC */
+	__be32		agf_versionnum;	/* header version == XFS_AGF_VERSION */
+	__be32		agf_seqno;	/* sequence # starting from 0 */
+	__be32		agf_length;	/* size in blocks of a.g. */
+	/*
+	 * Freespace information
+	 */
+	__be32		agf_roots[XFS_BTNUM_AGF];	/* root blocks */
+	__be32		agf_spare0;	/* spare field */
+	__be32		agf_levels[XFS_BTNUM_AGF];	/* btree levels */
+	__be32		agf_spare1;	/* spare field */
+
+	__be32		agf_flfirst;	/* first freelist block's index */
+	__be32		agf_fllast;	/* last freelist block's index */
+	__be32		agf_flcount;	/* count of blocks in freelist */
+	__be32		agf_freeblks;	/* total free blocks */
+
+	__be32		agf_longest;	/* longest free space */
+	__be32		agf_btreeblks;	/* # of blocks held in AGF btrees */
+	uuid_t		agf_uuid;	/* uuid of filesystem */
+
+	/*
+	 * reserve some contiguous space for future logged fields before we add
+	 * the unlogged fields. This makes the range logging via flags and
+	 * structure offsets much simpler.
+	 */
+	__be64		agf_spare64[16];
+
+	/* unlogged fields, written during buffer writeback. */
+	__be64		agf_lsn;	/* last write sequence */
+	__be32		agf_crc;	/* crc of agf sector */
+	__be32		agf_spare2;
+
+	/* structure must be padded to 64 bit alignment */
+   #+end_src
+
+** xfs_alloc_fix_minleft(xfs_alloc_arg)
+   - 检查xfs_alloc_arg->len / minleft, 如果xfs_agf_t->agf_freeblks满足不了,就减小xfs_alloc_arg->len, 如果xfs_alloc_arg->len < minlen, 就返回失败?
+   - xfs_alloc_arg->xfs_buf->b_addr指向的就是xfs_agf_t
+   > XFS_BUF_TO_AGF(xfs_alloc_arg->agbp)
+   - 最后检查通过返回1, 否则返回0
+
+** xfs_alloc_fixup_trees(xfs_btree_cur_t cnt_cur, xfs_btree_cur_t bno_cur, xfs_agblock_t fbno, xfs_extlen_t flen, xfs_agblock_t rbno, xfs_extlen_t rlen, int flags)
+   - 注释没看懂. 前面2个是btree的指针, 然后2套磁盘位置指针
+   - 如果flags没有XFSA_FIXUP_CNT_OK, 查找i? 检查i
+   > xfs_alloc_lookup_eq(xfs_btree_cur, xfs_agblock_t, xfs_extlen_t, i)
+   - 如果flags没有XFSA_FIXUP_BNO_OK, 
+   > xfs_alloc_lookup_eq(xfs_btree_cur_t, xfs_agblock_t, xfs_extlen_t, i)
+   - 上面2个查找应该不会返回1
+   - (rbno, rlen)会在(fbno, flen)范围内部, 如果2个范围不一样,需要释放多余的2块范围
+   - 为何删除count索引的节点?
+   > xfs_btree_delete(xfs_btree_cur_t, &i)
+   - 处理2头多余的范围
+   > xfs_alloc_lookup_eq(xfs_btree_cur_t, nfbno1, nflen1, i)
+   - 上面应该返回0,失败..
+   > xfs_btree_insert(xfs_btree_cnt_t, i)
+   - 这里insert操作没有参数? 奇怪. 查找操作后,应该插入的位置和数据就在xfs_btree_cur_t中.
+   - 处理bno_cur索引, 如果不用修改前面的头,只要把原来的删除就行
+   > xfs_btree_delete(xfs_btree_cur_t, i)
+   - 如果需要删除前面一点头,只需修改对应的节点
+   > xfs_alloc_update(xfs_btree_cur_t, nfbno1, nflen1)
+   - 对于后端的,就是插入
+   > xfs_alloc_lookup_eq(xfs_btree_cur_t, nfbno2, nflen2, i)
+   > xfs_btree_insert(xfs_btree_cur_t, i)
+
+** xfs_buftarg 
+   #+begin_src 
+	dev_t			bt_dev;
+	struct block_device	*bt_bdev;
+	struct backing_dev_info	*bt_bdi;
+	struct xfs_mount	*bt_mount;
+	unsigned int		bt_bsize;
+	unsigned int		bt_sshift;
+	size_t			bt_smask;
+
+	/* LRU control structures */
+	struct shrinker		bt_shrinker;
+	struct list_head	bt_lru;
+	spinlock_t		bt_lru_lock;
+	unsigned int		bt_lru_nr;
+   #+end_src
+
+** xfs_agfl_verify(xfs_buf)
+   - 验证xfs_buf数据有效性?! xfs_buf->b_target->bt_mount
+   - xfs_buf里面是ag free list
+   > XFS_BUF_TO_AGFL(xfs_buf)
+   - 对比xfs_agfl->agfl_uuid 和 xfs_mount->m_sb->sb_uuid, 这里有xfs_sb, 磁盘保存的数据结构
+   - xfs_agfl->agfl_magicnum 和 XFS_AGFL_MAGIC
+   - 比较xfs_agfl->agfl_seqno 和 xfs_buf->xfs_perag->pag_agno
+   - xfs_buf里面是数组,数组中全是xfs_agblock_t, 指针. 这些指针要不指向NULLAGBLOCK, 要不就在xfs_mount->xfs_sb->sb_agblocks, 不能超过每个ag的block数目
+
+** xfs_agfl 
+   #+begin_src 
+	__be32		agfl_magicnum;
+	__be32		agfl_seqno;
+	uuid_t		agfl_uuid;
+	__be64		agfl_lsn;
+	__be32		agfl_crc;
+	__be32		agfl_bno[];	/* actually XFS_AGFL_SIZE(mp) */
+   #+end_src
+
+** xfs_agfl_read_verify(xfs_buf)
+   - 只有XFS_SB_VERSION_5的xfs才支持crc?  xfs_sb->sb_versionnum
+   > xfs_verify_cksum(xfs_buf->b_addr, BBTOB(xfs_buf->b_length), xfs_agfl->agfl_crc)
+   > xfs_agfl_verfify(xfs_buf)
+   - xfs代码太有个性.
+
+** xfs_agfl_write_verify(xfs_buf)
+   - 计算xfs_buf中数据的crc
+
+** xfs_buf_op  xfs_agfl_buf_ops
+   #+begin_src 
+	.verify_read = xfs_agfl_read_verify,
+	.verify_write = xfs_agfl_write_verify,
+   #+end_src
+   - 只有2个回调函数.
+
+** 单位(重要)
+   - sector, block, fsb(file system block)
+   - (xfs_fs.h) BBSHIFT = 9, BBSIZE = 1<<9, 在xfs中使用BB表示block(basic block), B表示byte, 字节偏移.
+   - sector是xfs io的单位, minimum_io. sectorsize可调整, 它应该是blocksize的2^n倍. 在ag中,前面4个sector都是定义好的   xfs_sb->sb_sectsize. xfs_mount->m_sectbb_log表示sector的BB数量(log)
+   - fsb是xfs的基本地址单元,在ag分配地址时,必须是它的倍数.在xfs中BB没有任何意义,除了去块设备做io时.  xfs_sb->sb_blocksize, xfs_mount->m_blkbb_log表示fsb的BB数量(log). 它的范围是(512-65536)
+   - fsb能比sector小吗?  
+
+** xfs_alloc_read_agfl(xfs_mount, xfs_trans, xfs_agnumber, xfs_buf)
+   - 读回什么?xfs_buftarg是什么? 是mount唯一个?  
+   - 从xfs_mount计算第3个sector的偏移, 里面是AG internal free list. 偏移以block为单位
+   > XFS_AGFL_DADDR(xfs_mount)  / 3<<xfs_mount->m_sectbb_log  ag内部偏移
+   > XFS_AGB_TO_DADDR(xfs_mount, agno, 0) / agno * xfs_mount->xfs_sb->sb_agblocks + 0  ag的起始位置,以fsb为单位
+   > XFS_FSB_TO_BB(xfs_mount, fsbno)  / fsbno << xfs_mount->m_blkbb_log  fsb转化为bb,上面的ag起始位置
+   > XFS_AG_DADDR(xfs_mount, agno, address) ag起始位置加内部偏移,以BB为单位
+   - 这里依靠大量的宏计算偏移, 最后获取free list所在的sector的物理地址, 以BB为单位
+   > XFS_FSS_TO_BB(xfs_mount, 1)  / 1 << xfs_mount->m_sectbb_log / 把fs sector大小转化为BB大小, fs sector就是sector
+   > xfs_trans_read_buf(xfs_mount, xfs_trans, xfs_mount->m_ddev_targp, address, size, 0, xfs_buffer, xfs_agfl_buf_ops)
+   > xfs_buf_set_ref(xfs_buffer, XFS_AGFL_REF)
+
+** xfs_perag 
+   - 缓存ag free list和ag inode的信息
+   #+begin_src 
+	struct xfs_mount *pag_mount;	/* owner filesystem */
+	xfs_agnumber_t	pag_agno;	/* AG this structure belongs to */
+	atomic_t	pag_ref;	/* perag reference count */
+	char		pagf_init;	/* this agf's entry is initialized */
+	char		pagi_init;	/* this agi's entry is initialized */
+	char		pagf_metadata;	/* the agf is preferred to be metadata */
+	char		pagi_inodeok;	/* The agi is ok for inodes */
+	__uint8_t	pagf_levels[XFS_BTNUM_AGF];
+					/* # of levels in bno & cnt btree */
+	__uint32_t	pagf_flcount;	/* count of blocks in freelist */
+	xfs_extlen_t	pagf_freeblks;	/* total free blocks */
+	xfs_extlen_t	pagf_longest;	/* longest free space */
+	__uint32_t	pagf_btreeblks;	/* # of blocks held in AGF btrees */
+	xfs_agino_t	pagi_freecount;	/* number of free inodes */
+	xfs_agino_t	pagi_count;	/* number of allocated inodes */
+
+	/*
+	 * Inode allocation search lookup optimisation.
+	 * If the pagino matches, the search for new inodes
+	 * doesn't need to search the near ones again straight away
+	 */
+	xfs_agino_t	pagl_pagino;
+	xfs_agino_t	pagl_leftrec;
+	xfs_agino_t	pagl_rightrec;
+#ifdef __KERNEL__
+	spinlock_t	pagb_lock;	/* lock for pagb_tree */
+	struct rb_root	pagb_tree;	/* ordered tree of busy extents */
+
+	atomic_t        pagf_fstrms;    /* # of filestreams active in this AG */
+
+	spinlock_t	pag_ici_lock;	/* incore inode cache lock */
+	struct radix_tree_root pag_ici_root;	/* incore inode cache root */
+	int		pag_ici_reclaimable;	/* reclaimable inodes */
+	struct mutex	pag_ici_reclaim_lock;	/* serialisation point */
+	unsigned long	pag_ici_reclaim_cursor;	/* reclaim restart point */
+
+	/* buffer cache index */
+	spinlock_t	pag_buf_lock;	/* lock for pag_buf_tree */
+	struct rb_root	pag_buf_tree;	/* ordered tree of active buffers */
+
+	/* for rcu-safe freeing */
+	struct rcu_head	rcu_head;
+#endif
+	int		pagb_count;	/* pagb slots in use */
+   #+end_src
+
+** xfs_alloc_update_counter(xfs_trans, xfs_perag, xfs_buf, len)
+   - xfs_buf里面是xfs_agf, 
+   - xfs_perag->pagf_freeblks += len, xfs_agf->agf_freeblks += len
+   - debug, 在xfs_trans->t_ag_freeblks_delta += len
+   > xfs_trans_agblocks_delta(xfs_trans, len)
+   - ??
+   > xfs_alloc_log_agf(xfs_trans, xfs_buf, XFS_AGF_FREEBLKS)
+
+** xfs_alloc_ag_vextent(xfs_alloc_arg)
+   - 根据xfs_alloc_arg->type使用不同的策略?
+   - XFS_ALLOCTYPE_THIS_AG
+   > xfs_alloc_ag_vextent_size(xfs_alloc_arg)
+   - XFS_ALLOCTYPE_NEAR_BNO
+   > xfs_alloc_ag_vextent_near(xfs_alloc_arg)
+   - XFS_ALLOCTYPE_THIS_BNO
+   > xfs_alloc_ag_vextent_exact(xfs_alloc_arg)
+   - 检查结果? 如果xfs_alloc_arg->wasfromfl无效,不是从free list中分配的?
+   > xfs_alloc_update_counters(xfs_alloc_arg->xfs_trans, xfs_alloc_arg->perag, xfs_alloc_arg->xfs_buf, - xfs_alloc_arg->len)
+   - 上面的xfs_buf指什么?  然后确认这个extent是busy的?
+   > xfs_extent_busy_search(xfs_alloc_arg->xfs_mount, xfs_alloc_arg->agno, xfs_alloc_arg->agbno, xfs_alloc_arg->len)
+   - xfs_alloc_arg->isfl无效, 什么free list blocks?   transaction??
+   > xfs_trans_mod_sb(xfs_alloc_arg->xfs_trans, xfs_alloc_arg->wasdel?XFS_TRNS_SB_RES_FDBLOCKS: XFS_TRANS_SB_FDBLOCKS, - xfs_alloc_arg->len)
+   
+** xfs_alloc_ag_vextent_exact(xfs_alloc_arg)
+   - 在固定的位置分配extent. extent length在xfs_alloc_arg->(minlen,max_len)之间.
+   - xfs_alloc_arg->alignment必须是1,没必要对其.
+   - 首先准备xfs_btree_cur,用于操作btree. 它使用2个btree管理free space, 这里是按照位置排序(像btrfs的btrfs_path)
+   > xfs_allocbt_init_cursor(xfs_alloc_arg->xfs_mount, xfs_alloc_arg->xfs_trans, xfs_alloc_arg->xfs_buf, xfs_alloc_arg->agno, XFS_BTNUM_BNO)
+   - 根据bno,minlen, 去btree中查找对应的节点
+   > xfs_alloc_lookup_le(xfs_btree_cur, xfs_alloc_arg->agbno, xfs_alloc_arg->minlen, i)
+   - 如果函数返回错误,直接退出, 如果i错误,查找失败. 上面查找的是le?
+   - 从xfs_btree_cur中获取结果, 结果位置xfs_agblock_t <= xfs_alloc_arg->agbno?!
+   > xfs_alloc_get_rec(xfs_btree_cur, xfs_agblock_t, xfs_extlen_t, i)
+   - extent busy 操作?  tbno, tlen是最终结果
+   > xfs_extent_busy_trim(xfs_alloc_arg, xfs_agblock_t, xfs_extlen_t, tbno, tlen)
+   - (tbno, tlen) 必须覆盖 xfs_alloc_arg->agbno,minlen? 而且tlen不能使分配的extent超过xfs_alloc_agbno+maxlen
+   - 进一步修正, 根据prod/mod
+   > xfs_alloc_fix_len(xfs_alloc_arg)
+   - xfs_alloc_arg->xfs_buf指向的是xfs_agf, 修改xfs_agf->agf_freeblks, 减去xfs_alloc_arg->(len+minleft), minleft哪里来的?
+   > xfs_alloc_fix_minleft(xfs_alloc_arg)
+   - 再操作count btree, 初始化一个xfs_btree_cur
+   > xfs_allocbt_init_cursor(xfs_alloc_arg->xfs_mount, xfs_alloc_arg->xfs_trans, xfs_alloc_arg->xfs_buf, xfs_alloc_arg->agno, XFS_BTNUM_CNT)
+   - 这是有2个空间(fbno,flen), (tbno, tlen), 后者是校正的, 前者是从bno btree上查找的, 还有xfs_alloc_arg中的.
+   - 修改2个btree
+   > xfs_alloc_fixup_trees(xfs_btree_cur cnt_cur, xfs_btree_cur bno_cur, fbno, flen, xfs_alloc_arg->agbno, xfs_alloc_arg->len, XFSA_FIXUP_BNO_OK)
+   - 释放xfs_btree_cur, 设置xfs_alloc_arg->wasfromfl = 0
+
+** xfs_alloc_find_best_extent(xfs_alloc_arg, xfs_btree_cur gcur, xfs_btree_cur scur, xfs_agblock_t gdif, xfs_agblock_t sbno, xfs_extlen_t slen, xfs_agblock_t sbnoa, xfs_extlen_t slena, int dir)
+   - xfs把参数都解释的差不多了.  dir表示往左/右搜索(1/0)
+   - 使用scur遍历btree?
+   - 开始遍历
+   - 从xfs_btree_cur中获取结果, xfs_btree_cur遍历的是free space btree, xfs_alloc_rec_t, 里面是空间位置信息
+   > xfs_alloc_get_rec(xfs_btree_cur, sbno, slen, i)
+   - 使用extent busy信息进行校正??
+   > xfs_alloc_computer_aligned(xfs_alloc_arg, sbno, slen, sbnoa, slena)
+   - 比较上面返回的sbnoa和xfs_alloc_arg->agbno. 貌似理想的位置是xfs_alloc_arg->agbno+/-gdiff.
+   - 起始地址更可取后,而且slena>minlen, 替换结果?
+   > xfs_alloc_fix_len(xfs_alloc_arg)
+   > xfs_alloc_compute_diff(xfs_alloc_arg->agbno, len, ...)
+   - 如果需要继续搜索,根据dir移动xfs_btree_cur
+   > xfs_btree_increment(xfs_btree_cur, 0, i)
+   > xfs_btree_decrement(xfs_btree_cur, 0, i)
+   - 最后没有更新xfs_alloc_arg, 但会更新参数, 如果使用原来xfs_btree_cur指向的节点,就把另一个xfs_btree_cur删除, 设置双重指针为NULL
+   > xfs_btree_del_cursor(...)
+
+** xfs_alloc_ag_vextent_near(xfs_alloc_arg)
+   - 在xfs_alloc_arg->agbno附近分配. 够复杂的. btree操作太复杂
+   - 先准备一个btree的遍历指针, 用来遍历count btree
+   > xfs_allocbt_init_cursor(xfs_alloc_arg->xfs_mount, xfs_alloc_arg->xfs_trans, xfs_alloc_arg->xfs_buf, xfs_alloc_arg->agno, XFS_BTNUM_CNT)
+   - 在btree中查找比maxlen大的
+   > xfs_alloc_lookup_ge(xfs_btree_cur, 0, xfs_alloc_arg->maxlen, i)
+   - 如果失败,最小的??
+   > xfs_alloc_ag_vextent_small(xfs_alloc_arg, xfs_btree_cur, ltbno, ltlen, i)
+   - i= 0 || ltben=0应该表示没有空间? 
+   - 下面开始循环,退出条件是下面为真? 也就是最后一个block?
+   > xfs_btree_islastblock(xfs_btree_cur, 0)
+   - 从小向大查找所有的xfs_alloc_rec, 现在xfs_btree_cur指向什么?
+   - 如果ltlen有效,表示上面重新搜索了比maxlen小的block,这里要跳过比min_len小的xfs_alloc_rec
+   - 获取当前xfs_btree_cur指向的xfs_alloc_rec
+   > xfs_alloc_get_rec(xfs_btree_cur, ltbno, ltlen, i)
+   - 如果xfs_alloc_rec->ar_blockcount < xfs_alloc_arg->minlen, 检查下一个.
+   > xfs_btree_increment(xfs_btree_cur, 0, i)
+   > 检查当前节点开始到不超过xfs_alloc_arg->maxlen范围内的xfs_alloc_rec,挑一个最优的
+   - 向前遍历循环
+   > xfs_btree_increment(xfs_btree_cur, 0, i)
+   - 获取当前xfs_alloc_rec
+   > xfs_alloc_get_rec(xfs_btree_cur, ltbno, ltlen, i)
+   - 如果xfs_alloc_rec->ar_blockcount < xfs_alloc_arg->minlen, 处理下一个,不可能!
+   - 计算校正的ltbnoa,ltlena, 校正len, 符合mod/prod
+   > xfs_alloc_compute_aligned(xfs_alloc_arg, ltbno, ltlen, ltbnoa, ltlena)
+   > xfs_alloc_fix_len(xfs_alloc_arg)
+   - 计算diff?? 如果xfs_alloc_arg->len > blen 或者 ltdiff < bdiff, 这是条件更好的,记录下来, blen, bdiff, bnew, btree指针i.
+   > xfs_alloc_compute_diff(xfs_alloc_arg->agbno, xfs_alloc_arg->len, xfs_alloc_arg->alignment, ltbnoa, ltlena, ltnew)
+   - 遍历完成后,取出最优的, 通过xfs_btree_cur->bc_ptrs[0] = besti取回, 设置最好长度?! xfs_alloc_arg->len = blen 这不就是最长?
+   > xfs_alloc_get_rec(xfs_alloc_arg, ltbno, ltlen, i)
+   - 这是什么意思?
+   > xfs_alloc_fix_minleft(xfs_alloc_arg)
+   - xfs_alloc_arg->agbno是bnew,确定要使用这个xfs_alloc_rec
+   - 去bno tree中分配下来,创建一个xfs_btree_cur
+   > xfs_allocbt_init_cursor(xfs_alloc_arg->xfs_mount, xfs_alloc_arg->xfs_trans, xfs_alloc_arg->xfs_buf, xfs_alloc_arg->agno, XFS_BTNUM_BNO)
+   - 修改btree, 为何2套参数???
+   > xfs_alloc_fixup_trees(xfs_btree_cur cnt, xfs_btree_cur bno, ltbno, ltlen, bnew, blen, XFS_FIXUP_CNT_OK)
+   - 如果上面找不出来最有的,blen=0, 使用第2套算法. 同时先2边搜索足够大的xfs_alloc_rec
+   - 创建bno的xfs_btree_cur
+   > xfs_allocbt_init_cursor(xfs_alloc_arg->xfs_mount, ...)
+   - 查找xfs_alloc_arg->agbno左边的, 长度什么用??
+   > xfs_alloc_lookup_le(xfs_btre_cur, xfs_alloc_arg->agbno, xfs_alloc_arg->maxlen, i)
+   - 然后复制一个xfs_btree_cur, 向右搜索
+   > xfs_btree_dup_cursor(xfs_btree_cur lt, xfs_btree_cur gt)
+   - lt的向右偏移一个
+   > xfs_btree_increment(xfs_btree_cur gt, 0, i)
+   - 开始循环,可向2边搜索,直到找到一个长度超过minlen的
+   - 对于左边就是减小索引,对于右边就是增大
+   > xfs_btree_decrement(xfs_alloc_cur, 0, i)
+   - 检查是否满足要求
+   > xfs_alloc_get_rec(xfs_btree_cur, ltbno, ltlen, i)
+   - 当然是校正过的长度lelena > xfs_alloc_arg->minlen
+   > xfs_alloc_compute_aligned(xfs_alloc_arg, ltbno, ltlen, ltbnoa, ltlena)
+   - 在移动时碰到边界,对应的xfs_btree_cur设为NULL, 如果2个都为0,就是找不到
+   - 如果2个xfs_btree_cur都有效,但还是有先后问题,可能先搜索的占优!
+   - xfs_alloc_arg->len = min(ltlena, maxlen), 并且校正
+   > xfs_alloc_fix_len(xfs_alloc_arg)
+   - 先计算diff??
+   > xfs_alloc_compute_diff(xfs_alloc_arg->agbno, len, alignment, ltbnoa, ltlena, ltnew)
+   - 为何2个xfs_btree_cur?? 还要再在2者之间搜索一遍
+   - xfs_alloc_find_best_extent(xfs_alloc_arg, xfs_btree_cur lt, xfs_btree_cur gt, ltdiff, gtbno, gtlen, gtbnoa, gtlena, 0)
+   - 最后找到一套ltbno,ltlen, ltnew, rlen, 去cnt tree中分配
+   > xfs_alloc_fixup_trees(xfs_btree_cur cnt, xfs_btree_cur bno, ltbno, ltlen, ltnew, rlen, XFSA_FIXUP_BNO_OK)
+
+** xfs_alloc_ag_vexent_size(xfs_alloc_arg)
+   - 分配一个大小介于(minlen,maxlen)的xfs_alloc_rec, 而且长度满足(prod,mod)
+   - 首先准备cnt xfs_btree_cur
+   > xfs_allocbt_init_cur(xfs_alloc_arg->xfs_mount, ..., XFS_BTNUM_CNT)
+   - 根据大小查找
+   > xfs_alloc_lookup_ge(xfs_btree_cur, 0, xfs_alloc_arg->maxlen+alignment-1, i)
+   - 如果查找失败,找一个最小的??
+   > xfs_alloc_ag_vextent_small(xfs_alloc_arg, xfs_btree_cur, fbno, flen, i)
+   - 如果也找不到,肯定失败了
+   - 如果上面找到了,但不能确定xfs_btree_cur指向的什么?!先右搜索,确认找一个rlen > xfs_alloc_arg->maxlen
+   > xfs_alloc_get_rec(xfs_alloc_arg, fbno, flen, i)
+   > xfs_alloc_compute_aligned(xfs_alloc_arg, fbno, flen, rbno, rlen)
+   - 移动指针
+   > xfs_btree_increment(xfs_btree_cur, 0, i)
+   - 对于上面查找不到的,使用了smallest的情况  rlen < xfs_alloc_arg->maxlen, 检查是否有小的更合适的xfs_alloc_rec
+   > xfs_btree_decrement(xfs_btree_cur, 0, i)
+   > xfs_alloc_get_rec(xfs_btree_cur, ...)
+   > xfs_alloc_compute_aligned(xfs_alloc_arg, fbno, flen, rbno, rlen)
+   - 找一个经过计算rlen最大的xfs_alloc_rec. 搜索只碰到flen比best rlen小,停止搜索.这还是一个cnt的btree
+   - 最后找到的结果为rlen,rbno, flen, fbno? 又是2套!!
+   > xfs_alloc_fix_len(xfs_alloc_arg)
+   > xfs_alloc_fix_minleft(xfs_alloc_arg)
+   - 去block btree中分配
+   > xfs_allocbt_init_cur(xfs_alloc_arg->xfs_mount, ...)
+   > xfs_alloc_fixup_trees(xfs_alloc_cur, ...)
+
+** xfs_alloc_ag_vextent_small(xfs_alloc_arg, xfs_btree_cur, xfs_agblock fbnop, xfs_extlen flenp, int stat)
+   - 但找不到足够大的xfs_alloc_rec的情况时使用. 返回最后一个,也就是最大的,或者去freelist分配?!
+   - xfs_btree_cur指向什么?  如果移动错误,直接返回
+   > xfs_btree_decrement(xfs_btree_cur, 0, i)
+   - 如果可以移动,获取它的xfs_alloc_rec
+   > xfs_alloc_get_rec(xfs_btree_cur, fbno, flen, i)
+   - 如果不能移动,已经是最左端的,去free list分配. 需要检查能不能去
+   - xfs_alloc_arg->minlen == 1, alignment=1, xfs_alloc_arg->isfl=0, xfs_agf->agf_flcount>xfs_alloc_arg->minleft, 这么多限制!!
+   > xfs_alloc_get_freelist(xfs_alloc_arg->xfs_trans, xfs_alloc_arg->xfs_buf, fbno, 0)
+   > xfs_extent_busy_reuse(xfs_alloc_arg->xfs_mount, ...)
+   - 如果xfs_alloc_arg->userdata有效,可以使用???
+   > xfs_btree_get_bufs(xfs_alloc_arg->xfs_mount, ... )
+   - 把结果给xfs_alloc_arg, len = 1, agbno = fbno, wasfromfl = 1
+   - 如果上面移动得到一个, 如果太短,flen < xfs_alloc_arg->minlen, 设置xfs_alloc_arg->agbno = NULLAGBLOCK.
+   - 但返回的fbnop/flenp是有效的.
+
+** xfs_free_extent(xfs_trans, xfs_buf, xfs_agnumber, xfs_agblock, xfs_extlen, isfl)
+   - 释放extent.
