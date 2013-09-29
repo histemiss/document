@@ -358,5 +358,71 @@
    - 再处理ATTR_SIZE 
    > nfs_vmtruncate(inode, iattr->ia_size)
 
+** kstat 
+   #+begin_src 
+	u64		ino;
+	dev_t		dev;
+	umode_t		mode;
+	unsigned int	nlink;
+	kuid_t		uid;
+	kgid_t		gid;
+	dev_t		rdev;
+	loff_t		size;
+	struct timespec  atime;
+	struct timespec	mtime;
+	struct timespec	ctime;
+	unsigned long	blksize;
+	unsigned long long	blocks;   
+   #+end_src
+
 ** nfs_getattr(mnt, dentry, kstat)
-   
+   - 对于普通文件, 等待io完成 
+   > nfs_inode_dio_wait(inode)
+   > filemap_write_and_wait(inode->address_space)
+   - 计算是否查找atime
+   - nfs_inode->cache_validity & NFS_INO_INVALID_ATIME 需要atime
+   - 如果vfsmount->mnt_flags有MNT_NOATIME, 或者有MNT_NODIRATIME, 不需要atime
+   - 如果need_atime !=0 
+   > __nfs_revalidate_inode(nfs_server, inode)
+   - 否则,检查本地缓存attr的有效性
+   > nfs_revalidate_inode(nfs_server, inode)
+   - 如果上面revalidate操作没问题,根据inode填充kstat 
+   > generic_fillattr(inode, kstat)
+   - ino是单独计算, 对于nfs来说,ino没有任何意义, 他只会使用fileid/nfsfh
+   > nfs_compat_user_ino64(NFS_FILEID(inode))
+
+** nfs_lock_context
+   #+begin_src 
+	atomic_t count;
+	struct list_head list;
+	struct nfs_open_context *open_context;
+	struct nfs_lockowner lockowner;
+	struct nfs_io_counter io_count;   
+   #+end_src
+
+** nfs_lockowner
+   #+begin_src 
+	fl_owner_t l_owner;	//他是files_struct指针
+	pid_t l_pid;   
+   #+end_src
+
+** nfs_init_lock_context(nfs_lock_context)
+   - 初始化nfs_lock_context->nfs_lockowner
+
+** __nfs_find_lock_context(nfs_open_context)
+   - 查找一个可用的nfs_lock_context.
+   - 遍历nfs_open_context->list链表上的nfs_lock_context, 比较nfs_lockowner和current->files_struct / tgid
+   - 如果找不到相同的,返回NULL
+
+** nfs_get_lock_context(nfs_open_context)
+   - 先查找可用的nfs_lock_context 
+   > __nfs_find_lock_context(nfs_open_context)
+   - 如果找不到,构造一个新的 
+   > nfs_init_lock_context(nfs_lock_context)
+   - nfs_lock_context和nfs_open_context什么关系? 还有nfs_lockowner
+
+** nfs_put_lock_context(nfs_lock_context)
+   - 释放nfs_lock_context->count技术, 如果减为0,释放nfs_lock_context 
+
+** nfs_close_context(nfs_open_context, is_sync)
+   - 
