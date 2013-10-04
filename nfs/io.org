@@ -1472,7 +1472,7 @@ enum {
       - nfs_commit_completion_ops 
       - nfs_commit_release_pages
 	- 在释放nfs_commit_data时使用
-	- 如果verifier一致,可以释放nfs_page/page的关系
+	- 如果verifier一致,可以释放nfs_page/page的关系,释放nfs_page
 	> nfs_inode_remove_request(nfs_page)
 	> nfs_unlock_and_release_request(nfs_page)
 	- 否则需要设置PG_dirty, 重新处理nfs_open_context

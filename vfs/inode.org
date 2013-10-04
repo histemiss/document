@@ -1,0 +1,575 @@
+* inode.c
+
+** inode
+   #+begin_src 
+	umode_t			i_mode;
+	unsigned short		i_opflags;
+	kuid_t			i_uid;
+	kgid_t			i_gid;
+	unsigned int		i_flags;
+
+#ifdef CONFIG_FS_POSIX_ACL
+	struct posix_acl	*i_acl;
+	struct posix_acl	*i_default_acl;
+#endif
+
+	const struct inode_operations	*i_op;
+	struct super_block	*i_sb;
+	struct address_space	*i_mapping;
+
+#ifdef CONFIG_SECURITY
+	void			*i_security;
+#endif
+
+	/* Stat data, not accessed from path walking */
+	unsigned long		i_ino;
+	/*
+	 * Filesystems may only read i_nlink directly.  They shall use the
+	 * following functions for modification:
+	 *
+	 *    (set|clear|inc|drop)_nlink
+	 *    inode_(inc|dec)_link_count
+	 */
+	union {
+		const unsigned int i_nlink;
+		unsigned int __i_nlink;
+	};
+	dev_t			i_rdev;
+	loff_t			i_size;
+	struct timespec		i_atime;
+	struct timespec		i_mtime;
+	struct timespec		i_ctime;
+	spinlock_t		i_lock;	/* i_blocks, i_bytes, maybe i_size */
+	unsigned short          i_bytes;
+	unsigned int		i_blkbits;
+	blkcnt_t		i_blocks;
+
+#ifdef __NEED_I_SIZE_ORDERED
+	seqcount_t		i_size_seqcount;
+#endif
+
+	/* Misc */
+	unsigned long		i_state;
+	struct mutex		i_mutex;
+
+	unsigned long		dirtied_when;	/* jiffies of first dirtying */
+
+	struct hlist_node	i_hash;
+	struct list_head	i_wb_list;	/* backing dev IO list */
+	struct list_head	i_lru;		/* inode LRU list */
+	struct list_head	i_sb_list;
+	union {
+		struct hlist_head	i_dentry;
+		struct rcu_head		i_rcu;
+	};
+	u64			i_version;
+	atomic_t		i_count;
+	atomic_t		i_dio_count;
+	atomic_t		i_writecount;
+	const struct file_operations	*i_fop;	/* former ->i_op->default_file_ops */
+	struct file_lock	*i_flock;
+	struct address_space	i_data;
+#ifdef CONFIG_QUOTA
+	struct dquot		*i_dquot[MAXQUOTAS];
+#endif
+	struct list_head	i_devices;
+	union {
+		struct pipe_inode_info	*i_pipe;
+		struct block_device	*i_bdev;
+		struct cdev		*i_cdev;
+	};
+
+	__u32			i_generation;
+
+#ifdef CONFIG_FSNOTIFY
+	__u32			i_fsnotify_mask; /* all events this inode cares about */
+	struct hlist_head	i_fsnotify_marks;
+#endif
+
+#ifdef CONFIG_IMA
+	atomic_t		i_readcount; /* struct files open RO */
+#endif
+	void			*i_private; /* fs or device private pointer */   
+   #+end_src
+
+** address_space 
+   #+begin_src 
+	struct inode		*host;		/* owner: inode, block_device */
+	struct radix_tree_root	page_tree;	/* radix tree of all pages */
+	spinlock_t		tree_lock;	/* and lock protecting it */
+	unsigned int		i_mmap_writable;/* count VM_SHARED mappings */
+	struct rb_root		i_mmap;		/* tree of private and shared mappings */
+	struct list_head	i_mmap_nonlinear;/*list VM_NONLINEAR mappings */
+	struct mutex		i_mmap_mutex;	/* protect tree, count, list */
+	/* Protected by tree_lock together with the radix tree */
+	unsigned long		nrpages;	/* number of total pages */
+	pgoff_t			writeback_index;/* writeback starts here */
+	const struct address_space_operations *a_ops;	/* methods */
+	unsigned long		flags;		/* error bits/gfp mask */
+	struct backing_dev_info *backing_dev_info; /* device readahead, etc */
+	spinlock_t		private_lock;	/* for use by the address_space */
+	struct list_head	private_list;	/* ditto */
+	void			*private_data;	/* ditto */   
+   #+end_src
+
+** super_operations
+   #+begin_src 
+   	struct inode *(*alloc_inode)(struct super_block *sb);
+	void (*destroy_inode)(struct inode *);
+
+   	void (*dirty_inode) (struct inode *, int flags);
+	int (*write_inode) (struct inode *, struct writeback_control *wbc);
+	int (*drop_inode) (struct inode *);
+	void (*evict_inode) (struct inode *);
+	void (*put_super) (struct super_block *);
+	int (*sync_fs)(struct super_block *sb, int wait);
+	int (*freeze_fs) (struct super_block *);
+	int (*unfreeze_fs) (struct super_block *);
+	int (*statfs) (struct dentry *, struct kstatfs *);
+	int (*remount_fs) (struct super_block *, int *, char *);
+	void (*umount_begin) (struct super_block *);
+
+	int (*show_options)(struct seq_file *, struct dentry *);
+	int (*show_devname)(struct seq_file *, struct dentry *);
+	int (*show_path)(struct seq_file *, struct dentry *);
+	int (*show_stats)(struct seq_file *, struct dentry *);
+#ifdef CONFIG_QUOTA
+	ssize_t (*quota_read)(struct super_block *, int, char *, size_t, loff_t);
+	ssize_t (*quota_write)(struct super_block *, int, const char *, size_t, loff_t);
+#endif
+	int (*bdev_try_to_free_page)(struct super_block*, struct page*, gfp_t);
+	int (*nr_cached_objects)(struct super_block *);
+	void (*free_cached_objects)(struct super_block *, int);   
+   #+end_src
+
+** get_nr_inodes_unused() / get_nr_inodes / get_nr_dirty_inodes
+   - 全局变量nr_inodes表示系统inode个数
+   - nr_unused表示空闲inode的个数
+   - dirty的个数就是nr_inodes - nr_unused
+   - /proc/sys/fs/inode-nr 可查看这两个值
+
+** inode_init_always(super_block, inode)
+   - 初始化inode和inode->i_data address_space
+   - 对于address_space->backing_dev_info,使用super_block->block_device->bd_inode->address_space->backing_dev_info
+   - 但在后面的初始化中,他还会改为super_block的bdi
+
+** alloc_inode(super_block)
+   - 创建inode, 如果super_operations->alloc_inode有效
+   > super_block->s_op->alloc_inode(super_block)
+   - 否则使用inode_cachep分配
+   - 做简单的初始化
+   > inode_init_alwyas(super_block, inode)
+
+** free_inode_nonrcu(inode)
+   - 直接释放
+   > kmem_cache_free(inode_cachep, inode)
+
+** __destroy_inode(inode)
+   - 释放inode, 在销毁inode之前使用
+   - inode不能有buffer_head的metadata
+   > inode_has_buffers(inode)
+   - 如果inode->i_nlink ==0, 减小super_block->s_remove_count, 在unlink操作中增加这个计数
+   - 释放acl
+   - 最后减小nr_inodes
+
+** i_callback(rcu_head)
+   - 这是rcu使用的回调函数,释放inode使用的内存，返给inode_cachep
+
+** destroy_inode(inode)
+   - 释放inode之前的操作
+   - 释放buffer_head, acl,修改计数
+   > __destroy_inode(inode)
+   - 如果super_operations->destroy_inode有效 
+   > super_operations->destroy_inode(inode)
+   - 否则使用rcu释放
+   > call_ruc(inode->i_ruc, i_callback)
+
+** drop_nlink(inode) / inc_nlink(inode)
+   - 减小inode->i_nlink / 增大
+   - 如果inode->i_nlink ==0, 增加super_block->s_remove_count
+
+** clear_nlink(inode) / set_nlink(inode, nlink)
+   - 把inode->i_nlink设为0
+   - 增加super_block->s_remove_count
+
+** set_nlink(inode, nlink)
+   - 如果nlink ==0 
+   > clear_nlink(inode)
+   - 否则直接修改inode->i_nlink
+   - 如果原来为0, 减小super_block->s_remove_count
+
+** inc_nlink(inode)
+   - 如果inode->i_nlink ==0, 减小super_block->s_remove_count
+   - 增加inode->i_nlink
+
+** address_space_init_once(address_space)
+   - 初始化address_space
+   - INIT_RADIX_TREE(address_space->page_tree, GFP_ATOMIC)
+
+** inode_init_once(inode)
+   - 初始化, hash表, io的链表
+   > address_space_init_once(inode->i_data)
+   - i_size修改使用的seq锁
+   > i_size_ordered_init(inode)
+
+** init_once(inode)
+   > inode_init_once(inode)
+
+** __iget(inode)  / ihold(inode)
+   - 增加inode->i_count
+
+** inode_lru_list_add(inode) / inode_lru_list_del(inode)
+   - 把不用的inode放到super_block->s_inode_lru队列中，而且修改nr_inodes_unused. 第二个函数和第一个相反
+   - 增加计数nr_unused
+
+** inode_add_lru(inode)
+   - 检查inode是否可以放到lru队列中
+   - inode->i_state不包括I_DIRTY,I_SYNC,I_FREEING,I_WILL_FREE
+   - inode->i_count ==0
+   - 而且super_block是可用的  super_block->s_flags包括MS_ACTIVE
+   > inode_lru_list_add(inode)
+
+** inode_sb_list_add(inode) / inode_sb_list_del(inode)
+   - 把inode添加到super_block->s_inodes中,使用inode->i_sb_list
+
+** hash(super_block, hashval)
+   - 根据suer_block指针和hashval计算hash, hashval一般是ino
+
+** __insert_inode_hash(inode, hashval) / __remove_inode_hash(inode)
+   - 把inode加到inode_hashtable中
+
+** clear_inode(inode)
+   - 清理inode的资源之后的操作
+   - 在释放inode时,写回pagecache, 以及数据相关资源?
+   - 检查关联的资源
+   - address_space->nrpages == 0
+   - address_space->private_list没有buffer_head 
+   - inode->i_state有I_FREEING, 没有I_CLEAR
+   - 设置inode->i_state = I_FREEING|I_CLEAR
+
+** evict(ionde)
+   - 销毁一个inode, 在iput中使用
+   - 释放时,drop_inode判断是放到lru中,还是直接释放. 或者回收内存时直接释放
+   - 检查他的状态, 必须inode->i_state必须有I_FREEING, 不在lru队列中
+   - 如果还在bdi的写回队列中,释放 inode->i_wb_list 
+   > inode_wb_list_del(inode)
+   - 释放inode->i_sb_list链表
+   > inode_sb_list_del(inode)
+   - 等待sync操作, 等待inode->i_state的__I_SYNC
+   > inode_wait_for_writeback(inode)
+   - 如果super_block提供evict_inode，则调用这个函数
+   > super_operations->evict_inode(inode)
+   - 如果没提供,只处理pagecache, 设置标志
+   > truncate_inode_pages(inode->address_space, 0)
+   > clear_inode(inode)
+   - 释放rehash关系
+   > remove_inode_hash(inode)
+   - 唤醒等待__I_NEW标志位的任务, 在查找inode时,如果碰到释放中的,等释放完成,继续查找?
+   > wake_up_bit(inode->i_state, __I_NEW)
+   - 最后释放inode,以及inode的acl指针
+   > destroy_inode(inode)
+
+** dispose_list(list_head)
+   - list_head是使用inode->i_lru构成的队列，释放队列上的inode
+   > evict(inode)
+
+** evict_inodes(super_block)
+   - 释放super_block上所有可以释放的inode
+   - 扫面super_block->s_inodes链表
+   - 如果inode->i_count !=0, 不能释放
+   - 如果inode->i_state中有I_NEW, I_FREEING, I_WILL_FREE, 也不处理,它自己在释放
+   - 把inode放到临时链表中,一块释放
+   > dispose_list(list_head)
+
+** invalidate_inodes(super_block, kill_dentry)
+   - 释放super_block上的所有inode, 扫描super_block->s_inodes链表
+   - 如果inode->i_state中有I_NEW, I_FREEING, I_WILL_FREE, 不再处理. 
+   - I_NEW的也会自己释放??
+   - 如果kill_dentry==0, 检查inode->i_count > 0, 也不能释放,而且返回1
+   - 设置inode->i_state的I_FREEING标志, 释放lru队列 
+   > inode_lru_list_del(inode)
+   - 集中释放
+   > dispose_list(list_head)
+   - 这个函数在block设备卸载时使用,先释放inode,再释放文件系统
+
+** can_unuse(inode)
+   - 检查inode是否在使用中
+   - 如果inode->i_state中有任何不是I_REFERENCED的标志, 表示它在使用中. 
+   - 其他标志包括DIRTY,NEW,FREE,SYNC,DIO等
+   - 如果inode->address_space.private_list非空,表示有metadata, 也在使用中
+   - 如果inode->i_count > 0, 有使用者, 也在使用中
+   - 如果inode->address_space->nrpages > 0, 也有使用者??
+
+** prune_icache_sb(super_block, nr_to_scan)
+   - 在回收内存时使用
+   - 遍历super_block->s_inode_lru, 发现没有用的inode,放到回收队列中，统一释放
+   - 锁住inode->i_lock, 如果锁不住,不处理它
+   - 如果inode->i_count > 0, 或者inode->i_state表示他在释放中? 增加super_block->s_nr_inodes_unused, nr_unused
+   - 如果inode->i_state有I_REFERENCED, 把它放到lru队列最后
+   - 如果inode有metadata的buffer_head,或pagecache, 释放他们
+   > inode_has_buffers(inode)
+   > remove_inode_buffers(inode)
+   > invalidate_mapping_pages(inode->address_space)
+   - 上面的过程使用, __iget / iput保护
+   - 然后检查是否还有使用者, 否则不处理
+   > can_unuse(inode)
+   - 如果可以释放, 设置I_FREEING, 放到临时队列
+   - 减小super_block->s_nr_inodes_unused, nr_unused
+   - 一块释放inode
+   > dispose_list
+
+** find_inode(super_block, hlist_head, test_func_t, data)
+   - 遍历hlist_head的inode, 查找inode
+   - 比较super_block和test_func_t
+   - 如果inode->i_state有I_FREEING|I_WILL_FREE标志, 等待释放完成, 使用__I_NEW
+   > __wait_on_freeing_inode(inode)
+   > __iget(inode)
+
+** find_inode_fast(super_block, hlist_head, ino)
+   - 这里只比较super_block和ino
+
+** get_next_ino()
+   - 获取percpu变量last_ino, 使用系统生成唯一的ino
+
+** new_inode_pseudo(super_block) / new_inode(super_block)
+   - 分配inode,把状态设为0
+   > alloc_inode(super_block)
+   - 第二个函数把inode加到super_block的队列中
+
+** unlock_new_inode(inode)
+   - 去掉inode->i_state的I_NEW, 唤醒等待这个标志的任务 
+   > wake_up_bit(inode->i_state, __I_NEW)
+
+** iget5_locked(super_block, hashval, test, set, data)
+   - 这里操作hash表使用inode_hash_lock 
+   - 先查找inode 
+   > find_inode(super_block, hlist_head, test, data)
+   - 如果找到,等待它的I_NEW,等待初始化
+   > wait_on_inode(inode)
+   - 否则创建新的inode 
+   > alloc_inode(super_block)
+   > set(inode, data)
+   - 设置inode->i_state = I_NEW, 放到hash链表中, 还有super_block的链表中 
+   > inode_sb_list_add(inode)
+
+** iget_locked(super_block, ino)
+   - 使用ino查找inode, 而不是test函数
+
+** iunique(super_block, ino_t)
+   - 找可用的ino, 遍历hash,去检查碰撞
+
+** igrab(inode)
+   - 如果inode->i_state有I_FREEING|I_WILL_FREE标志, 返回NULL
+   > __iget(inode)
+
+** ilookup5_nowait(super_block, hashval, test, data)
+   - 查找inode, 会增加inode->i_count
+   > find_inode(super_block, hlist_head, test, data)
+
+** ilookup5(super_block, hashval, test, data)
+   - 先查找 
+   > ilookup5_nowait(super_block, hashval, test, data)
+   - 等待inode的初始化
+   > wait_on_inode(inode)
+
+** ilookup(super_block, ino)
+   - 根据ino查找,而且等待它初始化
+
+** insert_inode_locked(inode)
+   - 把inode放到hash链表中, 需要检查碰撞, 根据super_block, ino
+   - 如果inode->i_state有I_FREEING|I_WILL_FREE标志, 可以忽略
+   - 如果碰到一样的, 等待释放I_NEW
+   > wait_on_inode(inode)
+   - 如果这个inode释放hash链表关系,可以忽略,否则inode碰撞,返回-EBUSY
+   
+** insert_inode_locked4(inode, hashval, test, data)
+   - 和上面的类似,不过这里查找碰撞,使用test函数 
+
+** generic_delete_inode(inode)
+   > return 1
+
+** iput_final(inode)
+   - 在inode->i_count减为0时使用
+   - inode->i_state肯定没有I_NEW
+   - 检查是否需要释放 
+   > super_operations->drop_inode(inode)
+   - 如果没有结果,直接释放
+   > generic_drop_inode(inode)
+   - 如果不需要drop,而且super_block->s_flags有MS_ACTIVE,把它放到lru,直接退出
+   > inode_add_lru(inode)
+   - 其他情况,要释放inode
+   - 如果drop =0, 但super_block->s_flags没有MS_ACTIVE,只能说明需要释放inode的资源
+   - 先设置inode->i_state的I_WILL_FREE, 同步写回数据 
+   > write_inode_one(inode, 1)
+   - 去掉I_WILL_FREE, 只有这里使用这个标志
+   - 设置inode->i_state的I_FREEING, 释放lru
+   > inode_lru_list_del(inode)
+   - 后面只需要释放inode本身
+   > evict(inode)
+
+** iput(inode)
+   - inode->i_state不能有I_CLEAR
+   - 减小inode->i_count, 如果减为0, 释放inode 
+   > iput_final(inode)
+
+** bmap(inode, block)
+   - 映射文件在磁盘的位置
+   > address_space->bmap(address_space, block)
+
+** relatime_need_update(vfsmount, inode, timespec)
+   - 检查是否更新atime
+   - 如果mount没有MNT_RELATIME, 必须更新. relative atime表示atime比ctime/mtime小时,才使用
+   > timespec_compare(inode->i_mtime, inode->i_atime)
+   - 或者atime已经过去一天
+
+** update_time(inode, time, flags)
+   - 根据flags,更新atime,ctime,mtime 
+   > inode_operations->update_time(inode, time, flags)
+   - 如果没有实现上面的函数, 根据flags直接更新inode
+   - 最后设置I_DIRTY_SYNC
+   > mark_inode_dirty_sync(inode)
+
+** touch_atime(path)
+   - 更新access time 
+   - 如果inode->i_flags有NOATIME, 直接返回. 这是怎么设定的?
+   - dir的noatime需要检查super_block 
+   > super_block->s_flags的MS_NODIRATIME
+   - vfsmount->mnt_flags的MNT_NOATIME, MNT_NOTDIRATIME
+   - 根据jiffies计算 
+   > current_fs_time(inode->super_block)
+   - 检查relatime 
+   > relatime_need_update(vfsmount, inode, now)
+   - 更新atime 
+   > update_time(inode, now, S_ATIME)
+
+** file_update_time(file)
+   - 在写操作中更新mtime,ctime?
+   - 如果inode->flags有NOCMTIME, 不再更新
+   - 然后更新ctime, mtime, i_version 
+   > update_time(inode, now, sync_it)
+
+** inode_needs_sync(inode)
+   - 检查inode是否是同步处理
+   - inode->i_flags带有I_SYNC, 或者有I_DIRSYNC
+
+** __wait_on_freeing_inode(inode)
+   - 等待inode->i_state的I_NEW
+
+** 总结
+   - 这里只是一些辅助函数,处理inode的生命周期
+   - inode的状态包括创建,更新,lru,释放, 回收
+
+   - 创建过程
+   > iget5_locked
+   - 先根据hash,test函数查找
+   > find_inode(super_block, hash, test, data)
+   - 查找时跳过时等待使用中的或者初始化中的inode
+   > wait_on_inode(inode)
+   - 如果找不到创建一个
+   > alloc_inode
+   - 一般使用super_operations回调函数 
+   > super_operations->alloc_inode(super_block)
+   - 初始化inode和外包的数据结构,而且设置唯一表示inode的东西,不仅仅是ino
+   - 对于btrfs是objectid,btrfs_root, 对于nfs是fileid,nfsfh
+   > set(inode, void)
+   - 然后直接放到super_block/hash表管理中
+   - 设置I_NEW标志
+   - 这个函数准备的inode有I_NEW, 其他的lookup操作都需要等待
+   - 创建者会继续初始化,获取文件的其他信息,必须iattr,inode_operations,file_operations,aops等
+   - 创建完成,去掉I_NEW,大家可以使用. 
+   > unlock_new_inode(inode)
+   - 上面的查找使用hash锁,创建使用inode->i_lock, super_block的链表使用使用super_block的锁, 释放I_NEW使用inode->i_lock
+
+   - 释放过程
+   - 释放inode,需要写回data/metadata,还要释放内存中关系的信息,和pagecache的IO同步.
+   > iput(inode)
+   - 减小inode->i_count, 如果减为0, 开始释放 
+   > iput_final(inode)
+   - 首先检查是否能够释放
+   > super_operations->drop_inode(inode)
+   - 如果inode有问题,可以直接释放. 否则使用标准的判断
+   - inode->i_nlink =0, 或者inode不在hash链表中
+   - 正常情况下,2个条件都不满足
+   > generic_drop_inode(inode)
+   - 如果不能释放,放到lru队列中
+   - 如果不能释放,但fs需要卸载,写回inode的data/metadata,继续释放 
+   > write_inode_now(inode, 1)
+   - 设置inode->i_state的I_FREEING, 释放lru队列
+   > evict(inode)
+   - 开始释放inode, 应该不会再操作磁盘??
+   - 释放super_block关系, bdi io链表
+   > inode_wb_list_del(inode)
+   > inode_sb_list_del(inode)
+   - 前面的写回操作只有在fs释放时才使用,普通情况下,很可能inode在写回过程中
+   - 等待sync操作
+   > inode_wait_for_writeback(inode)
+   - 开始释放pagecache,metadata
+   - 对于pagecache,即使是dirty的page也直接删除??
+   > super_operations->evict_inode(inode)
+   - 设置I_CLEAR
+   > clear_inode(inode)
+   - 释放hash表关系, 这个释放lru不会影响上面的drop判断.
+   > remove_inode_hash(inode)
+   - 释放inode数据结果
+   > destroy_inode(inode)
+   - 释放inode->i_acl, 修改统计数nr_inodes
+   > __destroy_inode(inode)
+   - 释放内存
+   > super_block->destroy_inode(inode)
+
+   - inode回收
+   - 在inode释放后,先放到lru队列中,在内存压力大时回收
+   > prune_super(shrinker, shrink_control)
+   - shrinker是super_block->s_shrink, 用来回收内存
+   > prune_icache_sb(super_block, inodes)
+   - 遍历super_block->s_inode_lru链表
+   - 对于inode->i_count > 0, 或者i_node->i_state有有效标记的, 直接释放lru队列
+   - 要不他们在释放中,或者别人又使用他们
+   - 如果没人使用,检查buffer的metadata,或pagecache 
+   > __iget_inode(inode)
+   - 如果不是dirty的buffer_head/page,直接释放,否则不处理
+   - 因为inode没有了dirty, 也不知道怎么变脏
+   > remove_inode_buffers(inode)
+   > invalidate_mapping_pages(inode->address_space, 0, -1)
+   > iput(inode)
+   - 然后比较inode是否在super_block中,来判断inode是否释放!
+   - 检查是否可释放, 没有pagecache, 没有标记
+   > can_unuse(inode)
+   - 如果还是没任何标记,没使用者,设置I_FREEING. 增加nr_unused计数
+   - 这里可能inode在hash链表中
+   > dispoase_list(list_head)
+   - 挨个释放inode
+   > evict(inode)
+
+   - 写回过程会调用这里的lru操作. 在写回时等待I_SYNC.
+   > inode_sync_complete(inode)
+   > inode_add_lru(inode)
+   - 在写回过程中,操作inode没有增加计数等.释放操作应该不会释放他们,因为inode至少有I_DIRTY,或者I_SYNC
+
+   - inode的hash表, 在创建时直接放到hash表中,在释放inode时才释放
+   - 在普通的释放中,使用generic_drop_inode释放它,应该没什么意义?因为只要释放,就不会给其他人释放的机会!!
+
+   - inode更新与I_DIRTY相关
+   - 对于I_DIRTY_PAGES,在设置page的PG_dirty时使用. 通过检查address_space中没有PAGECACHE_TAG_DIRTY的page而设定. 
+   - 对于I_DIRTY_SYNC/I_DIRTY_DATASYNC, 同样在__writeback_single_inode中去掉,写回metadata
+   > aops->write_inode(inode, writeback_control)
+   - 上面2个DIRTY貌似没什么区别.
+   - 在写操作中修改i_size或setattr中会设置这两个标志,主要用于写回metadata
+
+   - 对于nfs没有缓存attr, setattr需要发送rpc请求,更新server
+   - 对于xfs, 直接把attr放到xfs_dinode,哪里把它写回?? xfs的inode管理使用专门的缓冲处理
+
+   - inode更新主要在time 
+   - 在写操作中使用它, 用于修改ctime,mtime,i_version. 没看出来mtime和ctime的区别
+   > file_update_time(file)
+   - 判断是否需要修改
+   > update_time(inode, now, sync_it)
+   - 直接更新inode, xfs使用自己的函数?? 
+   - 设置I_DIRTY_SYNC
+   > mark_inode_dirty_sync(inode)
+
+   - 在dentry的路径查找更新atime, 这是用于dir
+   - 在普通文件读操作中修改, 这是file
+   - 还有特殊的symlink, 不看了
+   > touch_atime(path)
+   > update_time(inode, now, S_ATIME)
