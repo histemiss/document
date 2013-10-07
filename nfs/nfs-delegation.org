@@ -1,0 +1,338 @@
+* delegation.c 
+** nfs_delegation
+   #+begin_src 
+	struct list_head super_list; //使用nfs_server管理所有的delegation
+	struct rpc_cred *cred;
+	struct inode *inode;
+	nfs4_stateid stateid; //delegation是一种状态数据, nfs4_stateid是一个16字节的id,里面有seqid
+	fmode_t type;
+	loff_t maxsize;
+	__u64 change_attr;
+	unsigned long flags;  //标志包括NFS_DELEGATION_NEED_RECLAIM/RETURN/REFERENCED
+	spinlock_t lock;
+	struct rcu_head rcu;   
+   #+end_src
+
+** nfs4_state
+   #+begin_src 
+	//open state或者lock state
+	struct list_head open_states;	/* List of states for the same state_owner */  //某个stateowner关联的所有state
+	struct list_head inode_states;	/* List of states for the same inode */
+	struct list_head lock_states;	/* List of subservient lock stateids */
+
+	struct nfs4_state_owner *owner;	/* Pointer to the open owner */
+	struct inode *inode;		/* Pointer to the inode */
+
+	unsigned long flags;		/* Do we hold any locks? */
+	spinlock_t state_lock;		/* Protects the lock_states list */
+
+	seqlock_t seqlock;		/* Protects the stateid/open_stateid */
+	nfs4_stateid stateid;		/* Current stateid: may be delegation */
+	nfs4_stateid open_stateid;	/* OPEN stateid */
+
+	/* The following 3 fields are protected by owner->so_lock */
+	unsigned int n_rdonly;		/* Number of read-only references */
+	unsigned int n_wronly;		/* Number of write-only references */
+	unsigned int n_rdwr;		/* Number of read/write references */
+	fmode_t state;			/* State on the server (R,W, or RW) */
+	atomic_t count;   
+   #+end_src
+
+** nfs_open_context 
+   #+begin_src 
+	struct nfs_lock_context lock_context;
+	struct dentry *dentry;
+	struct rpc_cred *cred;
+	struct nfs4_state *state;
+	fmode_t mode;
+
+	unsigned long flags;
+#define NFS_CONTEXT_ERROR_WRITE		(0)
+#define NFS_CONTEXT_RESEND_WRITES	(1)
+#define NFS_CONTEXT_BAD			(2)
+	int error;
+
+	struct list_head list;
+	struct nfs4_threshold	*mdsthreshold;   
+   #+end_src
+
+** nfs_mark_delegation_referenced(nfs_delegation)
+   - 设置nfs_delegation->flags的NFS_DELEGATION_REFERENCED
+   - 在使用delegation时设置
+
+** nfs4_have_delegation(inode, flags)
+   - 检查inode对应的delegation是否支持flags的访问方式
+   - nfs_inode->nfs_delegation->flags不能有NFS_DELEGATION_RETURNING 
+   > nfs_mark_delegation_referenced(nfs_delegation)
+
+** nfs_delegation_claim_locks(nfs_open_context, nfs4_state, nfs4_stateid) 
+   - 重新申请nfs_open_context关联的文件锁. 
+   - nfs4_stateid表示delegation, 但nfs4_state正在使用它. open时获取了delegation
+   - open操作会返回一个nfs4_stateid, 如果获取delegation,还有一个delegation使用的stateid
+   - 访问的文件是nfs4_state->inode, 遍历它的file_lock队列
+   - 如果inode->i_flock == NULL, 没有锁操作,直接返回
+   - 检查file_lock关联的文件是否使用nfs_open_context一样, file->private_data是nfs_open_context
+   > nfs_file_open_context(file_lock->fl_file) 
+   - 重新获取锁
+   > nfs4_lock_delegation_recall(nfs4_state, file_lock)
+
+** nfs_delegation_claim_opens(inode, nfs4_stateid) 
+   - nfs4_stateid表示delegation, 在某个open操作中获取
+   - 检查打开inode的nfs_open_context,如果它使用delegation,重新执行open操作
+   - 遍历nfs_inode->open_files的nfs_open_context
+   - nfs4_state->flags的NFS_DELEGATED_STATE表示open获取delegation
+   > nfs4_open_delegation_recall(nfs_open_context, nfs4_state, nfs4_stateid)
+   - 调用OPEN,重新声明之前的delegation. 
+   - 执行OPEN操作,claim模式是NFS4_OPEN_CLAIM_DELEGATE_CUR, 下面还有模式NFS4_OPEN_CLAIM_PREVIOUS的结果处理.
+   - 然后重新执行lock操作
+   > nfs_delegation_claim_locks(nfs_open_context, nfs4_state, nfs4_stateid)
+
+** nfs_inode_reclaim_delegation(inode, rpc_cred, nfs_openres) 
+   - 这个函数在OPEN调用返回时使用, open的方式应该是上面的NFS4_OPEN_CLAIM_DELEGATE_CUR
+   - 根据open返回结果更新nfs_inode->delegation
+   > 如果nfs_inode->nfs_delegation !=NULL,才更新,否则返回
+   - 如果nfs_delegation->inode == NULL, 说明这个nfs_delegation是无效的??
+   - 直接创建一个新的,给inode  
+   > nfs_inode_set_delegation(inode, rpc_cred, nfs_openres)
+   - 否则把返回的delegation的信息更新到原来的nfs_delegation 
+   > nfs4_stateid_copy(nfs_delegation->stateid, nfs_openres->delegation)
+   - 更新rpc_cred???
+
+** nfs_do_return_delegation(inode, nfs_delegation, issync)
+   - 调用RPC DELEGRETURN, 释放delegation
+   > nfs4_proc_delegreturn(inode, cred, stateid, issync)
+   > nfs_free_delegation(nfs_delegation)
+
+** nfs_delegation_grab_inode
+   - 为何要阻止释放inode?
+   > igrab(nfs_delegation->inode)
+
+** nfs_start_delegation_return_locked(nfs_inode)
+   - 获取nfs_inode->nfs_delegation
+   - 设置nfs_delegation->flags的NFS_DELEGATION_RETURNING, 如果已经设置返回NULL
+   > test_and_set_bit(NFS_DELEGATION_RETURNING, &delegation->flags)
+
+** nfs_start_delegation_return(nfs_inode) 
+   - 使用rcu锁访问nfs_delegation  
+   > rcu_read_lock() 
+   > nfs_start_delegation_return_locked(nfs_inode)
+   > rcu_read_unlock()
+
+** nfs_abort_delegation_return(nfs_delegation, nfs_client)
+   - 在return delegation错误处理中使用
+   - 清除nfs_delegation->flags的NFS_DELEGATION_RETURNING, 设置NFS_DELEGATION_RETURN
+   - 还设置nfs_client->cl_state的NFS4CLNT_DELEGRETURN标志???
+
+** nfs_detach_delegation_locked(nfs_inode, nfs_delegation, nfs_server) 
+   - nfs_delegation应该是nfs_inode->delegation, 如果不是,返回NULL
+   - 设置nfs_delegation->flags的NFS_DELEGATION_RETURNING
+   - 释放nfs_delegation->super_list链表,他应该在nfs_server中
+   - 设置nfs_inode->delegation = NULL
+   - 返回nfs_delegation,继续释放
+
+** nfs_detach_delegation(nfs_inode, nfs_delegation, nfs_server) 
+   - 使用nfs_client->cl_lock锁住??  nfs_server->nfs_client 
+   > nfs_detach_delegation_locked(nfs_inode, nfs_delegation, nfs_server)
+
+** nfs_inode_detach_delegation(inode) 
+   - 先获取nfs_delegation 
+   > nfs_start_delegation_return(nfs_inode)
+   - 如果返回的nfs_delegation有效, 释放nfs_inode的nfs_delegation
+   > nfs_detach_delegation(nfs_inode, nfs_delegation, nfs_server)
+
+** nfs_inode_set_delegation(inode, rpc_cred, nfs_openres)
+   - 创建新的nfs_delegation
+   - 设置 nfs_inode->delegation_state = nfs_delegation->type  = nfs_openres->delegation_type
+   - change_attr = inode->i_version
+   - 把nfs_delegation->super_list放到nfs_server->delegations链表中
+   - 设置nfs_inode->cache_validity的NFS_INO_REVAL_FORCED, 下次访问inode时必须刷新metadata/data
+   - nfs_delegation的操作还是使用nfs_client的锁同步
+
+** nfs_end_delegation_return(inode, nfs_delegation, issync)
+   - 如果要发送delegation return, 要不是server要求,要不是rpc有错误, 所以才重新open??
+   - 首先重新执行open操作???
+   > nfs_delegation_claim_opens(inode, nfs_delegation->nfs4_stateid) 
+   > nfs4_wait_clnt_recover(nfs_client)
+   - 如果上面有错误, 设置nfs_delegation标志
+   > nfs_abort_delegation_return(nfs_delegation, nfs_client)
+   - 释放nfs_delegation
+   > nfs_detach_delegation(nfs_inode, nfs_delegation, nfs_server)
+   - 发送delegation return 
+   > nfs_do_return_delegation(inode, nfs_delegation, issync)
+
+** nfs_delegation_need_return(nfs_delegation)
+   - 如果nfs_delegation->flags包含NFS_DELEGATION_RETURN, 返回true
+   - 如果nfs_delegation->flags包含NFS_DELEGATION_RETURN_IF_CLOSED, 而且nfs_inode没有nfs_open_context, 返回true
+   - nfs_inode->open_files链表空
+
+** nfs_client_return_marked_delegations(nfs_client) 
+   - 释放nfs_server的一些nfs_delegation 
+   > nfs_delegation_need_return(nfs_delegation)
+   - 阻止inode释放
+   > nfs_delegation_grab_inode(nfs_delegation)
+   - 获取nfs_delegation 
+   > nfs_start_delegation_return_locked(nfs_inode)
+   - 异步释放
+   > nfs_end_delegation_return(inode, nfs_delegation, 0)
+   - 如果上面操作返回错误,设置nfs_client->cl_state的NFS4CLNT_DELEGRETURN
+
+** nfs_inode_return_delegation_noreclaim(inode)
+   - 直接释放inode, 不需要重新执行open
+   - 在释放inode时使用, evict_inode
+   - 让nfs_inode释放nfs_delegation
+   > nfs_inode_detach_delegation(nfs_inode)
+   > nfs_do_return_delegation(inode, nfs_delegation, 0)
+
+** nfs_inode_return_delegation(inode)
+   - 写回所有数据 
+   > nfs_wb_all(inode) 
+   - 获取nfs_delegation 
+   > nfs_start_delegation_return(nfs_inode)
+   - 这里会重新执行open操作, 同步释放
+   > nfs_end_delegation_return(inode, nfs_delegation, 1)
+
+** nfs_mark_return_if_closed_delegation(nfs_server, nfs_delegation)
+   - 释放长时间不用的delegation, 在文件关闭之后释放它
+   - 设置nfs_delegation->flags的NFS_DELEGATION_RETURN_IF_CLOSED
+   - 设置nfs_server->nfs_client->cl_state的NFS4CLNT_DELEGRETURN
+
+** nfs_mark_return_delegation(nfs_server, nfs_delegation) 
+   - 设置nfs_server->nfs_client->cl_state的NFS4CLNT_DELEGRETURN
+   - 设置nfs_delegation->flags的NFS_DELEGATION_RETURN
+
+** nfs_server_mark_return_all_delegations(nfs_server)
+   - 标记nfs_server->delegations中所有的nfs_delegation 
+   > nfs_mark_return_delegation(nfs_server, nfs_delegation)
+
+** nfs_client_mark_return_all_delegations(nfs_client)
+   - 之前nfs_delegation在rpc_client中,现在在rpc_server中
+   - 遍历所有的nfs_server 
+   > nfs_server_mark_return_all_delegations(nfs_server)
+
+** nfs_delegation_run_state_manager(nfs_client) 
+   - 如果nfs_client->cl_state有NFS4CLNT_DELEGRETURN,启动state线程
+   > nfs4_schedule_state_manager(nfs_client)
+
+** nfs_expire_all_delegations(nfs_client)
+   - 设置所有的nfs_delegation的NFS_DELEGATION_RETURN 
+   > nfs_delegation_run_state_manager(nfs_client)
+
+** nfs_server_return_all_delegation(nfs_server)
+   - 只处理一个nfs_server 
+   > nfs_server_mark_return_all_delegations(nfs_server)
+   > nfs4_schedule_state_manager(nfs_client)
+   - 等待state线程完成 
+   > nfs4_wait_clnt_recover(nfs_client)
+
+** nfs_mark_return_unused_delegation_types(nfs_server, flags)
+   - 遍历nfs_delegation, 把flags访问方式的nfs_delegation释放
+   - 如果nfs_delegation->type是读写, FMODE_READ|FMODE_WRITE, 而且flags不是写,不能释放 
+   > nfs_mark_return_if_closed_delegation(nfs_server, nfs_delegation)
+
+** nfs_client_mark_return_unused_delegation_types(nfs_client, flags)
+   > nfs_mark_return_unused_delegation_types(nfs_server, flags)
+
+** nfs_remove_bad_delegation(inode)
+   - 释放nfs_delegation对应的nfs4_state?? 
+   > nfs_inode_detach_delegation(inode)
+   - 标记对应的nfs4_state, nfs4_stateowner, 启动state线程
+   > nfs_inode_find_state_and_recover(inode, nfs_delegation->nfs4_stateid)
+   - 直接释放nfs_delegation 
+   > nfs_free_delegation(nfs_delegation)
+
+** nfs_expire_unused_delegation_types(nfs_client, fmode_t)
+   - unused, 到文件关闭后才释放
+   > nfs_client_mark_return_unused_delegation_types(nfs_client, flags)
+   - 启动state manager任务
+   > nfs_delegation_run_state_manager(nfs_client) 
+
+** nfs_mark_return_unreferenced_delegations(nfs_server)
+   - 遍历nfs_delegation, 过滤包含NFS_DELEGATION_REFERENCED标志的 
+   > nfs_mark_return_if_closed_delegation(nfs_server, nfs_delegation)
+
+** nfs_expire_unreferenced_delegations(nfs_client) 
+   - 遍历nfs_server
+   > nfs_mark_return_unreferenced_delegations(nfs_server)
+   - 启动state线程
+   > nfs_delegation_run_state_manager(nfs_client)
+
+** nfs_async_inode_return_delegation(inode, nfs4_stateid)
+   - 异步的释放一个nfs_delegation
+   - 先把数据写回, 异步写,不等待
+   > filemap_flush(address_space)
+   - 比较nfs_delegation?? 
+   > nfs_client->cl_mvops->match_stateid(nfs_delegation->stateid, nfs4_stateid)
+   - 设置标志,然后出发state manager.
+   > nfs_mark_return_delegation(nfs_server, nfs_delegation)
+   > nfs_delegation_run_state_manager(nfs_client)
+
+** nfs_delegation_find_inode_server(nfs_server, nfs_fh) 
+   - 在nfs_server的所有nfs_delegation中找一个，它关联的nfs_inode使用nfs_fh
+   > nfs_compare_fh(nfs_fh, nfs_delegation->nfs_inode->nfs_fh)
+
+** nfs_delegation_find_inode(nfs_client, nfs_fh)
+  - 遍历nfs_server 
+  > nfs_delegation_find_inode_server(nfs_server, nfs_fh)
+
+** nfs_delegation_mark_reclaim_server(nfs_server) / nfs_delegation_mark_reclaim(nfs_client) 
+  - 给关联的nfs_delegation设置NFS_DELEGATION_NEED_RECLAIM. 这个操作比较危险,再发生严重错误的调用..
+
+** nfs_delegation_reap_unclaimed(nfs_client) 
+   - 在reboot recovery操作之后,删除没有恢复的nfs_delegation, 不用rpc process.
+   > nfs_delegation_grab_inode
+   > nfs_detach_delegation(...)
+   > nfs_free_delegation(..)
+   > iput(inode)
+
+** nfs_delegation_present(nfs_client)
+   - nfs_client是否有nfs_delegation
+
+** nfs_copy_delegation_stateid(nfs4_stateid dst, inode, flags)
+   - 把nfs_inode->nfs_delegation->nfs4_stateid给参数 
+   > nfs4_stateid_copy(dst, nfs4_delegation->nfs4_stateid)
+   > nfs_mark_delegation_referenced(nfs_delegation)
+
+** 总结
+   - 在open操作中创建nfs_delegation,或更新nfs_delegation?
+   > nfs_inode_reclaim_delegation(inode, rpc_cred, nfs_openres)
+   > nfs_inode_set_delegation
+
+   - 在错误处理NFS4ERR_OPENMODE, 或者open方式和delegation冲突, 归还nfs_delegation 
+   > nfs4_inode_return_delegation(inode)
+   - 但这里释放delegation还要重新发送open,需要更新nfs4_state在server端的状态, 发送使用CLAIM_DELEGATE_CUR
+   - 设置nfs_delegation->flags的NFS_DELEGATION_RETURNING
+   > nfs_start_delegation_return(nfs_inode)
+   > nfs_end_delegation_return(inode)
+   - 发送open操作 
+   > nfs_delegation_claim_opens(inode, nfs4_stateid)
+   - 等待state recovery?? 
+   > nfs4_wait_clnt_recover(nfs_client)
+   - 释放nfs_delegation
+   > nfs_detach_delegation(nfs_inode, nfs_delegation, nfs_server)
+   - 发送rpc请求 
+   > nfs_do_return_delegation(inode, nfs_delegation, issync)
+
+   - 在state线程中释放nfs_delegation 
+   > nfs_claim_return_marked_delegations(nfs_client)
+   - 检查NFS_DELEGATION_RETURN, 或者NFS_DELEGATION_RETURN_IF_CLOSED
+   > nfs_delegation_need_return(nfs_delegation)
+   - 其他操作和上面一样 
+   > nfs_start_delegation_return(inode)
+   - 异步释放
+   > nfs_end_delegation_return(inode, nfs_delegation, 0)
+
+   - 在释放inode时, nfs4_evict_inode会释放nfs_delegation
+   > nfs_inode_return_delegation_noreclaim(inode)
+
+   - 在错误处理中,会释放整个nfs_client的nfs_delegation, 或者释放nfs_server时,释放他的nfs_delegation
+   > nfs_expire_all_delegations(nfs_client)
+   - 只是设置nfs_delegation->flags的NFS_DELEGATION_RETURN
+   - 启动state线程 
+   > nfs4_schedule_state_manager(nfs_client)
+
+   - 接受到server的recall请求时使用 
+   > nfs_async_inode_return_delegation(inode, nfs4_stateid)
+
+   - 在server reboot之后,需要恢复delegation,不能恢复的删除
+   - 使用NFS_DELEGATION_NEED_RECLAIM表示
+   > nfs4_state_clear_reclaim_reboot(nfs_client)

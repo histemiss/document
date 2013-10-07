@@ -1,0 +1,1339 @@
+* nfs4session.c
+
+** nfs4_slot 
+   #+begin_src 
+	struct nfs4_slot_table	*table;
+	struct nfs4_slot	*next;
+	unsigned long		generation;
+	u32			slot_nr;
+	u32		 	seq_nr;
+	unsigned int		interrupted : 1;   
+   #+end_src
+
+** nfs4_slot_table 
+   #+begin_src 
+	struct nfs4_session *session;		/* Parent session */
+	struct nfs4_slot *slots;		/* seqid per slot */ //单链表
+	unsigned long   used_slots[SLOT_TABLE_SZ]; /* used/unused bitmap */
+	spinlock_t	slot_tbl_lock;
+	struct rpc_wait_queue	slot_tbl_waitq;	/* allocators may wait here */
+	u32		max_slots;		/* # slots in table */
+	u32		max_slotid;		/* Max allowed slotid value */
+	u32		highest_used_slotid;	/* sent to server on each SEQ.
+						 * op for dynamic resizing */
+	u32		target_highest_slotid;	/* Server max_slot target */
+	u32		server_highest_slotid;	/* Server highest slotid */
+	s32		d_target_highest_slotid; /* Derivative */
+	s32		d2_target_highest_slotid; /* 2nd derivative */
+	unsigned long	generation;		/* Generation counter for
+						   target_highest_slotid */
+	struct completion complete;
+	unsigned long	slot_tbl_state;   
+   #+end_src
+
+** nfs4_session
+   #+begin_src 
+	struct nfs4_sessionid		sess_id;
+	u32				flags;
+	unsigned long			session_state;
+	u32				hash_alg;
+	u32				ssv_len;
+
+	/* The fore and back channel */
+	struct nfs4_channel_attrs	fc_attrs;
+	struct nfs4_slot_table		fc_slot_table;
+	struct nfs4_channel_attrs	bc_attrs;
+	struct nfs4_slot_table		bc_slot_table;
+	struct nfs_client		*clp;   
+   #+end_src
+
+
+
+
+** nfs4_shrink_slot_table(nfs4_slot_table, newsize)
+   - 改变slot大小, nfs4_slot_table->max_slots
+   - 如果变大,直接返回
+   - 否则删除多余的nfs4_slot
+
+** nfs4_free_slot(nfs4_slot_table, nfs4_slot)
+   - nfs4_slot_table->used_slots使用bitmap记录nfs4_slot的使用
+   - 这里释放nfs4_slot 
+   > __clear_bit(nfs4_slot->slot_nr, nfs4_slot_table->used_slots)
+   - 更新nfs4_slot_table->highest_used_slotid 
+   - 如果nfs4_slot->slot_nr == nfs4_slot_table->highest_used_slotid才需要更新
+   > find_last_bit(nfs4_slot_table->used_slots, slotid)
+   - 如果找到,设置nfs4_slot_table->highest_used_slotid
+   - 如果找不到,说明没有使用的, 设置为NFS4_NO_SLOT
+   - 唤醒等待的任务  nfs4_slot_table->complete
+   > nfs4_slot_tbl_drain_complete(nfs4_slot_table)
+
+** nfs4_new_slot(nfs4_slot_table, slotid, seq_init, gfp_mask)
+   - 分配新的nfs4_slot, 设置seq,slot_nr
+
+** nfs4_find_or_create_slot(nfs4_slot_table, slotid, seq_init, gfp_mask)
+   - 查找slotid对应的nfs4_slot->slot_nr
+   - 如果找不到创建nfs4_slot, 放到nfs4_slot_table的单链表中
+   - slot_nr必须是连续的, 如果找不到, 不能直接创建最后一个,需要创建多个,保持bitmap的对应
+
+** nfs4_alloc_slot(nfs4_slot_table)
+   - 通过查找bitmap, 查找可用的nfs4_slot 
+   > find_first_zero_bit(nfs4_slot_table->used_slots, nfs4_slot_table->max_slotid + 1)
+   - 如果找到,而且在nfs4_slot_table->max_slotid范围内
+   - 表示是可用的nfs4_slot, 修改used_slots, 返回nfs4_slot
+   - 否则创建新的slot 
+   > nfs4_find_or_create_slot(nfs4_slot_table, slotid, 1, GFS_NOWAIT)
+   - 更新nfs4_slot_table->highest_used_slotid
+   - 设置nfs4_slot->generation = nfs4_slot_table->generation???
+
+** nfs4_grow_slot_table(nfs4_slot_table, max_reqs, ivalue)
+   - 增大nfs4_slot的数量, 通过上面的创建实现
+   - 如果max_reqs < nfs4_slot_table->max_slots, 直接返回
+   > nfs4_find_or_create_slot(nfs4_slot_table, max_reqs-1, ivalue, GFS_NOFS)
+   - 这里初始的seqid = ivalue??
+
+** nfs4_reset_slot_table(nfs4_slot_table, server_highest_slotid, ivalue)
+   - 改变nfs4_slot的数量 
+   > nfs4_shrink_slot_table(nfs4_slot_table, server_highest_slotid+1)
+   - 遍历所有的nfs4_slot, 设置seq_nr = ivalue 
+   - 初始化nfs4_slot_table->highest_used_slotid, max_slotid等
+
+** nfs4_realloc_slot_table(nfs4_slot_table, max_reqs, ivalue)
+   - max_reqs不能超过1024, 不能同时发送1024个请求??
+   - 先创建nfs4_slot_table 
+   > nfs4_grow_slot_table(nfs4_slot_table, max_reqs, ivalue)
+   - 然后初始化它们
+   > nfs4_reset_slot_table(nfs4_slot_table, max_reqs-1, i_value)
+
+** nfs4_destroy_slot_tables(nfs4_session)
+   - 释放所有的nfs4_slot  
+   > nfs4_shrink_slot_table(nfs4_session->fc_slot_table, 0)
+   > nfs4_shrink_slot_table(nfs4_session->bc_slot_table, 0)
+
+** nfs41_assign_slot(rpc_task, pslot)
+   - pslot是nfs4_slot, rpc_task是sequence请求
+   - 在所有的compound请求的prepare阶段,如果无法获取nfs4_slot, 先在nfs4_slot_table->slot_tbl_waitq上睡眠
+   - 这是rpc的调度中使用的,检查是否应该唤醒rpc_task
+   - 如果nfs_client暂停rpc请求, 返回false,继续等待
+   - 检查nfs4_slot_table->slot_tbl_state的NFS4_SLOT_TBL_DRAINING
+   - nfs4_slot_tbl_draining(nfs4_slot_table)
+   - 这里是sequence请求获取资源,初始化 
+   - nfs4_slot->generation = nfs4_slot_table->generation??
+   - rpc_task中的参数是nfs4_sequence_args / nfs4_sequence_res, 关联nfs4_slot
+
+** __nfs41_wake_and_assign_slot(nfs4_slot_table, nfs4_slot)
+   - 唤醒rpc_task 
+   > rpc_wake_up_first(nfs4_slot_table->slot_tbl_waitq, nfs41_assign_slot, nfs4_slot)
+
+** nfs41_try_wake_next_slot_table_entry(nfs4_slot_table)
+   - 找一个空闲的nfs4_slot, 可能会创建新的
+   - 分配给等待的rpc_task 
+   > __nfs41_wake_and_assign_slot(nfs4_slot_table, nfs4_slot)
+   - 如果唤醒,返回true
+   - 否则释放nfs4_slot, 返回false
+
+** nfs41_wake_slot_table(nfs4_slot_table)
+   - 唤醒所有的rpc_task?? 
+   - 循环唤醒,直到返回false
+   > nfs41_try_wake_next_slot_table_entry(nfs4_slot_table)
+
+** nfs41_set_max_slotid_locked(nfs4_slot_table)
+   - 设置nfs4_slot_table->max_slotid, 它限制nfs4_slot的最大数量
+   - nfs4_slot不能超过nfs4_slot_table->server_highest_slotid / target_highest_slotid, NFS4_MAX_SLOT_TABLE/1024
+   - 创建nfs4_slot, 唤醒等待的rpc_task
+   > nfs41_wake_slot_table(nfs4_slot_table)
+
+** nfs41_set_target_slotid_locked(nfs4_slot_table)
+   - 设置nfs4_slot_table->target_highest_slotid
+   - 增加nfs4_slot_table->generation ++
+
+** nfs41_set_target_slotid(nfs4_slot_table, target_highest_slotid)
+   > nfs41_set_target_slotid_locked(nfs4_slot_table, target_highest_slotid)
+   - 更新max_slotid 
+   > nfs41_set_max_slotid_locked(nfs4_slot_table, target_highest_slotid)
+   - nfs4_slot_table->d_target_highest_slotid / d2_target_highest_slotid是什么??
+
+** nfs41_set_server_slotid_locked(nfs4_slot_table, highest_slotid)
+   - 和上面类似, highest_slotid < nfs4_slot_table->highest_used_slotid, 直接返回
+   > nfs4_shrink_slot_table(nfs4_slot_table, highest_slotid+1)
+   - 这里不会更新max_slotid
+
+** nfs41_derivative_target_slotid(s1, s2)
+   - s1 -= s2, 这里使用算法,放置max_slotid的剧烈变化 
+
+** nfs41_update_target_slotid(nfs4_slot_table, nfs4_slot, nfs4_sequence_res)
+   - 根据nfs4_sequence_res更新nfs4_slot_table 
+   > nfs41_is_outlier_target_slotid(nfs4_slot_table, nfs4_sequence_res->sr_target_highest_slotid)
+   > nfs41_set_target_slotid_locked(nfs4_slot_table, sr_target_highest_slotid)
+   > nfs41_set_server_slotid_locked(nfs4_slot_table, sr_highest_slotid)
+   - 重新计算max_slotid
+   > nfs41_set_max_slotid_locked(nfs4_slot_table, nfs4_sequence_res->sr_target_highest_slotid)
+
+** nfs4_setup_session_slot_tables(nfs4_session)
+   - 创建nfs4_session的2个nfs4_slot_table 
+   - sequence计数从1开始
+   - 创建nfs4_slot
+   > nfs4_realloc_slot_table(nfs4_slot_table, nfs4_session->fc_attrs->max_reqs, 1)
+
+** nfs4_alloc_session(nfs_client)
+   - 构造nfs4_session
+   - 初始化nfs4_slot_table, rpc_wait_queue
+
+** nfs4_destroy_session(nfs4_session)
+   - 获取rpc_cred 
+   > nfs4_get_exchange_id_cred(nfs4_session->nfs_client)
+   - 发送destroy session请求 
+   > nfs4_proc_destroy_session(nfs4_session, rpc_cred)
+   - 释放backchannel的rpc_xprt, rpc_rqst
+   > xprt_destroy_backchannel(rpc_xprt, NFS41_BC_MIN_CALLBACKS)
+   - nfs4_slot_table 
+   > nfs4_destroy_slot_tables(nfs4_session)
+
+** nfs41_check_session_ready(nfs_client)
+   - 等待session的状态 
+   - 如果nfs_client->cl_cons_state == NFS_CS_SESSION_INITING, 等待初始化
+   - 触发state任务,建立lease机制
+   > nfs4_client_recover_expired_lease(nfs_client)
+
+** nfs4_init_session(nfs_client)
+   - 去掉nfs4_session->session_state的NFS4_SESSION_INITING 
+   > nfs41_check_session_ready(nfs_client)
+
+** nfs4_init_ds_session(nfs_client, lease_time)
+   - 初始化ds使用的nfs4_session 
+   > nfs41_check_session_ready(nfs_client)
+
+** 总结
+   - nfs4_session通过nfs4_slot对rpc请求添加限制
+   - 在sequence处理中,先获取nfs4_slot资源
+
+   - 在创建nfs_client时,创建nfs4_session, 在exchange_id/create_session初始化nfs4_session/nfs4_slot
+   
+   - 对于nfs4.1来说, nfs_client初始化后,设置nfs_client->cl_cons_state = NFS_CS_SESSION_INITING
+   - 在创建nfs_server时,检查nfs_client的状态
+   > nfs4_init_session(nfs_client)
+   - 触发state任务,建立exchange_id的任务, 在建立起来lease机制后,改为NFS_CS_READY
+
+* nfs4renewd.c 
+
+** nfs4_state_maintenance_ops
+   #+begin_src 
+	int (*sched_state_renewal)(struct nfs_client *, struct rpc_cred *, unsigned);  //rpc操作
+	struct rpc_cred * (*get_state_renewal_cred_locked)(struct nfs_client *);  //获取rpc_cred
+	int (*renew_lease)(struct nfs_client *, struct rpc_cred *);  //异步的rpc操作
+   #+end_src
+
+** nfs4_renew_state(work_struct)
+   - renew工作在workqueue中实行
+   - 如果nfs_client->cl_res_state有NFS_CS_STOP_RENEW, 直接退出 
+   - 在nfs_client没有nfs_server时设置
+   - 检查是否超时 nfs_client->cl_lease_time / cl_last_renewal
+   - 如果超时, 执行请求
+   - 获取rpc_cred 
+   > nfs4_state_maintenance_ops->get_state_renewal_cred_locked(nfs_client)
+   - 如果获取不到,释放所有的delegation
+   - 执行rpc请求
+   > nfs4_state_maintenance_ops->sched_state_renewal(nfs_client, rpc_cred, renew_flags)
+   - 修改work_struct的计时器
+   > nfs4_schedule_state_renewal(nfs_client)
+   - 释放长时间不用的nfs_delegation 
+   > nfs_expire_unreferenced_delegations(nfs_client)
+
+** nfs4_schedule_state_manager(nfs_client)
+   - 设置nfs_client->cl_renewd的计时器
+   - 对于nfs4.1, 在释放nfs_sequence时,设定计时器
+
+** 总结
+   - 在nfs4.0的renew操作完成或nfs4.1的sequence操作完成时,设置renew的计时器
+   - 在创建session后,创建renew计时器
+   - 在renew的work_struct完成后,创建计时器
+
+* nfs4state.c
+** nfs_client
+   #+begin_src 
+	atomic_t		cl_count;
+	atomic_t		cl_mds_count;
+	int			cl_cons_state;	/* current construction state (-ve: init error) */
+#define NFS_CS_READY		0		/* ready to be used */
+#define NFS_CS_INITING		1		/* busy initialising */
+#define NFS_CS_SESSION_INITING	2		/* busy initialising  session */
+	unsigned long		cl_res_state;	/* NFS resources state */
+#define NFS_CS_CALLBACK		1		/* - callback started */
+#define NFS_CS_IDMAP		2		/* - idmap started */
+#define NFS_CS_RENEWD		3		/* - renewd started */
+#define NFS_CS_STOP_RENEW	4		/* no more state to renew */
+#define NFS_CS_CHECK_LEASE_TIME	5		/* need to check lease time */
+	unsigned long		cl_flags;	/* behavior switches */
+#define NFS_CS_NORESVPORT	0		/* - use ephemeral src port */
+#define NFS_CS_DISCRTRY		1		/* - disconnect on RPC retry */
+#define NFS_CS_MIGRATION	2		/* - transparent state migr */
+#define NFS_CS_INFINITE_SLOTS	3		/* - don't limit TCP slots */
+	struct sockaddr_storage	cl_addr;	/* server identifier */
+	size_t			cl_addrlen;     //server网址
+	char *			cl_hostname;	/* hostname of server */
+	struct list_head	cl_share_link;	/* link in global client list */  //全部的nfs_client
+	struct list_head	cl_superblocks;	/* List of nfs_server structs */  //nfs_server队列
+
+	struct rpc_clnt *	cl_rpcclient;   //每个nfs_server有自己的,这个是恢复状态的
+	const struct nfs_rpc_ops *rpc_ops;	/* NFS protocol vector */
+	int			cl_proto;	/* Network transport protocol */  //tcp
+	struct nfs_subversion *	cl_nfs_mod;	/* pointer to nfs version module */
+
+	u32			cl_minorversion;/* NFSv4 minorversion */
+	struct rpc_cred		*cl_machine_cred;
+
+#if IS_ENABLED(CONFIG_NFS_V4)
+	u64			cl_clientid;	/* constant */
+	nfs4_verifier		cl_confirm;	/* Clientid verifier */
+	unsigned long		cl_state;
+
+	spinlock_t		cl_lock;
+
+	unsigned long		cl_lease_time;
+	unsigned long		cl_last_renewal;
+	struct delayed_work	cl_renewd;
+
+	struct rpc_wait_queue	cl_rpcwaitq;
+
+	/* idmapper */
+	struct idmap *		cl_idmap;
+
+	/* Our own IP address, as a null-terminated string.
+	 * This is used to generate the mv0 callback address.
+	 */
+	char			cl_ipaddr[48];
+	u32			cl_cb_ident;	/* v4.0 callback identifier */
+	const struct nfs4_minor_version_ops *cl_mvops;
+
+	/* The sequence id to use for the next CREATE_SESSION */
+	u32			cl_seqid;
+	/* The flags used for obtaining the clientid during EXCHANGE_ID */
+	u32			cl_exchange_flags;
+	struct nfs4_session	*cl_session;	/* shared session */
+	bool			cl_preserve_clid;
+	struct nfs41_server_owner *cl_serverowner;
+	struct nfs41_server_scope *cl_serverscope;
+	struct nfs41_impl_id	*cl_implid;
+#endif /* CONFIG_NFS_V4 */
+
+#ifdef CONFIG_NFS_FSCACHE
+	struct fscache_cookie	*fscache;	/* client index cache cookie */
+#endif
+
+	struct net		*cl_net;   
+   #+end_src
+
+** nfs_server 
+   #+begin_src 
+	struct nfs_client *	nfs_client;	/* shared client and NFS4 state */
+	struct list_head	client_link;	/* List of other nfs_server structs
+						 * that share the same client
+						 */
+	struct list_head	master_link;	/* link in master servers list */
+	struct rpc_clnt *	client;		/* RPC client handle */
+	struct rpc_clnt *	client_acl;	/* ACL RPC client handle */
+	struct nlm_host		*nlm_host;	/* NLM client handle */
+	struct nfs_iostats __percpu *io_stats;	/* I/O statistics */
+	struct backing_dev_info	backing_dev_info;
+	atomic_long_t		writeback;	/* number of writeback pages */
+	int			flags;		/* various flags */
+	unsigned int		caps;		/* server capabilities */
+	unsigned int		rsize;		/* read size */
+	unsigned int		rpages;		/* read size (in pages) */
+	unsigned int		wsize;		/* write size */
+	unsigned int		wpages;		/* write size (in pages) */
+	unsigned int		wtmult;		/* server disk block size */
+	unsigned int		dtsize;		/* readdir size */
+	unsigned short		port;		/* "port=" setting */
+	unsigned int		bsize;		/* server block size */
+	unsigned int		acregmin;	/* attr cache timeouts */
+	unsigned int		acregmax;
+	unsigned int		acdirmin;
+	unsigned int		acdirmax;
+	unsigned int		namelen;
+	unsigned int		options;	/* extra options enabled by mount */
+#define NFS_OPTION_FSCACHE	0x00000001	/* - local caching enabled */
+#define NFS_OPTION_MIGRATION	0x00000002	/* - NFSv4 migration enabled */
+
+	struct nfs_fsid		fsid;  //major,minor
+	__u64			maxfilesize;	/* maximum file size */
+	struct timespec		time_delta;	/* smallest time granularity */
+	unsigned long		mount_time;	/* when this fs was mounted */
+	dev_t			s_dev;		/* superblock dev numbers */
+
+#ifdef CONFIG_NFS_FSCACHE
+	struct nfs_fscache_key	*fscache_key;	/* unique key for superblock */
+	struct fscache_cookie	*fscache;	/* superblock cookie */
+#endif
+
+	u32			pnfs_blksize;	/* layout_blksize attr */
+#if IS_ENABLED(CONFIG_NFS_V4)
+	u32			attr_bitmask[3];/* V4 bitmask representing the set
+						   of attributes supported on this
+						   filesystem */
+	u32			attr_bitmask_nl[3];
+						/* V4 bitmask representing the
+						   set of attributes supported
+						   on this filesystem excluding
+						   the label support bit. */
+	u32			cache_consistency_bitmask[3];
+						/* V4 bitmask representing the subset
+						   of change attribute, size, ctime
+						   and mtime attributes supported by
+						   the server */
+	u32			acl_bitmask;	/* V4 bitmask representing the ACEs
+						   that are supported on this
+						   filesystem */
+	u32			fh_expire_type;	/* V4 bitmask representing file
+						   handle volatility type for
+						   this filesystem */
+	struct pnfs_layoutdriver_type  *pnfs_curr_ld; /* Active layout driver */
+	struct rpc_wait_queue	roc_rpcwaitq;
+	void			*pnfs_ld_data;	/* per mount point data */
+
+	/* the following fields are protected by nfs_client->cl_lock */
+	struct rb_root		state_owners;
+#endif
+	struct ida		openowner_id;
+	struct ida		lockowner_id;
+	struct list_head	state_owners_lru;
+	struct list_head	layouts;
+	struct list_head	delegations;
+	void (*destroy)(struct nfs_server *);
+
+	atomic_t active; /* Keep trace of any activity to this server */
+
+	/* mountd-related mount options */
+	struct sockaddr_storage	mountd_address;
+	size_t			mountd_addrlen;
+	u32			mountd_version;
+	unsigned short		mountd_port;
+	unsigned short		mountd_protocol;
+   #+end_src
+
+** nfs_seqid_counter
+   #+begin_src 
+	ktime_t create_time;
+	int owner_id;
+	int flags;
+	u32 counter;
+	spinlock_t lock;		/* Protects the list */
+	struct list_head list;		/* Defines sequence of RPC calls */
+	struct rpc_wait_queue	wait;	/* RPC call delay queue */   
+   #+end_src
+
+** nfs4_init_clientid(nfs_client, rpc_cred) 
+   - nfs4.0使用,建立clientid
+   - 这是nfs4_state_recovery_ops中的establish_clid, 使用SETCLIENTID/SETCLIENTID_CONFIRM
+   > nfs4_proc_setclientid(nfs_client, NFS4_CALLBACK, port, rpc_cred, nfs4_setclientid_res)
+   > nfs4_proc_setclientid_confirm(nfs_client, nfs4_setclientid_res, rpc_cred)
+   - 启动renew任务,现在也使用workstruct 
+   > nfs4_schedule_state_manager(nfs_client)
+
+** nfs40_discover_server_trunking(nfs_client clp, nfs_client result, rpc_cred)
+   - 查找可重用的nfs_client
+   > nfs4_proc_setclientid(nfs_client, NFS4_CALLBACK, port, rpc_cred, nfs4_setclientid_res)
+   - 根据获取的clientid, 查找所有的nfs_client, 如果有相同的可以重用它
+   - 但需要替换老的cb_ident
+   > nfs40_walk_client_list(nfs_client, nfs_client, rpc_cred)
+
+** nfs4_get_machine_cred_locked(nfs_client) 
+   - 什么是machine的rpc_cred?  root用户的??
+   > get_rpccred(nfs_client->cl_machine_cred)
+
+** nfs4_get_renew_cred_server_locked(nfs_server)
+   - 查找可用的rpc_cred
+   - 遍历nfs_server的nfs4_state_owner
+   - 如果nfs4_state_owner有使用的nfs4_state, 返回这个nfs4_state_owner->cred
+
+** nfs4_get_renew_cred_server_locked(nfs_client)
+   - nfs4.0的renew操作使用的rpc_cred 
+   - 先找machine的rpc_cred 
+   > nfs4_get_machine_cred_locked(nfs_client)
+   - 如果找不到,找一个nfs4_state_owner的
+   - 遍历所有的nfs_server 
+   > nfs4_get_renew_cred_server_locked(nfs_server)
+
+** nfs41_setup_state_renewal(nfs_client) 
+   - 建立renew机制, 首先获取时间间隔
+   - nfs_client->cl_res_state的NFS_CS_CHECK_LEASE_TIME表示已经获取
+   - 使用root文件的fsinfo获取
+   - nfs4_proc_get_lease_time(nfs_client, nfs_fsinfo)
+   - 如果没有错误,启动renew工作
+   - nfs4_schedule_state_renewal(nfs_client) 
+
+** nfs4_end_drain_slot_table(nfs4_slot_table)
+   - 如果nfs4_slot_table->slot_tbl_state有NFS4_SLOT_DRAINING, 去掉这个标志,而且唤醒等待的任务
+   - 发射等待的rpc请求
+   > nfs41_wake_slot_table(nfs4_slot_table)
+
+** nfs4_end_drain_session(nfs_client) 
+   - 操作nfs_client->nfs4_session
+   - 结束阻止sequence操作, 唤醒所有等待nfs4_slot的rpc_task
+   > nfs4_end_drain_slot_table(nfs4_session->bc_slot_table)
+   > nfs4_end_drain_slot_table(nfs4_session->fc_slot_table)
+
+** nfs4_slot_tbl_drain_complete(nfs4_slot_table)
+   - 所有的sequence操作都完成,没有使用sequence的rpc_task
+   - 唤醒等待的任务, state manager? 
+   > nfs4_slot_tbl_draining(nfs4_slot_table)
+   > complete(nfs4_slot_table->complete)
+
+** nfs4_drain_slot_tbl(nfs4_slot_table)
+   - 暂定rpc请求
+   > set_bit(NFS4_SLOT_TBL_DRAINING, &tbl->slot_tbl_state)
+   - 如果有sequence操作没有完成, 等待它们 
+   > wait_for_completion_interruptible(nfs4_slot_table->complete)
+
+** nfs4_begin_drain_session(nfs_client)
+   - 先停止back channel 
+   > nfs4_drain_slot_tbl(nfs4_session->bc_slot_table)
+   - 然后是fore channel
+
+** nfs41_finish_session_reset(nfs_client) 
+   - 在exchange_id/create_session完成之后, 修改nfs_client的状态
+   - 去掉nfs_client->cl_state的NFS4CLNT_LEASE_CONFIRM, NFS4CLNT_SESSION_RESET, NFS4CLNT_BIND_CONN_TO_SESSION??
+   - 启动renew
+   > nfs41_setup_state_renewal(nfs_client)
+
+** nfs41_init_clientid(nfs_client, rpc_cred) 
+   - 对于nfsv41,建立nfs_client通过以下步骤
+   - 清除nfs4_session的slot上等待的rpc_task
+   > nfs4_begin_drain_session(nfs_client) 
+   - 发送EXCHANGE_ID请求
+   > nfs4_proc_exchange_id(nfs_client, rpc_cred) 
+   - 设置nfs_client->cl_state的NFS4CLNT_LEASE_CONFIRM, 他表示exchange_id完成,需要操作create_session
+   - 发送CREATE_SESSION,同时创建slot
+   > nfs4_proc_create_session(nfs_client, rpc_cred) 
+   - 启动lease / renew
+   - nfs41_finish_session_reset(nfs_client) 
+   - 最后设置nfs_client->cl_cons_state = NFS_CS_READY
+
+** nfs41_discover_server_trunking(nfs_client,  nfs_client** result, rpc_cred)
+   - 向nfs_client中发送exchange_id请求
+   > nfs4_proc_exchange_id(nfs_client, rpc_cred) 
+   - 设置nfs_client->cl_state的NFS4CLNT_LEASE_CONFIRM
+   - 里面比较的东西很少, proto/minorversion. 
+   - 它和nfs4.0的区别是,不需要cb_ident
+   > nfs41_walk_client_list(nfs_client, nfs_client resule, rpc_cred)
+
+** nfs4_get_exchange_id_cred(nfs_client)
+   > nfs4_get_machine_cred_locked(nfs_client)
+
+** nfs4_get_setclientid_cred_server(nfs_server) 
+   - 这里反而使用任意一个nfs4_state_owner->rpc_cred 
+   - 遍历nfs_server->state_owners这个rbtree
+
+** nfs4_get_setclientid_cred(nfs_client)
+   - 首先是machine cred 
+   > nfs4_get_machine_cred_locked(nfs_client)
+   - 然后遍历nfs_server 
+   > nfs4_get_setclientid_cred_server(nfs_server)
+
+** nfs4_find_state_owner_locked(nfs_server, rpc_cred) 
+   - 遍历nfs_server->state_owners这个rbtree,找一个符合rpc_cred的东西
+   - rb_tree使用rpc_cred指针排序
+
+** nfs4_insert_state_owner_locked(nfs4_state_owner) 
+   - 把nfs4_state_owner添加到nfs_server的state_owners中
+   - 使用nfs_server->openowner_id这个ida,分配一个seqid使用的owner_id. 
+   - ida_get_new(nfs_server->openowner_id, nfs4_state_owner->so_seqid.owner_id) 
+
+** nfs4_remove_state_owner_locked(nfs4_state_owner) 
+   - 上面的逆过程.
+
+** nfs4_init_seqid_counter(nfs_seqid_counter) 
+   - 初始化nfs_seqid_counter
+   - rpc_init_wait_queue(nfs_seqid_counter->wait, ...)
+
+** nfs4_destroy_seqid_counter(...) 
+   - 上面的逆过程,仅释放等待队列.
+
+** nfs4_alloc_state_owner(nfs_server, rpc_cred, gfp_flags)
+   - 构造新的nfs4_state_owner, 主要管理rpc_cred 
+   > nfs4_init_seqid_counter(nfs4_state_owner)
+
+** nfs4_drop_state_owner(nfs4_state_owner)
+   - 释放nfs4_state_owner->so_server_node的rb-tree关系
+
+** nfs4_free_state_owner(nfs4_state_owner)
+   - 释放nfs4_state_owner
+   > nfs4_destroy_seqid_counter(nfs4_state_owner->so_seqid)
+   > put_rpccred(nfs4_state_owner->rpc_cred)
+
+** nfs4_gc_state_owners(nfs_server) 
+   - 根据nfs4_state_owner->so_expires回收nfs4_state_owner, 时间不能提前jiffies nfs_client->cl_lease_time
+   - 只处理nfs4_server->state_owners_lru队列中的nfs4_state_owner
+   - nfs4_remove_state_owner_locked(nfs4_state_owner)
+   - nfs4_free_state_owner(nfs4_state_owner) 直接释放..
+
+** nfs4_get_state_owner(nfs_server, rpc_cred, gfp_t)
+   - 查找nfs4_state_owner, 如果找不到,创建新的 
+
+** nfs4_put_state_owner(nfs4_state_owner)
+   - 减小nfs4_state_owner->so_count
+   - 如果减为0, 放到lru队列中 nfs4_state_owner->state_owners_lru
+
+** nfs4_purge_state_owners(nfs_server)
+   - 释放所有的nfs4_state_owner, 在umount中使用??
+   - 释放nfs4_server的lru队列中的所有nfs4_state_owner, 其他的呢??
+
+** nfs4_alloc_open_state()
+   - 创建nfs4_state
+
+** nfs4_state_set_mode_locked(nfs4_state, fmode_t)
+   - 设置nfs4_state->state = fmode_t
+   - 移动它在nfs4_state_owner->so_states链表中的位置. 读的在后面,写的在前面
+
+** __nfs4_find_state_byowner(inode, nfs4_state_owner)
+   - 根据nfs4_state_owner查找nfs4_state
+   > nfs4_valid_open_stateid(nfs4_state)
+   - 同一个任务,打开2次一个文件,会发送open请求,而且会覆盖原来的nfs_state?
+
+** nfs4_free_open_state(nfs4_state)
+   - 直接释放
+
+** nfs4_get_open_state(inode, nfs4_state_owner)
+   - 先查找, 找不到,创建新的 
+   > __nfs4_find_state_byowner(inode, nfs4_state_owner)
+   > nfs4_alloc_open_state()
+   - nfs4_state关联inode, nfs4_state_owner
+
+** nfs4_put_open_state(nfs4_state)
+   - 释放链表关系 
+   > iput(inode)
+   > nfs4_free_open_state(nfs4_state)
+   > nfs4_put_state_owner(nfs4_state_owner)
+
+** __nfs4_close(nfs4_state, fmode_t, gfp_t, wait) 
+   - 在释放nfs_open_context时使用, 不仅仅关闭文件. 
+   - 在写操作中,nfs_page会使用nfs_open_context, 所以可能在哪里关闭文件
+   - 使用的CLOSE请求,在server端会对应的释放stateid使用的资源.  
+   - 只是释放fmode_t对应的使用计数, nfs4_state->n_rdonly/wronly/rdwr
+   - 根据nfs4_state->n_rdwr/r_rdonly/n_wronly计算打开open state
+   - 设置nfs4_state->state
+   > nfs4_state_set_mode_locked(nfs4_state, newstate)
+   - nfs4_state->flags表示当前的open state? 上面计算时,如果rdwr/rd/wr的打开计算变为0,需要发送close操作
+   - 如果没有打开的, newstate = 0, 去掉nfs4_state->flags的NFS_DELEGATED_STATE, 这时nfs4_state已经无效
+   - 如果nfs4_state的open state状态没有改变,不需要发送close操作, 释放使用计数
+   > nfs4_put_open_state(nfs4_state)
+   > nfs4_put_state_owner(nfs4_state_owner)
+   - 否则需要发送close请求
+   > nfs4_do_close(nfs4_state, gfp_t, wait) 
+   - 如果nfs4_state的state为0,没人使用它,发送CLOSE请求,否则发送OPEN_DOWNGRADE
+
+** nfs4_close_close / nfs4_close_sync  
+   - 包装上面的函数,第一个是异步,第二个是同步, 等待rpc_task结束
+
+** __nfs4_find_lock_state(nfs4_state, fl_owner_t, pid_t, type)
+   - 查找nfs4_state->lock_states中的nfs4_lock_state.
+   - 支持2种lock, posox,flock
+
+** nfs4_alloc_lock_state(nfs4_state, fl_owner_t, pid_t, type)
+   - 构造nfs4_lock_state
+
+** nfs4_get_lock_state(nfs4_state, fl_owner_t, pid_t, type)
+   - 先查找,再创建
+
+** nfs4_put_lock_state(nfs4_lock_state)
+   - 使用计数 nfs4_lock_state->ls_count
+
+** nfs4_select_rw_stateid(nfs4_stateid, nfs4_state, fmode_t, nfs_lockowner)
+   - 在读写操作中选择可用的nfs4_stateid
+   - 首先尝试delegation
+   - nfs4_state关联inode,但nfs_open_context关联dentry??
+   > nfs4_copy_delegation_stateid(nfs4_stateid, nfs4_state->inode, f_mode)
+   - 否则使用lock 
+   - nfs_lockowner传递pid_t, fl_owner_t, 来自nfs_open_context
+   > nfs4_copy_lock_stateid(nfs4_stateid, nfs4_state, nfs_lockowner)
+   - 否则使用nfs4_stateid 
+   > nfs4_copy_open_stateid(nfs4_stateid, nfs4_state)
+
+** nfs_seqid 
+   #+begin_src 
+	struct nfs_seqid_counter *sequence;
+	struct list_head list;
+	struct rpc_task *task;   
+   #+end_src
+
+** nfs_alloc_seqid(nfs_seqid_counter) 
+   - 创建nfs_seqid
+   - 在操作rpc参数时使用,这里操作的nfs_seqid只是关联起来sequence counter和rpc task.
+
+** nfs_release_seqid(nfs_seqid)
+   - 释放nfs_seqid
+   - 如果nfs_seqid_counter->list链表为空, 唤醒其他等待的任务???
+   > rpc_wake_up_queued_task(&sequence->wait, next->task)
+
+** nfs_free_seqid(nfs_seqid)
+   > nfs_release_seqid(nfs_seqid)
+   > kfree(nfs_seqid)
+
+** nfs_increment_seqid(status, nfs_seqid) 
+   - 这个函数是增加sequence counter
+
+** nfs_increment_open_seqid(status, nfs_seqid)
+   - 如果seq错误, 释放nfs4_state_owner
+   - status == NFS4ERR_BAD_SEQID 
+   > nfs4_drop_state_owner(nfs4_state_owner)
+   - 否则增加seq 
+   > nfs_increment_seqid(status, nfs_seqid)
+
+** nfs_increment_lock_seqid(status, nfs_seqid)
+   > nfs_increment_seqid(status, nfs_seqid)
+
+** nfs_wait_on_sequence(nfs_seqid, rpc_task) 
+   - 让rpc_task在nfs_seqid_counter->rpc_wait_queue上等待,实现串行化.
+   - 把nfs_seqid->list放到nfs_seqid_counter->list链表中
+   - 如果不是第一个,去队列中等待 
+   > rpc_sleep_on(nfs_seqid_counter->wait, rpc_task, NULL)
+
+** nfs4_clear_state_manager_bit(nfs_client)
+   - 使用NFS4CLNT_MANAGER_RUNNING同步这个操作, 去掉NFS4CLNT_MANAGER_RUNNING
+   - 唤醒等待它的任务 
+   - 什么东西在这里等待???
+   > rpc_wake_up(nfs_client->cl_rpcwaitq)
+
+** nfs4_schedule_state_manager(nfs_client)
+   - 设置NFS4CLNT_MANAGER_RUNNING, 如果已经设置,别人在实行它,直接退出
+   > kthread_run(nfs4_run_state_manager, clp, "%s", buf)
+
+** nfs4_schedule_lease_recovery(nfs_client) 
+   - 启动state manager, 操作lease ?  
+   - 如果nfs_client->cl_state没有NFS4CLNT_LEASE_EXPIRED, 设置NFS4CLNT_CHECK_LEASE??
+   > nfs4_schedule_state_manager(nfs_client)
+
+** nfs4_wait_clnt_recover(nfs_client)
+   - 等待state manager任务完成
+   - 等待nfs_client->cl_state的NFS4CLNT_MANAGER_RUNNING标志
+
+** nfs4_client_recover_expired_lease(nfs_client)
+   - 等待lease机制完成 
+   - 循环等待, 先等待state manager 
+   > nfs4_wait_clnt_recover(nfs_client)
+   - 检查nfs_client->cl_state的NFS4CLNT_LEASE_EXPIRED, NFS4CLNT_CHECK_LEASE?? 他们表示什么?
+   - 如果状态不对,启动state manager 
+   > nfs4_schedule_state_manager(nfs_client)
+
+** nfs40_handle_cb_pathdown(nfs_client) / nfs4_schedule_path_down_recovery
+  - 处理NFS4ERR_CB_PATH_DOWN错误, 在renew失败中也使用
+  - 设置nfs_client->cl_state的NFS4CLNT_LEASE_EXPIRED
+  - 设置nfs_delegation->flags的NFS_DELEGATION_RETURN, 在state manager中会处理它们.
+  > nfs_expire_all_delegations(nfs_client)
+
+** nfs4_schedule_path_down_recovery(nfs_client)
+   - renew失败后调用 
+   > nfs40_handle_cb_pathdown(nfs_client)
+   - 多次启动state manager 
+   > nfs4_schedule_state_manager(nfs_client)
+
+** nfs4_state_mark_reclaim_reboot(nfs_client, nfs4_state)
+   - 设置nfs4_state的NFS_STATE_RECLAIM_REBOOT
+   - 如果nfs4_state->flags有NFS_STATE_RECLAIM_NOGRACE, 直接退出.
+   - nfs4_state_owner->so_flags的NFS_OWNER_RECLAIM_REBOOT
+   - nfs_client->cl_state的NFS4CLNT_RECLAIM_REBOOT
+
+** nfs4_state_mark_reclaim_nograce(nfs_client, nfs4_state) 
+   - 设置nfs4_state->flags的NFS_STATE_RECLAIM_NOGRACE
+   - 去掉nfs4_state->flags的NFS_STATE_RECLAIM_REBOOT
+   - 设置nfs4_state_owner->so_flags的NFS_OWNER_RECLAIM_NOGRACE
+   - nfs_client->cl_state的NFS4CLNT_RECLAIM_NOGRACE
+
+** nfs4_schedule_stateid_recovery(nfs_server, nfs4_state) 
+   - 在错误处理中, 使用
+   > nfs4_state_mark_reclaim_nograce(nfs_client, nfs4_state)
+   - 启动state manager
+   > nfs4_schedule_state_manager(nfs_client)
+
+** nfs_inode_find_state_and_recover(inode, nfs4_stateid) 
+   - 在delegation状态错误中使用
+   - 这个nfs4_stateid是delegation, 找出使用delegation的nfs4_state/nfs_open_context
+   - 恢复对应的open state
+   > nfs4_state_mark_reclaim_nograce(nfs_client, nfs4_state)
+
+** nfs4_state_mark_open_context_bad(nfs4_state)
+   - 设置使用nfs4_state的nfs_open_context->flags的NFS_CONTEXT_BAD
+   - 在write/read中会检查这个标志
+
+** nfs4_state_mark_recovery_failed(nfs4_state, error)
+   - 设置nfs4_state->flags的NFS_STATE_RECOVERY_FAILED??  
+   - 在状态恢复中使用
+   > nfs4_state_mark_open_context_bad(nfs4_state)
+
+** nfs4_state_recovery_ops
+   #+begin_src 
+	int owner_flag_bit;
+	int state_flag_bit;
+	int (*recover_open)(struct nfs4_state_owner *, struct nfs4_state *);
+	int (*recover_lock)(struct nfs4_state *, struct file_lock *);
+	int (*establish_clid)(struct nfs_client *, struct rpc_cred *);
+	struct rpc_cred * (*get_clid_cred)(struct nfs_client *);
+	int (*reclaim_complete)(struct nfs_client *, struct rpc_cred *);
+	int (*detect_trunking)(struct nfs_client *, struct nfs_client **,
+		struct rpc_cred *);   
+   #+end_src
+
+** nfs4_reclaim_locks(nfs4_state, nfs4_state_recovery_ops)
+  - 恢复nfs4_state的lock state
+  - 遍历nfs4_state->inode->i_flock链表
+  - 检查file->nfs_open_context->nfs4_state, 只处理使用参数nfs4_state的
+  > nfs_file_open_context(file_lock->file)
+  - 恢复lock state
+  > nfs4_state_recovery_ops->recover_lock(nfs4_state, file_lock)
+  - 这里没有错误处理
+  - 这里的操作使用nfs_inode->rwsem, 同步delegation操作
+
+** nfs4_reclaim_open_state(nfs4_state_owner, nfs4_state_recovery_ops) 
+   - 遍历nfs4_state_owner->so_states的所有nfs4_state,发送rpc请求
+   - ops->state_flag_bit和nfs4_state->flags必须对应,否则不再recovery
+   - 检查nfs4_state的有效行 NFS_STATE_RECOVERY_FAILED
+   > nfs4_valid_open_stateid(nfs4_state)
+   - 如果nfs4_state->state == 0, 已经失效, 没人打开它
+   > ops->recover_open(nfs4_state_owner, nfs4_state)
+   - 恢复lock 
+   > nfs4_reclaim_locks(nfs4_state, nfs4_state_recovery_ops)
+   - 这里有2种错误处理, 一种直接失败ESTALE
+   > nfs4_state_mark_recovery_failed(nfs4_state, error)
+   - 另一种是继续回收?? NFS_STATE_RECLAIM_NOGRACE
+   > nfs4_state_mark_reclaim_nograce(nfs_client, nfs4_state) 
+
+** nfs4_clear_open_state(nfs4_state)
+   - 重新初始化nfs4_state?
+   - 去掉nfs4_state->flags的NFS_DELEGATED_STATE, NFS_O_RDONLY_STATE, NFS_O_WRONLY_STATE, NFS_O_RDWR_STATE
+   - 遍历nfs4_state的nfs4_lock_state, 去掉NFS_LOCK_INITIALIZED标志
+
+** nfs4_reset_seqids(nfs_server, mark_reclaim)
+   - mark_reclaim是回调函数,设置nfs4_state
+   > 遍历nfs_server的nfs4_state_owner
+   - 设置nfs4_state_owner->so_seqid->flags = 0
+   - 遍历他的nfs4_state 
+   > mark_reclaim(nfs_client, nfs4_state)
+   - 重新设置nfs4_state的状态
+   > nfs4_clear_open_state(nfs4_state)
+
+** nfs4_state_mark_claim_helper(nfs_client, mark_reclaim)
+   - 遍历nfs_server 
+   > nfs4_reset_seqids(nfs_server, mark_reclaim)
+
+** nfs4_state_start_reclaim_reboot(nfs_client) 
+   - 在发现server reboot后,启动回收工作
+   > nfs_delegation_mark_reclaim(nfs_client) 
+   > nfs4_state_mark_reclaim_helper(nfs_client, nfs4_state_mark_reclaim_reboot)
+
+** nfs4_reclaim_complete(nfs_client, nfs4_state_recovery_ops, rpc_cred)
+   > nfs4_state_recovery_ops->reclaim_complete(nfs_client, rpc_cred)
+
+** nfs4_clear_reclaim_server(nfs_server)
+   - 处理有NFS_STATE_RECLAIM_REBOOT标志的nfs4_state
+   - 双重遍历,外面是nfs4_state_owner, 里面是nfs4_state 
+   > test_and_clear_bit(NFS_STATE_RECLAIM_REBOOT, &state->flags)
+   - 如果有标记,设置NFS_STATE_RECLAIM_NOGRACE??
+   > nfs4_state_mark_reclaim_nograce(nfs_client, nfs4_state)
+
+** nfs4_state_clear_reclaim_reboot(nfs_client)
+   - 遍历nfs_client的nfs_server
+
+** nfs4_state_end_reclaim_reboot(nfs_client) 
+   - 先更新nfs4_state 
+   > nfs4_state_clear_reclaim_reboot(nfs_client)
+   - 触发回调函数 
+   > nfs4_reclaim_complete(nfs_client, nfs4_state_recovery_ops, rpc_cred)
+
+** nfs_delegation_clear_all(nfs_client) 
+   - 先设置所有的delegation的NFS_DELEGATION_NEED_RECLAIM
+   - nfs_delegation_mark_reclaim(nfs_client)
+   - 然后释放这些nfs_delegation, 没有return, 而是直接释放 
+   > nfs_delegation_reap_unclaimed(nfs_client)
+
+** nfs4_state_start_reclaim_nograce(nfs_client) 
+   - 启动nograce recovery操作. 在recovery lease之后使用.
+   - 先释放delegation, 所有的??
+   > nfs4_delegation_clear_all(nfs_client)
+   - 然后重新设置所有的nfs4_state??
+   > nfs4_state_mark_reclaim_helper(nfs_client, nfs4_state_mark_reclaim_nograce)
+
+** nfs4_recovery_handle_error(nfs_client, error)
+   - 处理错误
+   - 对于NFS4ERR_CB_PATH_DOWN, callback无效, delegation无法工作
+   - 设置nfs_delegation->flags的NFS_DELEGATION_RETURN, state manager应该处理它
+   > nfs40_handle_cb_pathdown(nfs_client)
+   - 对于NFS4ERR_NO_GRACE, 禁止reclaim
+   - 设置NOGRACE相关标记,哪里处理这种nfs4_state?
+   > nfs4_state_end_reclaim_reboot(nfs_client)
+   - 对于NFS4ERR_STALE_CLIENTID/NFS4ERR_LEASE_MOVED, server reboot 
+   - 重启lease?
+   > set_bit(NFS4CLNT_LEASE_EXPIRED, nfs_client->cl_state)
+   - 同样释放REBOOT标记的nfs4_state 
+   > nfs4_state_clear_reclaim_reboot(nfs_client)
+   - 开始回收?? 上面都清除了?? 
+   > nfs4_state_start_reclaim_reboot(nfs_client)
+   - 对于NFS4ERR_EXPIRED, 设置nfs_client->cl_state的NFS4CLNT_LEASE_EXPIRED? 
+   - 开始回收nograce ?? 
+   > nfs4_state_start_reclaim_nograce(nfs_client)
+   - 对于NFS4ERR_CONN_NOT_BOUND_TO_SESSION, 设置nfs_client->cl_state的NFS4CLNT_BIND_CONN_TO_SESSION??
+   - 对于session相关, 设置nfs_client->cl_state的NFS4CLNT_SESSION_RESET??
+   
+** nfs4_do_reclaim(nfs_client, nfs4_state_recovery_ops)
+   - 根据nfs4_state_recovery_ops恢复状态
+   - 先遍历所有的nfs_server 
+   - 释放lru队列中的nfs4_state_owner
+   > nfs4_purge_state_owners(nfs_server)
+   - 遍历所有的nfs4_state_owner
+   - 检查nfs4_state_owner->so_flags是否包含nfs4_state_recovery_ops->owner_flags_bit, 挑选要处理的nfs4_state_owner
+   - 恢复nfs4_state, 使用nfs4_state_recovery_ops的回调函数
+   > nfs4_reclaim_open_state(nfs4_state_owner, ops)
+   - 如果有错误, 重新设置recovery状态
+   > nfs4_recovery_handle_error(nfs_client, status)
+
+** nfs4_check_lease(nfs_client)
+   - 如果nfs_client->cl_state有NFS4CLNT_LEASE_EXPIRED, 直接退出. 这个表示用来停止lease??
+   - 使用rpc请求,恢复lease机制
+   - 获取nfs4_state_maintenance_ops, 它负责lease操作
+   - 获取rpc_cred 
+   > nfs4_state_maintenance_ops->get_state_renewal_cred_locked(nfs_client)
+   - 如果找不到, 自己挑一个 
+   > nfs4_get_setclientid_cred(nfs_client)
+   - 发送rpc请求
+   > nfs4_state_maintenance_ops->renew_lease(nfs_client, cred)
+   - 如果返回-ETIMEOUT, 设置NFS4CLNT_CHECK_LEASE?? 重新执行??
+   - 其他错误比较严重
+   > nfs4_recovery_handle_error(nfs_client, status)
+
+** nfs4_handle_reclaim_lease_error(nfs_client, status)
+   - 处理reclaim的错误?
+   - 如果是NFS4ERR_SEQ_MISORDERED, sequence请求的错误
+   - 设置NFS4CLNT_PURGE_STATE, 如果重复错误, 返回SERVERFAULT??
+   > test_and_set_bit(NFS4CLNT_PURGE_STATE, &clp->cl_state)
+   - 去掉NFS4CLNT_LEASE_CONFIRM标记
+   - 如果是NFS4ERR_STALE_CLIENTID
+   - 去掉NFS4CLNT_LEASE_CONFIRM标记, 他表示exchange_id无效
+   - 处理nograce的reclaim?
+   > nfs4_state_clear_reclaim_reboot(nfs_client)
+   > nfs4_state_start_reclaim_reboot(nfs_client)
+   - 如果是NFS4ERR_CLID_INUSE? EXCHANGE_ID错误?  
+   - 修改nfs_client->cl_cons_state = -EPERM
+   - 去掉NFS4CLNT_LEASE_CONFIRM标记, 他表示exchange_id无效
+   - 最后设置nfs_client->cl_state的NFS4CLNT_LEASE_EXPIRED??
+
+** nfs4_establish_lease(nfs_client)
+   - 实现exchange_id的任务, 使用nfs_client->nfs4_minor_version_ops->reboot_recovery_ops
+   - 获取rpc_cred
+   > nfs4_state_recovery_ops->get_clid_cred(nfs_client)
+   - 发送EXCHANGE_ID请求 
+   > nfs4_state_recovery_ops->establish_clid(nfs_client, rpc_cred)
+   - 什么意思??
+   - pnfs_destroy_all_layouts(nfs_client)
+
+** nfs4_reclaim_lease(nfs_client)
+   - 建立exchange_id, 就开始了lease? 
+   > nfs4_establish_lease(nfs_client)
+   - 如果有问题 
+   > nfs4_handle_reclaim_lease_error(nfs_client, status)
+   - 如果nfs_client->cl_state没有NFS4CLNT_RECLAIM_NOGRACE, 设置NFS4CLNT_RECLAIM_REBOOT?? nograce和reboot不能共存
+   - 去掉NFS4CLNT_CHECK_LEASE,和NFS4CLNT_LEASE_EXPIRED
+
+** nfs4_purge_lease(nfs_client)
+   - 重新建立lease
+   > nfs4_establish_lease(nfs_client)
+   - 去掉nfs_client->cl_state的NFS4CLNT_PURGE_STATE??
+   - 设置NFS4CLNT_LEASE_EXPIRED?? 
+   - 开始nograce reclaim 
+   > nfs4_state_start_reclaim_nograce(nfs_client)
+   - 这两个都需要建立lease?? purge_lease是purge state,也就purge之前的lease, 结束时设置NFSCLNT_LEASE_EXPIRED, 重新建立lease, recovery state..
+   - 在nfs4_reset_all_state中设置NFS4CLNT_PURGE_STATE,出发nfs4_purge_lease操作, 这里是清除所有的state, 应该是借助clientid的更新,清除server端的所有状态..
+
+** nfs4_discover_server_trunking(nfs_client, nfs_client result)
+   - 使用nfs_client->nfs4_minor_version_ops->reboot_recovery_ops的回调函数 
+   - 为何这里也需要rpc_cred? 
+   > nfs4_state_recovery_ops->get_clid_cred(nfs_client)
+   - 还要发送请求??
+   > nfs4_state_recovery_ops->detect_trunking(nfs_client, result, rpc_cred)
+
+** nfs4_schedule_session_recovery(nfs4_session, error)
+   - 错误处理,恢复session 
+   - 如果是NFS4ERR_CONN_BOUND_TO_SESSION, 设置nfs_client->cl_state的NFS4CLNT_BIND_CONN_TO_SESSION
+   - 否则设置NFS4CLNT_SESSION_RESET 
+   > nfs4_schedule_lease_recovery(nfs_client)
+
+** nfs41_ping_server(nfs_client)
+   - 设置NFS4CLNT_CHECK_LEASE?? 
+   > nfs4_schedule_state_manager(nfs_client)
+
+** nfs41_server_notify_highest_slotid_update(nfs_client)
+   - 发送sequence请求?? 在sequence处理中中使用,如果nfs4_slot_table->highest_used_slotid改变, 发送请求??
+   > nfs41_ping_server(nfs_client)
+
+** nfs4_reset_all_state(nfs_client)
+   - 设置NFS4CLNT_LEASE_EXPIRED标志, 
+   - 如果之前没有, 设置NFS4CLNT_PURGE_STATE, 去掉NFS4CLNT_LEASE_CONFIRM标记
+   - 开始nograce恢复 
+   > nfs4_state_start_reclaim_reboot(nfs_client)
+   - 启动state manager 
+   > nfs4_schedule_state_manager(nfs_client)
+
+** nfs41_handle_server_reboot(nfs_client)
+   - 处理SEQ4_STATUS_RESTART_RECLAIM_NEEDED标志, 在sequence处理中使用
+   - 设置NFS4CLNT_LEASE_EXPIRED
+   - 如果之前没有, 启动reboot恢复 
+   > nfs4_state_start_reclaim_reboot(nfs_client)
+   > nfs4_schedule_state_manager(nfs_client)
+
+** nfs41_handle_state_revoked(nfs_client)
+   - 处理sequence的结果
+   - 释放所有的nfs4_state??
+   > nfs4_reset_all_state(nfs_client)
+
+** nfs41_handle_recallable_state_revoked(nfs_client)
+   - 处理sequence的结果
+   - 释放nfs_delegation 
+   > nfs_expire_all_delegations(nfs_client)
+
+** nfs41_handle_backchannel_fault(nfs_client)
+   - 释放所有的delegation 
+   > nfs_expire_all_delegations(nfs_client)
+   - 设置NFS4CLNT_SESSION_RESET标志 
+   > test_and_set_bit(NFS4CLNT_SESSION_RESET, &clp->cl_state)
+
+** nfs41_handle_cb_path_down(nfs_client)
+   - 设置nfs_client->cl_state的NFS4CLNT_BIND_CONN_TO_SESSION, 要重新发送bind操作?? 
+   > nfs4_schedule_state_manager(nfs_client)
+
+** nfs41_handle_sequence_flags_error(nfs_client, flags)
+   - 这里处理sequence的返回结果, 在renew使用的sequence请求中使用
+   - 对于SEQ4_STATUS_RESTART_RECLAIM_NEEDED,  reboot?
+   > nfs41_handle_server_reboot(nfs_client)
+   - 对于释放所有的nfs4_state? SEQ4_STATUS_EXPIRED_ALL_STATE_REVOKED等,回收nfs4_state 
+   > nfs41_handle_state_revoked(nfs_client)
+   - 对于SEQ4_STATUS_RECALLABLE_STATE_REVOKED, 处理delegation 
+   > nfs41_handle_recallable_state_revoked(nfs_client)
+   - 对于SEQ4_STATUS_BACKCHANNEL_FAULT
+   > nfs41_handle_backchannel_fault(nfs_client)
+   - 对于CB_PATH_DOWN, 它和backchannel不一样?? 
+   > nfs41_handle_cb_path_down(nfs_client)
+
+** nfs4_reset_session(nfs_client) 
+   - 重新创建session
+   - 暂定rpc请求 
+   > nfs4_begin_drain_session(nfs_client)
+   - 获取rpc_cred 
+   > nfs4_get_exchange_id_cred(nfs_client)
+   - 释放session?
+   > nfs4_proc_destroy_session(nfs_client->cl_session, cred)
+   - 发送rpc请求, 获取session id
+   > nfs4_proc_create_session(nfs_client, cred) 
+   - 去掉nfs_client标记, 启动lease
+   > nfs41_finish_session_reset(nfs_client)
+
+** nfs4_bind_conn_to_session(nfs_client)
+   - 暂定rpc请求
+   > nfs4_begin_drain_session(nfs_client)
+   - 获取rpc_cred
+   > nfs4_get_exchange_id_cred(nfs_client)
+   - 发送bind请求
+   > nfs4_proc_bind_conn_to_session(nfs_client, cred) 
+   - 去掉NFS4CLNT_BIND_CONN_TO_SESSION
+
+** nfs4_state_manager(nfs_client)
+   - 这是state manager线程执行的任务
+   - 根据nfs_client->cl_state, 执行特定的命令
+   - 对于NFS4CLNT_PURGE_STATE
+   > nfs4_purge_lease(nfs_client)
+   - 对于NFS4CLNT_LEASE_EXPIRED
+   > nfs4_reclaim_lease(nfs_client)
+   - 对于NFS4CLNT_SESSION_RESET
+   > nfs4_reset_session(nfs_client)
+   - 对于NFS4CLNT_BIND_CONN_TO_SESSION
+   > nfs4_bind_conn_to_session(nfs_client)
+   - 对于NFS4CLNT_CHECK_LEASE
+   > nfs4_check_lease(nfs_client)
+   - 对于NFS4CLNT_RECLAIM_REBOOT
+   > nfs4_do_reclaim(nfs_client, nfs_client->cl_mvops->reboot_recovery_ops)
+   - 对于NFS4CLNT_RECLAIM_NOGRACE
+   > nfs4_do_reclaim(nfs_client, nfs_client->cl_mvops->nograce_recovery_ops)
+   - 最后恢复操作完成 
+   - 启动sequence 
+   > nfs4_end_drain_session(nfs_client)
+   - 如果有NFS4CLNT_DELEGRETURN 
+   > nfs_client_return_marked_delegation(nfs_client)
+   - 恢复nfs4_client的标志
+   > nfs4_clear_state_manager_bit(nfs_client)
+
+** nfs4_stateid 
+   #+begin_src 
+	struct list_head open_states;	/* List of states for the same state_owner */
+	struct list_head inode_states;	/* List of states for the same inode */
+	struct list_head lock_states;	/* List of subservient lock stateids */
+
+	struct nfs4_state_owner *owner;	/* Pointer to the open owner */
+	struct inode *inode;		/* Pointer to the inode */
+
+	unsigned long flags;		/* Do we hold any locks? */
+	spinlock_t state_lock;		/* Protects the lock_states list */
+
+	seqlock_t seqlock;		/* Protects the stateid/open_stateid */
+	nfs4_stateid stateid;		/* Current stateid: may be delegation */
+	nfs4_stateid open_stateid;	/* OPEN stateid */
+
+	/* The following 3 fields are protected by owner->so_lock */
+	unsigned int n_rdonly;		/* Number of read-only references */
+	unsigned int n_wronly;		/* Number of write-only references */
+	unsigned int n_rdwr;		/* Number of read/write references */
+	fmode_t state;			/* State on the server (R,W, or RW) */
+	atomic_t count;   
+   #+end_src
+
+** 总结
+   - nfs4_state_recovery_ops的回调函数实现state的管理, 在nfs4_minor_version_ops中使用
+   - recovery有2种,reboot和nograce,也就是正常情况下使用
+     
+   - nfs40_reboot_recovery_ops
+     - get_clid_cred = nfs4_get_setclientid_cred, 获取rpc_cred
+     - 首先尝试machine cred, 然后查找使用中的
+     
+     - establish_clid = nfs4_init_clientid
+     - 用来建立clientid, 使用SETCLIENTID/SETCLIENTID_CONFIRM
+     - 获取clientid, confirm之前NFS4CLNT_LEASE_CONFIRM标记, confirm之后去掉
+     - 启动renew任务
+       
+     - detech_trunking = nfs40_discover_server_trunking
+     - 查找可重用的nfs_client
+     > nfs40_walk_client_list(nfs_client, nfs_result **result, rpc_cred)
+     - 找到clientid一致的,还是需要发送setclientid_confirm??
+
+     - recover_open = nfs4_open_reclaim, 在reboot之后恢复状态
+     > nfs4_do_open_reclaim(nfs_open_context, nfs4_stateid)
+     - 找到任意的使用者?? 
+     - 使用nfs_open_context->dentry, 使用dentry->d_name
+     - 发送open请求,更新现有的nfs4_state
+     > _nfs4_do_open_reclaim(nfs_open_context, nfs4_state)
+     - nfs4_state可以表示3中文件打开的状态,每种都要发送一个open请求
+
+     - recover_lock = nfs4_lock_reclaim(nfs4_state, file_lock)
+     - nfs4_state是open state, lock是nfs4_lock_state
+     - 如果nfs4_state使用delegation, 不用发送锁??
+     - nfs4_state->flags有NFS_DELEGATED_STATE
+     - 原来的nfs4_lock_state在file_lock->fl_u->nfs4_fl->nfs4_lock_state
+     - 最后使用返回的nfs4_stateid更新nfs4_lock_state
+
+   - nfs40_nograce_recovery_ops, 正常情况下的超时处理, 怎么会超时无效呢??
+     - establish_clid / get_clid_cred和上面一样 
+     
+     - recover_open = nfs4_open_exipred(nfs4_state_owner, nfs4_state)
+     > nfs4_do_open_expired(nfs_open_context, nfs4_state)
+     > _nfs4_do_open_expired(nfs_open_context, nfs4_state)
+     - 上面也是使用这个操作?? 错误处理呢?
+     > nfs_open_recover(nfs4_opendata, nfs4_state)
+     
+     - recover_lock = nfs4_lock_expired(nfs4_state, file_lock)
+     - 和上面一样,重新发送锁请求,但没有设置reclaim
+     > _nfs4_do_setlk(nfs4_state, F_SETLK, file_lock, NFS_LOCK_EXPIRED)
+
+   - nfs41_reboot_recovery_ops, nfs4.1使用的
+     - recover_open / recover_lock和nfs4.0的一样 
+     
+     - get_clid_cred = nfs4_get_exchange_id_cred(nfs_client)
+     - 只是用machine cred
+
+     - establish_clid = nfs41_init_clientid(nfs_client, rpc_cred)
+     - 先获取clientid, 再建立session
+     > 如果设置NFS4CLNT_LEASE_CONFIRM, 直接去创建session
+     - 否则使用exchange_id 
+     - 暂定rpc请求, 等待所有的rpc请求完成??
+     > nfs4_begin_drain_session(nfs_client)
+     > nfs4_proc_exchange_id(nfs_client, rpc_cred)
+     - 创建session 
+     > nfs4_proc_create_session(nfs_client, rpc_cred)
+     - 根据返回结果初始化nfs4_slot_table
+
+     - reclaim_complete = nfs41_proc_reclaim_complete(nfs_client)
+     - 发送reclaim_complete请求
+     
+   - nfs41_nograce_recovery_ops
+     - establish_clid / get_clid_cred和上面一样 
+
+     - recover_open = nfs41_open_expired(nfs4_state_owner, nfs4_state)
+     - 相比nfs4.0,先如果nfs4_state使用delegation, 释放delegation
+     - 使用TEST_STATEID/FREE_STATEID请求释放
+     > nfs41_clear_delegation_stateid(nfs4_state)
+     - 然后检查nfs4_stateid的open nfs4_stateid
+     > nfs41_check_open_stateid(nfs4_stateid)
+     - 检测之后,如果返回错误,但不是NFS4ERR_BAD_STATEID,释放nfs4_stateid
+     - NFS4ERR_BAD_STATEID表示server不认识这个,可以直接释放它.
+     - 去掉nfs4_state->flags的NFS_O_RDONLY_STATE|NFS_O_WRONLY_STATE|NFS_O_RDWR_STATE|NFS_OPEN_STATE
+     - 这样nfs4_state就是无效的??
+     - 哪里使用这些标志??
+     - 最后使用nfs4.0的恢复函数
+     > nfs4_open_expired(nfs4_state_owner, nfs4_state)
+
+     - recover_lock = nfs41_lock_expired(nfs4_state, file_lock)
+     - nfs4_state->flags的LK_STATE_IN_USE表示有lock?? 检查nfs4_stateid 
+     - 遍历nfs4_state的nfs4_lock_state
+     > nfs41_check_expired_locks(nfs4_stateid)
+     - 检测之后,如果返回错误,但不是NFS4ERR_BAD_STATEID,释放nfs4_stateid
+     - 然后去掉nfs4_lock_state->ls_flags的NFS_LOCK_INITIALIZED标志, 这个lock也是无效..
+     - 最后使用nfs4.0的功能释放 
+     > nfs4_lock_expired(nfs4_state, file_lock)
+
+   - nfs4_state_maintenance_ops是lease使用的
+   - nfs40_state_renewal_ops提供回调函数,实现lease操作
+     
+     - get_state_renewal_cred_locked = nfs4_get_renew_cred_server_locked(nfs_client)
+     - 使用任意的rpc_cred
+     
+     - renew_lease = nfs4_proc_renew(nfs_client, rpc_cred)
+     - 使用RENEW请求
+     - 如果没有错误, 设置nfs_client->cl_last_renewal, 这是本地时间,不是server时间
+     > do_renew_lease(nfs_client, now)
+      
+     - sched_state_renewal = nfs4_proc_async_renew(nfs_client, rpc_cred, renew_flags)
+     > 上面使用同步rpc请求,这里使用异步方式
+     - 在rpc回调函数中,如果有错误,启动恢复工作?? 
+     > nfs4_schedule_lease_recovery(nfs_client)
+     - 如果没问题 
+     > do_renew_lease(nfs_client, timestamp)
+     - 这里执行renew不会等待结果,只是定时触发renew
+
+   - nfs41_state_renewal_ops
+     - get_state_renewal_cred_locked = nfs4_get_machine_cred_locked
+     > 只是用machine rpc_cred, nfs_client->cl_machine_cred
+
+     - renew_lease = nfs4_proc_sequence
+     - 在state manager中使用, 强制执行renew操作
+     > _nfs41_proc_sequence(nfs_client, rpc_cred, true)
+     - 在rpc回调函数中, 更新lease, 好复杂的sequence
+     > do_renew_lease(nfs_client, nfs4_sequence_res->sr_timestamp)
+
+     - sched_state_renewal = nfs41_proc_async_sequence(nfs_client, rpc_cred, renew_flags)
+     > 如果renew_flags没有NFS4_RENEW_TIMEOUT, 先检查是否超时, 在nfs4_renew_state/wor_struct中使用
+     > _nfs41_proc_sequence(nfs_client, rpc_cred, false)
+     - 这里如果只处理超时,为何调用者还检查其他提交, NFS4_RENEW_DELEGATION_CB
+
+   - state manager的任务
+
+   - NFS4CLNT_PURGE_STATE, 重新恢复所有的nfs4_stateid, 非常严重的错误
+     - 在恢复lease中,碰到NFS4ERR_SEQ_MISORDERED
+     > nfs4_handle_reclaim_lease_error(nfs_client, status)
+     - 在sequence处理结果时,碰到SEQ4_STATUS_EXPIRED_ALL_STATE_REVOKED|SEQ4_STATUS_LEASE_MOVED?? 如果没有NFS4CLNT_LEASE_EXPIRED, 不是超时导致的这些错误
+     > nfs41_handle_sequence_flags_error(nfs_client, flags)
+     - 开始处理
+     > nfs4_purge_lease(nfs_client)
+     - 通过rpc重新建立clientid? 相当于重新建立连接 
+     > nfs4_establish_lease(nfs_client)
+     > reboot_recovery_ops->establish_clid(nfs_client, rpc_cred)
+     - 设置NFS4CLNT_LEASE_EXPIRED
+     - 启动nograce恢复
+     > nfs4_state_start_reclaim_reboot(nfs_client)
+     - 删除所有的delegation
+     > nfs_delegation_clear_all(nfs_client)
+     - 标记所有的nfs4_state/nfs4_state_owner, NFS4CLNT_RECLAIM_NOGRACE
+     > nfs4_state_mark_reclaim_nograce(nfs_client, nfs4_state)
+     - 重新初始化所有的nfs4_stateid, 都变为无效
+     > nfs4_clear_open_state(nfs4_state)
+     - 后面会启动恢复任务
+  
+   - NFS4CLNT_LEASE_EXPIRED, lease超时
+     - 在处理NFS4ERR_LEASE_MOVED/NFS4ERR_EXPIRED时,server migrate需要处理
+     - 如果renew碰到CB_PATHDOWN, 也设置NFS4CLNT_LEASE_EXPIRED??
+     - 在sequence处理中碰到SEQ4_STATUS_RESTART_RECLAIM_NEEDED, 需要设置, 同时启动reboot恢复
+     - 开始恢复lease, 看来也非常严重
+     > nfs4_reclaim_lease(nfs_client)
+     - 重新建立clientid 
+     > nfs4_establish_lease(nfs_client)
+     - 如果没有NFS4CLNT_RECLAIM_NOGRACE, 设置NFS4CLNT_RECLAIM_REBOOT??
+     - 去掉NFS4CLNT_CHECK_LEASE|NFS4CLNT_LEASE_EXPIRED
+  
+   - NFS4CLNT_SESSION_RESET, 恢复session
+     - 当得到NFS4ERR_BADSESSION,NFS4ERR_BADSLOT,NFS4ERR_BAD_HIGH_SLOT,DEADSESSION时重建
+     > nfs4_reset_session(nfs_client)
+     > nfs4_get_exchange_id_cred(nfs_client)
+     - 首先暂停rpc请求 
+     - 释放session 
+     > nfs4_proc_destroy_session(nfs4_session, rpc_cred)
+     - 释放session, 也没有重置rpc_xprt等?? 
+     - 错误处理中,转移到lease的错误??
+     > nfs4_recovery_handle_error(nfs_client, status)
+     - 重新创建session 
+     > nfs4_proc_create_session(nfs_client, rpc_cred)
+     > _nfs4_proc_create_session(nfs_client, rpc_cred)
+     - 初始化nfs4_slot_table 
+     > nfs4_setup_session_slot_tables(nfs4_session)
+     - 然后启动lease? 
+     > nfs41_finish_session_reset(nfs_client)
+     - 去掉nfs_client->cl_state的NFS4CLNT_LEASE_CONFIRM, EXCHANGE_ID/CREATE_SESSION任务全部完成
+     - 去掉NFS4CLNT_SESSION_RESET, session已经reset
+     - 去掉NFS4CLNT_BIND_CONN_TO_SESSION?? 创建session, channel也就完成??
+     - 启动lease renew 
+     > nfs41_setup_state_renewal(nfs_client)
+     - 如果nfs_client->cl_res_state没有NFS_CS_CHECK_LEASE_TIME, 获取时间间隔
+     - 使用getattr, 设置nfs_client->cl_lease_time = nfs_fsinfo->lease_time
+     > nfs4_proc_get_lease_time(nfs_client, nfs_fsinfo)
+     - 然后启动renew 
+     > nfs4_schedule_state_renewal(nfs_client)
+     
+   - NFS4CLNT_BIND_CONN_TO_SESSION用来bind channel
+     - 一般sequence请求会完成,但有安全性要求时,需要这个命令??
+     - 在nfs4.1中,cb_path_down也使用它恢复, 在碰到错误NFS4CLNT_BIND_CONN_TO_SESSION时,也使用
+     > nfs4_bind_conn_to_session(nfs_client)
+     - 暂定rpc请求 
+     > nfs4_begin_drain_session(nfs_client)
+     > nfs4_get_exchange_id_cred(nfs_client)
+     - nfs4.1发送的rpc请求, dir使用NFS4_CDFC4_BACK_OR_BOTH
+     > nfs4_proc_bind_conn_to_session(nfs_client, rpc_cred)
+     - 错误处理中,使用统一的恢复处理,转移错误
+     > nfs4_recovery_handle_error(nfs_client, ret)
+  
+   - NFS4CLNT_CHECK_LEASE,这里只是调用renew操作
+     - 看到一些错误处理中,先启动lease renew, 用来定位错误?
+     > nfs4_schedule_lease_recovery(nfs_client)
+     - 开始检查lease, 使用nfs4_state_maintenance_ops接口
+     > nfs4_check_lease(nfs_client)
+     - 获取rpc_cred
+     > nfs4_state_maintenance_ops->get_state_renewal_cred_locked(nfs_client)
+     - 发送rpc请求
+     > nfs4_state_maintenance_ops->renew_lease(nfs_client, rpc_cred)
+     - 统一的错误处理 
+     > nfs4_recovery_handle_error(nfs_client, status)
+  
+   - NFS4CLNT_RECLAIM_REBOOT, 恢复nfs4_stateid
+     > nfs4_state_start_reclaim_reboot(nfs_client)
+     - 设置delegation/nfs4_state/nfs4_state_owner/NFS4CLNT_RECLAIM_REBOOT
+     - 在处理SEQ_STATUS_RESTART_RECLAIM_NEEDED中使用,或者NFS4ERR_STALE_CLIENTID中使用
+     - 这也算是碰到严重的错误
+     - 使用nfs4_state_recovery_ops的回调函数 
+     > nfs4_do_reclaim(nfs_client, nfs_client->cl_mvops->reboot_recovery_ops)
+     - 遍历所有的nfs4_state_owner, 只处理带有NFS_OWNER_RECLAIM_REBOOT的, 哪里设置的??
+     > nfs4_reclaim_open_state(nfs4_state_owner, nfs4_state_recovery_ops)
+     - 遍历所有的nfs4_state, 只处理带有NFS_STATE_RECLAIM_REBOOT的nfs4_stateid 
+     > nfs4_state_recovery_ops->recover_open(nfs4_state_owner, nfs4_state)
+     - 碰到无法恢复的, 对于ESTALE 
+     > nfs4_state_mark_recovery_failed(nfs4_state, status)
+     - 否则,设置nograce恢复 
+     > nfs4_state_mark_reclaim_nograce(nfs_client, nfs4_state)
+     - 然后处理无法恢复的nfs4_stateid,结束恢复阶段
+     > nfs4_state_end_reclaim_reboot(nfs_client)
+     > nfs4_state_clear_reclaim_reboot(nfs_client)
+     - 去掉NFS4CLNT_RECLAIM_REBOOT
+     - 把NFS_STATE_RECLAIM_REBOOT的nfs4_state变为nograce
+     > nfs4_state_mark_reclaim_nograce(nfs_client, nfs4_state)
+     - 释放没有恢复的delegation, 上面恢复了open stateid, 如果恢复时获取delegation, 这里不会处理,否则delegation也是多余的
+     > nfs_delegation_reap_unclaimed(nfs_client)
+     - 发送reclaim_complete请求 
+     > nfs4_reclaim_complete(nfs_client, nfs4_state_recovery_ops, rpc_cred)
+     > nfs4_state_recovery_ops->reclaim_complete(nfs_client, rpc_cred)
+     
+   - NFS4CLNT_RECLAIM_NOGRACE, 处理正常情况的nfs4_state恢复 
+     - 触发nograce reclaim有2种, 一种是针对某个nfs4_state
+     - 在nfs4_handle_exception中,碰到stateid相关错误, 设置nfs4_state的NFS_STATE_RECLAIM_NOGRACE
+     > nfs4_schedule_stateid_recovery(nfs_server, nfs4_state)
+     > 标记nfs4_state 
+     > nfs4_state_mark_reclaim_nograce(nfs_client, nfs4_state)
+     - 另一种是针对整个nfs_client错误
+     - 开始恢复nfs4_stateid, 和上面一样,删除所有的delegation, 标记所有的nfs4_state/nfs4_state_owner 
+     > nfs4_state_start_reclaim_nograce(nfs_client)
+     - 在lease expired,或revoke stateid时使用
+     - 使用恢复函数,不过回调接口不一样
+     > nfs4_do_reclaim(nfs_client, nfs4_state_recovery_ops->nograce_recovery_ops)
+  
+   - NFS4CLNT_DELEGRETURN, 释放delegation 
+     - 释放带有NFS_DELEGATION_RETURN/NFS_DELEGATION_RETURN_IF_CLOSED标志的nfs_delegation
+     > nfs_client_return_marked_delegations(nfs_client)
+  
