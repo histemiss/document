@@ -1,0 +1,68 @@
+* nfs4proc.c
+  - 这里是非常繁琐的东西,大体分成一下部分: open,close,write,read,commit,sequence等
+
+** sequence 
+
+** nfs41_sequence_free_slot(nfs4_sequence_res)
+   - 在rpc回调函数 rpc_done中使用
+   - 更新nfs4_slot_table, 如果highest_used_slotid > target_highest_slotid, 告诉server? 
+   - 唤醒等待nfs4_slot的rpc_task, 使用当前释放的nfs4_slot
+   > nfs41_wake_and_assign_slot(nfs4_slot_table, nfs4_sequence_res->nfs4_slot)
+   - 如果唤醒,就不用通知,因为下一个请求会包含sequence请求, 而且不用释放nfs4_slot
+   - 否则释放nfs4, nfs4_slot_table的bitmap
+   > nfs4_free_slot(nfs4_slot_table, nfs4_slot)
+   - 奇怪? 如果不能唤醒,没有rpc请求, 最后只有highest_used_slotid == NFS4_NO_SLOT才发送?
+   > nfs41_server_notify_highest_slotid_update(nfs_client)
+
+** nfs41_sequence_done(rpc_task, nfs4_sequence_res)
+   - rpc_task完成后,处理sequence的结果, 在很多包装compound的请求中使用
+   - 如果没有错误,更新nfs4_slot 
+   - nfs4_slot->seq_nr ++
+   - 更新lease 
+   > do_renew_lease(nfs_client, nfs4_sequence_res->sr_timestamp)
+   - 如果nfs4_sequence_res->sr_status_flags !=0, 有错误??
+   > nfs4_schedule_lease_recovery(nfs_client)
+   - 更新slot数量限制 
+   > nfs41_update_target_slotid(nfs4_slot_table, nfs4_slot, nfs4_sequence_res)
+   - 最后释放nfs4_slot 
+   > nfs41_sequence_free_slot(nfs4_sequence_res)
+
+** nfs4_sequence_done(rpc_task, nfs4_sequence_res)
+   - sequence请求完成 
+   > nfs41_sequence_done(rpc_task, nfs4_sequence_res)
+
+** nfs41_init_sequence(nfs4_sequence_args, nfs4_sequence_res, cache_reply)
+   - 初始化参数
+
+** nfs4_set_sequence_privileged(nfs4_sequence_args)
+   - 设置nfs4_sequence_args->sa_privileged = 1, 在rpc等待队列中使用高优先级, 或者在slot drain时不被阻塞
+
+** nfs41_setup_sequence(nfs4_session, nfs4_sequence_args, nfs4_sequence_res, rpc_task)
+   - 在rpc回调函数rpc_prepare中执行
+   - 分配nfs4_slot, 没有资源时,等待 
+   > nfs4_alloc_slot(nfs4_slot_table)
+   - 设置nfs4_sequence_res
+   - 启动rpc 
+   > rpc_call_start(rpc_task)
+
+** nfs4_setup_sequence(nfs_server, nfs4_sequence_args, nfs4_sequence_res, rpc_task)
+   - 在compound请求中,初始化sequence的参数
+   > nfs41_setup_sequence(nfs4_session, nfs4_sequence_args, ..)
+
+** nfs41_call_sync_data
+   #+BEGIN_SRC 
+	const struct nfs_server *seq_server;
+	struct nfs4_sequence_args *seq_args;
+	struct nfs4_sequence_res *seq_res;
+	//包装rpc请求??
+   #+END_SRC
+
+** nfs41_call_sync_prepare(rpc_task, calldata)
+   - 初始化nfs41_call_sync_data
+   > nfs41_setup_sequence(..)
+
+** nfs41_call_sync_done(rpc_task, calldata)
+   > nfs41_sequence_done(rpc_task, nfs4_sequence_res)
+   - 上面2个函数是
+
+** 

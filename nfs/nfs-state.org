@@ -561,7 +561,7 @@
    > put_rpccred(nfs4_state_owner->rpc_cred)
 
 ** nfs4_gc_state_owners(nfs_server) 
-   - 根据nfs4_state_owner->so_expires回收nfs4_state_owner, 时间不能提前jiffies nfs_client->cl_lease_time
+   - 根据nfs4_state_owner->so_expires恢复nfs4_state_owner, 时间不能提前jiffies nfs_client->cl_lease_time
    - 只处理nfs4_server->state_owners_lru队列中的nfs4_state_owner
    - nfs4_remove_state_owner_locked(nfs4_state_owner)
    - nfs4_free_state_owner(nfs4_state_owner) 直接释放..
@@ -793,7 +793,7 @@
    > nfs4_reclaim_locks(nfs4_state, nfs4_state_recovery_ops)
    - 这里有2种错误处理, 一种直接失败ESTALE
    > nfs4_state_mark_recovery_failed(nfs4_state, error)
-   - 另一种是继续回收?? NFS_STATE_RECLAIM_NOGRACE
+   - 另一种是继续恢复?? NFS_STATE_RECLAIM_NOGRACE
    > nfs4_state_mark_reclaim_nograce(nfs_client, nfs4_state) 
 
 ** nfs4_clear_open_state(nfs4_state)
@@ -815,7 +815,7 @@
    > nfs4_reset_seqids(nfs_server, mark_reclaim)
 
 ** nfs4_state_start_reclaim_reboot(nfs_client) 
-   - 在发现server reboot后,启动回收工作
+   - 在发现server reboot后,启动恢复工作
    > nfs_delegation_mark_reclaim(nfs_client) 
    > nfs4_state_mark_reclaim_helper(nfs_client, nfs4_state_mark_reclaim_reboot)
 
@@ -860,17 +860,17 @@
    - 设置NOGRACE相关标记,哪里处理这种nfs4_state?
    > nfs4_state_end_reclaim_reboot(nfs_client)
    - 对于NFS4ERR_STALE_CLIENTID/NFS4ERR_LEASE_MOVED, server reboot 
-   - 重启lease?
+   - 重启lease, 也就是重建exchange_id
    > set_bit(NFS4CLNT_LEASE_EXPIRED, nfs_client->cl_state)
-   - 同样释放REBOOT标记的nfs4_state 
+   - 同样释放REBOOT标记的nfs4_state, 避免重复恢复工作??
    > nfs4_state_clear_reclaim_reboot(nfs_client)
-   - 开始回收?? 上面都清除了?? 
+   - 开始恢复, 这里会清除nfs4_state的状态,而且只处理需要reboot处理的,过滤掉nograce处理的
    > nfs4_state_start_reclaim_reboot(nfs_client)
-   - 对于NFS4ERR_EXPIRED, 设置nfs_client->cl_state的NFS4CLNT_LEASE_EXPIRED? 
-   - 开始回收nograce ?? 
+   - 对于NFS4ERR_EXPIRED, 设置nfs_client->cl_state的NFS4CLNT_LEASE_EXPIRED
+   - 开始nograce恢复
    > nfs4_state_start_reclaim_nograce(nfs_client)
-   - 对于NFS4ERR_CONN_NOT_BOUND_TO_SESSION, 设置nfs_client->cl_state的NFS4CLNT_BIND_CONN_TO_SESSION??
-   - 对于session相关, 设置nfs_client->cl_state的NFS4CLNT_SESSION_RESET??
+   - 对于NFS4ERR_CONN_NOT_BOUND_TO_SESSION, 设置nfs_client->cl_state的NFS4CLNT_BIND_CONN_TO_SESSION
+   - 对于session相关, 设置nfs_client->cl_state的NFS4CLNT_SESSION_RESET, 重建session
    
 ** nfs4_do_reclaim(nfs_client, nfs4_state_recovery_ops)
    - 根据nfs4_state_recovery_ops恢复状态
@@ -1001,7 +1001,7 @@
    - 这里处理sequence的返回结果, 在renew使用的sequence请求中使用
    - 对于SEQ4_STATUS_RESTART_RECLAIM_NEEDED,  reboot?
    > nfs41_handle_server_reboot(nfs_client)
-   - 对于释放所有的nfs4_state? SEQ4_STATUS_EXPIRED_ALL_STATE_REVOKED等,回收nfs4_state 
+   - 对于server单独释放了nfs4_state, SEQ4_STATUS_EXPIRED_ALL_STATE_REVOKED等,恢复nfs4_state 
    > nfs41_handle_state_revoked(nfs_client)
    - 对于SEQ4_STATUS_RECALLABLE_STATE_REVOKED, 处理delegation 
    > nfs41_handle_recallable_state_revoked(nfs_client)
@@ -1337,3 +1337,20 @@
      - 释放带有NFS_DELEGATION_RETURN/NFS_DELEGATION_RETURN_IF_CLOSED标志的nfs_delegation
      > nfs_client_return_marked_delegations(nfs_client)
   
+
+   - 错误处理
+   - 普通恢复错误
+     - 在check_lease, nfs4_do_reclaim,reset_session失败中使用
+     > nfs4_recovery_handle_error(nfs_client, status)
+     - 根据返回值,设置state的错误标记,继续恢复. 分一下情况
+     - cb_pathdown, 相当于NFS4CLNT_LEASE_EXPIRED
+     - NFS4ERR_NO_GRACE, 结束reboot恢复, 启动nograce恢复
+     - clientid无效或迁移, 同样是NFS4CLNT_LEASE_EXPIRED, 启动reboot恢复, reboot恢复之后应该会有Nograce恢复
+     - session相关的,重建session, NFS4CLNT_SESSION_RESET
+  
+   - lease恢复处理, 这里应该是严重的错误,都会去重建exchange_id
+     - NFS4CLNT_LEASE_EXPIRED, 停止普通的lease check 
+     > nfs4_handle_reclaim_lease_error(nfs_client, status)
+     
+   
+   
