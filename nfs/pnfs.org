@@ -108,14 +108,12 @@
    - 看一下file layout 的具体情况..
 
 
-* pnfs_dev.c
-
 ** nfs_deviceid
    #+begin_src 
 	char data[NFS4_DEVICEID4_SIZE];
    #+end_src
 
-* nfs4_deviceid_node
+** nfs4_deviceid_node
   #+begin_src 
 	struct hlist_node		node;
 	struct hlist_node		tmpnode;
@@ -126,8 +124,6 @@
 	atomic_t			ref;
 	// 这个数据结构管理pnfs_layoutdriver_type和nfs4_deviceid
   #+end_src
-
-* nfs4filelayout.h
 
 ** nfs4_pnfs_ds
    #+begin_src 
@@ -267,3 +263,4 @@ nfsv4_1_file_layout_ds_addr4
         };
 
         使用这两个数据结构，可决定访问某个unit的数据使用的data server地址和filehandler.
+
