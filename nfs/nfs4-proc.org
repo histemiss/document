@@ -1,5 +1,5 @@
 * nfs4proc.c
-  - 这里是非常繁琐的东西,大体分成一下部分: open,close,write,read,commit,sequence等
+  - 这里是非常繁琐的东西,大体分成一下部分: open,close,write,read,sequence等
 
 * sequence 
 
@@ -405,4 +405,305 @@
    > nfs4_do_open_expired(nfs_open_context, nfs4_state)
 
 ** nfs41_clear_delegation_stateid(nfs4_state)
-   - 清除
+   - 在恢复expired nfs4_state时,先释放delegation, 这里使用rpc释放
+   - 如果nfs4_state使用nfs_delegation的nfs4_stateid, 检查是否有效
+   > nfs41_test_stateid(nfs_server, nfs4_stateid, rpc_cred)
+   - 如果返回不是NFS_OK?? 说明正常, 不再操作,后面恢复state之后,会delegreturn释放
+   - 否则,需要只释放delegation的nfs4_stateid
+   - 通过rpc请求释放
+   > nfs41_free_stateid(nfs_server, nfs4_stateid, rpc_cred)
+   - 释放本地delegation资源
+   - 这里只是标注nfs4_state的NFS_STATE_RECLAIM_NOGRACE,通过state manager启动nfs4_stateid的恢复
+   > nfs_remove_bad_delegation(nfs4_state->inode)
+   - 清除nfs4_state的NFS_DELEGATED_STATE
+
+** nfs41_check_open_stateid(nfs4_state)
+   - 通过TEST_STATEID检查nfs4_state->open_stateid的有效性
+   - 如果nfs4_state->flags没有NFS_O_WRONLY_STATE等打开的标志,返回NFS4ERR_BAD_STATED
+   - 发送rpc请求
+   > nfs41_test_stateid(nfs_server, nfs4_stateid, rpc_cred)
+   - 如果不是NFS4_OK, 状态有问题, 释放它
+   > nfs41_free_stateid(nfs_server, nfs4_stateid, rpc_cred)
+   - 清除打开的标志,还有NFS_OPEN_STATE
+
+** nfs41_open_expired(nfs4_state_owner, nfs4_state)
+   - 先检查delegation的有效性 
+   > nfs41_clear_delegation_stateid(nfs4_state)
+   - 检查open的stateid的有效性 
+   > nfs41_check_open_stateid(nfs4_state)
+   - 如果不是NFS4_OK, 需要恢复, 否则不需要? 
+   > nfs4_open_expired(nfs4_state_owner, nfs4_state)
+   - 哪里使用nfs4_state的标志?? 这里只是去掉标志,没有修改计数
+
+** _nfs4_open_and_get_state(nfs4_opendata, fmode, flags, nfs_open_context)
+   - 正宗的open操作
+   - 发送rpc请求
+   > _nfs4_proc_open(nfs4_opendata)
+   - 根据结果获取nfs4_state
+   - nfs4_opendata里面可能已经分配nfs4_state, 但这里会根据结果更新它
+   > nfs4_opendata_to_nfs4_state(nfs4_opendata)
+   - 如果nfs4_opendata->dentry还没有关联inode, 这里建立联系
+   > d_add_unique(dentry, inode)
+   - 建立access cache 
+   > nfs4_opendata_access(rpc_cred, nfs4_opendata, nfs4_state, fmode, flags)
+   - 处理nfs_open_state
+   - 整个过程监视nfs4_state_owner->so_reclaim_seqcount, 如果有改变,需要启动state manager, 他表示有nfs4_state恢复
+
+** _nfs4_do_open(inode, nfs_open_context, flags, iattr, nfs4_label)
+   - 获取nfs4_state_owner
+   > nfs4_get_state_owner(nfs_client, rpc_cred, GFP_KERNEL)
+   - 检查lease机制是否正常,等待state manager 
+   > nfs4_recover_expired_lease(nfs_server)
+   - 检查fmode是否和delegation冲突 
+   > nfs4_return_incompatible_delegation(inode, fmode)
+   - 创建nfs4_opendata.
+   - 如果dentry有inode, 使用nfs_fh打开,而不是文件名
+   > nfs4_opendata_alloc(dentry, nfs4_state_owner, fmode, flags, iattr, label, claim, GFP_KERNEL)
+   - 打开操作 
+   > _nfs4_open_and_get_state(nfs4_opendata, fmode, flags, nfs_open_context)
+   - 如果是O_CREAT|O_EXCL, 设置attr 
+   > nfs4_exclusive_attrset(nfs4_opendata, iattr)
+   > nfs4_do_setattr(inode, rpc_cred, nfs_fattr, iattr, nfs4_state, label, olabel)
+   - 根据返回的nfs_fattr,更新inode 
+   > nfs_post_op_update_inode(inode, nfs_fattr)
+   - 最后释放nfs4_opendata等
+
+** nfs4_do_open(inode, nfs_open_context, flags, iattr, nfs4_label)
+   - 循环发送open请求, 处理返回的错误
+   > _nfs4_do_open(inode, nfs_open_context, flags, sattr, label)
+   - 只能处理某些错误
+
+** nfs4_atomic_open(inode, nfs_open_context, open_flags, iattr)
+   - 文件打开操作, 不会创建文件
+   > nfs4_do_open(inode, nfs_open_context, open_flags, iattr, label)
+
+** nfs4_proc_create(inode, dentry, iattr, flags)
+   - 先分配nfs4_opendata, 为何是FMODE_READ方式打开?
+   > alloc_nfs_open_context(dentry, FMODE_READ)
+   - 发送请求 
+   > nfs4_do_open(dir, nfs_open_context, flags, iattr, nfs4_label)
+
+* close 
+** nfs4_closedata
+   #+BEGIN_SRC 
+	struct inode *inode;
+	struct nfs4_state *state;
+	struct nfs_closeargs arg;
+	struct nfs_closeres res;
+	struct nfs_fattr fattr;
+	unsigned long timestamp;
+	bool roc;
+	u32 roc_barrier;   
+   #+END_SRC
+
+** nfs4_free_closedata(data)
+   - 释放nfs4_closedata
+   - nfs4_stateid, pnfs资源, nfs_seqid, nfs4_state_owner
+
+** nfs4_close_clear_stateid_flags(nfs4_state, fmode)
+   - 关闭文件操作之后,更新nfs4_state
+   - 如果是OPEN_DOWNGRADE,不会完全释放nfs4_state
+   - 清除nfs4_state->flags的NFS_O_RDWR_STATE
+   - fmode是close之后的nfs4_state表示的打开方式,释放对应的flags标志
+   - 如果fmode = 0, 所有都释放,还有NFS_OPEN_STATE
+
+** nfs4_close_done(rpc_task, data)
+   - 先处理sequence 
+   > nfs4_sequence_done(rpc_task, nfs4_sequence_res)
+   - 如果结果没有问题， 释放pnfs ??
+   > pnfs_roc_set_barrier(inode, nfs4_closedata->roc_barrier)
+   - 更新stateid/flags
+   > nfs_set_open_stateid(nfs4_state, nfs4_stateid, 0)
+   - 更新lease 
+   > renew_lease(nfs_server, timestamp)
+   - 关闭flags, 哪里更新n_rdwr等计数?
+   > nfs4_close_clear_stateid_flags(nfs4_state, fmode)
+   - 如果有错误
+   > nfs4_async_handle_error(rpc_task, nfs_server, nfs4_state)
+   - 更新nfs_inode 
+   - 释放nfs_seqid
+   > nfs_refresh_inode(inode, nfs_fattr)
+
+** nfs4_close_prepare(rpc_task, nfs4_closedata)
+   - 首先获取nfs_seqid资源, nfs4.1也需要这个?
+   > nfs_wait_on_sequence(nfs_seqid, rpc_task)
+   - 这里已经更新nfs4_state->n_rdwr等计数, 根据这些计数, 计算需要关闭哪些打开方式
+   - nfs4_state->flags表示当前的open, 如果对应的计数为0, 需要关闭这种
+   - 计算结果在nfs4_closeargs->fmode
+   - 检查nfs4_stateid的有效性, 没有NFS_STATE_RECOVERY_FAILED
+   > nfs4_valid_open_stateid(nfs4_state)
+   - 如果经过计算nfs4_state的打开状态不变,不需要close操作,直接退出
+   - 如果结果nfs4_state的状态为0,使用CLOSE请求
+   - 停止pnfs操作? 
+   > pnfs_roc_drain(inode, roc_barrier, rpc_task)
+   - 否则使用OPEN_DOWNGRADE请求
+   - 获取nfs4_slot资源 
+   > nfs4_setup_sequence(inode, nfs4_sequence_args, .)
+   
+** nfs4_do_close(nfs4_state, gfp_mask, wait)
+   - 首先创建nfs4_closedata
+   - 然后发送请求 
+   > rpc_run_task(rpc_task_setup)
+   - 等待结果 
+   > rpc_wait_for_completion_task(rpc_task)
+
+** nfs4_close_context(nfs_open_context, is_sync)
+   - 如果is_sync !=0, 同步关闭,也就是close操作 
+   > nfs4_close_sync(nfs_open_context->nfs4_state, fmode)
+   - 否则是释放nfs4_stae?
+   > nfs4_close_state(nfs_open_context->nfs4_state, fmode)
+   - 他们操作nfs4_state, 先修改计数, 计算是否需要调用nfs4_do_close
+     
+* read
+
+** nfs4_set_rw_stateid(nfs4_stateid, nfs_open_context, nfs_lock_context, fmode)
+   - 根据fmode选择一个nfs4_stateid
+   - 他会检查delegation, nfs4_lock_state, nfs4_state
+   > nfs4_select_rw_stateid(nfs4_stateid, nfs_open_context->nfs4_state, fmode, lockowner)
+
+** nfs4_stateid_is_current(nfs4_stateid, nfs_open_context, nfs_lock_context)
+   - 首先根据nfs_open_context / nfs_lock_context选择一个
+   > nfs4_set_rw_stateid(nfs4_setateid, nfs_open_context, nfs_lock_context, fmode)
+   - 检查他和参数nfs4_state是否一样
+   > nfs4_stateid_match(.)
+
+** nfs4_error_stateid_expired(err)
+   - 检查err的错误,是否由于expired导致
+
+** nfs_read_data
+   #+BEGIN_SRC 
+	struct nfs_pgio_header	*header;
+	struct list_head	list;
+	struct rpc_task		task;
+	struct nfs_fattr	fattr;	/* fattr storage */
+	struct nfs_readargs args;
+	struct nfs_readres  res;
+	unsigned long		timestamp;	/* For lease renewal */
+	int (*read_done_cb) (struct rpc_task *task, struct nfs_read_data *data);
+	__u64			mds_offset;
+	struct nfs_page_array	pages;
+	struct nfs_client	*ds_clp;	/* pNFS data server */   
+   #+END_SRC
+
+** __nfs4_read_done_cb(nfs_read_data)
+   - nfs_invalidate_atime(nfs_read_data->nfs_pginfo_header->inode)
+   - 谁会用atime? 
+
+** nfs4_read_done_cb(rpc_task, nfs_read_data)
+   - 处理错误 
+   > nfs4_async_handle_error(rpc_task, nfs_server, nfs4_state)
+   - 如果是-EGAGIN, 重新启动
+   > rpc_restart_call_prepare
+   - 否则处理结果 
+   > __nfs4_read_done_cb(nfs_read_data)
+   - 更新lease 
+   > renew_lease(nfs_server, timestamp)
+
+** nfs4_read_stateid_changed(rpc_task, nfs_readargs)
+   - 如果nfs4_state有更新,重新发送read 
+   - 先检查是否有更新, 在非expired, 或者stateid没有改变时,不需要重新发送
+   > nfs4_error_stateid_expired(rpc_task->tk_status)
+   > nfs4_stateid_is_current(nfs4_stateid, nfs_open_context, nfs_lock_context, FMODE_READ)
+   - 否则,重新rpc 
+   > rpc_restart_call_prepare(rpc_task)
+
+** nfs4_read_done(rpc_task, nfs_read_data)
+   - 处理sequence的结果, 在rpc回调中rpc_done中调用, 3层回调
+   > nfs4_sequence_done(rpc_task, nfs4_sequence_res)
+   - 检查nfs4_stateid是否有效?? 处理错误 
+   > nfs4_read_stateid_changed(rpc_task, nfs4_sequence_args)
+   - 然后调用nfs_read_data->read_done_cb回调
+   - 如果没有提供,使用默认的 
+   > nfs4_read_done_cb(rpc_task, nfs_read_data)
+
+** nfs4_proc_read_setup(nfs_read_data, rpc_message)
+   - 设置rpc_message, 在rpc请求之前，调用
+   - nfs_read_data->timestamp, 更新lease
+   - rpc_proc使用NFSPROC4_CLNT_READ? 还有备选?
+   - 初始化sequence的参数
+   > nfs41_init_sequence(nfs4_sequence_args, nfs4_sequence_res, 0)
+
+** nfs4_proc_read_rpc_prepare(rpc_task, nfs_read_data)
+   - 准备sequence, 在read的rpc的回调rpc_call_prepare中调用
+   > nfs4_setup_sequence(nfs_server, nfs4_sequence_args, nfs4_sequence_res, rpc_task)
+   - 设置nfs4_stateid,给nfs4_readargs->stateid
+   > nfs4_set_rw_stateid(stateid, nfs_open_context, nfs_lock_context, FMODE_READ)
+
+* write
+
+** nfs4_write_done_cb(rpc_task, nfs_write_data)
+   - 先检查错误? 
+   > nfs4_async_handle_error(rpc_task, nfs_server, nfs4_state)
+   - 如果返回-EAGAIN, 重新rpc 
+   > rpc_restart_call_prepare(rpc_task)
+   - 否则,更新lease, metadata 
+   > renew_lease(nfs_server, timestamp)
+   > nfs_post_op_update_inode_force_wcc(inode, nfs_fattr)
+
+** nfs4_write_stateid_changed(rpc_task, nfs_writeargs)
+   - 检查错误是否因为nfs4_stateid不对, 重新发送写
+   > nfs4_error_stateid_expired(rpc_task->tk_status)
+   > nfs4_stateid_is_current(nfs_writeargs->nfs4_stateid, nfs_open_context, nfs_lock_context, FMODE_WRITE)
+   - 重新启动rpc 
+   > rpc_restart_call_prepare(rpc_task)
+
+** nfs4_write_done(rpc_task, nfs_write_data)
+   - 处理sequence的结果
+   > nfs4_sequence_done(rpc_task, nfs4_sequence_res)
+   - 检查错误 
+   > nfs4_write_stateid_changed(rpc_task, nfs_writeargs)
+   - 回调处理 
+   > nfs_write_data->write_done_cb()
+   > nfs4_write_done_cb(rpc_task, nfs_write_data)
+
+** nfs4_write_need_cache_consistency_data(nfs_write_data)
+   - write请求是否要求返回wcc数据??
+   - 如果是pnfs或者O_DIRECT, 不需要 
+   - nfs_write_data->ds_clp != NULL
+   - nfs_write_data->dreq != NULL ???
+   - 如果有任何delegation, 也不需要
+   > nfs4_have_delegation(inode, FMODE_READ)
+
+** nfs4_proc_write_setup(nfs_write_data, rpc_message)
+   - 准备rpc_message
+   - 如果不需要wcc， 清除nfs_writeargs->bitmask, fattr.
+   - 在发送时,就不会包含getattr?
+   > nfs4_write_need_cache_consistency_data(nfs_write_data)
+   - 设置nfs_write_data->write_done_cb = nfs4_write_done_cb
+   - 初始化sequence的参数
+   > nfs41_init_sequence(nfs4_sequence_args, res, 1)
+
+** nfs4_proc_write_rpc_prepare(rpc_task, nfs_write_data)
+   - 先准备sequence
+   > nfs_setup_sequence(..)
+   - 然后获取stateid 
+   > nfs4_set_rw_stateid(nfs_writeargs->stateid, nfs_open_context, nfs_lock_context, FMODE_WRITE)
+   - 在write.c中使用, 这里准备rpc_message, 里面会发送rpc请求
+
+** nfs4_proc_commit_rpc_prepare(rpc_task, nfs_commit_data)
+   - commit请求的prepare调用的接口, 在nfs_rpc_ops->write_rpc_prepare
+   - 在commit的prepare中包装
+   - 设置sequence
+   > nfs4_setup_sequence(inode, nfs4_sequence_args, .)
+   - 这里2层回调
+
+** nfs4_commit_done_cb(rpc_task
+   - commit的普通回调函数, 在nfs_commit_data->commit_done_cb中
+   - 如果有错误,而且返回-EAGAIN, 重启rpc 
+   > nfs4_async_handle_error(rpc_task, nfs_server, NULL)
+   > rpc_restart_call_prepare(rpc_task)
+
+** nfs4_commit_done(rpc_task, nfs_commit_data)
+   > nfs_commit_data->commit_done_cb(rpc_task, nfs_commit_data)
+   - 这时nfs_rpc_ops->commit_done的函数, 在commit的rpc回调函数rpc_done中使用 nfs_commit_done
+   - 这里回调3层
+   - rpc_call_ops=>nfs_rpc_ops=>nfs_commit_data->commit_done_cb
+
+** nfs4_proc_commit_setup(nfs_commit_data, rpc_message)
+   - 初始化rpc_message
+   - 初始化sequence
+   > nfs41_init_sequence(nfs4_sequence_args, .)
+   - 在发送rpc请求之前
+   - nfs_initiate_commit=>nfs_rpc_ops->commit_setup
+     
+* layout
