@@ -286,10 +286,12 @@
 ** nfs_zap_caches(inode)
    - 使用inode->i_lock保护
    > nfs_zap_caches_locked(nfs_inode)
+   - 在rpc的错误处理中, 处理-ESTALE错误.
 
 ** nfs_zap_mapping(inode, address_space)
    - 设置nfs_inode->cache_validity的NFS_INO_INVALID_DATA
    - pagecache无效?为何不删除数据?
+   - 在page写回后的错误处理中, 或者readdir的错误处理中
 
 ** nfs_zap_acl_cache(inode)
    - 单独释放acl
@@ -297,12 +299,18 @@
    - 去掉nfs_inode->cache_validity的NFS_INO_INVALID_ACL标志
 
 ** nfs_invalidate_atime(inode)
-   - atime失效, 去掉nfs_inode->cache_validity的NFS_INO_INVALID_ATIME
+   - atime失效, 添加nfs_inode->cache_validity的NFS_INO_INVALID_ATIME
+   - 在read/readdir完成后设置,表示atime已经无效,需要去server端取出来
+   - atime只和read/readdir有关
 
 ** nfs_invalidate_inode(inode)
-   - 设置nfs_inode->flags的NFS_INO_STALE, 整个inode失效
+   - 设置nfs_inode->flags的NFS_INO_STALE, 整个inode无效
    - 设置所有的invalid标志
    > nfs_zap_caches_locked(inode)
+   - 只在update它的metadata时使用
+   > nfs_update_inode(inode, nfs_fattr)
+   - 在很多操作中会检查这个标志, 表示这个inode已经无法挽救, 必须删除.
+   - 当然可以重新读取server,创建新的inode. 为何不立刻删除它?
 
 ** nfs_init_locked(inode, void)
    - 初始化inode使用, 设置fileid, nfsfh
@@ -501,7 +509,7 @@
    - 如果nfs_inode->cache_validity 有 NFS_INO_INVALID_ACL, 释放acl 
    > nfs_zap_acl_cache(inode)
    - ATTR如果无效,必须通过rpc请求, acl无效,可以设置null, 使用时再去,pagecache应该同样
-   
+
 ** nfs_attribute_timeout(inode)
    - 获取attribute是否有效
    > time_in_range_open(jiffies, nfs_inode->read_cache_jiffies, nfs_inode->read_cache_jiffies + attrtimeo)
@@ -518,6 +526,15 @@
    > nfs_attribute_cache_expired(inode)
    > __nfs_revalidate_inode(nfs_server, inode)
 
+** 总结
+   - 上面2个函数实现更新数据的有效性
+   - 在dentry的lookup_revalidate中使用
+   > nfs_lookup_verify_inode(inode, flags)
+   - 在下面更新pagecache中使用
+   - 在dir操作中大量使用??
+   - cto是nfsv3使用的,在文件关闭时,也要更新文件状态. 因为nfsv3的open没有任何操作,所以在close时更新. 如果open有验证工作,close也就省了
+   - 在getattr/getacl中使用
+   
 ** nfs_invalidate_mapping(inode, address_space)
    - 只有pagecache有缓存时才写回数据
    > nfs_sync_mapping(address_space)
@@ -526,15 +543,15 @@
    - 这个代价很高!
 
 ** nfs_mapping_need_revalidate_inode(inode)
-   - 是否需要重新获取缓存的数据
+   - 在验证缓存数据有效性时,是否需要重新获取metadata
    - 如果有delegation, 不需要revalidate 
    > nfs_have_delegated_attributes(inode)
-   - nfs_inode->cache_validity有NFS_INO_REVAL_PAGECACHE. PAGECACHE和DATA什么区别?
+   - nfs_inode->cache_validity有NFS_INO_REVAL_PAGECACHE
    - 或者timeout 
    > nfs_attribute_timeout(inode)
 
 ** nfs_revalidate_mapping(inode, address_space)
-   - revalidate pagecache 
+   - 要验证缓存的数据,也就是pagecache
    - 检查是否需要revalidate metadata
    > nfs_mapping_need_revalidate_inode(inode)
    - 可能只有通过matadate,才能知道data是否有效.
@@ -542,8 +559,13 @@
    - 总不能把数据读出来才知道!!
    - 如果有NFS_INO_INVALID_DATA, 释放pagecache
    > nfs_invalidate_mapping(inode, address_space)
-   - NFS_INO_REVAL_PAGECACHE表示需要更新iattr
+
+** 总结
+   - NFS_INO_REVAL_PAGECACHE表示需要更新metadata, 通过更新metadata, 获取数据是否有效
+   - 只有在i_version不一致时或者size不一致时,才无效掉数据
+   - nfs在没有delegation时,每次写一个page,增加i_version
    - NFS_INO_INVALID_DATA表示释放pagecache,写回数据
+   - 在read/readdir开始,执行这里
 
 ** nfs_wcc_update_inode(inode, nfs_fattr)
    - 根据nfs_fattr更新inode. 
@@ -648,10 +670,10 @@
    > nfs_wcc_update_inode(inode, nfs_fattr)
    - 使用上面返回的结果开始计算cache_validity
    - 处理change, 如果nfs_fattr->valid有NFS_ATTR_FATTR_CHANGE, 而且i_version != change_attr, 更新inode->i_version
-   - invalid添加NFS_INO_INVALID_ATTR, DATA, ACCESS, ACL, NFS_INO_REVAL_PAGECACHE
+   - invalid添加NFS_INO_INVALID_ATTR, DATA, ACCESS, ACL, NFS_INO_REVAL_PAGECACHE, 表示整个inode都需要更新
    - 如果nfs_fattr中没有NFS_ATTR_FATTR_CHANGE, 如果nfs_server支持NFS_CAP_CHANGE_ATTR, 设置invalid |= save_cache_validity, 之前的所有invalid都需要保留
    - 处理mtime, 如果nfs_fattr->valid包括NFS_ATTR_FATTR_MTIME, 直接更新inode->mtime, 否则保留save_cache_validity的NFS_INO_INVALID_ATTR|NFS_INO_REVALID_FORCED
-   - 同样是ctime, 这里是修复invalid,不会继承invalid.
+   - 同样是ctime, 这里仅仅去掉invalid,不会继承invalid.
    - 处理size, 如果nfs_fattr->valid有NFS_ATTR_FATTR_SIZE, 而且nfs_fattr->size != inode->i_size, 而且nfs_inode->npage ==0, 没有layout, 才能更新i_size
    - 设置inode->i_size, 以及NFS_INO_INVALID_ATTR和NFS_INO_INVALID_DATA
    - 否则设置invalid |= save_cache_validity & (NFS_INO_INVALID_ATTR和NFS_INO_REVAL_PAGECACHE,NFS_INO_REVAL_FORCED)
@@ -686,10 +708,15 @@
    - 在创建nfs_inode/inode时,使用nfs_fattr.根据它设置对应的属性,如果不提供,会设置NFS_INO_INVALID_ATTR等.
    - 在setattr/close/access等操作会返回nfs_fattr,根据他更新nfs_inode
    - getattr等更会更新..
-   - write/open等操作在修改metadata后,也会返回nfs_fattr,修改nfs_inode,为何要设置NFS_INO_INVALID_PAGECACHE??
+   - 在open/link/write操作后,获取nfs_fattr,更新inode, 他会强制设置NFS_INO_INVALID_ATTR|NFS_INO_REVAL_PAGECACHE, 然后根据返回的nfs_fattr去掉这写标志
+   > nfs_post_op_update_inode(inode, nfs_fattr)
+   > nfs_post_op_update_inode_force_wcc(inode, nfs_fattr)
+   - 所以在写之后再读,会发起一个getattr
+
    - attr/lock操作前会写回所有数据,但好像包括metadata.
-   - 对于NFS_INO_REVAL_PAGECACHE,用于检查是否获取revalidate inode, 在write/open之后设置.更新inode之后去掉
+   - 对于NFS_INO_REVAL_PAGECACHE,用于检查是否revalidate inode, 在write/open之后设置.更新inode之后去掉
    - 对于NFS_INO_INVALID_DATA,在更新inode/nfs_inode时,如果i_size/i_version不一致设置,用来释放pagecache.释放pagecache后去掉.
+
    - 哪里会revalidate inode?? 一种是数据操作时,另一种应该是inode操作时
    - 在lock/seek/write中,如果用到size,更新文件属性. nfs_revalidate_file_size
    - 在读操作中,检查metadata和pagecache的数据有效性  nfs_revalidate_mapping
