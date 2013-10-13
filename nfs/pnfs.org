@@ -1,11 +1,89 @@
+* pnfs_dev.c
+
+** nfs4_deviceid
+   #+begin_src 
+	char data[NFS4_DEVICEID4_SIZE];
+   #+end_src
+
+** nfs4_deviceid_node
+  #+begin_src 
+	struct hlist_node		node;
+	struct hlist_node		tmpnode;
+	const struct pnfs_layoutdriver_type *ld; 
+	const struct nfs_client		*nfs_client;
+	unsigned long 			flags;
+	unsigned long			timestamp_unavailable;
+	struct nfs4_deviceid		deviceid;
+	atomic_t			ref;
+	//他表示ds节点？
+  #+end_src
+
+
+** _lookup_deviceid(pnfs_layoutdriver_type, nfs_client, nfs4_deviceid, hash)
+   - nfs4_deviceid_node使用hash表管理, nfs4_deviceid_hash
+   - 根据nfs4_deviceid / nfs_client / pnfs_layoutdriver_type 区别
+
+** _find_get_deviceid(pnfs_layoutdriver_type
+   > _lookup_deviceid(pnfs_layoutdriver_type, nfs_client, nfs4_deviceid, hash)
+   - 使用rcu hash锁
+
+** nfs4_find_get_deviceid(pnfs_layoutdriver_type, nfs_client, nfs4_deviceid)
+   - 根据nfs4_deviceid计算hash
+   > _find_get_deviceid(pnfs_layoutdriver_type, nfs_client, .)
+
+** nfs4_delete_deviceid(pnfs_layoutdriver_type, nfs_client, nfs4_deviceid)
+   - 都释放了,为何不直接操作?
+   - 先找到nfs4_deviceid_node 
+   > _lookup_deviceid(pnfs_layoutdriver_type, nfs_client, nfs4_deviceid, hash)
+   - rcu hash表操作 
+   > hlist_del_init_rcu(nfs4_deviceid->node)
+   - 释放它的使用计数?  nfs4_deviceid_node->ref 
+   > pnfs_layoutdriver_type->free_deviceid_node(nfs4_deviceid_node)
+
+** nfs4_init_deviceid_node(nfs4_deviceid_node, pnfs_layoutdriver_type, nfs_client, nfs4_deviceid)
+   - 初始化，关联数据结构 
+
+** nfs4_insert_deviceid_node(nfs4_deviceid_node)
+   - 创建新的nfs4_deviceid_node, 插入到hash表中
+   - 先查找,是否有重复的
+   > _find_get_deviceid(pnfs_layoutdriver_type, nfs_client
+   
+** nfs4_put_deviceid_node(nfs4_deviceid_node)
+   - 直接释放,减小nfs4_deviceid_node->ref
+   > nfs4_deviceid_node->pnfs_layoutdriver_type->free_deviceid_node(nfs4_deviceid_node)
+
+** nfs4_mark_deviceid_unavailable(nfs4_deviceid_node)
+   - 设置nfs4_deviceid_node->timestamp_unavailable = jiffies
+   - flags的NFS_DEVICEID_UNAVAILABLE
+
+** nfs4_test_deviceid_unavailable(nfs4_deviceid_node)
+   - 检查nfs4_deviceid_node是否不可使用?
+   - 首先nfs4_deviceid_node->flags有NFS_DEVICEID_UNAVAILABLE
+   - 而且失
+效时间不能太久?
+   > jiffies - timestamp_unavailable < PNFS_DEVICE_RETRY_TIMEOUT
+   - 否则,去掉NFS_DEVICEID_UNAVAILABLE??
+
+** _deviceid_purge_client(nfs_client, hash)
+   - 释放nfs_client关联的nfs4_deviceid_node
+
+** nfs4_deviceid_purge_client(nfs_client)
+   - 便利hash链表
+   > _deviceid_purge_client(nfs_client, hash)
+
+** nfs4_deviceid_mark_client_invalid(nfs_client)
+   - 把nfs_client关联的nfs4_deviceid_node设为无效
+   - 设置nfs4_deviceid_node->flags的NFS_DEVICEID_INVALID
+
 * pnfs.c
 
-** pnfs_layoutdriver_type
-   #+begin_src 
+** pnfs_layoutdriver_type 
+   #+BEGIN_SRC 
+	//表示layout解析驱动
 	struct list_head pnfs_tblid;
-	const u32 id;         //对应某种layout..
-	const char *name;     //file / object/ block
-	struct module *owner; //子模块实现..
+	const u32 id;
+	const char *name;
+	struct module *owner;
 	unsigned flags;
 
 	int (*set_layoutdriver) (struct nfs_server *, const struct nfs_fh *);
@@ -53,9 +131,8 @@
 
 	void (*encode_layoutcommit) (struct pnfs_layout_hdr *layoutid,
 				     struct xdr_stream *xdr,
-				     const struct nfs4_layoutcommit_args *args);
-   
-   #+end_src
+				     const struct nfs4_layoutcommit_args *args);   
+   #+END_SRC
 
 ** pnfs_layout_hdr
    #+begin_src 
@@ -67,6 +144,7 @@
 	atomic_t		plh_outstanding; /* number of RPCs out */
 	unsigned long		plh_block_lgets; /* block LAYOUTGET if >0 */
 	u32			plh_barrier; /* ignore lower seqids */
+	unsigned long		plh_retry_timestamp;
 	unsigned long		plh_flags;
 	loff_t			plh_lwb; /* last write byte for layoutcommit */
 	struct rpc_cred		*plh_lc_cred; /* layoutcommit cred */
@@ -99,35 +177,6 @@
 	u64 offset;
 	u64 length;
    #+end_src
-
-
-** find_pnfs_driver_locked(id)
-   - 所有的pnfs_layoutdriver_type->pnfs_tblid都放到pnfs_modules_tbl队列中.. 根据id查找..
-
-** pnfs_layoutdriver_type->pg_read_ops
-   - 看一下file layout 的具体情况..
-
-
-* pnfs_dev.c
-
-** nfs_deviceid
-   #+begin_src 
-	char data[NFS4_DEVICEID4_SIZE];
-   #+end_src
-
-* nfs4_deviceid_node
-  #+begin_src 
-	struct hlist_node		node;
-	struct hlist_node		tmpnode;
-	const struct pnfs_layoutdriver_type *ld;
-	const struct nfs_client		*nfs_client;
-	unsigned long 			flags;
-	struct nfs4_deviceid		deviceid;
-	atomic_t			ref;
-	// 这个数据结构管理pnfs_layoutdriver_type和nfs4_deviceid
-  #+end_src
-
-* nfs4filelayout.h
 
 ** nfs4_pnfs_ds
    #+begin_src 
@@ -187,26 +236,103 @@
 	struct pnfs_commit_bucket *buckets;
    #+end_src
 
+** find_pnfs_driver_locked(id)
+   - id是pnfs_layoutdriver_type->id
+   - 使用pnfs_modules_tbl管理pnfs_layoutdriver_type->pnfs_tblid
+   - 查找pnfs_layoutdriver_type
 
-1. 
+** find_pnfs_driver(id)
+   - 使用全局索pnfs_spinlock
+   - 根据id查找pnfs_layoutdriver_type
+   > find_pnfs_driver_locked(id)
 
-pnfs_layout_hdr关联某个文件  nfs_inode
-pnfs_layout_segment 表示某次io, 关联pnfs_layout_range, pnfs_layout_hdr
+** unset_pnfs_layoutdriver(nfs_server)
+   - nfs_server->pnfs_curr_ld关联pnfs_layoutdriver_type
+   - 释放对应的pnfs资源? 
+   > pnfs_layoutdriver_type->clear_layoutdriver(nfs_server)
+   - nfs_server->nfs_client->cl_mds_count表示什么资源? 释放mds? nfs_client应该是mds
+   - 释放它使用的nfs4_deviceid_node, 看来nfs4_deviceid_node只是管理deviceid资源,而不能管理ds
+   > nfs4_deviceid_purge_client(nfs_client)
+   - 释放pnfs_layoutdriver_type 
+   > module_put(pnfs_layoutdriver_type->owner)
+
+** set_pnfs_layoutdriver(nfs_server, nfs_fh, id)
+   - 设置nfs_server的pnfs资源
+   - 检查nfs_server->nfs_client->cl_exchange_flags的EXCHGID4_FLAG_USE_NON_PNFS | EXCHGID4_FLAG_USE_NFS_MDS ?
+   - 这里怎么是EXCHGID4_FLAG_USE_NON_PNFS??
+   - 查找pnfs_layoutdriver_type 
+   > find_pnfs_driver(id)
+   - 如果找不到,查找驱动模块
+   - 初始化使用nfs_fh? 
+   > pnfs_layoutdriver_type->set_layoutdriver(nfs_server, nfs_fh)
+   - 增加nfs_client->cl_mds_count
+   - nfs_server->nfs_client应该是mds
+
+** pnfs_register_layoutdriver(pnfs_layoutdriver_type)
+   - 把pnfs_layoutdriver_type->pnfs_tblid放到pnfs_modules_tbl链表中 
+
+** pnfs_unregister_layoutdriver(pnfs_layoutdriver_type)
+   - 释放链表
+
+** pnfs_get_layout_hdr(pnfs_layout_hdr)
+   - 增加pnfs_layout_hdr->plh_refcount, 
+   - 他管理inode的layout资源
+   
+** pnfs_alloc_layout_hdr(inode, gfp_flags)
+   > nfs_client->pnfs_layoutdriver_type->alloc_layout_hdr(inode, gfp_flags)
+
+** pnfs_free_layout_hdr(pnfs_layout_hdr)
+   - pnfs_layout_hdr->plh_layouts在nfs_server->layouts
+   - 释放这个链表 
+   > put_rpccred(pnfs_layout_hdr->plh_lc_cred)
+
+** pnfs_detach_layout_hdr(pnfs_layout_hdr)
+   - 没有资源释放,直接设置nfs_inode->layout / write_io / read_io ?? 
+
+** pnfs_put_layout_hdr(pnfs_layout_hdr)
+   - 减小pnfs_layout_hdr->plh_refcount使用计数
+   - 先释放nfs_inode   
+   > pnfs_detach_layout_hdr(pnfs_layout_hdr)
+   - 释放pnfs_layout_hdr, 使用回调函数
+   > pnfs_free_layout_hdr(pnfs_layout_hdr)
+
+** pnfs_iomode_to_fail_bit(iomode)
+   - iomode只有3种, 错误有2种? 
+   - IOMODE_RW/IOMODE_READ/IOMODE_ANY
+   - NFS_LAYOUT_RO_FIALED / NFS_LAYOUT_RW_FAILED
+
+** pnfs_layout_set_fail_bit(pnfs_layout_hdr, fail_bit)
+   - 设置pnfs_layout_hdr->plh_retry_timestamp = jiffies 
+   - 设置pnfs_layout_hdr->plh_flags的fail_bit
+   - 如果原来没有,增加pnfs_layout_hdr->plh_refcount
+
+** pnfs_layout_clear_fail_bit(pnfs_layout_hdr, fail_bit)
+   - 清除pnfs_layout_hdr->plh_flags的fail_bit
+   - 同时减小pnfs_layout_hdr->plh_refcount 
+
+** pnfs_layout_io_set_failed(pnfs_layout_hdr, iomode)
+   - 设置错误标志, 还要释放pnfs_layout_range资源 ?
+   > pnfs_layout_set_fail_bit(pnfs_layout_hdr, pnfs_iomode_to_fail_bit(iomode)
+   - 构造全局pnfs_layout_range, 用来获取目前所有的layout
+   > pnfs_mark_matching_lsegs_invalid(pnfs_layout_hdr, list_head, pnfs_layout_range)
+   - 释放他们  
+   > pnfs_free_lseg_list(list_head)
+
+** pnfs_layout_io_test_failed(pnfs_layout_hdr, iomode)
 
 
-2. file layout
+** GETDEVICEINFO, 根据deviceid4获取一个关于网络地址的2维队列. 
+   device_addr4
+   layouttype4  da_layout_type
+   opaque     da_addr_body<>   
 
-GETDEVICEINFO, 根据deviceid4获取一个关于网络地址的2维队列. 
-device_addr4
-  layouttype4  da_layout_type
-  opaque     da_addr_body<>   
-
-da_addr_body的结构是
-  nfsv4_1_file_layout_ds_addr4
+   da_addr_body的结构是
+   nfsv4_1_file_layout_ds_addr4
     uint32_t  nflda_stripe_indices<>  数组大小就是stripe count
     multipath_list4 nflda_multipath_ds_list<>  这是二维数组,第一维是数据分布，第二维是数据分发备份.
 
-LAYOUTGET, 根据一些访问信息(layout_type,file,clientid,stateid,iomode,offset,length),获取layout的信息,虽然也返回stateid,但它会更新client已经获取的layout的stateid.  这里返回的是一串layout4,也就是说一个文件可以有多个layout4.
+
+** LAYOUTGET, 根据一些访问信息(layout_type,file,clientid,stateid,iomode,offset,length),获取layout的信息,虽然也返回stateid,但它会更新client已经获取的layout的stateid.  这里返回的是一串layout4,也就是说一个文件可以有多个layout4.
 
 layout4
   offset4
@@ -267,3 +393,6 @@ nfsv4_1_file_layout_ds_addr4
         };
 
         使用这两个数据结构，可决定访问某个unit的数据使用的data server地址和filehandler.
+
+
+
