@@ -319,6 +319,311 @@
    > pnfs_free_lseg_list(list_head)
 
 ** pnfs_layout_io_test_failed(pnfs_layout_hdr, iomode)
+   - 检查pnsf_layout_hdr的有效性
+   - 首先检查pnfs_layout_hdr->plh_flags的iomode对应的标志, 如果没有,直接返回
+   - 否则检查失效时间, jiffies - pnfs_layout_hdr->plh_retry_timestamp < PNFS_LAYOUTGET_RETRY_TIMEOUT
+   - 如果不久之前,去掉标志?? 而且不算失效
+
+** init_lseg(pnfs_layout_hdr, pnfs_layout_segment)
+   - pnfs_layout_segment表示pnfs_layout_range的资源
+   - 初始化pnfs_layout_segment, 设置pnfs_layout_segment->pls_flags的NFS_LSEG_VALID
+
+** pnfs_free_lseg(pnfs_layout_segment)
+   - 释放回调函数 
+   > pnfs_layoutdriver_type->free_lseg(pnfs_layout_segment)
+   
+** pnfs_layout_remove_lseg(pnfs_layout_hdr, pnfs_layout_segment)
+   - 释放pnfs_layout_segment?
+   - 首先是pnfs_layout_segment->pls_list链表,在pnfs_layout_hdr->segments中
+   - 如果pnfs_layout_segment->plh_segs不在任何队列中,去掉NFS_LAYOUT_BULK_RECALL标志
+   - 唤醒nfs_inode->roc_rpcwaitq???
+
+** pnfs_put_lseg(pnfs_layout_segment)
+   - 释放pnfs_layout_segment->pls_refcount
+   - 如果计数减为0,开始释放关联的资源 
+   > pnfs_layout_remove_lseg(pnfs_layout_hdr, pnfs_layout_segment)
+   > pnfs_free_lseg(pnfs_layout_segment)
+
+** pnfs_lseg_range_contained(pnfs_layout_range l1, pnfs_layout_range l2)
+   - 检查l1是否完全覆盖l2, 而不只是交叉
+
+** pnfs_lseg_range_intersecting(pnfs_layout_segment l1, l2)
+   - l1和l2交叉
+
+** should_free_lseg(pnfs_layout_range lseg_range, recall_range)
+   - 要释放recall_range表示的资源
+   - 检查lseg_range是否和它有关联?
+   - 首先pnfs_layout_range->iomode相同,或recall_range->iomode == IOMODE_ANY
+   - 然后range交叉 
+   > pnfs_lseg_range_intersecting(lseg_range, recall_range)
+
+** pnfs_lseg_dec_and_remove_zero(pnfs_layout_segment, list_head)
+   - 释放pnfs_layout_segment的使用计数
+   - 如果减为0, 放到list_head队列中,集中释放
+   - 首先释放pnfs_layout_hdr的关系
+   > pnfs_layout_remove_lseg(pnfs_layout_hdr, pnfs_layout_segment)
+
+** mark_lseg_invalid(pnfs_layout_segment, list_head)
+   - 设置pnfs_layout_segment为无效,而且直接释放 
+   > test_and_clear_bit(NFS_LSEG_VALID, &lseg->pls_flags)
+   > pnfs_lseg_dec_and_remove_zero(pnfs_layout_segment, tmp_list)
+
+** pnfs_mark_matching_lsegs_invalid(pnfs_layout_hdr, list_head tmp_list, pnfs_layout_range recall_range)
+   - 如果参数pnfs_layout_segment有效,释放和他重叠的pnfs_layout_segment
+   - 如果无效,释放所有的pnfs_layout_segment
+   - 遍历所有的pnfs_layout_segment, 如果有关系,就直接释放
+   - 遍历pnfs_layout_hdr->plh_segs中的pnfs_layout_segment 
+   - 检查是否应该释放
+   > should_free_lseg(pnfs_layout_segment->pnfs_layout_range, recall_range)
+   - 设置无效的标志, 如果是空闲的,直接释放
+   - 如果还有使用的,就不会释放掉
+   > mark_lseg_invalid(pnfs_layout_segment, tmp_list)
+
+** pnfs_free_lseg_list(list_head)
+   - 他已经释放和pnfs_layout_hdr/nfs_inode的关系
+   > pnfs_free_lseg(pnfs_layout_segment)
+
+** pnfs_destroy_layout(nfs_inode)
+   - 首先增加pnfs_layout_hdr->plh_block_lgets ??
+   - 首先释放所有的pnfs_layout_segment 
+   > pnfs_mark_matching_lsegs_invalid(pnfs_layout_hdr, tmp_list, NULL)
+   > pnfs_free_lseg_list(tmp_list)
+   - 然后去掉pnfs_layout_hdr->plh_flags的标志, NFS_LAYOUT_RO_FAILED | NFS_LAYOUT_RW_FAILED??
+   - 修改时增减pnfs_layout_hdr->plh_refcount 
+
+** pnfs_layout_and_bulk_destroy_list(inode, list_head)
+   - 把pnfs_layout_hdr->plh_bulk_destroy放到list_head中
+   - 要释放pnfs_layout_hdr?? 
+
+** pnfs_layout_bulk_destroy_byserver_locked(nfs_client, nfs_server, list_head)
+   - pnfs_layout_hdr->layouts在nfs_server->layouts中
+   - 遍历pnfs_layout_hdr, 收集到list_head中 
+   > pnfs_layout_add_bulk_destroy_list(inode, list_head)
+   - 使用inode的计数保护
+
+** pnfs_layout_free_bulk_destroy_list(list_head, is_bulk_recall)
+   - 释放上面收集的pnfs_layout_hdr
+   - 构造一个覆盖全文件的pnfs_layout_range, 用来收集pnfs_layout_segment 
+   - 遍历pnfs_layout_hdr
+   - 如果is_bulk_recall!=0, 设置pnfs_layout_hdr->plh_flags的NFS_LAYOUT_BULK_RECALL
+   - 收集所有的pnfs_layout_range
+   > pnfs_mark_matching_lsegs_invalid(pnfs_layout_hdr, list_head, pnfs_layout_range)
+   - 集中释放 
+   > pnfs_free_lseg_list(list_head)
+   - 释放inode / pnfs_layout_hdr 
+   > pnfs_put_layout_hdr(pnfs_layout_hdr)
+   > iput(inode)
+
+** pnfs_destroy_layouts_byfsid(nfs_client, nfs_fsid, is_recall)
+   - fsid应该对应一个nfs_server?
+   - 遍历nfs_client->cl_superblocks链表上的nfs_server
+   - 如果nfs_server->fsid符合, 处理他的pnfs_layout_hdr
+   > pnfs_layout_bulk_destroy_byserver_locked(nfs_client, nfs_server, list_head)
+   - 最后集中释放pnfs_layout_hdr 
+   > pnfs_layout_free_bulk_destroy_list(list_head, is_recall)
+
+** pnfs_destroy_layouts_byclid(nfs_client, is_recall)
+   - 释放nfs_client所有的nfs_server的pnfs资源 
+   > pnfs_layout_bulk_destroy_byserver_locked(nfs_client, nfs_server, list_head)
+   > pnfs_layout_free_bulk_destroy_list(list_head, is_recall)
+
+** pnfs_destroy_all_alyouts(nfs_client)
+   - 先标记nfs_client使用的nfs4_deviceid_node
+   > nfs4_deviceid_mark_client_invalid(clp)
+   - nfs_client是mds?
+   - 释放他关联的nfs4_deviceid_node
+   - 释放操作好像没有使用flags的标记, 谁使用了?
+   > nfs4_deviceid_purge_client(clp)
+   - 释放使用的pnfs_layout_hdr
+   > pnfs_destroy_layouts_byclid(clp, false)
+
+** pnfs_set_layout_stateid(pnfs_layout_hdr, nfs4_stateid, update_barrier)
+   - 比较nfs4_stateid->seqid
+   - 如果参数的seqid大, 或者pnfs_layout_hdr空闲, 更新stateid
+   - pnfs_layout_hdr->plh_segs没有pnfs_layout_segment
+   - 把nfs4_stateid给pnfs_layout_hdr->plh_stateid
+   - update_barrier是设置pnfs_layout_hdr->plh_barrier = nfs4_stateid->seqid??
+
+** pnfs_layout_stateid_blocked(pnfs_layout_hdr, nfs4_stateid)
+   - blocked? 
+   - 如果nfs4_stateid->seqid小,就是blocked?
+   > pnfs_seqid_is_newer(seqid, lo->plh_barrier)
+
+** pnfs_layoutgets_blocked(pnfs_layout_hdr, lget)
+   - block layoutget? 在send_layoutget请求中使用
+   - 如果pnfs_layout_hdr->plh_block_lgets !=0, 是blocked ?
+   - 如果pnfs_layout_hdr->plh_flags有NFS_LAYOUT_BULK_RECALL， 也是blocked ?
+   - 如果pnfs_layout_hdr->plh_outstanding > lget, 而且没有pnfs_layout_segment, 也是blocked ? 
+
+** pnfs_choose_layoutget_stateid(nfs4_stateid, pnfs_layout_hdr, nfs4_state)
+   - 准备layoutget请求,使用的nfs4_stateid
+   - 检查blocked? 
+   > pnfs_layoutgets_blocked(pnfs_layout_hdr, 1)
+   - 然后检查open stateid, 也就是nfs4_state
+   > nfs4_valid_open_stateid(nfs4_state)
+   - 如果pnfs_layout_hdr->plh_segs为空,也就是空闲的, 使用nfs4_state的 
+   > nfs4_stateid_copy(nfs4_stateid, nfs4_state->stateid)
+   - 否则使用pnfs_layout_hdr->plh_stateid
+
+** nfs4_layoutget_args 
+   #+BEGIN_SRC 
+	struct nfs4_sequence_args seq_args;
+	__u32 type;
+	struct pnfs_layout_range range;
+	__u64 minlength;
+	__u32 maxcount;
+	struct inode *inode;
+	struct nfs_open_context *ctx;
+	nfs4_stateid stateid;
+	unsigned long timestamp;
+	struct nfs4_layoutdriver_data layout;   
+   #+END_SRC
+
+** nfs4_layoutget_res 
+   #+BEGIN_SRC 
+	struct nfs4_sequence_res seq_res;
+	__u32 return_on_close;
+	struct pnfs_layout_range range;
+	__u32 type;
+	nfs4_stateid stateid;
+	struct nfs4_layoutdriver_data *layoutp;   
+   #+END_SRC
+
+** nfs4_layoutget 
+   #+BEGIN_SRC 
+	struct nfs4_layoutget_args args;
+	struct nfs4_layoutget_res res;
+	struct rpc_cred *cred;
+	gfp_t gfp_flags;   
+   #+END_SRC
+
+** send_layoutget(pnfs_layout_hdr, nfs_open_context, pnfs_layout_range, gfp_flags)
+   - layoutget请求, 构造nfs4_layoutget
+   - 初始化nfs4_layoutget->nfs4_layoutget_args
+   - 设置range, minlength = 4096, maxcount = 4096, nfs_open_context / inode
+   - nfs4_layoutget_args->type = nfs_client->pnfs_layoutdriver_type->id
+   - rpc_cred = pnfs_layout_hdr->plh_lc_cred??
+   - 发送请求 
+   > nfs4_proc_layoutget(nfs4_layoutget, gfp_flags)
+   - 如果失败,设置pnfs_layout_hdr->plh_flags的fail_bit
+
+** 总结
+   -发送请求在nfs4proc.c中, 使用回调函数使用这里的操作
+
+   - 在prepare阶段, 设置sequence/nfs4_slot, stateid
+   > nfs4_layoutget_prepare
+   > pnfs_choose_layoutget_stateid(nfs4_layoutget_args->stateid, nfs_inode->pnfs_layout_hdr, nfs_open_context->nfs4_state)
+
+   - 在done阶段, 处理sequence结果, 处理错误
+   > nfs_async_handle_error(rpc_task, nfs_server, nfs4_state)
+
+   - 在release中,释放nfs4_slot, 其他资源
+   
+   - 最后调用者解析nfs4_layoutget中获取的数据
+   > pnfs_layout_process(nfs4_layoutget)
+
+** pnfs_clear_layoutcommit(inode, list_head)
+   - 去掉nfs_inode->flags的NFS_INO_LAYOUTCOMMIT
+   - 如果原来没有,直接退出
+   - 遍历nfs_inode->pnfs_layout_hdr中的pnfs_layout_segment
+   - 去掉pnfs_layout_segment->pls_flags的NFS_LSEG_LAYOUTCOMMIT
+   - 如果原来有,还要释放pnfs_layout_segment
+   - 先释放他和pnfs_layout_hdr的关系
+   > pnfs_lseg_dec_and_remove_zero(pnfs_layout_segment, list_head)
+
+** _pnfs_return_layout(inode)
+   - 释放nfs_inode->pnfs_layout_hdr
+   - 首先释放所有的pnfs_layout_segment
+   - 先释放NFS_LSEG_LAYOUTCOMMIT的
+   > pnfs_clear_layoutcommit(inode, list_head)
+   - 再释放NFS_LSEG_VALID的
+   > pnfs_mark_matching_lsegs_invalid(pnfs_layout_hdr, list_head, NULL)
+   - 这里不仅是收集到list_head中,还要针对标志,释放使用计数
+   - pnfs_free_lseg_list(list_head)
+   - 构造pnfs_layoutreturn结构, 发送请求 
+   > nfs4_proc_layoutreturn(nfs4_layoutreturn)
+   - 这里归还的是整个pnfs_layout_hdr, 而不是pnfs_layout_segment!!
+
+** pnfs_commit_and_return_layout(inode)
+   - 要释放commit的数据?
+   - 首先阻止layoutget操作? 设置pnfs_layout_hdr->plh_block_lgets ++ 
+   - 等待数据写回
+   > filemap_fdatawait(inode->address_space)
+   - commit layout? 
+   > pnfs_layoutcommit_inode(inode, true)
+   - 然后return layout? 
+   > _pnfs_return_layout(inode)
+   - 最后设置pnfs_layout_hdr->plh_block_lgets
+
+** pnfs_roc(inode)
+   - roc应该是return on close
+   - 如果pnfs_layout_hdr->plh_flags有NFS_LAYOUT_BULK_RECALL，不用处理??
+   - 如果pnfs_layout_hdr->plh_flags没有NFS_LAYOUT_ROC, 不用处理
+   - 遍历pnfs_layout_hdr->plh_segs中的pnfs_layout_segment
+   - 收集有NFS_LSEG_ROC的pnfs_layout_segment 
+   > mark_lseg_invalid(pnfs_layout_segment, list_head)
+   - 释放他们
+   > pnfs_free_lseg_list(list_head)
+   - 同时设置pnfs_layout_hdr->plh_block_lgets, 需要return layout?
+
+** pnfs_roc_release(inode)
+   - 在close操作完成后,释放对应的roc数据
+   - 设置pnfs_layout_hdr->plh_block_lgets --
+   - 释放pnfs_layout_hdr->plh_refcount -- 
+   - 如果减为0， 完全释放, 关联的nfs_inode
+   > pnfs_detach_layout_hdr(pnfs_layout_hdr)
+   > pnfs_free_layout_hdr(pnfs_layout_hdr)
+
+   - 在close rpc发送之前, 为何在这里?
+   - 检查是否需要roc 
+   > pnfs_roc(inode)
+   - 在close完成之后,再释放pnfs_layout_hdr的资源
+   > pnfs_roc_release(inode)
+
+** pnfs_roc_set_barrier(inode, barrier)
+   - 设置pnfs_layout_hdr->plh_barrier
+   > pnfs_seqid_is_newer(barrier, pnfs_layout_hdr->plh_barrier
+
+** pnfs_roc_drain(inode, barrier, rpc_task)
+   - 对于roc, 在发送close之前, 需要释放layout
+   - 在close请求的rpc_callback_prepare回调中使用它
+   - 所以如果还有pnfs_layout_segment, 带有NFS_LSEG_ROC, rpc_task需要等待 
+   > rpc_sleep_on(&NFS_SERVER(ino)->roc_rpcwaitq, task, NULL)
+   - 在释放pnfs_layout_segment时,会唤醒它
+   - 否则,获取barrier 
+   - pnfs_layout_hdr->nfs4_stateid->seqid + pnfs_layout_hdr->plh_outstanding
+
+** pnfs_lseg_range_cmp(pnfs_layout_range l1, pnfs_layout_range l2)
+   - 先比较offset, 然后是length, 然后是iomode
+   - IOMODE_READ > IOMODE_WRITE
+
+** pnfs_layout_insert_lseg(pnfs_layout_hdr, pnfs_layout_segment)
+   - 把pnfs_layout_segment放到pnfs_layout_hdr->plh_segs链表中
+   - 链表是有序的,使用上面的比较函数决定顺序
+
+** alloc_init_layout_hdr(inode, nfs_open_context, gfp_t)
+   - 分配新的pnfs_layout_hdr 
+   > pnfs_alloc_layout_hdr(inode, gfp_flags)
+   - 初始化链表 / inode/ rpc_cred
+   - rpc_cred来自nfs_open_context
+
+** pnfs_find_alloc_layout(inode, nfs_open_context, gfp_flags)
+   - 先检查nfs_inode->layout是否有效, 无效再创建 
+   > alloc_init_layout_hdr(inode, nfs_open_context, gfp_flags)
+
+** iomode 
+   #+BEGIN_SRC 
+       * ANY		READ	true
+       * ANY		RW	true
+       * RW		READ	false
+       * RW		RW	true
+       * READ		READ	true
+       * READ		RW	true
+   #+END_SRC
+
+** pnfs_lseg_range_match(pnfs_layout_range ls_range, range)
+   - 2个参数什么来历??
+
 
 
 ** GETDEVICEINFO, 根据deviceid4获取一个关于网络地址的2维队列. 
