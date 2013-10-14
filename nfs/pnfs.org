@@ -613,17 +613,151 @@
 
 ** iomode 
    #+BEGIN_SRC 
-       * ANY		READ	true
-       * ANY		RW	true
-       * RW		READ	false
-       * RW		RW	true
-       * READ		READ	true
-       * READ		RW	true
+iomode是要查找的io参数
+lseg是已经存在的pnfs_layout_segment
+ * iomode matching rules:
+ * iomode	lseg	match
+ * -----	-----	-----
+ * ANY		READ	true
+ * ANY		RW	true
+ * RW		READ	false
+ * RW		RW	true
+ * READ		READ	true
+ * READ		RW	true    
    #+END_SRC
 
 ** pnfs_lseg_range_match(pnfs_layout_range ls_range, range)
-   - 2个参数什么来历??
+   - 检查ls_range是否满足range的io要求
+   - 如果range->iomode == IOMODE_RW, ls_range->iomode是IOMODE_RW, 不满足
+   - 如果位置不交叉,也不满足
+   > pnfs_lseg_range_intersecting(ls_range, range)
+   - 如果上面2个条件满足, 检查ls_range是否覆盖range->offset, 这里不要求全部覆盖range
+   > pnfs_lseg_range_contained(ls_range, range1)
 
+** pnfs_find_lseg(pnfs_layout_hdr, pnfs_layout_range )
+   - 遍历pnfs_layout_hdr->plh_segs中的pnfs_layout_segment
+   - 是否满足pnfs_layout_range要求 
+   - 过滤掉没有NFS_LSEG_VALID的pnfs_layout_segment 
+   > pnfs_lseg_range_match(pnfs_layout_segment->pnfs_layout_range, pnfs_layout_range)
+
+** nfs4_threshold
+   #+BEGIN_SRC 
+	__u32	bm;
+	__u32	l_type;
+	__u64	rd_sz;
+	__u64	wr_sz;
+	__u64	rd_io_sz;
+	__u64	wr_io_sz;   
+   #+END_SRC
+
+** pnfs_within_mdsthershold(nfs_open_context, inode, iomode)
+   - 检查io应该使用mds,还是使用pnfs
+   - 比较i_size, io_size, nfs4_threshold
+   - io_size是nfs_inode->read_io/write_io, 应该是rsize/wsize
+   - 如果iomode是IOMODE_READ, 表示对read有限制
+   - 如果nfs4_threshold->bm有THRESHOLD_RD,比较fsize < nfs4_threshold->rd_sz
+   - 如果bm有THRESHOLD_RD_IO, 比较read_io < nfs4_threshold->rd_io_sz
+   - 如果iomode是IOMODE_RW, 表示对write有限制
+   - 如果bm有THRESHOLD_WR, 比较fsize < nfs4_threshold->wr_sz
+   - 如果bm有THRESHOLD_WR_IO, write_io < nfs4_threshold->wr_io_sz
+
+** pnfs_update_layout(inode, nfs_open_context, pos, count, pnfs_iomode, gfp_flags)
+   - 检查nfs_client是否使用pnfs
+   > nfs_client->pnfs_layoutdriver_type
+   - 检查io是否应该使用pnfs 
+   > pnfs_within_mdsthershold(nfs_open_context, inode, iomode)
+   - 准备nfs_inode->pnfs_layout_hdr
+   > pnfs_find_alloc_layout(inode, nfs_open_context, gfp_flags)
+   - 如果pnfs_layout_hdr->plh_flags有NFS_LAYOUT_BULK_RECALL, 不能使用
+   - 检查layout是否失效
+   - 即使有io_fail_bit, 但是不久之前设置,可以重新尝试
+   > pnfs_layout_io_test_failed(pnfs_layout_hdr, iomode)
+   - 查找已有的pnfs_layout_segment, 根据(iomode, pos, count)查找
+   > pnfs_find_lseg(pnfs_layout_hdr, pnfs_layout_range)
+   - 如果找到,直接退出
+   - 否则需要发送layoutget请求
+   - 修改pnfs_layout_hdr->plh_outstanding, 表示在处理的layoutget请求个数?
+   - 如果layout blocked, 也不能使用? 
+   > pnfs_layoutgets_blocked(pnfs_layout_hdr, 0)
+   - 发送rpc请求 
+   > send_layoutget(pnfs_layout_hdr, nfs_open_context, pnfs_layout_range, gfp_flags)
+   - 最后减小pnfs_layout_hdr->plh_outstanding
+
+** pnfs_layout_process(nfs4_layoutget)
+   - 根据rpc返回的结果,获取pnfs_layout_segment
+   - 创建pnfs_layout_segment, 创建一个? 
+   > nfs_client->pnfs_layoutdriver_type->alloc_lseg(pnfs_layout_hdr, nfs4_layoutget_res, gfp_flags)
+   - 再次检查pnfs_layout_hdr->plh_flags的NFS_LAYOUT_BULK_RECALL
+   - layoutget blocked?? 
+   > pnfs_layoutgets_blocked(pnfs_layout_hdr, 1)
+   > pnfs_layout_stateid_blocked(pnfs_layout_hdr, nfs4_stateid)
+   - 更新pnfs_layout_hdr的nfs4_stateid 
+   > pnfs_set_layout_stateid(pnfs_layout_hdr, nfs4_stateid, false)
+   - 初始化pnfs_layout_segment 
+   > init_lseg(pnfs_layout_hdr, pnfs_layout_segment)
+   - 把pnfs_layout_segment放到pnfs_layout_hdr->plh_segs链表中 
+   > pnfs_layout_insert_lseg(pnfs_layout_hdr, pnfs_layout_segment)
+   - 如果nfs4_layoutget_res->return_on_close !=0, 设置pnfs_layout_segment->pls_flags的NFS_LSEG_ROC, 设置pnfs_layout_hdr->plh_flags的NFS_LAYOUT_ROC
+
+** pnfs_generic_pg_init_read(nfs_pageio_descriptor, nfs_page)
+   - 为read操作准备nfs_pageio_descriptor
+   - 如果nfs_pageio_descriptor->wb_offset != wb_pgbase, 不使用pnfs 
+   - 重新设置nfs_pageio_descriptor->nfs_pageio_ops, 提交io的方式使用普通的nfs操作
+   > nfs_pageio_reset_read_mds(nfs_pageio_descriptor)
+   - 创建nfs_pageio_descriptor使用的pnfs_layout_segment 
+   > pnfs_update_layout(inode, nfs_open_context, offset, rd_size, IOMODE_READ, GFP_KERNEL)
+   - 如果获取失败, 重置nfs_pageio_ops等 
+   > nfs_pageio_reset_read_mds(nfs_pageio_descriptor)
+   - 这里单独处理了direct-io??
+
+** pnfs_generic_pg_init_write(nfs_pageio_descriptor, nfs_page, wb_size)
+   - 和上面一样
+   > pnfs_update_layout(inode, nfs_open_context, offset, wb_size, IOMODE_RW, GFP_NOFS)
+
+** pnfs_pageio_init_read(nfs_pgeio_descriptor, inode, nfs_pgio_completion_ops)
+   - 初始化nfs_pageio_descriptor
+   - nfs_pageio_completion_ops应该是通用的, nfs_async_read_completion_ops
+
+** pnfs_pageio_init_write(nfs_pageio_descriptor, inode, ioflags, nfs_pgio_completion_ops)
+   - 和上面一样, 回调函数指针是nfs_async_write_completion_ops
+
+** pnfs_generic_pg_test(nfs_pageio_descriptor, nfs_page prev, nfs_page req)
+   - 检查nfs_page是否能合并提交
+   - nfs_page的范围在pnfs_layout_segment内 
+   - 范围是nfs_pageio_descriptor->pnfs_layout_hdr->pls_range
+
+** pnfs_write_done_resend_to_mds(inode, list_head, nfs_pgio_completion_ops, nfs_direct_req)
+   - 重新发送write请求,使用普通方式
+   - 创建nfs_pageio_descriptor
+   > nfs_pageio_init_write(nfs_pageio_descriptor, inode, FLUSH_STABLE, nfs_pgio_completion_ops)
+   - 处理list_head中的nfs_page
+   > nfs_pageio_add_request(nfs_pageio_descriptor, nfs_page)
+   - 发送rpc请求 ?? 
+   > nfs_pageio_completion(nfs_pageio_descriptor)
+
+** pnfs_ld_handle_write_error(nfs_write_data)
+   - 处理write的错误
+   - 如果nfs_server->pnfs_layoutdriver_type->flags有PNFS_LAYOUT_ON_ERROR, 严重错误? 
+   - return layout 
+   > pnfs_return_layout(nfs_pgio_header->inode)
+   - 设置nfs_pgio_header->flags的NFS_IOHDR_REDO
+   - 如果之前没有标志,可以再次读数据
+   > pnfs_write_done_resend_to_mds(inode, list_head, nfs_pgio_header->completion_ops, nfs_direct_req)
+
+** pnfs_ld_write_done(nfs_write_data)
+   - object layout使用的函数?
+   - 这应该是rpc的回调函数 
+   - 如果nfs_pgio_header->pnfs_error == 0, rpc没有问题
+   - pnfs_set_layoutcommit(nfs_pgio_header)
+   - 这里把一个rpc请求分解了?
+   > nfs_pgio_header->mds_ops->rpc_call_done(nfs_write_data->rpc_task, nfs_write_data)
+   - 如果有错误 
+   > pnfs_ld_handle_write_error(nfs_write_data)
+   - 释放nfs_write_data 
+   > nfs_pgio_header->mds_ops->rpc_release(nfs_write_data)
+
+** pnfs_write_through_mds(nfs_pgio_descriptor, nfs_write_data)
+   - 
 
 
 ** GETDEVICEINFO, 根据deviceid4获取一个关于网络地址的2维队列. 
