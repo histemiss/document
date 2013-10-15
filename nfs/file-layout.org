@@ -530,6 +530,13 @@
 	struct pnfs_ds_commit_info commit_info;   
    #+END_SRC
 
+** nfs_mds_commit_info 
+   #+BEGIN_SRC 
+	atomic_t rpcs_out;
+	unsigned long		ncommit;
+	struct list_head	list;   
+   #+END_SRC
+
 ** nfs_commit_info
    #+BEGIN_SRC 
 	spinlock_t			*lock;
@@ -608,17 +615,100 @@
    > pnfs_put_lseg(pnfs_layout_segment)
 
 ** filelayout_choose_commit_list(nfs_page, pnfs_layout_segment, nfs_commit_info)
+   - 给nfs_page选一个list_head, 记录commit状态
+   - 如果nfs4_filelayout_segment->commit_through_mds !=0, commit发给mds
+   - 使用nfs_commit_info->mds->list
+   - 否则，根据nfs_page的文件偏移,找到stripe index 
+   > nfs4_fl_calc_j_index(pnfs_layout_segment, req_offset(page))
+   - 根据stripe index, 找到bucket索引
+   > select_bucket_index(nfs4_filelayout_segment, j)
+   - 使用nfs_commit_info->pnfs_ds_commit_info->buckets[i]
+   - 设置nfs_page->wb_flags的PG_COMMIT_TO_DS标志
+   - 增加pnfs_ds_commit_info->nwritten
 
+** filelayout_mark_request_commit(nfs_page, pnfs_layout_segment, nfs_commit_info)
+   - 先查找list_head 
+   > filelayout_choose_commit_list(nfs_page, pnfs_layout_segment, nfs_commit_info)
+   - 把nfs_page放回队列中, 设置nfs_page->wb_flags的PG_CLEAN
+   > nfs_request_add_commit_list(nfs_page, list_head, nfs_commit_info)
+   
 
+** calc_ds_index_from_commit(pnfs_layout_segment, i)
+   - i应该是pnfs_commit_bucket数组的索引
+   - 如果nfs4_filelayout_segment->stripe_type是STRIPE_SPARSE, 返回i
+   - 否则查询对应的nfs4_pnfs_ds索引
+   > nfs4_fl_calc_ds_index(pnfs_layout_segment, i)
+   - stripe的使用方式,决定了ds数组的使用方式??
 
+** select_ds_fh_from_commit(pnfs_layout_segment, i)
+   - 选择i对应的nfs_fh, 给commit使用
 
+** filelayout_initiate_commit(nfs_commit_data, how)
+   - 发送commit请求
+   - 计算ds索引,找到nfs4_pnfs_ds/nfs_client
+   > calc_ds_index_from_commit(pnfs_layout_segment, nfs_commit_data->ds_commit_index)
+   - 检查对应的nfs_pnfs_ds是否可用,如果有问题,重新创建nfs_client
+   > nfs4_fl_prepare_ds(pnfs_layout_segment, idx)
+   - 如果没有找到nfs4_pnfs_ds 
+   > prepare_to_resend_writes(nfs_commit_data)
+   > filelayout_commit_release(nfs_commit_data)
+   - 否则继续
+   - 设置nfs_commit_data->commit_done_cb = filelayout_commit_done_cb
+   - 找到对应的nfs_fh 
+   > select_ds_fh_from_commit(pnfs_layout_segment, nfs_commit_data->ds_commit_index)
+   - 发送rpc请求 
+   > nfs_initiate_commit(nfs4_pnfs_ds->nfs_client->rpc_clnt, nfs_commit_data, filelayout_commit_call_ops, how, RPC_TASK_SOFTCONN)
 
+** transfer_commit_list(list_head src, list_head dst, nfs_commit_info, max)
+   - src链表是nfs_commit_info中的某个队列
+   - 遍历里面的nfs_page 
+   - 锁住nfs_page 
+   > nfs_lock_request(nfs_page)
+   - 从nfs_commit_info中释放 
+   > nfs_request_remove_commit_list(nfs_page, nfs_commit_info)
+   - 去掉nfs_page->wb_flags的PG_COMMIT_TO_DS
+   - 把它放到dst链表中
 
+** filelayout_scan_ds_commit_list(pnfs_commit_bucket, pnfs_commit_bucket, max)
+   - 从pnfs_commit_bucket->written中获取一些nfs_page, 放到pnfs_commit_bucket->committing链表中
+   > transfer_commit_list(pnfs_commit_bucket->written, pnfs_commit_bucket->committing, nfs_commit_info, max)
+   - 修改pnfs_commit_bucket->nwritten / ncommitting
 
+** filelayout_scan_commit_lists(nfs_commit_info, max)
+   - 获取max个等待commit的nfs_page
+   - 遍历所有的nfs_commit_info->pnfs_ds_commmit_info->pnfs_commit_bucket数组
+   > filelayout_scan_ds_commit_list(pnfs_commit_bucket, nfs_commit_info)
 
+** filelayout_recover_commit_reqs(list_head, nfs_commit_info)
+   - 把所有的pnfs_commit_bucket->written队列上的nfs_page,放到List_head中
+   - 遍历pnfs_ds_commit_info的所有pnfs_commit_bucket
+   > transfer_commit_list(pnfs_commit_bucket->written, list_head, nfs_commit_info, 0)
 
-
-
+** alloc_ds_commits(nfs_commit_info, list_head)
+   - 遍历nfs_commit_info->pnfs_ds_commit_info->pnfs_commit_bucket数组
+   - 如果pnfs_commit_bucket->committing不是空,有nfs_page需要提交
+   - 创建对应的nfs_commit_data, 设置ds_commit_index/pnfs_layout_segment
+   > nfs_commitdata_alloc()
+   - 把pnfs_commit_bucket->pages放到list_head中
+   - 再次遍历, 提交committing链表 
+   > nfs_retry_commit(pnfs_commit_bucket->committing, pnfs_layout_segment, nfs_commit_info)
+   
+** filelayout_commit_pagelist(inode, list_head, how, nfs_commit_info)
+   - 遍历nfs_commit_info中需要commit的list_head, 构造对应的nfs_commit_data, 然后集体发送rpc请求
+   - 参数list_head里面是mds的nfs_page, 准备一个nfs_commit_data 
+   > nfs_commitdata_alloc()
+   - 然后是pnfs_commit_bucket的
+   > alloc_ds_commits(nfs_commit_info, list_head)
+   - 如果没有创建新的nfs_commit_info, 也就没有commit的必要
+   > nfs_commit_info->completion_ops->error_cleanup(inode)
+   - 遍历上面创建的nfs_commit_data 
+   - 如果nfs_commit_data->pnfs_layout_segment有效, 它是发送给ds的 
+   > nfs_init_commit(nfs_commit_data, pnfs_commit_bucket->committing, pnfs_layout_segment, nfs_commit_info)
+   - 提交commit请求 
+   > filelayout_initiate_commit(nfs_commit_info, how)
+   - 否则是发送给mds的
+   > nfs_init_commit(nfs_commit_data, mds_page, NULL, nfs_commit_info)
+   > nfs_initiate_commit(nfs_client, nfs_commit_data, nfs_commit_data->mds_ops, how, 0)
 
 ** filelayout_free_deviceid_node(nfs4_deviceid_node)
    - 释放nfs4_file_layout_dsaddr
@@ -635,3 +725,8 @@
 
 ** filelayout_get_ds_info(inode)
    - 准备nfs_commit_info, 获取nfs_inode->pnfs_layout_hdr=>nfs4_layout->pnfs_ds_commit_info
+
+** 总结
+   - STRIPE_SPARSE和STRIPE_DENSE的区别
+   - 前者使用stripe index索引ds index, 每个ds使用自己的nfs_fh
+   - 后者stripe和ds对应, 都是用独自的nfs_fh
