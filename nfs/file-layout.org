@@ -1,0 +1,637 @@
+* nfs4filelayoutdev.c
+
+** stripetype4 
+   #+BEGIN_SRC 
+	STRIPE_SPARSE = 1,
+	STRIPE_DENSE = 2   
+   #+END_SRC
+
+** nfs4_pnfs_ds_addr
+   #+BEGIN_SRC 
+	struct sockaddr_storage	da_addr;
+	size_t			da_addrlen;
+	struct list_head	da_node;  /* nfs4_pnfs_dev_hlist dev_dslist */
+	char			*da_remotestr;	/* human readable addr+port */   
+   #+END_SRC
+
+** nfs4_pnfs_ds 
+   #+BEGIN_SRC 
+	struct list_head	ds_node;  /* nfs4_pnfs_dev_hlist dev_dslist */
+	char			*ds_remotestr;	/* comma sep list of addrs */
+	struct list_head	ds_addrs;
+	struct nfs_client	*ds_clp;
+	atomic_t		ds_count;
+	unsigned long		ds_state;
+#define NFS4DS_CONNECTING	0	/* ds is establishing connection */   
+   #+END_SRC
+
+** nfs4_file_layout_dsaddr
+   #+BEGIN_SRC 
+	struct nfs4_deviceid_node	id_node;
+	u32				stripe_count;
+	u8				*stripe_indices;
+	u32				ds_num;
+	struct nfs4_pnfs_ds		*ds_list[1];   
+   #+END_SRC
+
+** nfs4_filelayout_segment
+   #+BEGIN_SRC 
+	struct pnfs_layout_segment generic_hdr;
+	u32 stripe_type;
+	u32 commit_through_mds;
+	u32 stripe_unit;
+	u32 first_stripe_index;
+	u64 pattern_offset;   //它所表示的范围的开始文件偏移
+	struct nfs4_file_layout_dsaddr *dsaddr; /* Point to GETDEVINFO data */
+	unsigned int num_fh;
+	struct nfs_fh **fh_array;   
+   #+END_SRC
+
+** _same_data_server_addrs_locked(list_head dsaddrs1, dsaddrs2)
+   - list_head是nfs4_pnfs_ds->ds_addrs, 里面应该是nfs4_pnfs_ds_addr
+   - 遍历2个链表, 比较nfs4_pnfs_ds_addr->da_addr 
+   > same_sockaddr(sockaddr, nfs4_pnfs_ds_addr->da_addr)
+
+** _data_server_lookup_locked(list_head)
+   - nfs4_data_server_cache链表中是所有的nfs4_pnfs_ds
+   - 遍历链表, 查找nfs4_pnfs_ds 
+   > _same_data_server_addrs_locked(nfs4_pnfs_ds->ds_addr, list_head)
+
+** nfs4_ds_connect(nfs_server, nfs4_pnfs_ds)
+   - 建立对应nfs4_pnfs_ds里面ip地址的nfs_client  
+   - 遍历nfs4_pnfs_ds->ds_addr链表中的nfs4_pnfs_ds_addr 
+   > nfs4_set_ds_client(nfs_server->nfs_client, nfs4_pnfs_ds_addr->da_addr, da_addrlen, IPOROTO_TCP, datasever_timeo, dataserver_retrans)
+   - 只要有一个成功,就可以返回
+   - 建立session, 或者说等待创建完成
+   > nfs4_init_ds_session(nfs_client, nfs_server->nfs_client->cl_lease_time)
+   - 把创建的nfs_client给nfs4_pnfs_ds
+
+   - 对于nfs4.1, nfs_client的过程包括
+   - 创建rpc_clnt, 只要cred/ip
+   - 建立exchange_id, 设置nfs_client->cl_state的NFS4CLNT_LEASE_CONFIRM, 虽然会检查trunk,但只是重用nfs_client
+   - 然后创建session过程. 在创建nfs_client时设置NFS4CLNT_LEASE_EXPIRED, 创建session就是启动state manager任务,让他处理NFS4CLNT_LEASE_EXPIRED
+
+** destroy_ds(nfs4_pnfs_ds)
+   - 实现是nfs_client 
+   > nfs_put_client(nfs4_pnfs_ds->nfs_client)
+   - 释放nfs4_pnfs_ds->ds_addrs中的nfs4_pnfs_ds_addr
+   - 然后是nfs4_pnfs_ds->ds_remotestr, 应该是rpc消息中返回的
+
+** nfs4_fl_free_deviceid(nfs4_file_layout_dsaddr)
+   - 在layoutget中获取的,在pnfs_layout_segment中使用,表示多个ds
+   - 对应一个nfs4_deviceid_node
+   - 遍历nfs4_file_layout_dsaddr->ds_list指针数组,里面是nfs4_pnfs_ds 
+   - 减小nfs4_pnfs_ds->ds_count计数,如果为0, 释放 
+   > destroy_ds(nfs4_pnfs_ds)
+   - 释放其他资源, 没有针对nfs4_deviceid_node的释放?
+
+** nfs_pnfs_remotestr(list_head, gfp_flags)
+   - list_head中是nfs4_pnfs_ds_addr, 把这些ip地址格式化到一个字符串
+   - {nfs4_pnfs_ds_addr->da_remotestr, .}
+
+** nfs4_pnfs_ds_add(list_head, gfp_flags)
+   - 根据nfs4_pnfs_ds_addr链表,创建nfs4_pnfs_ds
+   - 先准备remotestr 
+   > nfs4_pnfs_remotestr(list_head, gfp_flags)
+   - 然后根据list_head查找已有的nfs4_pnfs_ds 
+   > _data_server_lookup_locked(list_head)
+   - 如果找不到,使用新创建的
+   - 把它放到全局nfs4_data_server_cache链表中
+
+** decode_ds_addr(net, xdr_stream, gfp_flags)
+   - 解析getdeviceid中的一个ip地址, 转化为nfs4_pnfs_ds_addr
+   - 格式应该是[tcp|tcp6]ip.port
+
+** pnfs_device
+   #+BEGIN_SRC 
+	struct nfs4_deviceid dev_id;
+	unsigned int  layout_type;
+	unsigned int  mincount;
+	unsigned int  maxcount;	/* gdia_maxcount */
+	struct page **pages;
+	unsigned int  pgbase;
+	unsigned int  pglen;	/* reply buffer length */   
+   #+END_SRC
+
+** xdr 
+   #+BEGIN_SRC 
+   struct netaddr4 {
+           /* see struct rpcb in RFC 1833 */
+           string na_r_netid<>; /* network id */
+           string na_r_addr<>;  /* universal address */
+   };
+
+   typedef netaddr4 multipath_list4<>;
+   
+   struct nfsv4_1_file_layout_ds_addr4 {
+           uint32_t  nflda_stripe_indices<>  数组大小就是stripe count
+           multipath_list4 nflda_multipath_ds_list<>  这是二维数组,第一维是数据分布，第二维是数据分发备份.
+   }
+   
+   struct device_addr4 {
+           layouttype4             da_layout_type;
+           opaque                  da_addr_body<>;
+   };
+
+   #+END_SRC
+
+** decode_device(inode, pnfs_device, gfp_t)
+   - 处理get_deviceid的数据, 在pnfs_device->pages里面, 应该是上面的da_addr_body数据
+   - 先处理nflda_stripe_indices数组
+   - 创建nfs4_file_layout_dsaddr, 里面的deviceid已经解析出来
+   - 初始化nfs4_deviceid_node, 它关联nfs_client, nfs4_deviceid, pnfs_layoutdriver_type
+   > nfs4_init_deviceid_node(nfs4_file_layout_dsaddr->nfs4_deviceid_node, nfs_client->pnfs_curr_ld, nfs_client, pnfs_device->nfs4_deviceid)
+   - 开始解析nflda_multipath_ds_list, 2维数组解析
+   > decode_ds_addr(net, p, gfp_flags)
+   - 把list_head放到nfs4_file_layout_dsaddr->ds_list[i]中
+   - 这里的list_head链表表示数据的多条链路备份
+   > nfs4_pnfs_ds_add(list_head, gfp_flags)
+  
+** decode_and_add_device(inode, pnfs_device, gfp_flags)
+   - 解析pnfs_device数据, 获取nfs4_file_layout_dsaddr
+   > decode_device(inode, pnfs_device, gfp_flags)
+   - 构造完成后,放到hash表中
+   > nfs4_insert_deviceid_node(nfs4_file_layout_dsaddr->nfs4_deviceid_node)
+
+** filelayout_get_device_info(inode, nfs4_deviceid, rpc_cred, gfp_flags)
+   - 获取nfs4_deviceid对应的信息,放到nfs4_file_layout_dsaddr中
+   - 使用pnfs_device管理rpc请求使用的参数
+   - 发送rpc请求 
+   > nfs4_proc_getdeviceinfo(nfs_server, pnfs_device, rpc_cred)
+   - 处理结果 
+   > decode_and_add_device(inode, pnfs_device, gfp_flags)
+
+** nfs4_fl_put_deviceid(nfs4_file_layout_dsaddr)
+   - 使用pnfs_layoutdriver_type->free_deviceid_node回调函数释放
+   > nfs4_put_deviceid_node(nfs4_file_layout_dsaddr->nfs4_deviceid_node)
+   - 通过nfs4_deviceid_node管理他的释放和创建
+
+** nfs4_fl_calc_j_index(pnfs_layout_segment, offset)
+   - offset是文件偏移?
+   - 获取segment内部偏移
+   > tmp = offset - nfs4_filelayout_segment->stripe_unit
+   - 计算stripe的索引
+   > tmp /= nfs4_filelayout_segment->stripe_unit + nfs4_filelayout_segment->first_stripe_index
+   - 计算在stripe index数组的索引 
+   > tmp /= nfs4_filelayout_segment->stripe_count
+
+** nfs4_fl_calc_ds_index(pnfs_layout_segment, j)
+   - 获取nfs4_filelayout_segment->nfs4_file_layout_dsaddr->stripe_indices[j]
+   - stripe对应的在ds addr数组中的索引
+
+** nfs4_fl_select_ds_fh(pnfs_layout_segment, j)
+   - 在第j个stripe index中,使用的nfs_fh
+   - 如果是STRIPE_SPARSE
+   - 所有的ds使用相同的nfs_fh, nfs4_filelayout_segment->num_fh == 1, 只有一个文件
+   - 或者一个stripe index指向的多路ds使用同样的nfs_fh
+   > nfs4_fl_calc_ds_index(nfs4_filelayout_segment, j)
+   - 否则,每个ds使用自己的nfs_fh? 
+   > nfs4_filelayout_segment->fh_array[j]
+
+** nfs4_wait_ds_connect(nfs4_pnfs_ds)
+   - 等待nfs4_pnfs_ds->ds_state的NFS4DS_CONNECTING??
+
+** nfs4_clear_ds_conn_bit(nfs4_pnfs_ds)
+   - nfs4_pnfs_ds存储一个stripe的数组
+   - 虽然它有多路ds, 但只有其中的一个
+   - 清除nfs4_pnfs_ds->ds_state的NFS4DS_CONNECTING, 唤醒等待的任务
+   > wake_up_bit(&ds->ds_state, NFS4DS_CONNECTING)
+
+** nfs4_fl_prepare_ds(pnfs_layout_segment, ds_idx)
+   - ds_idx是stripe的索引,对应nfs4_filelayout_segment->nfs4_pnfs_ds指针数组
+   - 检查nfs4_filelayout_segment的nfs4_deviceid_node是否不可用 
+   > filelayout_test_devid_unavailable(nfs4_deviceid_node)
+   - 如果nfs4_pnfs_ds->nfs_client有效,直接使用
+   - 否则创建它
+   - 设置nfs4_pnfs_ds->ds_state的NFS4DS_CONNECTING
+   - 如果已经设置,别人在创建,等待nfs4_pnfs_ds 
+   > nfs4_wait_ds_connect(nfs4_pnfs_ds)
+   - 否则创建nfs_client 
+   > nfs4_ds_connect(nfs_server, nfs4_pnfs_ds)
+   - 如果失败, 设置整个nfs4_deviceid_node无效??
+   > nfs4_mark_deviceid_unavailable(nfs4_deviceid_node)
+
+* nfs4filelayout.c 
+
+** filelayout_get_dense_offset(nfs4_filelayout_segment, offset)
+   - offset是文件偏移
+   - 如果是STRIPE_SPARSE, 每个ds使用自己的nfs_fh/文件,因为他支持空洞,所以数据的文件偏移不用转换
+   - 如果是STRIPE_DENSE, 在一个ds上的数据在文件中的位置是压缩的
+   - 把offset对应的偏移转换为ds中文件的偏移
+   > offset -= nfs4_filelayout_segment->pattern_offset
+   - 计算stripe的索引
+   - stripe_no = offset /= (stripe_unit * stripe_count)
+   - 计算总的偏移
+   > stripe_no * stripe_unit + offset % stripe_unit
+   - 一个stripe包含stripe_count个块,每个块大小是stripe_unit
+   - 每个块对应一个nfs4_pnfs_ds,  nfs4_file_layout_dsaddr->stripe_count就是stripe中的块数
+
+** filelayout_get_dserver_offset(pnfs_layout_segment, loff_t)
+   - 如果是STRIPE_DENSE
+   > filelayout_get_dense_offset(pnfs_layout_segment, offset)
+   - 否则不改变offset
+
+** filelayout_reset_write(nfs_write_data)
+   - 设置nfs_pgio_header->flags的NFS_IOHDR_REDO
+   - 如果第一次设置,这里发送普通的读操作
+   > pnfs_write_done_resend_to_mds(inode, nfs_pgio_header->list_head, nfs_pgio_completion_ops, nfs_direct_req)
+   - 在rpc的rpc_call_prepare/rpc_call_done的错误处理中使用
+
+** filelayout_reset_read(nfs_read_data)
+   - 和上面相似 
+
+** filelayout_fenceme(inode, pnfs_layout_hdr)
+   - 释放inode的pnfs资源, pnfs_layout_hdr->plh_flags应该有NFS_LAYOUT_RETURN
+   - 去掉这个标志,如果原来有, 发送layoutreturn请求 
+   > pnfs_return_layout(inode)
+
+** filelayout_async_handle_error(rpc_task, nfs4_state, nfs_client, pnfs_layout_segment)
+   - 处理返回的错误, rpc_task->tk_status
+   - NFS4ERR_DELEG_REVOKED / NFS4ERR_ADMIN_REVOKED / NFS4ERR_BAD_STATEID, delegation失效
+   > nfs_remove_bad_delegation(nfs4_state->nfs_inode)
+   - 启动nograce的状态恢复, 直接释放delegation
+   - 如果是NFS4ERR_OPENMODE, 直接nograce恢复这个nfs4_state 
+   - 这里的恢复使用的nfs_client是inode对应的,mds,而不是ds
+   - nfs4_schedule_stateid_recovery(nfs_server, nfs4_state)
+   - 如果是NFS4ERR_EXPIRED
+   - 对于nfs4_stateid有效,启动nograce恢复,和上面一样
+   - 对于nfs4_stateid无效,启动lease恢复, NFS4CLNT_CHECK_LEASE
+   > nfs4_schedule_lease_recovery(nfs_client)
+   - 如果是NFS4ERR_BADSESSION/NFS4ERR_BADSLOT等, 重新创建session 
+   > nfs4_schedule_session_recovery(nfs4_session, tk_status)
+   - 如果是NFS4ERR_PNFS_NO_LAYOUT/STALE/ISDIR等,释放layout, 使用普通的nfs
+   > pnfs_destroy_layout(inode)
+   - 还要唤醒其他任务?
+   > rpc_wake_up(nfs4_slot_table->slot_tbl_waitq)
+   - 如果是ECONNREFUSED/EHOSTDOWN等rpc错误, 同样使用普通nfs
+   - 设置nfs4_deviceid_node的无效, 设置pnfs_layout_hdr->plh_flags的NFS_LAYOUT_RETURN
+   - 谁会释放layout??
+   > nfs4_mark_deviceid_unavailable(nfs4_deviceid_node)
+   
+** filelayout_read_done_cb(rpc_task, nfs_read_data)
+   - 处理nfs_read_data的错误 
+   > filelayout_async_handle_error(rpc_task, nfs_read_data->nfs4_readargs->nfs_open_context->nfs4_state, nfs_client, nfs_pgio_header->pnfs_layout_segment)
+   - 上面的nfs_client是ds的
+   - 如果上面返回-NFS4ERR_RESET_TO_MDS, 调用普通nfs操作 
+   > filelayout_reset_read(nfs_read_data)
+   - 如果返回-EAGAIN, 重新发送rpc, 重新从rpc_call_prepare开始
+   > rpc_reset_call_prepare(rpc_task)
+
+   - 读结果处理的3层回调
+   - 在read rpc_task的rpc_call_done 
+   > nfs_readpage_result_common(rpc_task, nfs_read_data)
+   > nfs_readpage_result(rpc_task, nfs_read_data)
+   - 使用nfs_rpc_ops的回调read_done(rpc_task, nfs_read_data)
+   > nfs4_read_done
+   - 使用nfs_read_data->read_done_cb
+   > filelayout_read_done_cb(rpc_task, nfs_read_data)
+ 
+** filelayout_set_layoutcommit(nfs_write_data)
+   - layoutcommit可以发送给mds, 也可以发送给ds?
+   - 如果nfs4_filelayout_segment->commit_through_mds !=0 或者写返回的是NFS_FILE_SYNC
+   - 表示不需要sync/commit
+   - 否则,设置inode/pnfs_layout_segment的标志
+   > pnfs_set_layoutcommit(nfs_write_data)
+
+** filelayout_test_devid_unavailable(nfs4_deviceid_node)
+   - 检查layout是否失效
+   - nfs4_deviceid_node->flags的NFS_DEVICEID_INVALID
+   > filelayout_test_devid_unavailable(nfs4_deviceid_node)
+   - 还有nfs4_deviceid_node->flags的NFS_DEVICEID_UNAVAILABLE
+   > nfs4_test_deviceid_unavailable(nfs4_deviceid_node)
+
+** filelayout_reset_to_mds(pnfs_layout_segment)
+   - 检查pnfs_layout_segment的nfs4_deviceid_node 
+   > filelayout_test_devid_unavailable(nfs4_deviceid_node)
+
+** filelayout_read_prepare(rpc_task, data)
+   - 处理nfs_read_data的请求
+   - 检查nfs_open_context->flags的NFS_CONTEXT_BAD, 直接返回-EIO
+   - 检查layout的有效性 
+   > filelayout_reset_to_mds(nfs_read_data->nfs_pgio_header->pnfs_layout_segment)
+   - 如果无效,使用普通nfs方式 
+   > filelayout_reset_read(nfs_read_data)
+   > rpc_exit(rpc_task, 0)
+   - 设置nfs_read_data->read_done_cb = filelayout_read_done_cb
+   - 处理错误rpc的错误
+   - 处理sequence, 这里的nfs4_session是ds的
+   > nfs41_setup_sequence(nfs4_session, nfs4_sequence_args, res, rpc_task)
+   - 选一个可用的nfs4_stateid, 和普通的nfs一样
+   > nfs4_set_rw_stateid(nfs4_readargs->nfs4_stateid, nfs_open_context, nfs_lock_context, FMODE_READ)
+
+** filelayout_read_call_done(rpc_task, nfs_read_data)
+   - 如果nfs_pgio_header->flags有NFS_IOHDR_REDO, 而且返回结果rpc_task->tk_status == 0
+   - 说明使用普通nfs方式完成,可直接返回
+   - 否则调用原来的rpc回调 
+   > nfs_pgio_header->mds_ops->rpc_call_done(rpc_task, nfs_read_data)
+
+** filelayout_read_count_stats(rpc_task, nfs_read_data)
+   > rpc_count_iostats(rpc_task, rpc_iostats)
+
+** filelayout_read_release(data)
+   - 这里只是包装普通nfs的rpc_call_release
+   - 释放layout
+   - 检查是否return layout
+   > filelayout_fenceme(inode, pnfs_layout_hdr)
+   - 释放ds nfs_client 
+   > nfs_put_client(nfs_read_data->ds_clp)
+   - 真正的释放 
+   > nfs_read_data->nfs_pgio_header->mds_ops->rpc_release(nfs_read_data)
+
+** 总结 
+   - 上面3个组成一个rpc_call_ops filelayout_read_call_ops, 应该放到nfs_rpc_ops
+
+** filelayout_write_done_cb(rpc_task, nfs_write_data)
+   - 处理rpc的错误 
+   > filelayout_async_handle_error(rpc_task, nfs_open_context->nfs4_state, nfs_write_data->ds_clp, pnfs_layout_segment)
+   - 如果返回NFS4ERR_RESET_TO_MDS, 使用普通nfs方式
+   > filelayout_reset_write(nfs_write_data)
+   - 如果是-EAGAIN, 重启rpc 
+   > rpc_reset_call_prepare(rpc_task)
+   - 设置commit标志 
+   > filelayout_set_layoutcommit(nfs_write_data)
+
+   - 这个函数像read一样,也是3层回调实现
+
+** prepare_to_resend_writes(nfs_commit_data)
+   - nfs_commit_data用来提交commit请求
+   - 修改nfs_commit_data->nfs_writeverf->verifier->data[0] ++
+   - 保证它和原来write返回的不一样
+
+** filelayout_commit_done_cb(rpc_task, nfs_commit_data)
+   - 处理commit的rpc结果? 
+   > filelayout_async_handle_error(rpc_task, NULL, nfs_client, nfs_write_data->pnfs_layout_segment)
+   - 如果是NFS4ERR_RESET_TO_MDS, 修改verifier, 重新发送写操作?? 
+   > prepare_to_resend_writes(nfs_write_data)
+   - 如果是EGAGIN, 重启rpc 
+   > rpc_restart_call_prepare(rpc_task)
+
+** filelayout_write_prepare(rpc_task, nfs_write_data)
+   - 检查nfs_open_context->flags的NFS_CONTEXT_BAD, 直接返回-EIO
+   - 检查layout的有效性
+   > filelayout_reset_to_mds(pnfs_layout_segment)
+   - 如果无效,直接使用普通nfs
+   > filelayout_reset_to_write(nfs_write_data)
+   - 设置sequence/nfs4_slot, 哪里设置的ds nfs_client??
+   > nfs41_setup_sequence(nfs_write_data->ds_clp->nfs4_session, ..)
+   - 选择nfs4_stateid 
+   > nfs4_set_rw_stateid(nfs4_stateid, nfs_open_context, nfs_lock_context, FMODE_WRITE)
+
+** filelayout_write_call_done(rpc_task, data)
+   - 和上面read一样
+   > nfs_write_data->nfs_pgio_header->mds_ops->rpc_call_done(nfs_write_data)
+
+** filelayout_write_count_stats(rpc_task, data)
+   > rpc_count_iostats(rpc_task, rpc_iostats)
+
+** filelayout_write_release(data)
+   - 释放nfs_write_data的layout资源 
+   > filelayout_fenceme(inode, pnfs_layout_hdr)
+   > nfs_put_client(nfs_write_data->ds_clp)
+   - nfs_write_data->nfs_pgio_header->mds_ops->rpc_release(nfs_write_data)
+
+** filelayout_write_commit_done(rpc_task, data)
+   - 看来commit也是发送给ds
+   - 直接回调 
+   > nfs_commit_data->mds_ops->rpc_call_done(rpc_task, nfs_commit_data)
+
+** filelayout_commit_count_stats(rpc_task, data)
+   - 这个rpc_iostate是mds的nfs_client
+   > rpc_count_iostats(rpc_task, rpc_iostats)
+
+** filelayout_commit_release(calldata)
+   - 这里回调更多? 
+   - 这个回调是什么???
+   > nfs_commit_data->completion_ops->completion(nfs_commit_data)
+   - 释放pnfs_layout_segment, ds nfs_client
+   > nfs_commitdata_release(nfs_commit_data)
+
+** 总结
+   - 上面针对write和commit也都有一套rpc_call_ops
+   - 还有在nfs_write_data/nfs_commit_data/nfs_read_data中使用的回调函数,在rpc完成后使用
+
+** filelayout_read_pagelist(nfs_read_data)
+   - 提交nfs_read_data的rpc请求
+   - 首先pnfs使用的资源
+   - 选择ds nfs4_pnfs_ds
+   - 计算stripe index
+   > nfs4_fl_calc_j_index(pnfs_layout_segment, offset)
+   - 获取ds index
+   > nfs4_fl_calc_ds_index(pnfs_layout_segment, j)
+   - 获取nfs4_pnfs_ds
+   > nfs4_fl_prepare_ds(pnfs_layout_segment, idx)
+   - 如果无法创建nfs4_pnfs_ds, 返回PNFS_NOT_ATTEMPTED
+   - 获取nfs_fh 
+   > nfs4_fl_select_ds_fh(pnfs_layout_segment, j)
+   - 计算文件偏移, 在nfs_readargs->offset
+   > filelayout_get_dserver_offset(pnfs_layout_segment, offset)
+   - 发起rpc请求 
+   > nfs_initiate_read(nfs4_pnfs_ds->nfs_client->rpc_clnt, nfs_read_data, filelayout_read_call_ops, RPC_TASK_SOFTCONN)
+   - 如果问题问题,返回PNFS_ATTEMPTED
+
+   - 原来的rpc_call_ops保存在nfs_read_data->mds_ops中, 在doio中已经转移
+
+** filelayout_write_pagelist(nfs_write_data, sync)
+   - 这个函数和上面的函数都是pnfs_layoutdriver_type中的回调函数
+   - 获取nfs4_pnfs_ds资源
+   > nfs4_fl_calc_j_index(pnfs_layout_segment, offset)
+   > nfs4_fl_calc_ds_index(pnfs_layout_segment, j)
+   > nfs4_fl_prepare_ds(pnfs_layout_segment, idx)
+   - 如果无法获取nfs_client, 返回PNFS_NOT_ATTEMPTED
+   - 设置nfs_write_data->write_done_cb = filelayout_write_done_cb?
+   - read是在rpc_call_prepare中, 这里提前了?
+   - 准备nfs_fh/offset 
+   > nfs4_fl_select_ds_fh(pnfs_layout_segment, j)
+   > filelayout_get_dserver_offset(pnfs_layout_segment, offset)
+   - 发送rpc请求 
+   > nfs_initiate_write(rpc_clnt, nfs_write_data, filelayout_write_call_ops, sync, RPC_TASK_SOFTCONN)
+
+** filelayout_check_layout(pnfs_layout_hdr, nfs4_filelayout_segment, nfs4_layoutget_res, nfs4_deviceid, gfp_flags)
+   - 在layoutget中获取的结构后,检查其有效性?
+   - nfs4_layoutget_res->pnfs_layout_range必须是(0, NFS4_MAX_UNIT64)??
+   - nfs4_layoutget_res->pattern_offset < pnfs_layout_segment->offset, pattern_offset是segment覆盖的范围
+   - stripe_unit 是 PAGE_SIZE倍数
+   - 查找缓存的nfs4_deviceid_node, 是否有对应nfs4_deviceid的
+   > nfs4_find_get_deviceid(pnfs_layoutdriver_hdr, nfs_client, nfs4_deviceid)
+   - 如果没有, 需要获取deviceinfo, nfs4_file_layout_dsaddr
+   > filelayout_get_device_info(pnfs_layout_hdr->inode, nfs4_deviceid, rpc_cred, gfp_flags)
+   - 检查nfs4_deviceid_node是否不可使用
+   > filelayout_test_devid_unavailable(nfs4_file_layout_dsaddr->nfs4_deviceid_node)
+   - nfs4_filelayout_segment->first_stripe_index 不能超过 nfs4_file_layout_dsaddr->stripe_count, stripe的个数
+   - 有到了stripe方式
+   - 如果使用STRIPE_SPARSE, 所有的ds使用相同的nfs_fh,或者使用自己的nfs_fh
+   - nfs4_filelayout_segment->num_fh == nfs4_file_layout_dsaddr->ds_num
+   - 如果是STRIPE_DENSE, 一个stripe使用一个nfs_fh
+   - nfs4_filelayout_segment->num_fh == nfs4_file_layout_dsaddr->stripe_count
+   - nfs4_filelayout_segment->stripe_unit必须是wsize/rsize的倍数
+
+** filelayout_free_fh_array(nfs4_filelayout_segment)
+   - 释放nfs_fh数组
+
+** _filelayout_free_lseg(nfs4_filelayout_segment)
+   > filelayout_free_fh_array(nfs4_filelayout_segment)
+   > kfree(nfs4_filelayout_segment)
+
+** xdr
+   #+BEGIN_SRC 
+
+
+   struct LAYOUTGET4resok {
+           bool               logr_return_on_close;
+           stateid4           logr_stateid;
+           layout4            logr_layout<>;
+   };
+
+   const NFL4_UFLG_MASK            = 0x0000003F;
+   const NFL4_UFLG_DENSE           = 0x00000001;
+   const NFL4_UFLG_COMMIT_THRU_MDS = 0x00000002;
+   const NFL4_UFLG_STRIPE_UNIT_SIZE_MASK
+                                   = 0xFFFFFFC0;
+
+   typedef uint32_t nfl_util4;
+   
+   struct nfsv4_1_file_layout4 {
+            deviceid4      nfl_deviceid;
+            nfl_util4      nfl_util;
+            uint32_t       nfl_first_stripe_index;
+            offset4        nfl_pattern_offset;
+            nfs_fh4        nfl_fh_list<>;
+   };
+
+   #+END_SRC
+
+** filelayout_decode_layout(pnfs_layout_hdr, nfs4_filelayout_segment, nfs4_layoutget_res, nfs4_deviceid)
+   - 解析layoutget返回的结果
+   - 先获取deviceid, 16字节的数据
+   - 然后是nfl_util
+   - 设置nfs4_filelayout_segment->comit_through_mds, stripe_type, stripe_unit
+   - 然后是nfl_first_stripe_index / pattern_offset
+   - 然后是nfs_fh数组
+
+** pnfs_commit_bucket
+   #+BEGIN_SRC 
+	struct list_head written;
+	struct list_head committing;
+	struct pnfs_layout_segment *wlseg;
+	struct pnfs_layout_segment *clseg;   
+   #+END_SRC
+
+** pnfs_ds_commit_info
+   #+BEGIN_SRC 
+	int nwritten;
+	int ncommitting;
+	int nbuckets;
+	struct pnfs_commit_bucket *buckets;   
+   #+END_SRC
+
+** nfs4_filelayout
+   #+BEGIN_SRC 
+	struct pnfs_layout_hdr generic_hdr;
+	struct pnfs_ds_commit_info commit_info;   
+   #+END_SRC
+
+** nfs_commit_info
+   #+BEGIN_SRC 
+	spinlock_t			*lock;
+	struct nfs_mds_commit_info	*mds;
+	struct pnfs_ds_commit_info	*ds;
+	struct nfs_direct_req		*dreq;	/* O_DIRECT request */
+	const struct nfs_commit_completion_ops *completion_ops;   
+   #+END_SRC
+
+** filelayout_free_lseg(pnfs_layout_segment)
+   - 释放pnfs_layout_segment
+   - 如果iomode == IOMODE_RW, 需要释放commit数据？ 
+   - nfs4_filelayout->pnfs_ds_commit_info->buckets???
+   > _filelayout_free_lseg(nfs4_filelayout_segment)
+
+** filelayout_alloc_commit_info(pnfs_layout_segment, nfs_commit_info, gfp_t)
+   - 在写操作时准备commit info, 
+   - 如果nfs4_filelayout_segment->commit_through_mds !=0, commit发送给mds, 直接返回
+   - nfs_commit_info里面有nfs4_filelayout->pnfs_ds_commit_info, 这里就是初始化他们
+   - 如果nfs_commit_info->pnfs_ds_commit_info->nbuckets !=0, 直接退出, 已经有人使用它
+   - 创建pnfs_commit_bucket数组
+   - 如果nfs4_filelayout_segment->stripe_type == STRIPE_SPARSE, 每个nfs4_pnfs_ds使用一个, nfs4_file_layout_dsaddr->ds_num
+   - 否则一个stripe使用一个, nfs4_file_layout_dsaddr->stripe_count
+   - 设置nfs_commit_info->pnfs_ds_commit_info->buckets/nbuckets
+
+** filelayout_alloc_lseg(pnfs_layout_hdr, nfs4_layoutget_res)
+   - 根据nfs4_layoutget_res创建nfs4_filelayout_segment
+   > filelayout_decode_layout(pnfs_layout_hdr, nfs4_filelayout_segment, nfs4_layoutget_res, nfs4_deviceid, gfp_flags)
+   - nfs4_filelayout_segment不会保存nfs4_deviceid, 而是直接获取nfs4_file_layout_dsaddr
+   > filelayout_check_layout(pnfs_layout_hdr, nfs4_filelayout_segment, nfs4_layoutget_res, nfs4_deviceid, gfp_flags)
+   - 这里只是获取deviceinfo, 还没有建立对应的nfs_client
+
+** filelayout_pg_test(nfs_pageio_descriptor, nfs_page, nfs_page)
+   - 检查是否可以合并nfs_page的请求
+   - 检查pnfs_layout_segment的范围,没有实质检查
+   > pnfs_generic_pg_test(nfs_pageio_descriptor, nfs_page, nfs_page)
+   > nfs_generic_pg_test(nfs_pageio_descriptor, .)
+   - 2个nfs_page必须在一个stripe中,也就是必须发送到一个相同的设备!!
+   - req_offset(nfs_page) / nfs4_filelayout_segment->stripe_unit
+   - 在这里, nfs4_filelayout_segment和nfs4_filelayout差不多了. 反正只有一个nfs4_filelayout_segment
+
+** filelayout_pg_init_read(nfs_pageio_descriptor, nfs_page)
+   - unaligned page不会处理  nfs_page->wb_offset != nfs_page->wb_pgbase
+   > nfs_pageio_reset_read_mds(nfs_pageio_descriptor)
+   - 这里是获取pnfs_layout_segment
+   > pnfs_update_layout(inode, nfs_open_context, 0, NFS4_MAX_UNIT64, IOMODE_READ, GFP_KERNEL)
+   - 如果无法获取,使用普通nfs方式
+   > nfs_pageio_reset_read_mds(nfs_pageio_descriptor)
+   - 在aops->readpage中处理page时使用,把nfs_page放到nfs_pageio_descriptor的队列中
+
+** filelayout_pg_init_write(nfs_pageio_descriptor, nfs_page)
+   - 准备pnfs_layout_segment 
+   > pnfs_update_layout(inode, nfs_open_context, 0, NFS4_MAX_UNIT64, IOMODE_RW, GFP_NOFS)
+   - 这里要求的pnfs_layout_range直接是整个文件范围!!
+   - 然后创建pnfs_ds_commit_info, 追踪commit信息???
+   > nfs_init_cinfo(nfs_commit_info, inode, nfs_direct_req)
+   > filelayout_alloc_commit_info(pnfs_layout_segment, nfs_commit_info, GFP_NOFS)
+
+** 总结
+   - 上面实现2套nfs_pageio_ops, 准备或提交nfs_pageio
+   - 由于只有一个nfs4_filelayout_segment, 所有只会有一套nfs4_file_layout_dsaddr, 在发起rpc请求之前,才会初始化nfs4_pnfs_ds->nfs_client
+
+** select_bucket_index(nfs4_filelayout_segment, j)
+   - 获取nfs4_file_layout_dsaddr中nfs4_pnfs_ds的索引
+   - 在nfs4_filelayout_segment->stripe_type是STRIPE_SPARSE时, 它是stripe计数 
+   > nfs4_fl_calc_ds_index(pnfs_layout_hdr, j)
+
+** filelayout_clear_request_commit(nfs_page, nfs_commit_info)
+   - 释放nfs_page
+   - 如果nfs_page->wb_flags没有PG_COMMIT_TO_DS, 不用处理commit
+   - 否则释放pnfs commit资源??
+   - 设置nfs_commit_info->pnfs_ds_commit_info->nwritten --
+   - 如果nfs_page->wb_list只有一个, 它是链表的最后一个, 释放pnfs_commit_bucket->pnfs_layout_segment
+   - 释放nfs_page->wb_list, 在哪个队列??
+   > nfs_request_remove_commit_list(nfs_page, nfs_commit_info)
+   > pnfs_put_lseg(pnfs_layout_segment)
+
+** filelayout_choose_commit_list(nfs_page, pnfs_layout_segment, nfs_commit_info)
+
+
+
+
+
+
+
+
+
+
+
+
+** filelayout_free_deviceid_node(nfs4_deviceid_node)
+   - 释放nfs4_file_layout_dsaddr
+   > nfs4_fl_free_deviceid(nfs4_file_layout_dsaddr)
+   - 包含它的remotestr, nfs4_pnfs_ds数组等
+
+** filelayout_alloc_layout_hdr(inode, gfp_flags)
+   - 创建nfs4_filelayout
+   - 在创建pnfs_layout_segment时,先查找pnfs_layout_hdr
+   - 如果找不到, 调用这里的回调创建一个
+
+** filelayout_free_layout_hdr(pnfs_layout_hdr)
+   - 释放nfs4_filelayout
+
+** filelayout_get_ds_info(inode)
+   - 准备nfs_commit_info, 获取nfs_inode->pnfs_layout_hdr=>nfs4_layout->pnfs_ds_commit_info
