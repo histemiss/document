@@ -70,101 +70,236 @@
    - 使rcu遍历方式失效, rcu怎么使用seq??
    > write_seqcount_barrier(dentry->d_seq)
 
-** dentry_iput 这个函数也在d_kill中使用,它是释放dentry和inode的关系
-	* dentry->d_inode / dentry->d_alias
-	* 检查inode->i_nlink -> fsnotify_inoderemove  这没有实事,inode会释放底层的资源
-	* d_op->d_iput(dentry, inode) / iput(inode)   d_iput就是调用了iput, cifs_dentry_ops没有实现它,nfs实现了，因为sillyrename和数据缓存.
-   dentry_unlink_inode(dentry)  和上面的函数一样
+** dentry_iput 
+   - 在d_kill中使用,它是释放dentry和inode的关系
+   - 设置dentry->d_inode = NULL, d_alias现在成了hash表
+   > hlist_del_init(dentry->d_alias)
+   - 如果inode->i_nlink ==0, 同法fsnotify消息?
+   > fsnotify_inoderemove
+   - d_iput就是调用了iput,释放inode->i_count计数
+   - 如果没有使用, 放到lru队列中
+   - nfs实现了，释放sillyrename和子目录的缓存
+   > d_op->d_iput(dentry, inode)
 
-** dentry_lru_add / __dentry_lru_del 把dentry放到super_block->s_dentry_lru队列中,修改dentry->d_flags的DCACHE_SHRINK_LIST标志
-   dentry_lru_prune(dentry) 包装上面的函数,dentry即将被删除
-   	-> d_op->d_prune(dentry)
-	dentry_lru_move_list(dentry, list_head) 把dentry放到一个队列中
+** dentry_unlink_inode(dentry)
+   - 和上面一样, 释放dentry->d_alias
+   - 如果dentry还在使用,无效ruc方式
+   > dentry_rcuwalk_barrier(dentry)
+   - 释放inode计数 
+   > dentry->d_op->d_iput(dentry, inode)
+   - 在d_delete中使用??
 
-** d_kill(dentry, dentry parent) 从lru队列中删除,更多的删除动作, 还没有hash/lru等.
-	-> list_del(dentry->d_u.d_child)  从父亲队列中删除
-	-> dentry->d_flags |= DCACHE_DISCONNECT  已经不在dcache树中
-	-> dentry_iput(dentry) 和inode脱离关系
-	-> d_free(dentry) 释放
+** dentry_lru_add(dentry)
+   - 把dentry->d_lru放到super_block->s_dentry_lru队列中
+   - 增加super_block->s_nr_dentry_unused计数
+   - 在dput中调用
 
-** __d_shrink(dentry) dentry在hash表中有两种情况,一种是在dcache树中,d_parent有效,它的hash表根据d_parent/name计算,另一种是不在树中,它在super_block->s_anon中. 使用DCACHE_DISCONNECTED检查属于那种情况?
-	-> __hlist_bl_del(dentry->d_hash)  这里就使用hash队头锁
-	__d_drop(dentry) / d_drop(dentry) 包装上面的实现, 这些操作会是lookup找不到这个inode,而d_delete不是，它让dentry变为negative,还可以找到.
-	d_clear_need_lookup(dentry) 继续包装上面的
+** __dentry_lru_del(dentry) 
+   - 释放dentry->d_lru链表
+   - 去掉dentry->d_flags的DCACHE_SHRINK_LIST标志
+   - 减小super_block->d_nr_dentry_unused
 
-** dentry_kill(dentry, ref) 要杀掉一个dentry, 应该是回收它,先找到d_parent
-	-> dentry_lru_prune(dentry)  从lru队列中释放 super_block->s_dentry_lru
-	-> __d_drop(dentry)  unhash
-	-> d_kill(dentry, parent) 从d_parent中释放,最后释放内存
+** dentry_lru_del(dentry)
+   - 使用dcache_lru_lock锁, 为何不用super_block的索？
+   > __dentry_lru_del(dentry)
 
-上面这些函数还都是static的...
-** dput(dentry)  操作dentry->d_count, 如果d_count减到0,则有条件的释放它,同时处理它的parent.
-	如果d_count没有到0，则返回
-	* 检查DCACHE_OP_DELETE, 如果有效,说明d_op->d_delete可用，使用它判断dentry是否需要立即删除  -> dentry_kill(dentry, 1) 这里会返回d_parent, 继续处理parent
-	* 如果不需要立即删除,只需把它count设为0,放到lru队列中, 从d_unhash中删除. 设置DCACHE_REFERENCED标志.
-	-> d_unhashed(dentry) 如果dentry没在hash队列中，删除它
-	-> dentry_lru_add(dentry) 放到lru队列中
-	-> dentry->d_count --
-	这就是在hash中能找到,也能使用d_parent能找到,放在lru队列中.
+** dentry_lru_move_list(dentry, list_head)
+   - list_head用来收集需要释放的dentry 
+   - 如果dentry->d_lru为空,把它放到list_head链表中
+   - 否则移动到最后面
 
-这个是外部模块经常使用的东西.
+** d_kill(dentry, dentry parent) 
+   - 释放dentry的内存,现在已经在hash和lru中释放
+   - 释放dentry->d_u->d_child, 从父目录中释放
+   - 设置dentry->d_flags 的DCACHE_DISCONNECT, 表示不再可用
+   - 只有在回朔删除父dentry时才使用
+   - 释放和inode的关系
+   > dentry_iput(dentry) 
+   - 释放自己
+   > d_free(dentry) 
 
-** d_invalidate(dentry) 这个函数作用和上面类似, 如果dentry不在hash表中,则不处理
-	-> shrink_dcache_parent(dentry) 处理它的孩子dentry
-	-> __d_drop(dentry) 释放hash关系, 但这里没有d_count的处理，还要再应用地方看它什么作用.
+** __d_shrink(dentry)
+   - 释放hash表关系, 如果不在hash表中,直接返回
+   > d_unhashed(dentry)
+   - dentry使用2中hash链表
+   - 一个是suepr_block->s_anon, 另一个是dentry_table
+   - 释放时需要hash表头的锁
+   - dentry->d_flags的DCACHE_DISCONNECTED表示在anon链表中
+   > hlist_bl_lock(hlist_bl_head)
+   > __hlist_bl_del(dentry->d_hash)
 
-** __dget_dlock / __dget(dentry) 增加dentry->d_count
-   dget_parent(dentry) 增加d_parent的计数
+** __d_drop(dentry)
+   - 这里是释放hash表?? 
+   - 检查是否在hash表中
+   > d_unhashed(dentry)
+   > __d_shrink(dentry)
+   > dentry_rcuwalk_barrier(dentry)
 
-复杂的地方
-** __d_find_alias(inode, want_discon)  找一个inode关联的dentry,增加计数. 这个dentry只能是dir或者在hash表中,表示inode是有效的. 如果want_discon,则返回一个标有DCACHE_DISCONNECT的dentry, 而且这个dentry是root. 这种情况的确很特殊.
-	-> __dget_dlock(alias)
-	d_find_alias(inode)  正常包装
-		-> __d_find_alias(inode, 0)
+** d_drop(dentry)
+   - 释放dentry->d_lock锁住 
+   > __d_drop(dentry)
 
-** d_prune_aliases(inode) 只处理i_dentry队列中 d_count=0的dentry.
-	-> __dget_dlock(dentry) 增加计数??
-	-> __d_drop(dentry)  unhash
-	-> dput(dentry)  一定删除它,因为它不在hash队列中
+** dentry_kill(dentry, ref)
+   - 释放dentry, 返回d_parent,可以回朔回收
+   - 先找到父目录, 锁住inode->i_lock和parent->d_lock
+   - 如果ref有效, 减小dentry->d_count, 为了一致性?
+   - 如果dentry->flags有DCACHE_OP_PRUNE
+   - 通知文件系统dentry要释放
+   > dentry->d_op->d_prune(dentry)
+   - 释放lru链表
+   > dentry_lru_del(dentry)
+   - 释放hash表
+   - __d_drop(dentry)
+   - 释放inode, 父dentry, 还有自己
+   - d_kill(dentry, parent)
 
-** try_prune_one_dentry(dentry) 这里不仅删除dentry,还会考虑parent
-	-> dentry_kill(dentry, 0)
-	-> d_parent->d_count --
-	-> dentry_kill(dentry, 0)  如果父dentry没人用，继续删除它. 这个和d_put很像.
+** dput(dentry)  
+   - 减小dentry->d_count, 如果d_count减到0,则释放它
+   - 如果d_count没有到0，则返回
+   - 如果dentry->flags有DCACHE_OP_DELETE,回调函数决定是否直接删除
+   - 对于nfs来说,检查对应的inode是否有错误 nfs_dentry_delete
+   > d_ops->d_delete(dentry)
+   - 如果不在hash表中, 直接释放??
+   > d_unhashed(dentry)
+   - 否则不会释放,放到lru队列中,设置DCACHE_REFERENCED标志.
+   > dentry_lru_add(dentry)
+   > dentry->d_count --
+   - 如果要释放, 函数返回d_parent, 回朔释放
+   > dentry_kill(dentry, 1)
 
-** shrink_dentry_list(list_head) 删除一队列的dentry, 队列使用d_lru, 处理每个dentry,如果d_count是0 -> try_prune_one_dentry(dentry)
+** d_invalidate(dentry)
+   - 如果dentry不在hash表中,则不处理, 已经被释放??
+   - 如果dentry->d_subdirs不是空,有子dentry
+   - 去遍历它的子树，收集没有使用的释放
+   - shrink_dcache_parent(dentry) 
+   - 如果dentry->d_count > 1, 而且inode有效, 而且是目录,返回-EBUSY
+   - 释放hash表关系, 表示不再vfs的树中,只是没有释放
+   > __d_drop(dentry) 
 
-** shrink_dcache_sb(super_block, count) 尝试释放一定数量的dentry, 遍历super_block->s_dentry_lru, 如果dentry带标志DCACHE_REFERENCED,则把它放回去,否则释放它
-	-> shrink_dentry_list(list)
+** 总结
+   - 释放有很多种
+   - 一种是放到lru队列中 dput
+   - 一种是有条件的直接释放 kill
+   - 一种是释放hash表关系, invalidate
+   - 下面还有一种,释放整个super_block的dentry
 
-	shrink_dcache_sb(super_block) 在umount之前使用,删除所有的dentry
+** __dget_dlock / __dget(dentry) 
+   - 修改dentry->d_count
 
-** shrink_dcache_for_umount_subtree(dentry) 这里要删除一个子文件夹,有树的深度优先遍历过程. dentry必须是root. 首先看处理过程,没有使用dentry_kill/dput,而是如下过程:
-	-> dentry_lru_prune(dentry)
-	-> __d_shrink(dentry)
-	-> list_del(dentry->d_u->d_child)
-	-> d_op->d_iput()  / list_del_init(dentry->d_alias)
-	-> d_free(dentry)
-	遍历过程是，先找最左下角叶子,然后回溯处理叶子，然后再循环.
-	shrink_dcache_for_umount(sb), 处理 super_block->s_root, 然后是s_anon上的dentry.
+** dget_parent(dentry) 
+   - 使用dentry->d_lock锁住
+   - 增加d_parent的计数
 
-看一下dentry的释放有两种,一种是dentry_kill, 彻底删除,在d_prune_alias/try_prune_one_dentry中使用,另一种是dput,只是降低计数,把他放到lru队列中,但其他关系还在, 还有就是d_invalidate, 仅仅在hash关系中删除.
+** __d_find_alias(inode, want_discon)
+   - 找一个inode关联的dentry,增加计数
+   - 如果是目录节点,应该只有一个dentry, 否则可能有多个
+   - 如果是不再hash表中,应该是释放掉的, d_count=1, 而且没有子文件
+   - 也就是有DCACHE_DISCONNECTED?? 
+   - 如果want_discon=1, 必须找一个root,而且是DCACHE_DISCONNECTED的dentry????
+   - 遍历inode->i_dentry链表中的dentry
+   - 找到和条件符合的
+   > __dget_dlock(dentry)
+
+** d_find_alias(inode)
+   - 使用dinode->i_lock锁住, 找一个正常的dentry
+   > __d_find_alias(inode, 0)
+
+** d_prune_aliases(inode)
+   - 释放inode关联的dentry 
+   - 遍历inode->i_dentry链表中的dentry
+   - 只处理dentry->d_count ==0的 
+   > __dget_dlock(dentry)
+   - 释放hash表关系
+   > __d_drop(dentry)
+
+** try_prune_one_dentry(dentry) 
+   - 这个dentry已经不再使用, 这是使用lru回收的
+   - 先释放自己
+   > dentry_kill(dentry, 0)
+   - 如果parent->d_count>1,有别人使用它
+   - 减小计数, 直接返回
+   - 否则继续回朔释放
+   - dentry_kill(dentry, 1)  
+
+** 总结
+   - dentry释放的锁有4种
+   - 上面的操作应该是获取dentry->d_lock
+   - 在开始释放时,获取inode/parent的索
+   - 里面有hash操作,使用自己的索
+   - 然后释放d_child链表, 设置DCACHE_DENTRY_KILLED, 释放parent->d_lock
+   - 然后释放inode关系,释放inode锁
+   - 最后再释放自己之前,释放d_lock
+
+** shrink_dentry_list(list_head) 
+   - 删除一队列的dentry, 队列使用d_lru, 遍历这些dentry
+   - 如果dentry->d_count > 0, 不能释放
+   - 只是释放lru链表,从当前链表中释放
+   - 否则释放它,而且释放父dentry
+   > try_prune_one_dentry(dentry)
+
+** shrink_dcache_sb(super_block, count) 
+   - 尝试super_block中空闲的dentry
+   - 遍历super_block->s_dentry_lru
+   - 如果dentry带标志DCACHE_REFERENCED,则把它放回去
+   - 否则放到临时链表中,最后集中释放
+   - 这里使用dcache_lru_lock保护,和上面的lru操作很想
+   - shrink_dentry_list(list)
+
+** shrink_dcache_sb(super_block)
+   - 释放整个super_block->s_dentry_lru链表, 直到为空
+   > shrink_dentry_list(list_head)
+
+** shrink_dcache_for_umount_subtree(dentry) 
+   - umount时使用,释放super_block的所有dentry
+   - dentry必须是root
+   - 使用树的深度优先遍历, 删除dentry
+   - 开始循环, 先到最底层的dentry, d_subdirs为空
+   - 通知fs
+   > d_op->d_prune(dentry)
+   - 释放lru和hash关系
+   > dentry_lru_prune(dentry)
+   > __d_shrink(dentry)
+   - 如果dentry->d_count >0, 报错
+   - 释放父dentry的关系
+   - list_del(dentry->d_u->d_child)
+   - 释放inode关系
+   > hlist_del_init(dentry->d_alias)
+   > d_op->d_iput(dentry, inode)
+   - 最后释放自己
+   > d_free(dentry)
+   - 这里没有使用任何锁??
+
+** shrink_dcache_for_umount(super_block)
+   - 首先释放super_block->s_root对应的子树
+   > shrink_dcache_for_umount_subtree(dentry)
+   - 然后是super_block->s_anon链表上的
+   - 链表使用dentry->d_hash?? 上面可能有遗漏的
+    -这里不会干扰上面的释放,因为不会增加计数
+   - 遍历hash表上的dentry
+   > shrink_dcache_for_umount_subtree(dentry)
 	
-** try_to_ascend(old, locked, seq) 就是找dentry->d_parent
+** try_to_ascend(old, locked, seq) 
+   - 找dentry->d_parent 
+   - 如果old->flags有DCACHE_DENTRY_KILLED, 或者seq和rename_lock不一致, 返回NULL
 
-** have_submounts(parent) 判断dentry是否mountpoint,检查dentry->d_flags是否带DCACHE_MOUNTPOINT, 遍历数使用深度遍历方法, 没有使用递归,因为树的关系太强,回溯很容易.
+** have_submounts(parent)
+   - 检查parent的子树的文件夹中,是否有mountpoint
+   - dentry->d_flags的DCACHE_MOUNTPOINT表示它是mountpoint
+   > d_mountpoint(dentry)
+   - 因为这里是有序树,而且遍历的时候树的结构不会改变, 可以使用循环的方式表示递归
+   - 刚才写了python, 不需要有序,但删除的操作,也可实现
 
 ** select_parent(dentry, list_head ) 遍历dentry的子数,发现d_count为0的放到list_head中,即将回收. 这里的遍历方法和上面一样.
-	-> dentry_lru_del(dentry) 如果d_count>0, 不能放到lru队列中
-	-> dentry_lru_move_list(dentry, dispose) 同时添加dcache->d_flags的DCACHE_SHRINK_LIST标志
+   - dentry_lru_del(dentry) 如果d_count>0, 不能放到lru队列中
+   - dentry_lru_move_list(dentry, dispose) 同时添加dcache->d_flags的DCACHE_SHRINK_LIST标志
 	shrink_dcache_parent(parent) 
-	-> select_parent(dentry, list)
-	-> shrink_dentry_list(list)
+   - select_parent(dentry, list)
+   - shrink_dentry_list(list)
 		-> try_prune_one_dentry
 
 ** __d_alloc(sb, name) 根据参数这里只设置super_block和name, 但这里还有super_block->d_ops
 	d_alloc(parent, name)  会增加parent的计数, 同时把dentry放到parent->d_u.d_child队列中.
-	-> __d_alloc(sb, name) 
+   - __d_alloc(sb, name) 
 
 	d_alloc_name(parent, name)
 
@@ -176,38 +311,38 @@
 ** __d_instantiate(dentry, inode) 建立dentry和inode的关系, 把dentry放到inode->i_dentry队列中, 如果inode是AUTOMOUNT,设置dentry->d_flags的DCACHE_NEED_AUTOMOUNT
 	d_instantiate(dentry, inode) 有了inode的dentry就不是negative的dentry, 但dentry的计数还是不变. 而对inode的使用计数在外部已经增加
 	d_instantiate_unique(dentry, inode) 在关联dentry和inode之前,先检查inode的所有dentry, 检查是否有相同的name和parent的,如果有,增加它的计数并返回，否则建立关系
-	-> d_instantiate(dentry, inode)
+   - d_instantiate(dentry, inode)
 	d_instantiate(dentry, inode)
 
 **  d_alloc_root(inode) 创建dentry,name="/",然后关联inode
-	-> __d_alloc
-	-> d_instantiate(dentry, inode)
+   - __d_alloc
+   - d_instantiate(dentry, inode)
 	d_make_root(inode) 和上面类似,但这里如果不能成功创建dentry,会释放inode. 没人使用
-	-> __d_alloc
-	-> d_instantiate(dentry, inode) 顺利则返回dentry
-	-> iput(inode) 不能创建dentry,则释放inode
+   - __d_alloc
+   - d_instantiate(dentry, inode) 顺利则返回dentry
+   - iput(inode) 不能创建dentry,则释放inode
 
 ** __d_find_any_alias(inode) 找到inode->i_dentry队列中的dentry, 增加计数
-	-> __dget(dentry)
+   - __dget(dentry)
 	d_find_any_alias(inode) 包装上面的函数
 
 	d_obtain_alias(inode)
-	-> d_find_any_alias(inode)  如果能找到返回
-	-> __d_alloc(inode->i_sb, string) 设置DCACHE_DISCONNECTED, 关联inode和dentry的关系, 把这个创建的dentry放到inode->i_sb->s_anon中,貌似好多地方创建这种临时的dentry
+   - d_find_any_alias(inode)  如果能找到返回
+   - __d_alloc(inode->i_sb, string) 设置DCACHE_DISCONNECTED, 关联inode和dentry的关系, 把这个创建的dentry放到inode->i_sb->s_anon中,貌似好多地方创建这种临时的dentry
 
 ** d_splice_alias(inode, dentry) 就是关联inode和dentry,不知为何这么多操作,如果inode是目录,首先找是否有DCACHE_DISCONNECTED的dentry,
-	-> __d_find_alias_inode(inode, 1)
-	-> d_move(new, dentry)  使用已有的就可以
-	-> 没有空闲的，就关联这两个 __d_instantiate(dentry, inode) ; d_rehash(dentry)
-	-> d_add(dentry,inode) 对于普通文件,就直接关联,同时重新计算hash表位置 
+   - __d_find_alias_inode(inode, 1)
+   - d_move(new, dentry)  使用已有的就可以
+   - 没有空闲的，就关联这两个 __d_instantiate(dentry, inode) ; d_rehash(dentry)
+   - d_add(dentry,inode) 对于普通文件,就直接关联,同时重新计算hash表位置 
 
 ** d_add_ci(dentry, inode, name) 这里还有case exact的文件名? 
-	-> d_hash_and_lookup(dentry->d_parent, name) 首先在父目录下面找一个name的文件
-	-> 如果没招到，就创建一个 -> d_alloc(dentry->d_parent, name)
-	-> d_splice_alias(inode, new)  参数dentry什么用处?
+   - d_hash_and_lookup(dentry->d_parent, name) 首先在父目录下面找一个name的文件
+   - 如果没招到，就创建一个 -> d_alloc(dentry->d_parent, name)
+   - d_splice_alias(inode, new)  参数dentry什么用处?
 	如果找到了,而且关联同样的inode,返回找到的dentry, 找到了，应该没有关联inode, 建立联系
-	-> d_clear_need_lookup
-	-> d_splice_alias(inode, dentry) 这是标准的建立联系的函数了...
+   - d_clear_need_lookup
+   - d_splice_alias(inode, dentry) 这是标准的建立联系的函数了...
 	只有ntfs和xfs使用
 
 上面一系列的函数都是创建dentry, 创建有两种，一种指定parent, 另一种不指定。 两种都要有super_block. 使用parent的，创建后就会放到parent的孩子队列中. 然后可以关联inode，同时把它inode的alias队列中.然后考虑放到hash队列中,但放到hash队列中,主要在find操作中使用,检查是否已有存在的dentry,有的话用存在的，没有的话创建新的,并关联inode，放到hash队列中.
@@ -219,12 +354,12 @@
 
 	d_lookup(parent, name) / __d_lookup(dentry, name) 这个寻找的过程和上面一样，比较参数都一样,但两边使用的锁和检查结果不一样.
 	d_hash_and_lookup(dentry, name) 先对name进行hash运算,然后查找
-	-> d_lookup(dentry, name)
+   - d_lookup(dentry, name)
 
 ** d_validate(dentry, parent) 增加dentry的计数，没人用！
 ** d_delete(dentry) 在删除文件时删除dentry，如果dentry没人用, 把dentry变为negative的,否则只是把它在hash队列中删除. 如果dentry在没有删除时,dentry->d_count会>=1.
-	-> dentry_unlink_inode(dentry) 释放inode的关系,但还是在hash队列中?
-	-> 否则只是把它在hash队列中释放 -> __d_drop(dentry)
+   - dentry_unlink_inode(dentry) 释放inode的关系,但还是在hash队列中?
+   - 否则只是把它在hash队列中释放 -> __d_drop(dentry)
 
 	__d_rehash(dentry, hlist_bl_head)  设置dentry->d_flags的DCACHE_RCUACCESS, 重新把dentry放到hash队列中
 	_d_rehash(dentry) 包装
@@ -234,16 +369,16 @@
 	d_move
 
 ** __d_unalias(inode, dentry, alias) 释放dentry,把它的内容给alias?
-	-> __d_move
+   - __d_move
 
 	__d_materialise_dentry(dentry, anon) 好像也是交换dentry和anon的内容,但没有hash相关操作,去掉anon的DCACHE_DISCONNECTED
 	d_materialise_unique(dentry, inode) 同样是关联dentry和inode,但首先确认inode没有关联的dentry
-	-> __d_find_alias(inode, 0)
-	-> 如果是root(anon) __d_materialise_dentry(dentry, alias)
-	-> __d_drop(dentry) 同时释放hash关系
-	-> 否则  __d_unalias(inode, dentry, alias) 使用dentry代替这个alias
-	-> 如果找不到alias,则使用原来方法关联 __d_instantiate_unique(dentry, inode)
-	-> _d_rehash(dentry) 处理hash队列
+   - __d_find_alias(inode, 0)
+   - 如果是root(anon) __d_materialise_dentry(dentry, alias)
+   - __d_drop(dentry) 同时释放hash关系
+   - 否则  __d_unalias(inode, dentry, alias) 使用dentry代替这个alias
+   - 如果找不到alias,则使用原来方法关联 __d_instantiate_unique(dentry, inode)
+   - _d_rehash(dentry) 处理hash队列
 
 下面都是一下获取路径的辅助方法,但看了上面这些感觉还是不够，应该看看path_follow相关的东西. 还有namei的东西,挑着看看.
 
@@ -278,41 +413,41 @@ nameidata :
 
 ** unlazy_walk(nameidata, dentry)
 	在rcu-wale中使用, nameidata->flags必须带有LOOKUP_RCU. 这个函数的作用是从lazy(rcu)-walk变为ref-walk. 但dentry和nameidata什么关系.
-	-> __d_rcu_to_refcount(dentry, seq) 比较seq和dentry->d_seq, 如果一样,增加dentry->d_count，否则返回失败.
+   - __d_rcu_to_refcount(dentry, seq) 比较seq和dentry->d_seq, 如果一样,增加dentry->d_count，否则返回失败.
 	nameidata中的path是父目录,增加path.dentry->d_count,如果dentry不为空，增加它的计数. 
-	-> mntget(nd->path.mnt) 增加vfsmount的计数
+   - mntget(nd->path.mnt) 增加vfsmount的计数
 
 ** complete_walk(nameidata) 在rcu模式查找路径完成时的操作, 
-	-> __d_rcu_to_refcount(dentry, seq) 如果失败,退出
-	-> mntget(nameidata->path.mnt) 如果获取dentry的计数,也要增加它的计数
-	-> d_revalidate(dentry, nameidata) 在支持revalidate操作和link搜索时使用
+   - __d_rcu_to_refcount(dentry, seq) 如果失败,退出
+   - mntget(nameidata->path.mnt) 如果获取dentry的计数,也要增加它的计数
+   - d_revalidate(dentry, nameidata) 在支持revalidate操作和link搜索时使用
 
 ** __vfs_follow_link(nameidata, link_name)
 	如果link_name是绝对路径(以"/"开头), 则更换nameidata->path/root为current->fs->root,并设置LOOKUP_JUMPED
-	-> path_get(nd->path)
-	-> link_path_walk(link, nd)
+   - path_get(nd->path)
+   - link_path_walk(link, nd)
 
 	follow_link(path, nameidata, p) 处理符号文件, path应该是只想一个link文件,而nameidata是它的父目录?
-	-> dentry->d_inode->i_op->follow_link(dentry, nameidata) 获取dentry的链接内容.
-	-> __vfs_follow_link(nameidata, string) 没人管link
+   - dentry->d_inode->i_op->follow_link(dentry, nameidata) 获取dentry的链接内容.
+   - __vfs_follow_link(nameidata, string) 没人管link
 
 ** follow_up_rcu(path) 使用rcu保护的路径向上走,这里要跨越mount,要是不跨越就直接parent
-	-> 如果path->mnt没有父mount,则返回0
-	-> 更换path = {path->mnt=>mnt_parent->mnt_mountpoint, path->mnt=>mnt_parent->mnt}
+   - 如果path->mnt没有父mount,则返回0
+   - 更换path = {path->mnt=>mnt_parent->mnt_mountpoint, path->mnt=>mnt_parent->mnt}
 
 	follow_up(path) 使用refcount方式的向上路径
 	和上面一样,但要释放老的paht,增加新path的计数
-	-> mntget / mntput 
-	-> dget / dput
+   - mntget / mntput 
+   - dget / dput
 ** follow_automount(path, flags, need_mntput) 这个还不清除做什么
-	-> path->dentry->d_op->d_automount(path) 这个返回一个vfsmount
-	-> finish_automount(mnt, path) 实现挂载功能
-	-> path_put / dget 切换path
+   - path->dentry->d_op->d_automount(path) 这个返回一个vfsmount
+   - finish_automount(mnt, path) 实现挂载功能
+   - path_put / dget 切换path
 
 ** follow_managed(path, flags) DCACHE_NEED_AUTOMOUNT, DCACHE_MANAGE_TRANSIT这两个标志都是autofs使用
-	-> d_op->d_manage(path->dentry, false) DCACHE_MANAGE_TRANSIT
-	-> follow_automount(path, flags, need_mntput) DCACHE_NEED_AUTOMOUNT
-	-> DCACHE_MOUNTED path是一个mountpoint,切换到mount的根,这里来看应该算是一个向下的搜索
+   - d_op->d_manage(path->dentry, false) DCACHE_MANAGE_TRANSIT
+   - follow_automount(path, flags, need_mntput) DCACHE_NEED_AUTOMOUNT
+   - DCACHE_MOUNTED path是一个mountpoint,切换到mount的根,这里来看应该算是一个向下的搜索
 
 	follow_down_one(path) 和上面DCACHE_MOUNTED一样
 
@@ -326,11 +461,11 @@ nameidata :
 ** follow_down(path)  这个函数和follow_managed类似,但这里不会处理DCACHE_NEED_AUTOMOUNT,nfsd使用它.
 
 ** d_alloc_and_lookup(dentry parent, qstr name, nameidata)
-	-> d_alloc(parent, name)
-	-> i_op->lookup(parent->d_inode, dentry, nd) 这里重新查找，里面有应该d_instantiate之类的复杂操作, 如果返回的有效,就需要释放它. cifs里面使用d_add，而且直接打开路径,但对于localfs,则需要读回目录下的内容.
+   - d_alloc(parent, name)
+   - i_op->lookup(parent->d_inode, dentry, nd) 这里重新查找，里面有应该d_instantiate之类的复杂操作, 如果返回的有效,就需要释放它. cifs里面使用d_add，而且直接打开路径,但对于localfs,则需要读回目录下的内容.
 
 	d_inode_lookup(dentry parent, dentry, nameidata) 在parent下面为dentry找合适的inode
-	-> i_op->lookup(inode, dentry, nd)
+   - i_op->lookup(inode, dentry, nd)
 
 ** do_lookup(nameidata, qstr, path, inode)
 	如果nameidata->flags带LOOKU_RCU,使用rcu模式查找
@@ -341,21 +476,21 @@ nameidata :
 	找到ref-walk -> unlazy_walk(nd, dentry)
 	如果不是rcu模式	-> __d_lookup(parent, name) 这个也是dcache的实现
 	如果没找到dentry, 则再找一遍,或分配一个新的
-	-> d_lookup(parent, name)
-	-> d_alloc_and_lookup(parent, name, nd)
-	-> d_inode_lookup(parent, dentry, nd) 找inode
-	-> follow_managed(path, nd->flags)
+   - d_lookup(parent, name)
+   - d_alloc_and_lookup(parent, name, nd)
+   - d_inode_lookup(parent, dentry, nd) 找inode
+   - follow_managed(path, nd->flags)
 
 	walk_component(nameidata, path, qstr, type, follow)
-	-> do_lookup(nd, name, path, inode) 如果返回的inode无效,则搜索失败, 把返回的path,inode给nameidata
+   - do_lookup(nd, name, path, inode) 如果返回的inode无效,则搜索失败, 把返回的path,inode给nameidata
 
 处理符号链接
 	nested_symlink(path, nameidata) 循环使用下面的函数,知道错误退出?
-	-> follow_link(link, nd, cookie)
-	-> walk_component(nd, path, last_name, nd->last_type, LOOKUP_FOLLOW)  
+   - follow_link(link, nd, cookie)
+   - walk_component(nd, path, last_name, nd->last_type, LOOKUP_FOLLOW)  
 
 	link_path_walk(name, nd)
-	-> 取出name中的路径片断  walk_component(nd, next, this, type, LOOKUP_FOLLOW)但判断剩下最后一点时,特殊处理
-	-> nsted_symlink(next, nd)
+   - 取出name中的路径片断  walk_component(nd, next, this, type, LOOKUP_FOLLOW)但判断剩下最后一点时,特殊处理
+   - nsted_symlink(next, nd)
 	把最后的一个片断给nameidata
 下面是创建/删除,查找，好复杂...,但上面真是没什么东西,所以还要看下面的实现.
