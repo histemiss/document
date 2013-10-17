@@ -83,11 +83,12 @@
 
 ** dentry_unlink_inode(dentry)
    - 和上面一样, 释放dentry->d_alias
-   - 如果dentry还在使用,无效ruc方式
+   - ruc的访问方式和seq_lock一块,无效这种访问方式
    > dentry_rcuwalk_barrier(dentry)
    - 释放inode计数 
    > dentry->d_op->d_iput(dentry, inode)
-   - 在d_delete中使用??
+   - 在d_delete中使用, 在删除inode时使用
+   - 变为negative的dentry
 
 ** dentry_lru_add(dentry)
    - 把dentry->d_lru放到super_block->s_dentry_lru队列中
@@ -100,8 +101,9 @@
    - 减小super_block->d_nr_dentry_unused
 
 ** dentry_lru_del(dentry)
-   - 使用dcache_lru_lock锁, 为何不用super_block的索？
+   - 使用dcache_lru_lock锁
    > __dentry_lru_del(dentry)
+   - dentry->d_lru不仅仅放到super_block中,还有用来收集需要释放的dentry
 
 ** dentry_lru_move_list(dentry, list_head)
    - list_head用来收集需要释放的dentry 
@@ -129,7 +131,7 @@
    > __hlist_bl_del(dentry->d_hash)
 
 ** __d_drop(dentry)
-   - 这里是释放hash表?? 
+   - 这里是释放hash表, 至少使dentry无法访问
    - 检查是否在hash表中
    > d_unhashed(dentry)
    > __d_shrink(dentry)
@@ -142,7 +144,7 @@
 ** dentry_kill(dentry, ref)
    - 释放dentry, 返回d_parent,可以回朔回收
    - 先找到父目录, 锁住inode->i_lock和parent->d_lock
-   - 如果ref有效, 减小dentry->d_count, 为了一致性?
+   - 如果ref有效, 减小dentry->d_count
    - 如果dentry->flags有DCACHE_OP_PRUNE
    - 通知文件系统dentry要释放
    > dentry->d_op->d_prune(dentry)
@@ -159,7 +161,7 @@
    - 如果dentry->flags有DCACHE_OP_DELETE,回调函数决定是否直接删除
    - 对于nfs来说,检查对应的inode是否有错误 nfs_dentry_delete
    > d_ops->d_delete(dentry)
-   - 如果不在hash表中, 直接释放??
+   - 如果不在hash表中, 直接释放
    > d_unhashed(dentry)
    - 否则不会释放,放到lru队列中,设置DCACHE_REFERENCED标志.
    > dentry_lru_add(dentry)
@@ -168,20 +170,21 @@
    > dentry_kill(dentry, 1)
 
 ** d_invalidate(dentry)
-   - 如果dentry不在hash表中,则不处理, 已经被释放??
+   - 如果dentry不在hash表中,则不处理, 已经无效
    - 如果dentry->d_subdirs不是空,有子dentry
    - 去遍历它的子树，收集没有使用的释放
    - shrink_dcache_parent(dentry) 
    - 如果dentry->d_count > 1, 而且inode有效, 而且是目录,返回-EBUSY
-   - 释放hash表关系, 表示不再vfs的树中,只是没有释放
+   - 释放hash表关系, 表示不在vfs的树中,只是没有释放
    > __d_drop(dentry) 
 
 ** 总结
    - 释放有很多种
    - 一种是放到lru队列中 dput
    - 一种是有条件的直接释放 kill
-   - 一种是释放hash表关系, invalidate
+   - 一种是释放hash表关系, invalidate/drop
    - 下面还有一种,释放整个super_block的dentry
+   - 如果没有关联inode,是negative, 而且没有使用者, 虽然在hash表里面
 
 ** __dget_dlock / __dget(dentry) 
    - 修改dentry->d_count
@@ -192,12 +195,10 @@
 
 ** __d_find_alias(inode, want_discon)
    - 找一个inode关联的dentry,增加计数
-   - 如果是目录节点,应该只有一个dentry, 否则可能有多个
-   - 如果是不再hash表中,应该是释放掉的, d_count=1, 而且没有子文件
-   - 也就是有DCACHE_DISCONNECTED?? 
-   - 如果want_discon=1, 必须找一个root,而且是DCACHE_DISCONNECTED的dentry????
    - 遍历inode->i_dentry链表中的dentry
-   - 找到和条件符合的
+   - 过滤掉不是文件夹也不在hash表中的, 那些是无效的
+   - 如果want_discon=1, 必须找一个root,而且是DCACHE_DISCONNECTED的dentry
+   - 否则必须找一个不是root, 而且不带DCACHE_DISCONNECTED的
    > __dget_dlock(dentry)
 
 ** d_find_alias(inode)
@@ -211,6 +212,9 @@
    > __dget_dlock(dentry)
    - 释放hash表关系
    > __d_drop(dentry)
+   - 再释放计数, 如果没有其他人使用,这时应该会释放
+   - 因为d_drop释放hash关系
+   > dput(dentry)
 
 ** try_prune_one_dentry(dentry) 
    - 这个dentry已经不再使用, 这是使用lru回收的
@@ -277,6 +281,10 @@
     -这里不会干扰上面的释放,因为不会增加计数
    - 遍历hash表上的dentry
    > shrink_dcache_for_umount_subtree(dentry)
+   - 在关闭super_block中调用
+   > kill_anon_super(super_block)
+   > generic_shutdown_super(super_block)
+   > shrink_dcache_for_umount(super_block)
 	
 ** try_to_ascend(old, locked, seq) 
    - 找dentry->d_parent 
@@ -319,6 +327,11 @@
    - 增加parent->d_count计数
    > __dget_dlock(parent)
    - 把dentry->d_u->d_child放到parent->d_subdirs链表中
+
+** d_alloc_pseudo(super_block, name)
+   - 创建一个dentry 
+   > __d_alloc(super_block, name)
+   - 设置dentry->d_flags的DCACHE_DISCONNECTED
    
 ** d_alloc_name(parent, name)
    - 上面的name都是qstr, 这里包装一下
@@ -335,7 +348,7 @@
 
 ** d_instantiate(dentry, inode) 
    - 有了inode的dentry就不是negative的dentry, 但dentry的计数还是不变
-   - 必须保证dentry在hash表中
+   - 必须保证dentry不在hash表中, 也就是无效的
    > hlist_unhashed(dentry->d_alias)
    > __d_instantiate(dentry, inode)
 
@@ -499,8 +512,11 @@
    > _d_rehash(dentry) 
 
 
-namei.c
-看一下dcache中树的查找,kernel提供两种,一种使用rcu/seqcount,另一种是refcount,第二种更安全一些,因为它在查找时增加dentry的计数.
+** 总结
+   dcache->flags的DCACHE_DISCONNECTED到底是什么时候使用??
+
+* namei.c
+  - dcache中树的查找,kernel提供两种,一种使用rcu/seqcount,另一种是refcount,第二种更安全一些,因为它在查找时增加dentry的计数.
 nameidata :
 	path 包含vfsmount, dentry
 	qstr last
