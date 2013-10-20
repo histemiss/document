@@ -1,12 +1,79 @@
-(kernel/workqueue.c)
-刚才看了workqueue.txt，发现标志特别多，但不是很复杂，目前还不清楚workqueue和work的实现形式. 对其他模块的应用者,只需两个数据结构work_struct/delayed_work和workqueue_struct,但workqueue_struct在c文件中定义,在其他文件中无法访问它的成员变量,只能把它当作一个(void *)类型使用,创建/释放都使用这里提供的接口.
+* kernel/workqueue.c
 
-1 数据结构
-    work_struct  这两个数据结构在这里基本上没用,因为比较简单.
-        * data      这个应该是标志使用的变量
-        * list_head entry
-        * work_func_t func  void func(work_struct) 这个函数的参数是work_struct,它一般内嵌在其他数据类型中.
-        data包含的数据包括color,标志
+** work_struct flags
+   #+begin_src 
+	WORK_STRUCT_PENDING_BIT	= 0,	/* work item is pending execution */
+	WORK_STRUCT_DELAYED_BIT	= 1,	/* work item is delayed */
+	WORK_STRUCT_PWQ_BIT	= 2,	/* data points to pwq */
+	WORK_STRUCT_LINKED_BIT	= 3,	/* next work is linked to this one */
+	WORK_STRUCT_COLOR_SHIFT	= 4,	/* color for workqueue flushing */
+
+	WORK_STRUCT_COLOR_BITS	= 4,
+
+	WORK_STRUCT_PENDING	= 1 << WORK_STRUCT_PENDING_BIT,
+	WORK_STRUCT_DELAYED	= 1 << WORK_STRUCT_DELAYED_BIT,
+	WORK_STRUCT_PWQ		= 1 << WORK_STRUCT_PWQ_BIT,
+	WORK_STRUCT_LINKED	= 1 << WORK_STRUCT_LINKED_BIT,
+#ifdef CONFIG_DEBUG_OBJECTS_WORK
+	WORK_STRUCT_STATIC	= 1 << WORK_STRUCT_STATIC_BIT,
+#else
+	WORK_STRUCT_STATIC	= 0,
+#endif
+
+	/*
+	 * The last color is no color used for works which don't
+	 * participate in workqueue flushing.
+	 */
+	WORK_NR_COLORS		= (1 << WORK_STRUCT_COLOR_BITS) - 1,
+	WORK_NO_COLOR		= WORK_NR_COLORS,
+
+	/* special cpu IDs */
+	WORK_CPU_UNBOUND	= NR_CPUS,
+	WORK_CPU_END		= NR_CPUS + 1,
+
+	/*
+	 * Reserve 7 bits off of pwq pointer w/ debugobjects turned off.
+	 * This makes pwqs aligned to 256 bytes and allows 15 workqueue
+	 * flush colors.
+	 */
+	WORK_STRUCT_FLAG_BITS	= WORK_STRUCT_COLOR_SHIFT +
+				  WORK_STRUCT_COLOR_BITS,
+
+	/* data contains off-queue information when !WORK_STRUCT_PWQ */
+	WORK_OFFQ_FLAG_BASE	= WORK_STRUCT_COLOR_SHIFT,
+
+	WORK_OFFQ_CANCELING	= (1 << WORK_OFFQ_FLAG_BASE),
+
+	/*
+	 * When a work item is off queue, its high bits point to the last
+	 * pool it was on.  Cap at 31 bits and use the highest number to
+	 * indicate that no pool is associated.
+	 */
+	WORK_OFFQ_FLAG_BITS	= 1,
+	WORK_OFFQ_POOL_SHIFT	= WORK_OFFQ_FLAG_BASE + WORK_OFFQ_FLAG_BITS,
+	WORK_OFFQ_LEFT		= BITS_PER_LONG - WORK_OFFQ_POOL_SHIFT,
+	WORK_OFFQ_POOL_BITS	= WORK_OFFQ_LEFT <= 31 ? WORK_OFFQ_LEFT : 31,
+	WORK_OFFQ_POOL_NONE	= (1LU << WORK_OFFQ_POOL_BITS) - 1,
+
+	/* convenience constants */
+	WORK_STRUCT_FLAG_MASK	= (1UL << WORK_STRUCT_FLAG_BITS) - 1,
+	WORK_STRUCT_WQ_DATA_MASK = ~WORK_STRUCT_FLAG_MASK,
+	WORK_STRUCT_NO_POOL	= (unsigned long)WORK_OFFQ_POOL_NONE << WORK_OFFQ_POOL_SHIFT,
+
+	/* bit mask for work_busy() return values */
+	WORK_BUSY_PENDING	= 1 << 0,
+	WORK_BUSY_RUNNING	= 1 << 1,
+
+	/* maximum string length for set_worker_desc() */
+	WORKER_DESC_LEN		= 24,   
+   #+end_src
+
+** work_struct
+   #+begin_src 
+	atomic_long_t data;   //work_struct的属性
+	struct list_head entry;  
+	work_func_t func;   
+
             * WORK_STRUCT_PENDING_BIT   等待中
             * WORK_STRUCT_DELAYED_BIT   延时work_struct
             * WORK_STRUCT_CWQ_BIT       data包含cpu_workqueue_struct指针
@@ -15,25 +82,122 @@
             * WORK_STRUCT_COLOR_BITS    4 可以表示2^4种颜色
             * WORK_STRUCT_NO_CPU        再上面的位表示cpu
             * WORK_CPU_UNBOUND          no cpu和unbound不一样..
+   #+end_src
 
-    
-    delayed_work
-        * work_struct
-        * timer_list 这里应该使用一个插入队列的计时器回调函数
 
-    worker 这个代表一个内核线程
-        * union
-            list_head entry 
-            hlist_node hentry
-        * work_struct  current_work
-        * cpu_workqueue_struct current_cwq
-        * list_head scheduled 这个也是work_struct队列
-        * task_struct task
-        * global_cwq gcwq
-        * last_active (timestamp)
-        * flags
-        * id
-        * work_struct rebind_work
+** delayed_work 
+   #+begin_src 
+	struct work_struct work;
+	struct timer_list timer;
+
+	/* target workqueue and CPU ->timer uses to queue ->work */
+	struct workqueue_struct *wq;
+	int cpu;   
+   #+end_src
+
+** worker
+   #+begin_src 
+	/* on idle list while idle, on busy hash table while busy */
+	union {
+		struct list_head	entry;	/* L: while idle */
+		struct hlist_node	hentry;	/* L: while busy */
+	};
+
+	struct work_struct	*current_work;	/* L: work being processed */
+	work_func_t		current_func;	/* L: current_work's fn */
+	struct pool_workqueue	*current_pwq; /* L: current_work's pwq */
+	bool			desc_valid;	/* ->desc is valid */
+	struct list_head	scheduled;	/* L: scheduled works */
+
+	/* 64 bytes boundary on 64bit, 32 on 32bit */
+
+	struct task_struct	*task;		/* I: worker task */
+	struct worker_pool	*pool;		/* I: the associated pool */
+						/* L: for rescuers */
+
+	unsigned long		last_active;	/* L: last active timestamp */
+	unsigned int		flags;		/* X: flags */
+	int			id;		/* I: worker id */
+
+	/*
+	 * Opaque string set with work_set_desc().  Printed out with task
+	 * dump for debugging - WARN, BUG, panic or sysrq.
+	 */
+	char			desc[WORKER_DESC_LEN];
+
+	/* used only by rescuers to point to the target workqueue */
+	struct workqueue_struct	*rescue_wq;	/* I: the workqueue to rescue */   
+   #+end_src
+
+** worker_pool 
+   #+begin_src 
+	spinlock_t		lock;		/* the pool lock */
+	int			cpu;		/* I: the associated cpu */
+	int			node;		/* I: the associated node ID */
+	int			id;		/* I: pool ID */
+	unsigned int		flags;		/* X: flags */
+
+	struct list_head	worklist;	/* L: list of pending works */
+	int			nr_workers;	/* L: total number of workers */
+
+	/* nr_idle includes the ones off idle_list for rebinding */
+	int			nr_idle;	/* L: currently idle ones */
+
+	struct list_head	idle_list;	/* X: list of idle workers */
+	struct timer_list	idle_timer;	/* L: worker idle timeout */
+	struct timer_list	mayday_timer;	/* L: SOS timer for workers */
+
+	/* a workers is either on busy_hash or idle_list, or the manager */
+	DECLARE_HASHTABLE(busy_hash, BUSY_WORKER_HASH_ORDER);
+						/* L: hash of busy workers */
+
+	/* see manage_workers() for details on the two manager mutexes */
+	struct mutex		manager_arb;	/* manager arbitration */
+	struct mutex		manager_mutex;	/* manager exclusion */
+	struct idr		worker_idr;	/* MG: worker IDs and iteration */
+
+	struct workqueue_attrs	*attrs;		/* I: worker attributes */
+	struct hlist_node	hash_node;	/* PL: unbound_pool_hash node */
+	int			refcnt;		/* PL: refcnt for unbound pools */
+
+	/*
+	 * The current concurrency level.  As it's likely to be accessed
+	 * from other CPUs during try_to_wake_up(), put it in a separate
+	 * cacheline.
+	 */
+	atomic_t		nr_running ____cacheline_aligned_in_smp;
+
+	/*
+	 * Destruction of pool is sched-RCU protected to allow dereferences
+	 * from get_work_pool().
+	 */
+	struct rcu_head		rcu;   
+   #+end_src
+
+** pool_workqueue
+   #+begin_src 
+	struct worker_pool	*pool;		/* I: the associated pool */
+	struct workqueue_struct *wq;		/* I: the owning workqueue */
+	int			work_color;	/* L: current color */
+	int			flush_color;	/* L: flushing color */
+	int			refcnt;		/* L: reference count */
+	int			nr_in_flight[WORK_NR_COLORS];
+						/* L: nr of in_flight works */
+	int			nr_active;	/* L: nr of active works */
+	int			max_active;	/* L: max active works */
+	struct list_head	delayed_works;	/* L: delayed works */
+	struct list_head	pwqs_node;	/* WR: node on wq->pwqs */
+	struct list_head	mayday_node;	/* MD: node on wq->maydays */
+
+	/*
+	 * Release of unbound pwq is punted to system_wq.  See put_pwq()
+	 * and pwq_unbound_release_workfn() for details.  pool_workqueue
+	 * itself is also sched-RCU protected so that the first pwq can be
+	 * determined without grabbing wq->mutex.
+	 */
+	struct work_struct	unbound_release_work;
+	struct rcu_head		rcu;   
+   #+end_src
 
     global_cwq 全局的per-cpu workqueue
         * lock cpu flags
@@ -56,37 +220,75 @@
         * nr_active max_active
         * list_head delayed_works
 
-    wq_flusher
-        * list_head list
-        * flush_color
-        * completion
-    
-    workqueue_struct
-        * flags 
-        * cpu_workqueue_struct pcpu / signel 前一个是__percpu指针，后面是普通的
-        * list list of all workqueues
-        * mutex flush_mutex
-        * work_color / flush_color
-        * nr_cwqs_to_flush
-        * wq_flusher    first_flusher
-        * list_head flusher_queue / flusher_overflow
-        * mayday_mask_t mayday_mask
-        * worker rescuer
-        * nr_drainers saved_max_active
-        * name[]
-一个workqueue_struct使用若干个cpu_workqueue_struct(在多处理器中), 它也使用若干个worker. cpu_workqueue_struct有关联对应cpu上的global_cwq.
+** wq_flusher
+   #+begin_src 
+	struct list_head	list;		/* WQ: list of flushers */
+	int			flush_color;	/* WQ: flush color waiting for */
+	struct completion	done;		/* flush completion */   
+   #+end_src
 
-2. 全局变量
-    system_wq, system_long_wq, system_nrt_wq, system_unbound_wq, system_freezable_wq
-    workqueues 队列 管理所有的workqueue_struct
+** workqueue_struct
+   #+begin_src 
+	struct list_head	pwqs;		/* WR: all pwqs of this wq */
+	struct list_head	list;		/* PL: list of all workqueues */
 
-    per-cpu  global_cwq  => global_cwq  gcwq_nr_running 这个是percpu变量,管理对应cpu上的所有cpu_workqueue_struct, gcwq_nr_running是percpu的计数,累计什么东西?
-                            unbound_gobal_cwq unbound_gcwq_nr_running 这是不限制cpu的global_cwq,它管理的也是cpu_workqueue_struct?
+	struct mutex		mutex;		/* protects this wq */
+	int			work_color;	/* WQ: current work color */
+	int			flush_color;	/* WQ: current flush color */
+	atomic_t		nr_pwqs_to_flush; /* flush in progress */
+	struct wq_flusher	*first_flusher;	/* WQ: first flusher */
+	struct list_head	flusher_queue;	/* WQ: flush waiters */
+	struct list_head	flusher_overflow; /* WQ: flush overflow list */
+
+	struct list_head	maydays;	/* MD: pwqs requesting rescue */
+	struct worker		*rescuer;	/* I: rescue worker */
+
+	int			nr_drainers;	/* WQ: drain in progress */
+	int			saved_max_active; /* WQ: saved pwq max_active */
+
+	struct workqueue_attrs	*unbound_attrs;	/* WQ: only for unbound wqs */
+	struct pool_workqueue	*dfl_pwq;	/* WQ: only for unbound wqs */
+
+#ifdef CONFIG_SYSFS
+	struct wq_device	*wq_dev;	/* I: for sysfs interface */
+#endif
+#ifdef CONFIG_LOCKDEP
+	struct lockdep_map	lockdep_map;
+#endif
+	char			name[WQ_NAME_LEN]; /* I: workqueue name */
+
+	/* hot fields used during command issue, aligned to cacheline */
+	unsigned int		flags ____cacheline_aligned; /* WQ: WQ_* flags */
+	struct pool_workqueue __percpu *cpu_pwqs; /* I: per-cpu pwqs */
+	struct pool_workqueue __rcu *numa_pwq_tbl[]; /* FR: unbound pwqs indexed by node */   
+   #+end_src
 
 
-还没有搞清楚worker, global_cwq, workqueue, work_struct的关系.
 
-3. 操作
+   - 一个workqueue_struct使用若干个cpu_workqueue_struct(在多处理器中), 它也使用若干个worker. cpu_workqueue_struct有关联对应cpu上的global_cwq.
+
+** worker_pool_assign_id(worker_pool)
+   - 从worker_pool_idr中分配一个id, 索引worker_pool指针
+
+** unbound_pwq_by_node(workqueue_struct, node)
+   - node应该对应cpu
+   - 获取workqueue_struct->numa_pwq_tbl[node]
+   - 使用rcu保护,或者pwq_lock, workqueue_struct->mutex
+
+** work_color_to_flags(color)
+   - color是work_struct->data中的标志, 从WORK_STRUCT_COLOR_SHIFT开始
+   - 一共WORK_STRUCT_COLOR_BITS(4)位, 也就是有16种, 在flush中使用
+
+** get_work_color(work_struct)
+   - ( work_struct->data >> WORK_STRUCT_COLOR_SHIFT) & ((1<<WORK_STRUCT_COLOR_BITS)-1)
+
+** work_next_work(color)
+   - ( color + 1 ) % WORK_NR_COLORS, 不能超过15
+
+** set_work_data(work_struct, data, flags)
+   - 设置work_struct->data的标志位
+   - work_struct当前必须在等待? work_struct->data必须有WORK_STRUCT_PENDING_BIT
+
 global_cwq的获取函数
     a. __next_gcwq_cpu(cpu, cpumask, sw) / __next_wq_cpu(cpu, cpumask, workqueue_struct)
         检查sw标志,返回cpu+1或者WORK_CPU_NONE. 第二个是第一个函数的包装,sw标志使用workqueue_struct->flags & WQ_UNBOUND. workqueue_struct可以是WQ_UNBOUND? 它还有多个worker吗？
