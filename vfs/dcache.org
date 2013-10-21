@@ -516,114 +516,291 @@
    dcache->flags的DCACHE_DISCONNECTED到底是什么时候使用??
 
 * namei.c
-  - dcache中树的查找,kernel提供两种,一种使用rcu/seqcount,另一种是refcount,第二种更安全一些,因为它在查找时增加dentry的计数.
-nameidata :
-	path 包含vfsmount, dentry
-	qstr last
-	path root 这个应该是task_struct中的
-	inode   path->dentry->d_inode
-	flags : 
-		LOOKUP_FOLLOW(symlink)
-		LOOKUP_DIRECTORY  找一个directory
-		LOOKUP_AUTOMOUNT 不错在的目录?
-		LOOKUP_PARENT ??
-		LOOKUP_REVAL : 需要验证dcache中的目录信息
-		LOOKUP_RCU ??
-		LOOKUP_ROOT ??
-		LOOKUP_OPEN  打开目录?
-		LOOKUP_CREATE
-		LOOKUP_EXCL
-		LOOKUP_RENAME_TARGET ?? 
-		LOOKUP_JUMPED 在绝对路径跳转时,设置这个标志
-		LOOKUP_EMPTY
-	last_type
-	seq
-	depth, saved_names
-	open_intent: 
-		- flags
-		- create_mode
-		- file
+
+  - dcache中树的查找有两种
+  - 一种使用rcu/seqcount,另一种是refcount
+  - 第二种更安全一些,因为它在查找时增加dentry的计数.
+
+** path 
+   #+BEGIN_SRC 
+	struct vfsmount *mnt;
+	struct dentry *dentry;   
+   #+END_SRC
+
+** path_get(path)
+   > mntget(path->mnt)
+   > dget(path->dentry)
+
+** path_put(path)
+   > dput(path->dentry)
+   > mntput(path->mnt)
+
+** nameidata
+   #+BEGIN_SRC 
+	struct path	path;
+	struct qstr	last;
+	struct path	root;
+	struct inode	*inode; /* path.dentry.d_inode */
+	unsigned int	flags;
+	unsigned	seq;
+	int		last_type;
+	unsigned	depth;
+	char *saved_names[MAX_NESTED_LINKS + 1];   
+
+	enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT, LAST_BIND};
+
+	LOOKUP_FOLLOW(symlink)
+	LOOKUP_DIRECTORY  找一个directory
+	LOOKUP_AUTOMOUNT 不错在的目录?
+	LOOKUP_PARENT ??
+	LOOKUP_REVAL : 需要验证dcache中的目录信息
+	LOOKUP_RCU ??
+
+	LOOKUP_ROOT ??
+	LOOKUP_OPEN  打开目录?
+	LOOKUP_CREATE
+	LOOKUP_EXCL
+	LOOKUP_RENAME_TARGET ?? 
+	LOOKUP_JUMPED 在绝对路径跳转时,设置这个标志
+	LOOKUP_EMPTY
+
+   #+END_SRC
+
+** unlock_rcu_walk()
+   - 锁住vfsmount_lock, lock/global锁
+   > rcu_read_lock
+
+** unlock_rcu_walk()
+   > rcu_read_unlock()
+   > br_read_unlock(vfsmount_lock)
+
+** __d_rcu_to_refcount(dentry, seq)
+   - 如果seq == dentry->d_seq, 表示没有改变,可以使用
+   - 增加dentry->d_count
 
 ** unlazy_walk(nameidata, dentry)
-	在rcu-wale中使用, nameidata->flags必须带有LOOKUP_RCU. 这个函数的作用是从lazy(rcu)-walk变为ref-walk. 但dentry和nameidata什么关系.
-   - __d_rcu_to_refcount(dentry, seq) 比较seq和dentry->d_seq, 如果一样,增加dentry->d_count，否则返回失败.
-	nameidata中的path是父目录,增加path.dentry->d_count,如果dentry不为空，增加它的计数. 
-   - mntget(nd->path.mnt) 增加vfsmount的计数
+   - 从rcu-walk变为ref-walk
+   - dentry是nameidata->path->dentry的子dentry
+   - nameidata->flags必须有LOOKUP_RCU
+   - 检查nameidata->root, 如果nameidata->flags没有LOOKUP_ROOT 
+   - 则设置want_root = 1, 而且比较nameidata->root和current->fs, 如果不一致返回错误?
+   - 当前位置是nameidata->path下面, 它只想nameidata->inode
+   - 如果dentry == NULL, 表示没找到?
+   - 检查parent是否改变
+   - __d_rcu_to_refcount(dentry, seq) 
+   - 如果dentry有效
+   - 检查dentry->parent是否和nameidata->parent一致
+   - 检查dentry是否改变,增加dentry的计数
+   > __d_rcu_to_refcount(dentry, nameidata->seq)
+   - 如果没有改变,还要增加parent->d_count??
+   - 如果上面设置want_root =1, 增加naemidata->root计数
+   > path_get(nameidata->root)
+   - 最后增加vsfmount计数, 所以dentry和vfsmount的计数都增加了
+   > mntget(nameidata->path->mnt)
+   - 最后去掉LOOKUP_RCU
+   - 如果上面检查有错误,都返回-ECHILD
 
-** complete_walk(nameidata) 在rcu模式查找路径完成时的操作, 
-   - __d_rcu_to_refcount(dentry, seq) 如果失败,退出
-   - mntget(nameidata->path.mnt) 如果获取dentry的计数,也要增加它的计数
-   - d_revalidate(dentry, nameidata) 在支持revalidate操作和link搜索时使用
+** d_revalidate(dentry, flags)
+   - 检查是否有效?
+   > dentry->d_op->d_revalidate(dentry, flags)
+
+** complete_walk(nameidata) 
+   - 查找路径完成时的操作
+   - 如果是rcu-walk, 转变为ref-walk
+   - 如果nameidata->flags没有LOOKUP_ROOT, 设置nameidata->root->mnt = NULL?? 
+   - 检查当前目录的有效性 nameidata->path->dentry
+   > __d_rcu_to_refcount(dentry, nameidata->seq)
+   - 如果返回错误,说明有路径变化,返回-ECHILD
+   - 否则继续,增加nameidata->path->mnt计数, 又和dentry一致
+   - mntget(nameidata->path.mnt)
+   - 如果nameidata->flags没有LOOKUP_JUMPTED?? 可以返回?
+   - 最后验证, 为何不用d_revalidate?
+   - 只有nfs使用它?
+   > d_op->d_weak_revalidate(dentry, namiedata->flags)
+
+** set_root(nameidata)
+   - 如果nameidata->root->mnt == NULL??
+   - 设置nameidata->root = current->fs->root
+   - 同时增加path的计数
+
+** set_root_rcu(namiedata)
+   - rcu-walk方式，设置nameidata->root
+   - nameidata->root = current->fs->root
+   - nameidata->seq = nameidata->root->dentry->d_seq
+   - 并没有增加计数
 
 ** __vfs_follow_link(nameidata, link_name)
-	如果link_name是绝对路径(以"/"开头), 则更换nameidata->path/root为current->fs->root,并设置LOOKUP_JUMPED
+   - 如果link_name是绝对路径(以"/"开头), 重新设置nameidata 
+   - 使用ref-walk方式?
+   > set_root(nameidata)
+   - 当前路径改为root, nameidata->path = nameidata->root
+   - 增加计数, 设置LOOKUP_JUMPTED
    - path_get(nd->path)
-   - link_path_walk(link, nd)
+   - 设置nameidata->inode = nameidata->path->dentry->inode
+   - 开始查找
+   > link_path_walk(link, nd)
 
-	follow_link(path, nameidata, p) 处理符号文件, path应该是只想一个link文件,而nameidata是它的父目录?
-   - dentry->d_inode->i_op->follow_link(dentry, nameidata) 获取dentry的链接内容.
-   - __vfs_follow_link(nameidata, string) 没人管link
+** path_put_conditional(path, nameidata)
+   - 释放path的计数
+   > dput(path->dentry)
+   - vfsmount只有和当前的不一样时,才释放, path->mnt != nameidata->path->mnt
+   > mntput(path->mnt)
+   
+** path_to_nameidata(path, nameidata)
+   - 修改nameidata的当前目录??
+   - 如果不是rcu-walk, 还要释放已有的计数
+   > dput(nameidata->path->dentry)
+   - 如果nameidata和path->mnt相同,不用释放
+   > mntput(nameidata->path->mnt)
+   - 但不会增加参数path的计数,rcu-walk和ref-walk都可使用
+   - ref-walk需要在外部增加
 
-** follow_up_rcu(path) 使用rcu保护的路径向上走,这里要跨越mount,要是不跨越就直接parent
+** nd_jump_link(nameidata, path)
+   - 直接设置nameidata的当前目录, 应该是ref-walk方式
+   > path_put(nameidata->path)
+   - 设置nameidata->path/inode,还有LOOKUP_JUMPED
+
+** put_link(nameidata, path, cookie)
+   - cookie里面时symlink的路径,释放它 
+   > inode->i_op->put_link(dentry, nameidata, cookie)
+   - 释放path计数
+   > path_put(link)
+
+** may_follow_link(path, nameidata)
+   - path指向symlink文件,检查是否可以展开?
+   - 如果有问题,返回-EACCESS
+
+** safe_hardlink_source(inode)
+   - link操作时的检查
+
+** may_linkat(path)
+   - 在linkat的syscall中,检查是否满足条件
+   - 这里在内存在已经关联?
+   - 文件是path->dentry->d_inode, 位置就是dentry
+
+** follow_link(path link, nameidata, p)
+   - 展开symlink, 必须是ref-walk方式查找
+   - link和nameidata->path什么关系?  
+   - link应该是当前目录下的一个文件
+   - 使用i_ops, 获取symlink文件的路径
+   - 把它放到nameidata->saved_names[depth]中
+   > dentry->d_inode->i_op->follow_link(dentry, nameidata)
+   - 开始遍历展开
+   > __vfs_follow_link(nameidata, string)
+
+** follow_up_rcu(path) 
+   - 使用rcu保护的路径向上走,跨越mount
    - 如果path->mnt没有父mount,则返回0
    - 更换path = {path->mnt=>mnt_parent->mnt_mountpoint, path->mnt=>mnt_parent->mnt}
 
-	follow_up(path) 使用refcount方式的向上路径
-	和上面一样,但要释放老的paht,增加新path的计数
-   - mntget / mntput 
-   - dget / dput
-** follow_automount(path, flags, need_mntput) 这个还不清除做什么
-   - path->dentry->d_op->d_automount(path) 这个返回一个vfsmount
-   - finish_automount(mnt, path) 实现挂载功能
-   - path_put / dget 切换path
+** follow_up(path)
+   - ref-walk方式的向上查找
+   - 同样跨越mount
+   - 使用mnt->mnt_mountpoint, mnt_parent->mnt
+   - 同时增加新的计数,释放老的计数
 
-** follow_managed(path, flags) DCACHE_NEED_AUTOMOUNT, DCACHE_MANAGE_TRANSIT这两个标志都是autofs使用
-   - d_op->d_manage(path->dentry, false) DCACHE_MANAGE_TRANSIT
-   - follow_automount(path, flags, need_mntput) DCACHE_NEED_AUTOMOUNT
-   - DCACHE_MOUNTED path是一个mountpoint,切换到mount的根,这里来看应该算是一个向下的搜索
+** follow_automount(path, flags, need_mntput)
+   - 检查是否要去mount 
+   - flags中没有LOOKUP_PARENT/LOOKUP_DIRECTORY/LOOKUP_OPEN/LOOKUP_CREAT/LOOKUP_AUTOMOUNT, 而且dentry->inode有效,不再mount
+   - 根据注释,这是statde操作
+   - 获取vfsmount
+   > path->dentry->d_op->d_automount(path)
+   - 挂在到dentry上面
+   > finish_automount(mnt, path) 
+   - 切换path, 指向新的vfs的根dentry
 
-	follow_down_one(path) 和上面DCACHE_MOUNTED一样
+** follow_managed(path, flags) 
+   - 处理特殊的dentry 
+   - dentry->d_flags包括DCACHE_MOUNTED, DCACHE_NEED_AUTOMOUNT, DCACHE_MANAGE_TRANSIT
+   - 对于DCACHE_MANAGE_TRANSIT
+   - d_op->d_manage(path->dentry, false) 
+   - 对于DCACHE_MOUNTED, 表示它是mountpoint,需要跨越vfs
+   - 先找到mountpoint的vfsmount
+   > lookup_mnt(path)
+   - 更新path指向的dentry/vfsmount
+   - 对于DCACHE_NEED_AUTOMOUNT,里面回更新path
+   - follow_automount(path, flags, need_mntput) 
+   - 这里返回是否需要释放path原来的vfsmount的计数???
 
-	__follow_mount_rcu(nameidata, path, inode) 这里还是和上面一样,但是没有nd的具体操作
-		-> d_op->d_manage(path->dentry)
-		-> d_mountpoint(path->dentry) 如果不是mountpoint,退出
-		-> __lookup_mnt(path->mnt, dentry, 1) 切换path,但没有计数的修改,这是rcu操作
+** follow_down_one(path)
+   - 向下查找，跨越mountpoint
+   > lookup_mnt(path)
+   - 更新path, 同时修改计数
 
-	follow_mount_rcu(nameidata) 切换nameidata->path, 这个只是简单的判断是否是挂载点. rcu操作需要不断的检查seq.
+** managed_dentry_might_block(dentry)
+   - 执行DCACHE_MANAGE_TRANSIT对应的操作
+   > d_op->d_manage(dentry, true)
 
-** follow_down(path)  这个函数和follow_managed类似,但这里不会处理DCACHE_NEED_AUTOMOUNT,nfsd使用它.
+** __follow_mount_rcu(nameidata, path, inode)
+   - rcu的方式向下查找, 用来跨越mountpoint
+   - 循环查找mountpoint 
+   - 首先检查d_manage, 只有autofs使用, 而且不允许rcu-walk
+   > managed_dentry_might_block(dentry)
+   - 如果是autofs,直接返回false
+   - 查找vfsmount 
+   > __lookup_mnt(path->mnt, path->dentry, 1)
+   - 切换path, 没有计数操作
+   - 添加nameidata->flags的LOOKUP_JUMPED
+   - 设置nameidata->seq = path->dentry->d_seq
+
+** follow_mount_rcu(nameidata)
+   - 不考虑d_manage的扩展
+   - 循环查找nameidata->path的mountpoint, 直接修改当前路径?
+   > __lookup_mnt(nameidata->path->mnt
+   - 更新path/seq
+
+** follow_dotdot_rcu(nameidata)
+   - 这里是循环处理,跳过mountpoint
+   - 如果nameidata->path和nameidata->root一样，直接退出
+   - 如果nameidata->path->dentry不是path->vfsmount->mnt_root,可以向上查找
+   - 首先检查nameidata->seq和path->dentry->s_seq, 如果不一致返回-ECHILD
+   - 直接更新nameidata->path->dentry, seq, 这两个必须是一致的
+   - 然后直接退出
+   - 否则它需要向上跨越mountpoint
+   > follow_up_rcu(nameidata->path)
+   - 然后检查新的dentry是否被别人mount??
+   > follow_mount_rcu(nameidata)
+
+   - 基本上是先向上查找
+   - 遇到nameidata->root退出
+   - 遇到vfsmount->root,向上跳过vfsmount, 而且继续.
+   - 否则向上d_parent, 然后退出
+   - 退出之后检查是否是mountpoint
+
+** follow_down(path)  
+   - 这个函数和follow_managed类似,但这里不会处理DCACHE_NEED_AUTOMOUNT,nfsd使用它.
 
 ** d_alloc_and_lookup(dentry parent, qstr name, nameidata)
    - d_alloc(parent, name)
    - i_op->lookup(parent->d_inode, dentry, nd) 这里重新查找，里面有应该d_instantiate之类的复杂操作, 如果返回的有效,就需要释放它. cifs里面使用d_add，而且直接打开路径,但对于localfs,则需要读回目录下的内容.
 
-	d_inode_lookup(dentry parent, dentry, nameidata) 在parent下面为dentry找合适的inode
+   - d_inode_lookup(dentry parent, dentry, nameidata) 在parent下面为dentry找合适的inode
    - i_op->lookup(inode, dentry, nd)
 
 ** do_lookup(nameidata, qstr, path, inode)
-	如果nameidata->flags带LOOKU_RCU,使用rcu模式查找
-		-> __d_lookup_rcu(parent, name, seq,inode) 这是dcache中的实现,查找parent下面的dentry, 如果找不到,跳到计数模式
-		-> d_revalidate
-		-> d_nned_lookup(dentry) 跳到计数模式	
-		-> __follow_mount_rcu(nd, path, inode) 处理mountpoing或autofs的东西
-	找到ref-walk -> unlazy_walk(nd, dentry)
-	如果不是rcu模式	-> __d_lookup(parent, name) 这个也是dcache的实现
-	如果没找到dentry, 则再找一遍,或分配一个新的
+   - 如果nameidata->flags带LOOKU_RCU,使用rcu模式查找
+   - 	-> __d_lookup_rcu(parent, name, seq,inode) 这是dcache中的实现,查找parent下面的dentry, 如果找不到,跳到计数模式
+   - 	-> d_revalidate
+   - 	-> d_nned_lookup(dentry) 跳到计数模式	
+   - 	-> __follow_mount_rcu(nd, path, inode) 处理mountpoing或autofs的东西
+   - 找到ref-walk -> unlazy_walk(nd, dentry)
+   - 如果不是rcu模式	-> __d_lookup(parent, name) 这个也是dcache的实现
+   - 如果没找到dentry, 则再找一遍,或分配一个新的
    - d_lookup(parent, name)
    - d_alloc_and_lookup(parent, name, nd)
    - d_inode_lookup(parent, dentry, nd) 找inode
    - follow_managed(path, nd->flags)
 
-	walk_component(nameidata, path, qstr, type, follow)
+   - walk_component(nameidata, path, qstr, type, follow)
    - do_lookup(nd, name, path, inode) 如果返回的inode无效,则搜索失败, 把返回的path,inode给nameidata
 
 处理符号链接
-	nested_symlink(path, nameidata) 循环使用下面的函数,知道错误退出?
+   - nested_symlink(path, nameidata) 循环使用下面的函数,知道错误退出?
    - follow_link(link, nd, cookie)
    - walk_component(nd, path, last_name, nd->last_type, LOOKUP_FOLLOW)  
 
-	link_path_walk(name, nd)
+   - link_path_walk(name, nd)
    - 取出name中的路径片断  walk_component(nd, next, this, type, LOOKUP_FOLLOW)但判断剩下最后一点时,特殊处理
    - nsted_symlink(next, nd)
-	把最后的一个片断给nameidata
+   - 把最后的一个片断给nameidata
 下面是创建/删除,查找，好复杂...,但上面真是没什么东西,所以还要看下面的实现.
