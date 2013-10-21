@@ -452,7 +452,7 @@
    - nfs4_layoutget_res->pattern_offset < pnfs_layout_segment->offset, pattern_offset是segment覆盖的范围
    - stripe_unit 是 PAGE_SIZE倍数
    - 查找缓存的nfs4_deviceid_node, 是否有对应nfs4_deviceid的
-   > nfs4_find_get_deviceid(pnfs_layoutdriver_hdr, nfs_client, nfs4_deviceid)
+   > nfs4_find_get_deviceid(pnfs_layoutdriver_type, nfs_client, nfs4_deviceid)
    - 如果没有, 需要获取deviceinfo, nfs4_file_layout_dsaddr
    > filelayout_get_device_info(pnfs_layout_hdr->inode, nfs4_deviceid, rpc_cred, gfp_flags)
    - 检查nfs4_deviceid_node是否不可使用
@@ -508,44 +508,6 @@
    - 然后是nfl_first_stripe_index / pattern_offset
    - 然后是nfs_fh数组
 
-** pnfs_commit_bucket
-   #+BEGIN_SRC 
-	struct list_head written;
-	struct list_head committing;
-	struct pnfs_layout_segment *wlseg;
-	struct pnfs_layout_segment *clseg;   
-   #+END_SRC
-
-** pnfs_ds_commit_info
-   #+BEGIN_SRC 
-	int nwritten;
-	int ncommitting;
-	int nbuckets;
-	struct pnfs_commit_bucket *buckets;   
-   #+END_SRC
-
-** nfs4_filelayout
-   #+BEGIN_SRC 
-	struct pnfs_layout_hdr generic_hdr;
-	struct pnfs_ds_commit_info commit_info;   
-   #+END_SRC
-
-** nfs_mds_commit_info 
-   #+BEGIN_SRC 
-	atomic_t rpcs_out;
-	unsigned long		ncommit;
-	struct list_head	list;   
-   #+END_SRC
-
-** nfs_commit_info
-   #+BEGIN_SRC 
-	spinlock_t			*lock;
-	struct nfs_mds_commit_info	*mds;
-	struct pnfs_ds_commit_info	*ds;
-	struct nfs_direct_req		*dreq;	/* O_DIRECT request */
-	const struct nfs_commit_completion_ops *completion_ops;   
-   #+END_SRC
-
 ** filelayout_free_lseg(pnfs_layout_segment)
    - 释放pnfs_layout_segment
    - 如果iomode == IOMODE_RW, 需要释放commit数据？ 
@@ -553,9 +515,9 @@
    > _filelayout_free_lseg(nfs4_filelayout_segment)
 
 ** filelayout_alloc_commit_info(pnfs_layout_segment, nfs_commit_info, gfp_t)
-   - 在写操作时准备commit info, 
+   - 在写操作时准备pnfs_ds_commit_info
    - 如果nfs4_filelayout_segment->commit_through_mds !=0, commit发送给mds, 直接返回
-   - nfs_commit_info里面有nfs4_filelayout->pnfs_ds_commit_info, 这里就是初始化他们
+   - nfs_commit_info索隐nfs4_filelayout->pnfs_ds_commit_info, 这里就是初始化它
    - 如果nfs_commit_info->pnfs_ds_commit_info->nbuckets !=0, 直接退出, 已经有人使用它
    - 创建pnfs_commit_bucket数组
    - 如果nfs4_filelayout_segment->stripe_type == STRIPE_SPARSE, 每个nfs4_pnfs_ds使用一个, nfs4_file_layout_dsaddr->ds_num
@@ -706,14 +668,14 @@
    > nfs4_write_done(rpc_task, nfs_write_data)
    - 检查sequence, 释放nfs4_slot资源 
    > nfs4_sequence_done(rpc_task, nfs_write_data->nfs4_sequence_res)
-   - 如果在写的过程中,有恢复操作,需要重新发送写请求
+   - 如果在写的过程中,有state恢复操作, 原来使用的stateid无效,需要重新发送写请求
    > nfs4_write_stateid_changes(rpc_task, nfs_write_data->nfs_writeargs)
    - 回调nfs_write_data->write_done_cb 
    > filelayout_write_done_cb(rpc_task, nfs_write_data)
    - 检查write返回的结果
    - 记录commit信息
    > filelayout_set_layoutcommit(nfs_write_data)
-   - 最后检查write的generic的结构, 如果没有同步,还需要重新发送
+   - 最后检查write的generic的结果, 如果没有同步写回,还需要重新发送
 
    - rpc_release = filelayout_write_release(rpc_task, nfs_write_data)
    - 检查是否要释放layout 
@@ -731,7 +693,8 @@
    - 如果是NFS_DATA_SYNC,而且没有使用pnfs, 就不用commit
    - 如果是NFS_FILE_SYNC,不需要commit
    - 设置nfs_pgio_header->verf = nfs_write_data->verf
-   - 还有nfs_pgio_heaer->flags的NFS_IOHDR_NEED_COMMIT
+   - 还有nfs_pgio_heaer->flags的NFS_IOHDR_NEED_COMMIT 
+   - 而且下面不再释放nfs_page
    - 如果已经有了, 直接比较verf
    - 如果不一样,设置NFS_IOHDR_NEED_RESCHED, 这就是错误了??
    - 释放write使用的资源 
@@ -903,3 +866,245 @@
    - STRIPE_SPARSE和STRIPE_DENSE的区别
    - 前者使用stripe index索引ds index, 每个ds使用自己的nfs_fh
    - 后者stripe和ds对应, 都是用独自的nfs_fh
+
+** pnfs_commit_bucket
+   #+BEGIN_SRC 
+	struct list_head written;
+	struct list_head committing;
+	struct pnfs_layout_segment *wlseg;
+	struct pnfs_layout_segment *clseg;   
+   #+END_SRC
+
+** pnfs_ds_commit_info
+   #+BEGIN_SRC 
+	int nwritten;
+	int ncommitting;
+	int nbuckets;
+	struct pnfs_commit_bucket *buckets;   
+   #+END_SRC
+
+** nfs4_filelayout
+   #+BEGIN_SRC 
+	struct pnfs_layout_hdr generic_hdr;
+	struct pnfs_ds_commit_info commit_info;   
+   #+END_SRC
+
+** nfs_mds_commit_info 
+   #+BEGIN_SRC 
+	atomic_t rpcs_out;
+	unsigned long		ncommit;
+	struct list_head	list;   
+   #+END_SRC
+
+** nfs_commit_info
+   #+BEGIN_SRC 
+	spinlock_t			*lock;
+	struct nfs_mds_commit_info	*mds;
+	struct pnfs_ds_commit_info	*ds;
+	struct nfs_direct_req		*dreq;	/* O_DIRECT request */
+	const struct nfs_commit_completion_ops *completion_ops;   
+   #+END_SRC
+
+** 总结
+
+   - commit操作
+   - 在write的rpc完成后,设置需要commit的nfs_page 
+   > filelayout_set_layoutcommit(nfs_write_data)
+   - 如果nfs4_filelayout_segment->commit_through_mds !=0
+   - write返回的nfs_writeverf->nfs3_stable_how == NFS_FILE_SYNC, 不需要pnfs的commit操作
+  
+   - 设置nfs_inode->flags的NFS_INO_LAYOUTCOMMIT
+   - 设置pnfs_layout_segment->pls_flags的NFS_LSEG_LAYOUTCOMMIT
+   - 更新pnfs_layout_hdr->plh_lwb = nfs_write_data->mds_offset = nfs_writeres->count
+   - 设置inode 
+   > mark_inode_dirty_sync(inode)
+
+   - 在释放nfs_pgio_header时,如果nfs_page的数据需要commit, 暂时不会释放它
+   > nfs_mark_request_commit(nfs_page, pnfs_layout_segment, nfs_commit_info)
+   - 首先把它放到pnfs的commit管理中
+   > pnfs_layoutdriver_type->mark_request_commit()
+   > filelayout_mark_request_commit(nfs_page, pnfs_layout_segment, nfs_commit_info)
+   - 需要把它放到ds专门的链表中
+   - 选择合适的链表
+   > filelayout_choose_commit_list(nfs_page, pnfs_layout_segment, nfs_commit_info)
+   - 如果nfs4_filelayout_segment->commit_through_mds !=0
+   - 直接返回nfs_commit_info->nfs_mds_commit_info->list
+   - 使用一个mds的队列
+   - 否则根据IO的位置,选择一个合适的pnfs_commit_bucket
+   - 计算stripe偏移
+   > nfs4_fl_calc_j_index(pnfs_layout_segment, offset)
+   - 计算ds的索引
+   > select_bucket_index(nfs4_filelayout_segment, j)
+   - 使用nfs_commit_info->pnfs_ds_commit_info->buckets[i]->written队列
+   - 设置nfs_page->wb_flags的PG_COMMIT_TO_DS标志
+   - 增加pnfs_ds_commit_info->nwritten
+
+   - 找到list_head, 把nfs_page放到队列中
+   > nfs_request_add_commit_list(nfs_page, list_head, nfs_commit_info)
+   - 设置nfs_page->wb_flags的PG_CLEAN?
+   > nfs_list_add_request(nfs_page, list_head)
+   - 增加nfs_commit_info->nfs_mds_commit_info->ncommit
+   - 更新inode 
+   > __mark_inode_dirty(inode, I_DIRTY_DATASYNC)
+
+
+   - nfs_commit_info/pnfs_ds_commit_info的创建
+   - nfs_commit_info就是一个指针的集和,用来传递参数
+   > nfs_init_cinfo(nfs_commit_info, inode, nfs_direct_req)
+   > nfs_init_cinfo_from_inode(nfs_commit_info, inode)
+   - nfs_mds_commit_info使用nfs_inode->commit_info
+   - nfs_pgio_header使用nfs_commit_completion_ops
+   - pnfs_ds_commit_info有点特殊 
+   > pnfs_get_ds_info(inode)
+   - 一个inode只使用一个pnfs_layout_segment, 而且它嵌在nfs4_filelayout中
+   > pnfs_layoutdriver_type->get_ds_info(inode)
+   - filelayout_get_ds_info(inode)
+   > nfs4_filelayout->pnfs_ds_commit_info
+
+
+   - 在初始化nfs_pageio_descriptor中, 获取pnfs_layout_segment, 就可以创建对应的pnfs_ds_commit_info 
+   > filelayout_alloc_commit_info(pnfs_layout_segment, nfs_commit_info, GFP_NOFS)
+
+
+   - 触发commit操作
+   > nfs_commit_inode(inode, how)
+   - 设置nfs_inode->flags的NFS_INO_COMMIT,表示开始commit
+   > nfs_commit_set_lock(nfs_inode, may_wait)
+   - 如果已经设置,而且how没有FLUSH_SYNC, 直接返回
+   - 否则等待这个标志
+   > out_of_line_wait_on_bit_lock(nfs_inode->flags, NFS_INO_COMMIT, nfs_wait_bit_killable, TASK_KILLABLE)
+   
+   - 收集nfs_commit_info 
+   > nfs_init_cinfo_from_inode(nfs_commit_info, inode)
+   - 收集nfs_page
+   > nfs_scan_commit_inode, list_head, nfs_commit_info)
+   - nfs_commit_info->nfs_mds_commit_info->ncommit表示需要commit的nfs_page数量
+   - 首先处理nfs_mds_commit_info 
+   > nfs_scan_commit_list(nfs_mds_commit_info->list, list_head, nfs_commit_info, max)
+   - 移动链表 
+   > nfs_request_remove_commit_list(nfs_page, nfs_commit_info)
+   - nfs_page->wb_flags必须没有PG_CLEAN,否则需要写回数据
+   - 减小nfs_mds_commit_info->ncommit
+   > nfs_list_add_request(nfs_page, list_head)
+
+   - 然后处理pnfs_ds_commit_info 
+   > pnfs_scan_commit_lists(inode, nfs_commit_info, max-ret)
+   - pnfs_layoutdriver_type->scan_commit_lists(nfs_commit_info, max)
+   > filelayout_scan_commit_lists(nfs_commit_info, max)
+   - 遍历pnfs_ds_commit_info的所有pnfs_commit_bucket
+   > filelayout_scan_ds_commit_list(pnfs_commit_bucket, nfs_commit_info, max)
+   - 转移nfs_page
+   - 里面并没有把nfs_page放到外部的list_head中
+   - 而是给pnfs_commit_bucket->committing链表
+   > transfer_commit_list(pnfs_commit_bucket->written, committing, nfs_commit_info, max)
+   - 修改pnfs_ds_commit->nwritten / ncommitting计数
+
+   - 收集完成后,开始提交nfs_page 
+   > nfs_generic_commit_list(inode, list_head, how, nfs_commit_info)
+
+   - 首先处理ds的list_head 
+   > pnfs_commit_list(inode, list_head, how, nfs_commit_info)
+   - pnfs_layoutdriver_type->commit_pagelist(inode, list_head, how, nfs_commit_info)
+   > filelayout_commit_pagelist(inode, list_head, how, nfs_commit_info)
+   - 这里把mds的链表也传进来,所以它和ds的链表同样处理
+
+   - 对于mds,什么都不设置
+   - 构造nfs_commit_data
+   > nfs_commitdata_alloc()
+   - 对于ds, 遍历所有的pnfs_commit_bucket
+   > alloc_ds_commits(nfs_commit_info, list)
+   - 对于pnfs_commit_bucket->committing不为空的,才需要commit 
+   > nfs_commitdata_alloc()
+   - 设置nfs_commit_data->ds_commit_index, pnfs_layout_segment
+   - 现在得到一个队列的nfs_commit_data
+
+   - 遍历nfs_commit_data链表
+   - 对于mds, 应该使用普通的nfs操作
+   > nfs_init_commit(nfs_commit_data, mds_pages, NULL, nfs_commit_info)
+   - 发送rpc请求
+   > nfs_initiate_commit(nfs_client, nfs_commit_data, nfs_commit_data->mds_ops, how, 0)
+
+   - 对于ds, 初始化需要pnfs
+   > nfs_init_commit(nfs_commit_data, pnfs_commit_bucket[index]->committing, nfs_commit_data->pnfs_layout_segment, nfs_commit_info)
+   - 使用filelayout方式发送 
+   > filelayout_initiate_commit(nfs_commit_data, how)
+   - 获取对应的nfs4_pnfs_ds 
+   > nfs4_fl_prepare_ds(pfns_layout_segment, ds_idx)
+   - 设置nfs_commit_data->commit_done_cb = filelayout_commit_done_cb
+   - 计算nfs_fh 
+   > select_ds_fh_from_commit(pnfs_layout_segment, ds_commit_index)
+   - 发送rpc 
+   > nfs_initiate_commit(nfs4_pnfs_ds->nfs_client->rpc_clnt, nfs_commit_data, filelayout_commit_call_ops, how, RPC_TASK_SOFTCONN)
+   - 这里还有初始化操作 
+   > nfs_rpc_ops->commit_setup(nfs_commit_data, rpc_message)
+   - nfs4_proc_commit_setup(nfs_commit_data, rpc_message
+   - 设置rpc_message->rpc_proc = nfs4_procedures[NFS4PROC_CLNT_COMMIT]
+   - 初始化sequence参数
+   - 最后启动rpc 
+   > rpc_run_task(rpc_task_setup)
+   - 如果how包括FLUSH_SYNC, 需要等待rpc完成
+
+   - 上面有2套rpc_call_ops
+   - 一个是mds使用的
+   - nfs_commit_ops
+   - nfs_commit_preapre
+   - nfs_commit_done
+   - nfs_commit_release
+
+   - 首先是prepare 
+   > nfs_commit_prepare
+   - nfs_rpc_ops->commit_rpc_prepare(rpc_task, nfs_commit_data)
+   > nfs4_proc_commit_rpc_prepare(rpc_task, nfs_commit_data)
+   - 获取nfs4_slot资源
+
+   - nfs_commit_done(rpc_task, nfs_commit_data)
+   > nfs_rpc_ops->commit_done(rpc_task, nfs_commit_data)
+   > nfs4_commit_done(rpc_task, nfs_commit_data)
+   - 处理sequence, 释放nfs4_slot
+   - nfs_commit_data->commit_done_cb(rpc_task, nfs_commit_data)
+   > nfs_commit_done_cb(rpc_task, nfs_commit_data)
+   - 处理rpc的错误, 可能重新写nfs_page,也可能重新启动rpc 
+
+   > nfs_commit_release(rpc_task, nfs_commit_done)
+   - 直接处理回调
+   - 这是从nfs_commit_info中传递过来
+   - 在创建nfs_commit_data时设置
+   - nfs_commit_completion_ops->completion(nfs_commit_data)
+   > nfs_commit_release_pages(nfs_commit_data)
+   - 遍历nfs_commit_data->pages中的nfs_page 
+   - 从链表中释放
+   > nfs_list_remove_request(nfs_page)
+   - bdi的统计信息
+   > nfs_clear_page_commit(nfs_page->wb_page)
+   - 如果status < 0, 设置nfs_open_context的错误
+   - 这是严重错误?
+   > nfs_inode_remove_request(nfs_page)
+   - 然后比较nfs_writeverf
+   - 如果一样,可以释放nfs_page
+   - 否则设置nfs_page->page的PG_dirty
+   - nfs_open_context->flags的NFS_CONTEXT_RESEND_WRITES, 谁使用它?
+   - 然后减小nfs_commit_info->nfs_mds_commit_info->rpcs_out
+   - 它表示处理中的nfs_commit_data的数量 
+   - 如果减为0, 释放nfs_inode->flags的标志 NFS_INO_COMMIT
+   > nfs_commit_clear_lock(nfs_inode)
+   - 最后释放nfs_commit_data
+   > nfs_commitdata_release(nfs_commit_data)
+   
+
+   - 对于filelayout来说
+   - filelayout_commit_call_ops
+   - filelayout_commit_prepare(rpc_task, nfs_commit_data)
+   > 分配nfs4_slot资源
+
+   - filelayout_write_commit_done(rpc_task, nfs_commit_data)
+   > nfs_commit_data->mds_ops->rpc_call_done(rpc_task, nfs_data)
+   - 和上面的一样,但使用的nfs_commit_data->commit_done_cb是filelayout_commit_done_cb
+
+   - filelayout_commit_release(rpc_task, nfs_commit_data)
+   - 调用普通的回调函数 
+   > nfs_commit_data->nfs_commit_completion_ops->completion(nfs_commit_data)
+   - 释放pnfs_layout_segment计数
+   > pnfs_put_lseg(nfs_commit_data->pnfs_layout_segment)
+   - 释放nfs_commit_data 
+   > nfs_commitdata_release(nfs_commit_data)
+   > nfs_commmit_free(nfs_commit_data)
