@@ -735,6 +735,20 @@
    - 然后是普通的释放内存
    - nfs_writehdr_free(nfs_pgio_header)
 
+   - write的方式 how:
+   - FLUSH_STABLE, FLUSH_COND_STABLE决定rpc参数nfs_writeargs->stable
+   - FLUSH_SYNC表示是否等待结果
+   - FLUSH_LOWPRI对应RPC_PRIORITY_LOW, FLUSH_HIGHPRIO对应RPC_PRIORITY_HIGH
+   - nfs_pageio_descriptor->pg_ioflags决定这些
+   - 根据writeback_control决定pg_ioflags
+   > wb_priority(writeback_control)
+   - 如果是for_reclaim, 使用FLUSH_HIGHPRI|FLUSH_STABLE
+   - 如果是update/background, 使用FLUSH_LOWPRI|FLUSH_COND_STABLE
+
+   - 普通情况是FLUSH_COND_STABLE
+   - 对于FLUSH_COND_STABLE, 只有nfs_mds_commit_info中有nfs_page时才使用
+   - 如果一开始就是FILE_SYNC, 也就不可能有commit状态的nfs_page, 所以会一直没有!
+     
 ** select_bucket_index(nfs4_filelayout_segment, j)
    - 获取nfs4_file_layout_dsaddr中nfs4_pnfs_ds的索引
    - 在nfs4_filelayout_segment->stripe_type是STRIPE_SPARSE时, 它是stripe计数 
@@ -1108,3 +1122,66 @@
    - 释放nfs_commit_data 
    > nfs_commitdata_release(nfs_commit_data)
    > nfs_commmit_free(nfs_commit_data)
+
+** nfs4_layoutcommit_data
+   #+BEGIN_SRC 
+	struct rpc_task task;
+	struct nfs_fattr fattr;
+	struct list_head lseg_list;
+	struct rpc_cred *cred;
+	struct nfs4_layoutcommit_args args;
+	struct nfs4_layoutcommit_res res;   
+   #+END_SRC
+
+** 总结
+
+   - nfs_inode的layoutcommit, 它是发给mds的请求? 
+
+   - 在write的回调中设置inode的commit标志
+   > filelayout_write_done_cb(rpc_task, nfs_write_data)
+   - 如果需要更新, 在nfs_inode/pnfs_layout_segment中标注
+   > filelayout_set_layoutcommit(nfs_write_data)
+   > pnfs_set_layoutcommit(nfs_write_data)
+   - 设置nfs_inode->flags的NFS_INO_LAYOUTCOMMIT
+
+
+   - 在提交inode时使用layoutcommit处理ds的数据
+   - 在sync文件时使用
+
+   > pnfs_layoutcommit_inode(inode, sync)
+   - nfs_inode->flags的NFS_INO_LAYOUTCOMMIT标志表示需要发送layoutcommit请求
+   - 创建nfs4_layoutcommit_data
+   - 设置nfs_inode->flags的NFS_INO_LAYOUTCOMMITTING标志,开始commit
+   - 如果sync!=0, 而且别人已经设置它,就先等待完成 
+   > wait_on_bit_lock(nfs_inode->flags, NFS_INO_LAYOUTCOMMITTING, nfs_wait_bit_killable, TASK_KILLABLE)
+   - 如果可以继续, 先去掉nfs_inode->NFS_INO_LAYOUTCOMMIT标志
+   - 收集需要commit的pnfs_layout_segment
+   - 根据pnfs_layout_segment->pls_flags的NFS_LSEG_LAYOUTCOMMIT标志
+   - 收集起来后,也去掉NFS_LSEG_LAYOUTCOMMIT标志
+   > pnfs_list_write_lseg(inode, nfs4_layoutcommit_data->lseg_list)
+   - nfs4_layoutcommit_args->lastbywritten = pnfs_layout_hdr->plh_lwb, 表示写的范围
+   - nfs4_layoutcommit_res->nfs_server = nfs_inode->nfs_server, 这是mds 
+   > nfs4_proc_layoutcommit(nfs4_layoutcommit_data, sync)
+   - 如果sync!=0, 等待rpc_task
+
+   - rpc_call_ops nfs4_layoutcommit_ops
+   
+   > nfs4_layoutcommit_prepare
+   - 获取nfs4_slot资源
+   > nfs41_setup_sequence(nfs4_session, .)
+
+   > nfs4_layoutcommit_done
+   - 释放nfs4_slot资源
+   - 根据返回的nfs_fattr更新inode 
+   > nfs_post_op_update_inode_force_wcc(inode, nfs_fattr)
+  
+   > nfs4_layoutcommit_release
+   - 释放nfs4_layoutcommit_data
+   > pnfs_layoutdriver_type->cleanup_layoutcommit(nfs4_layoutcommit_data)
+   - 只有block layout有这个函数
+   - 然后释放pnfs_layout_segment的commit标志
+   > pnfs_list_write_lseg_done(inode, nfs4_layoutcommit_data->lseg_list)
+   - 遍历链表里的pnfs_layout_segment
+   - 怎么没有去掉标志?
+   - 去掉nfs_inode->flags的NFS_INO_LAYOUTCOMMITTING, 唤醒等待的任务
+   > wake_up_bit(bitlock, NFS_INO_LAYOUTCOMMITTING)
