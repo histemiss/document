@@ -769,6 +769,48 @@
 
 ** follow_down(path)  
    - 这个函数和follow_managed类似,但这里不会处理DCACHE_NEED_AUTOMOUNT,nfsd使用它.
+   - 处理DCACHE_MANAGE_TRANSID, 对应d_ops->d_manage
+   - 处理DCAHCE_MOUNTED,向下跨越mountpoint
+
+** follow_mount(path)
+   - 只跨越mountpoint, 检查dentry->d_flags的DCACHE_MOUNTED标志
+   - 这里是计数模式的遍历
+
+** follow_dotdot(nameidata)
+   - nameidata->root->mnt表示root是否无效?
+   - 使用current->fs_struct->root
+   > set_root(nameidata)
+   - 如果nameidata->path不是root节点,更新nameidata->path->dentry
+   - 否则向上跳跃,然后再向上遍历
+   > follow_up(nameidata->path)
+   - 然后处理mountpoint 
+   > follow_mount(nameidata->path)
+
+** lookup_dcache(qstr name, dentry dir, flags, need_lookup)
+   - 从dir下面查找name对应的dentry
+   - 去hash表中查找
+   > d_lookup(dentry, name)
+   - 如果找到，而且dentry->d_flags有DCACHE_OP_REVALIDATE
+   > d_revalidate(dentry, flags)
+   - 如果返回0,返回的dentry无效,释放它 
+   > dput(dentry)
+   - 如果<0, 返回错误
+   - 如果找不到,创建一个, 设置need_lookup=true
+   > d_alloc(dir, name)
+
+** lookup_real(inode, dentry, flags)
+   - 使用i_ops操作, inode是目录,dentry是子文件
+   > dentry->inode->lookup(dir, dentry, flags)
+
+** __lookup_hash(name, dentry parent, flags)
+   - 先在hash中查找 
+   > lookup_dcache(name, parent, flags, need_lookup)
+   - 如果上面没有找到,也就是need_lookup = 1, 使用i_ops查找
+   - 所以下面dentry是新创建的
+   > lookup_real(dentry->inode, dentry/name, flags)
+
+** lookup_fast(nameidata, path, inode)
+
 
 ** d_alloc_and_lookup(dentry parent, qstr name, nameidata)
    - d_alloc(parent, name)
