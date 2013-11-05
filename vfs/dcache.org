@@ -810,39 +810,124 @@
    > lookup_real(dentry->inode, dentry/name, flags)
 
 ** lookup_fast(nameidata, path, inode)
+   - 在nameidata->path目录下面查找nemaidata->last
+   - 如果使用rcu模式遍历, nameidata->flags包含LOOKUP_RCU
+   - 在hash表中查找,seq是返回的dentry->d_seq
+   > __d_lookup_rcu(parent, nameidata->last, seq)
+   - 找到dentry, 替换nameidata->path
+   - 先检查seq, 包括刚找到的,还有nameidata->seq
+   > __read_seqcount_retry(dentry->d_seq, seq)
+   - 调用DCACHE_OP_REVALIDATE
+   > d_revalidate(dentry, nameidata->flags)
+   - 处理mountpoint, 同时修改path/inode/seq
+   - 只会跨越mountpoint和DCACHE_MANAGE_TRANSIT
+   > __follow_mount_rcu(nameidata, path, inode)
+   - 然后检查DCACHE_NEED_AUTOMOUNT, 如果没有可以直接退出
+   - 上面的所有操作如果不是-ECHILD错误,都会转化为ref模式
+   > unlazy_walk(nameidata, dentry)
+   - 这里dentry不一定是有效的
+   - 去掉nameidata->flags的LOOKUP_RCU, 而且增加nameidata->path/dentry的计数
+   - 如果nameidata->root->mnt有效,而且flags没有LOOKUP_ROOT,还有增加nameidata->root的计数
+   - 它必须是current->fs_struct->root
+   - 如果开始不是rcu模式
+   - 同样是查找,找到后立即增加dentry->d_count
+   > __d_lookup(parent, nameidata->last)
+   - 然后处理DCACHE_OP_REVALIDATE
+   > d_revalidate(dentry, nameidata->flags)
+   - 如果上面返回0,说明什么? 
+   > d_invalidate(dentry)
+   - 处理mountpoint, 处理DCACHE_MANAGED_DENTRY的所有情况
+   > follow_managed(path, namiedata->flags)
+   - 如果上面2种情况都没找到, 返回1,应该会调用i_ops的查找
 
+** lookup_slow(nameidata, path)
+   - 这里当然使用ref模式查找
+   - 先查找hash表,查找失败时,使用i_ops操作
+   > __lookup_hash(nameidata->last, parent, nameidata->flags)
+   - 处理mountpoint
+   - follow_managed(path, nameidata->flags)
+   - 如果跨越了mountpoint, 设置nameidata->flags的LOOKUP_JUMPTED
 
-** d_alloc_and_lookup(dentry parent, qstr name, nameidata)
-   - d_alloc(parent, name)
-   - i_op->lookup(parent->d_inode, dentry, nd) 这里重新查找，里面有应该d_instantiate之类的复杂操作, 如果返回的有效,就需要释放它. cifs里面使用d_add，而且直接打开路径,但对于localfs,则需要读回目录下的内容.
+** may_lookup(nameidata)
+   - 检查permission?
+   - 如果是rcu模式 
+   > inode_permission(nameidata->inode, MAY_EXEC|MAY_NOT_BLOCK)
+   - 如果返回不是-ECHILD, 直接返回
+   - 否则变为ref模式
+   - unlazy_walk(nameidata, NULL)
+   - 然后重新检查
+   > inode_permission(nameidata->inode, MAY_EXEC)
 
-   - d_inode_lookup(dentry parent, dentry, nameidata) 在parent下面为dentry找合适的inode
-   - i_op->lookup(inode, dentry, nd)
+** handle_dots(nameidata, type)
+   - 只处理type == LAST_DOTDOT的情况?
+   - 如果是rcu模式, nameidata->flags包含LOOKUP_RCU 
+   - 再处理path指针时,都没有增加计数
+   > follow_dotdot_rcu(nameidata)
+   - 如果是ref模式
+   > follow_dotdot(nameidata)
+   - 直接处理nameidata->path, 同时修改inode/seq
 
-** do_lookup(nameidata, qstr, path, inode)
-   - 如果nameidata->flags带LOOKU_RCU,使用rcu模式查找
-   - 	-> __d_lookup_rcu(parent, name, seq,inode) 这是dcache中的实现,查找parent下面的dentry, 如果找不到,跳到计数模式
-   - 	-> d_revalidate
-   - 	-> d_nned_lookup(dentry) 跳到计数模式	
-   - 	-> __follow_mount_rcu(nd, path, inode) 处理mountpoing或autofs的东西
-   - 找到ref-walk -> unlazy_walk(nd, dentry)
-   - 如果不是rcu模式	-> __d_lookup(parent, name) 这个也是dcache的实现
-   - 如果没找到dentry, 则再找一遍,或分配一个新的
-   - d_lookup(parent, name)
-   - d_alloc_and_lookup(parent, name, nd)
-   - d_inode_lookup(parent, dentry, nd) 找inode
-   - follow_managed(path, nd->flags)
+** terminate_walk(nameidata)
+   - 停止遍历?
+   - 如果是ref模式
+   > path_put(nameidata->path)
+   - 如果是rcu模式, 释放rcu的读锁
+   - 还有如果nameidata->flags没有LOOKUP_ROOT,设置nameidata->root->mnt = NULL
+   > unlock_rcu_walk()
 
-   - walk_component(nameidata, path, qstr, type, follow)
-   - do_lookup(nd, name, path, inode) 如果返回的inode无效,则搜索失败, 把返回的path,inode给nameidata
+** should_follow_link(inode, follow)
+   - 如果i_ops->follow_link无效,就设置inode->i_opflags的IOP_NOFOLLOW
+   - 用此来减小一点检查??
 
-处理符号链接
-   - nested_symlink(path, nameidata) 循环使用下面的函数,知道错误退出?
-   - follow_link(link, nd, cookie)
-   - walk_component(nd, path, last_name, nd->last_type, LOOKUP_FOLLOW)  
+** walk_component(nameidata, path, follow)
+   - 处理nameidata->last?
+   - 如果这个字符串不是普通的,也就是dot?
+   - nameidata->last_type != LAST_NORM 
+   > handle_dots(nameidata, nameidata->last_type)
+   - 否则,先使用fast模式, 基本上在hash中查找
+   > lookup_fast(nameidata, path, inode)
+   - 如果查找失败,可能是没找到,也可能是-ECHILD
+   - 如果没找到,使用slow模式
+   > lookup_slow(nameidata, path)
+   - 上面会同时获取inode, 如果没找到inode, 返回-ENOENT
+   - 检查follow_link
+   > should_follow_link(inode, follow)
+   - 如果需要处理link, 变成ref模式, 而且返回1
+   > unlazy_walk(nameidata, path->dentry)
+   - 否则返回0,把找到的path/inode给nameidata
+   > path_to_nameidata(path, nameidata)
 
-   - link_path_walk(name, nd)
-   - 取出name中的路径片断  walk_component(nd, next, this, type, LOOKUP_FOLLOW)但判断剩下最后一点时,特殊处理
-   - nsted_symlink(next, nd)
-   - 把最后的一个片断给nameidata
-下面是创建/删除,查找，好复杂...,但上面真是没什么东西,所以还要看下面的实现.
+** nested_symlink(path, nameidata)
+   - 循环遍历symlink的路径
+   - path指向的文件是symlink文件
+   - 获取symlink的字符串, 并遍历下去
+   > follow_link(path, nameidata, char)
+   - 然后怎么返回继续的遍历的??
+   > walk_component(nameidata, path, LOOKUP_FOLLOW)
+   - 然后释放symlink 
+   > put_link(nameidata, path, char)
+
+** can_lookup(inode)
+   - 如果inode->i_ops->lookup操作无效,使用IOP_LOOKUP标记
+   - 这里检查时,先确认inode->i_opflags的IOP_LOOKUP
+
+** link_path_walk(name, nameidata)
+   - 开始遍历路径?
+   - 跳过name开始的'/'
+   - 处理name的每一段路径
+   - 并没有完全截取,只是计算一段的长度,和hash值
+   > hash_name(name, qstr->hash)
+   - 根据截取的设置nameidata->last
+   - 如果name是'..'或'.', 设置nameidata->last_type = LAST_DOT/LAST_DOTDOT
+   - 否则设置LAST_NORM
+   - 如果name是最后一部分,name[len] == '0', 直接返回
+   - 最后一部分不处理?
+   - 开始遍历
+   > walk_component(nameidata, dentry, LOOKUP_FOLLOW)
+   - 如果上面返回1, 需要处理follow 
+   > nested_symlink(dentry, nameidata)
+   - 最后结束遍历
+   > terminate_walk(nameidata)
+
+** path_init(dfd, name, flags, nameidata, file)
+   - 
