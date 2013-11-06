@@ -930,4 +930,180 @@
    > terminate_walk(nameidata)
 
 ** path_init(dfd, name, flags, nameidata, file)
-   - 
+   - 这里应该是初始化nameidata
+   - 设置nameidata->last_type = LAST_ROOT
+   - 如果flags中包含LOOKUP_ROOT, 表示查找root?
+   - 检查nameidata->root指向的dentry/inode是否可用 
+   > can_lookup(nameidata->root->dentry->d_inode)
+   > inode_permission(inode, MAY_EXEC)
+   - 然后设置nameidata->path = nameidata->root
+   - 设置inode, 如果是rcu模式, 获取seq, 否则增加计数
+   - 然后直接返回
+   - 否则就没有LOOKUP_ROOT? 设置nameidata->root->mnt = NULL
+   - 如果name是'/'开始的路径
+   - 先找到root位置, 同样针对2种模式
+   - 这里获取的是current->fs_struct的root
+   > set_root_rcu(nameidata)
+   > set_root(nameidata)
+   - 对于ref模式,增加计数
+   > path_get(nameidata->root)
+   - 然后设置nameidata->path = nameidata->root, 退出开始遍历
+   - 如果dfd == AT_FDCWD, name是相对路径
+   - 设置nameidata->path = current->fs_struct->pwd
+   - 否则dfd是一个文件, 先找到它指向的dentry 
+   > fdget_raw(dfd)
+   - 检查是否能遍历它
+   > can_lookup(dentry->d_inode)
+   - 如果可以使用, 设置nameidata->path = file->f_path
+  
+** lookup_last(nameidata, path)
+   - 如果nameidata->last_type == LAST_NORM, 而且last不是最后一部分?
+   - 路径字符串后面还有? 应该是什么?
+   - 设置nameidata->flags的LOOKUP_FOLLOW|LOOKUP_DIRECTORY
+   - 去掉nameidata->flags的LOOKUP_PARENT
+   - 继续遍历???
+   > walk_component(nameidata, path, nameidata->flags & LOOKUP_FOLLOW)
+
+** path_lookupat(dfd, name, flags, nameidata)
+   - 首先初始化nameidata? 主要是path/inode/seq
+   > path_init(dfd, name, flags|LOOKUP_PARENT, nameidata, file)
+   - 开始遍历
+   > link_path_walk(name, nameidata)
+   - 如果上面没有错误,而且flags没有LOOKUP_PARENT, 处理last name? 
+   > lookup_last(nameidata, path)
+   - 如果返回>0, 需要follow link 
+   > may_follow_link(path, nameidata)
+   - 设置nameidata->flags的LOOKUP_PARENT??
+   > follow_link(path, nameidata, void)
+   - 继续查找 
+   > lookup_last(path, nameidata, void) 
+   - 释放symlink 
+   > put_link(path, nameidata, cookie)
+   - 结束遍历
+   > complete_walk(nameidata)
+   - 如果nameidata->root->mnt有效? 谁设置的? 而且nameidata->flags没有LOOKUP_ROOT
+   - 释放nameidata->root 
+   > path_put(nameidata->root)
+
+** filename_lookup(dfd, filename, flgs, nameidata)
+   - 首先使用rcu模式遍历 
+   > path_lookupat(dfd, filename->name, flags|LOOKUP_RCU, nameidata)
+   - 如果返回-ECHILD, 使用普通方式 
+   > path_lookupat(dfd, name, flags, nameidata)
+   - 如果返回-ESTALE, 再换一种
+   > path_lookupat(dfd, name, flags|LOOKUP_REVAL, nameidata)
+
+** do_path_lookup(dfd, name, flags, nameidata)
+   > filename_lookup(dfd, filename, flags, nameidata)
+
+** kern_path_locked(name, path)
+   - 遍历路径,剩下最后一段? 
+   > do_path_lookup(AT_FDCWD, name, LOOKUP_PARENT, nameidata)
+   - 检查nameidata->last_type != LAST_NORM, 返回-EINVAL
+   - 单独查找hash表或i_ops
+   > __lookup_hash(nameidata->last, nameidata->path->dentry, 0)
+   - 返回参数是找到的dentry, path是父目录??
+
+** kern_path(name, flags, path)
+   - 这里传入参数flags 
+   > do_path_lookup(AT_FDCWD, name, flags, nameidata)
+   - 如果没有问题,传回path是最后的??
+   - 这里nameidata是局部变量,不会返回
+
+** vfs_path_lookup(dentry, vfsmount, name, flags, path)
+   - 前2个参数限定nameidata->root, 从它下面查找name, 结果给path
+   - 下面使用LOOKUP_ROOT, 表示在开始查找时不用再计算nameidata->root
+   - 这里已经指定
+   > do_path_lookup(AT_FDCWD, name, flags | LOOKUP_ROOT, nameidata)
+
+** lookup_hash(nameidata)
+   - 查找last指向的dentry
+   - flags会传给d_op->d_revalidate, 以及i_op->lookup
+   > __lookup_hash(nameidata->last, nameidata->path->dentry, nameidata->flags)
+
+** lookup_one_len(name, dentry, len)
+   - len表示文件名字,不包含路径的'/'
+   > __lookup_hash(qstr, dentry, 0)
+
+** user_path_at_empty(dfd, name, flags, path, empty)
+   - 先从userspace中获取filename
+   - 查找dentry, 给path 
+   > filename_lookup(dfd, filename, flags, nameidata)
+
+** user_path_at(dfd, name, flags, path)
+   > user_path_at_empty(dfd, name, flags, path, NULL)
+
+** user_path_parent(dfd, name, nameidata, flags)
+   - 从userspace获取name 
+   > getname(name)
+   - 只使用flags中的LOOKUP_REVAL 
+   > filename_lookup(dfd, filename, flags | LOOKUP_PARENT, nameidata)
+
+** open_flags 
+   #+BEGIN_SRC 
+	int open_flag;
+	umode_t mode;
+	int acc_mode;
+	int intent;
+	int lookup_flags;   
+   #+END_SRC
+
+** atomic_open(nameidata, dentry, path, file, open_flags, got_write, need_lookup, opened)
+   - 获取open_flag
+   > open_to_namei_flags(open_flags->open_flag)
+   - 如果open_flag包含O_EXCL&O_CREAT, 去掉O_TRUNC??
+   - got_write是什么?
+   - 打开文件 ?
+   - 在nameidata指向的目录下面
+   > nameidata->path->dentry->inode->i_op->atomic_open(dir, dentry, file, open_flags, mode, opened)
+   - 再检查打开权限? 
+   > may_open(file->f_path, acc_mode, open_flag)
+
+** lookup_open(nameidata, path, file, open_flags, got_write, opened)
+   - got_write表示文件系统是否可写?
+   - 先查找nameidata最后指向的文件
+   - 这里仅仅在hash中查找, 如果找不到need_lookup = true
+   > lookup_dcache(nameidata->last, dir, nameidata->flags, need_lookup)
+   - 如果已经找到,而且有inode
+   - need_lookup = fasle, dentry->d_inode != NULL
+   - 直接把找到的dentry/nameidata->path->mnt给path返回
+   - 如果nameidata->flags有LOOKUP_OPEN? 使用atomic_open 
+   > atomic_open(nameidata, dentry, path, file, op, got_write, need_lookup, opened)
+   - 如果没有LOOKUP_OPEN, 或没有atomic_open, 继续处理
+   - 如果需要查找need_lookup == true, 使用i_op查找 
+   > lookup_real(dir_inode, dentry, nameidata->flags)
+   - 找到dentry, 检查negative
+   - dentry->inode无效,而且open_flag有O_CREAT, 创建文件
+   > vfs_create(dir->d_inode, dentry, mode, nameidata->flags & LOOKUP_EXCL)
+   - 最后返回dentry/mnt
+
+** do_last(nameidata, path, file, open_flags, opened, filename)
+   - 同样处理路进改的最后一段, nameidata->last
+   - 检查nameidata->last_type, 如果不是LAST_NORM, 那就是LAST_DOTDOT 
+   > handle_dots(nameidata, nameidata->last_type)
+   - 如果是LAST_NORM继续
+   - 如果open_flag没有O_CREAT, 是正常的打开
+   - 如果last不是路径的最后一段,后面应该有'/'??
+   - 设置nameidata->flags的 LOOKUP_DIRECTORY|LOOKUP_FOLLOW
+   - 如果open_flag没有O_PATH?, 而且nameidata->flags没有LOOKUP_FOLLOW, 表示处理symlink文件?
+   - 打开文件?
+   > lookup_fast(nameidata, path, inode)
+   - 如果open_flag有O_CREAT, 是创建文件
+   - 停止遍历
+   > complete_walk(nameidata)
+   - last必须是最后的字符串, 他最后必须是'0'
+   - 如果open_flag有O_CREAT|O_TRUNC|O_WRONLY|O_RDWR, 检查是否可写 
+   > mnt_want_write(nameidata->path->mnt)
+   - 如果支持写,设置got_write = true, 但不能写也没有返回?
+   - 继续查找? 
+   > lookup_open(nameidata, path, file, open_flag, got_write, opened)
+   - 如果返回0,表示文件已经打开, 直接跳到最后?
+   - 如果返回<0, 返回操作失败
+   - 如果返回>0? 如果opened有FILE_CREATED, 表示创建文件
+   - 设置nameidata->path, 去掉open_flag的O_RUNC
+   - 这里可能有4个步骤, lookup, creae, open
+   - 上面是找到文件,而且没有打开创建操作?
+   - 如果open_flag包含O_EXCL|O_CREAT, 直接退出?
+   - 返回-EEXIST, 因为文件已经存在,不需要创建
+   - 跳跃mountpoint 
+   > follow_managed(path, nameidata->flags)
