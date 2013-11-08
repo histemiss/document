@@ -4,7 +4,7 @@
    #+begin_src 
 	WORK_STRUCT_PENDING_BIT	= 0,	/* work item is pending execution */
 	WORK_STRUCT_DELAYED_BIT	= 1,	/* work item is delayed */
-	WORK_STRUCT_PWQ_BIT	= 2,	/* data points to pwq */
+	WORK_STRUCT_PWQ_BIT	= 2,	/* data points to pwq */ pool_workqueue
 	WORK_STRUCT_LINKED_BIT	= 3,	/* next work is linked to this one */
 	WORK_STRUCT_COLOR_SHIFT	= 4,	/* color for workqueue flushing */
 
@@ -73,17 +73,7 @@
 	atomic_long_t data;   //work_struct的属性
 	struct list_head entry;  
 	work_func_t func;   
-
-            * WORK_STRUCT_PENDING_BIT   等待中
-            * WORK_STRUCT_DELAYED_BIT   延时work_struct
-            * WORK_STRUCT_CWQ_BIT       data包含cpu_workqueue_struct指针
-            * WORK_STRUCT_LINKED_BIT    link work_struct是什么?
-            * WORK_STRUCT_COLOR_SHIFT   上面的位表示color,调度使用
-            * WORK_STRUCT_COLOR_BITS    4 可以表示2^4种颜色
-            * WORK_STRUCT_NO_CPU        再上面的位表示cpu
-            * WORK_CPU_UNBOUND          no cpu和unbound不一样..
    #+end_src
-
 
 ** delayed_work 
    #+begin_src 
@@ -100,7 +90,7 @@
 	/* on idle list while idle, on busy hash table while busy */
 	union {
 		struct list_head	entry;	/* L: while idle */
-		struct hlist_node	hentry;	/* L: while busy */
+		struct hlist_node	hentry;	/* L: while busy */ 在worker_pool->busy_hash表中
 	};
 
 	struct work_struct	*current_work;	/* L: work being processed */
@@ -199,27 +189,6 @@
 	struct rcu_head		rcu;   
    #+end_src
 
-    global_cwq 全局的per-cpu workqueue
-        * lock cpu flags
-        * list_head worklist
-        * nr_workers  表示所有worker的比率
-        * nr_idle     idle workder的数量, nr_workers-nr_idle就是busy worker的数量
-        * list_head idle_list  idle的worker队列, 使用worker->entry
-        * hlist_node busy_hash[BUSY_WORKER_HASH_SIZE]
-        * timer_list idle_timer mayday_timer
-        * ida worker_ida
-        * task_struct trustee
-        * trustee_state trustee_wait
-        * worker first_idle
-    
-    cpu_workqueue_struct per-cpu workqueue
-        * global_cwq gcwq
-        * workqueue_struct wq
-        * work_color flush_color
-        * nr_in_flight[WORK_NR_COLORS]
-        * nr_active max_active
-        * list_head delayed_works
-
 ** wq_flusher
    #+begin_src 
 	struct list_head	list;		/* WQ: list of flushers */
@@ -263,10 +232,6 @@
 	struct pool_workqueue __rcu *numa_pwq_tbl[]; /* FR: unbound pwqs indexed by node */   
    #+end_src
 
-
-
-   - 一个workqueue_struct使用若干个cpu_workqueue_struct(在多处理器中), 它也使用若干个worker. cpu_workqueue_struct有关联对应cpu上的global_cwq.
-
 ** worker_pool_assign_id(worker_pool)
    - 从worker_pool_idr中分配一个id, 索引worker_pool指针
 
@@ -288,134 +253,297 @@
 ** set_work_data(work_struct, data, flags)
    - 设置work_struct->data的标志位
    - work_struct当前必须在等待? work_struct->data必须有WORK_STRUCT_PENDING_BIT
+   > atomic_long_set(&work->data, data | flags | work_static(work))
+   - 最后需要留下WORK_STRUCT_STATIC?
 
-global_cwq的获取函数
-    a. __next_gcwq_cpu(cpu, cpumask, sw) / __next_wq_cpu(cpu, cpumask, workqueue_struct)
-        检查sw标志,返回cpu+1或者WORK_CPU_NONE. 第二个是第一个函数的包装,sw标志使用workqueue_struct->flags & WQ_UNBOUND. workqueue_struct可以是WQ_UNBOUND? 它还有多个worker吗？
-    b. for_each_gcwq_cpu / for_each_online_gcwq_cpu / for_each_cwq_cpu
-        遍历cpu 
+** set_work_pwq(work_struct, pool_workqueue, extra_flags)
+   - 设置work_struct->data的标志位
+   > set_work_data(work_struct, pool_workqueue, WORK_STRUCT_PENDING|WORK_STRUCT_PWQ|extra_flags)
 
-global_cwq相关操作
-    a. get_gcwq(int cpu) get_gcwq_nr_running
-        返回 per_cpu(global_cwq, cpu) 或者 unbound_gobal_cwq 如果cpu=WORK_CPU_UNBOUND
-        后者应该返回工作队列中的work_struct数量
+** set_work_pool_and_keep_pending(work_struct, pool_id)
+   - 设置pool_id, 它表示什么? 
+   > set_work_data(work_struct, pool_id << WORK_OFFQ_POOL_SHIFT, WORK_STRUCT_PENDING)
 
-    b. get_cwq(cpu, workqueue_struct)
-        返回cpu_workqueue_struct, 它是workqueue_struct->cpu_wq.pcpu或者workqueue_struct->cpu_wq->signal. 每个workqueue_struct关联一组per-cpu的cpu_workqueue_struct和unbound的cpu_workqueue_struct, 每个cpu_workqueue_struct关联对应cpu的global_cwq
+** set_work_pool_and_clear_pending(work_struct, pool_id)
+   - 设置pool_id, 而且去掉WORK_STRUCT_PENDING 
+   > set_work_data(work_struct, pool_id << WORK_OFFQ_POOL_SHIFT, 0)
 
-work_struct->data的操作函数
-    c. get_work_color(work_struct)
-        work_struct->data包含color
-    
-    a. set_work_data(work_struct, data,flags)
-        设置work_struct->data，这应该是一个标志域, 包含data和flags. 枚举一下，不算复杂
-        * WORK_STRUCT_PENDING_BIT   0   pending
-        * WORK_STRUCT_DELAYED_BIT   1   delayed
-        * WORK_STRUCT_CWQ_BIT       2   data point to cwq  多用途的data
-        * WORK_STRUCT_LINKED_BIT    3   next work
-        * WORK_STRUCT_STATEIC_BIT   4   debug
-        * WORK_STRUCT_COLOR_SHIFT   5   下面4位是COLOR, 什么是COLOR?
-        * WORK_STRUCT_COLOR_BITS    4
-        * WORK_NR_COLORS            15
-        * WORK_NO_COLOR             15
+** clear_work_data(work_struct)
+   - 这里的pool_id是WORK_STRUCT_NO_POOL 
+   > set_work_data(work_struct, WORK_STRUCT_NO_POOL, 0)
 
-        * WORK_STRUCT_PENDING       1<<WORK_STRUCT_PENDING_BIT  
-        * WORK_STRUCT_DELAYED       1<<WORK_STRUCT_DELAYED_BIT
-        * WORK_STRUCT_CWQ           1<<WORK_STRUCT_CWQ_BIT
-        * WORK_STRUCT_LINKED        1<<WORK_STRUCT_LINKED_BIT
+** get_work_pwq(work_struct)
+   - 从work_struct->data中获取pool_workqueue
+   - 只有data中包含WORK_STRUCT_PWQ时,他才包含pool_workqueue指针 
+   > data & WORK_STRUCT_WQ_DATA_MASK
 
-        * WORK_STRUCT_FLAG_BITS     WORK_STRUCT_COLOR_SHIFT+WORK_STRUCT_COLOR_BITS      使用低9位表示flags，高位给cpu的标志使用,或者cpu_workqueue_struct使用
-        * WORK_CPU_UNBOUND          NR_CPUS  从第9(8)位，表示work_struct从那个cpu上
-        * WORK_CPU_NONE             NR_CPUS+1
-        * WORK_CPU_LAST             WORK_CPU_NONE 这个和WORK_CPU_UNBOUND什么区别?
-        * WORK_STRUCT_FLAG_MASK     1<<WORK_STRUCT_FLAG_BITS -1
-        * WORK_STRUCT_WQ_DATA_MASK  ~ WORK_STRUCT_FLAG_MASK
-        * WORK_STRUCT_NO_CPU        WORK_CPU_NONE<<WORK_STRUCT_FLAG_BITS
-        
-        * WORK_BUSY_PENDING
-        * WORK_BUSY_RUNNING
+** get_work_pool(work_struct)
+   - 计算worker_pool
+   - 如果work_struct->data带标志WORK_STRUCT_PWQ
+   - 使用pool_workqueue->worker_pool
+   - 如果没有, 获取pool_id
+   - work_struct->data >> WORK_OFFQ_POOL_SHIFT
+   - 如果是WORK_OFFQ_POOL_NONE, pool_id无效,返回NULL 
+   - 查找全局的worker_pool
+   > idr_find(worker_pool_idr, pool_id)
 
-    b. set_work_cwq(work_struct, cpu_workqueue_struct, extra_flags)
-        设置work_struct->data为cwq和WORK_STRUCT_PENDING, WORK_STRUCT_CWQ以及extra_flags标志, 需要保证cpu_workqueue_struct的低n位不用
-        -> set_work_data
+** get_work_pool_id(work_struct)
+   - 计算pool_id
+   - 如果work_struct->data带标志WORK_STRUCT_PWQ, 使用pool_workqueue->worker_pool->id
+   - 否则使用work_struct->data >> DATA_OFFQ_POOL_SHIFT
 
-    c. set_work_cpu(work_struct, cpu)
-        设置work_struct->data的cpu值, 当work_struct开始执行时,设置对应的cpu值.
-        -> set_work_data(work_struct, cpu<<WORK_STRUCT_FLAG_BITS, WORK_STRUCT_PENDING)
+** mark_work_concelling(work_struct)
+   - 设置work_struct->data
+   - 包括pool_id, WORK_OFFQ_CANCELING, WORK_STRUCT_PENDING
+   > set_work_data(work, pool_id | WORK_OFFQ_CANCELING, WORK_STRUCT_PENDING)
 
-    d. clear_work_struct(work_struct)
-        WORK_STRUCT_NO_CPU竟然用在这里
-        set_work_data(work_struct, WORK_STRUCT_NO_CPU, 0)
+** work_is_cancelling(work_struct)
+   - work_struct->data没有WORK_STRUCT_PWQ??
+   - 而且有WORK_OFFQ_CANCELLING
 
-    e. get_work_cwq(work_struct)
-        从work_struct->data中取出数据cpu_workqueue_struct，但要先判断它带标志WORK_STRUCT_CWQ, 否则返回NULL
+** __need_more_worker(worker_pool)
+   - 如果worker_pool->nr_running == 0, 需要更多的worker??
 
-    f. get_work_gcwq(work_struct)
-        以前看的时候都把global_cwq和cpu_workqueue_struct混了!! 这个函数封装上面的函数,但它返回global_cwq, 首先如果它属于cpu_workqueue_struct(属于有说明什么), 先获取cpu_workqueue_struct, 返回返回cpu_workqueue_struct->global_cwq.
-        -> get_work_cwq(work_struct)
-        否则判断它使用的cpu, 如果不是WORK_CPU_NONE, 返回cpu对应的global_cwq
-        -> get_gcwq(work_struct->data >> WORK_STRUCT_FLAG_BITS)
-        否则返回NULL. 这里可看出在work_struct->data中, cpu信息和cpu_workqueue_struct信息是不能共存的,根据WORK_STRUCT_CWQ标志决定它是什么信息. 应该是..
-    
+** need_more_worker(worker_pool)
+   - worker_pool->worklist里面是什么? 不为空
+   > __need_more_worker(worker_pool)
 
-下面貌似开始操作global_cwq, 下面叫policy function,检查是否需要创建和释放worker.
-    a. __need_more_worker(global_cwq)
-        这是判断是否需要更多的worker? worker是通过global_cwq管理的?而不是workqueue_struct管理? global_cwq->flags & GCWQ_HIGHPRI_PENDING, 如果有高优先级任务等待,就需要更多的worker? 看来这个标志很重要.
+** may_start_working(worker_pool)
+   - 是否可以启动现有的worker??
+   > worker_pool->nr_idle
 
-    b. may_start_working(global_cwq)
-        返回global_cwq->nr_idle. 这是busy却没有running的worker使用的
+** keep_working(worker_pool)
+   - 是否需要继续工作? 
+   > worker_pool->worklist不为空,而且worker_pool->nr_running <= 1
 
-    c. keep_working(global_cwq)
-        检查下面几个条件, 这是在运行的worker中使用的
-            * global_cwq->worklist, 这个是work_struct队列,奇怪！！
-            * get_gcwq_nr_running(global_cwq->cpu)这个cpu上的worker?
-            * global_cwq->flags & GCWQ_HIGHPRI_PENDING
+** need_to_create_worker(worker_pool)
+   - 需要更多的worker
+   > need_more_worker(worker_pool)
+   - 而且不能启动现有的?
+   > may_start_working(worker_pool)
 
-    d. need_to_create_worker(global_cwq)
-        从manager worker中调用
-        -> need_more_worker(global_cwd)
-        -> may_start_working(global_cwq)
+** need_to_manage_workers(worker_pool)
+   - 是否可以变成manager? 
+   - 需要创建新的worker 
+   > need_to_create_worker(worker_pool)
+   - 或者worker_pool->flags有POOL_MANAGE_WORKERS??
 
-    e. need_to_manage_workers(global_cwq)
-        当前worker是否需要成为manager? 还要判断global_cwq->flags & GCWQ_MANAGE_WORKERS
-        -> need_to_create_worker(global_cwq)
-        
-    f. too_many_workers(global_cwq)
-        判断global_cwq的worker是否太多, 先找出nr_idle,idle worker的数量,它busy worker的数量相比超过一定比率(4). 还有glbal_cwq->flags & GCWQ_MANAGING_WORKERS,表示有一个manager worker, 它看作idle worker.
-        
-唤醒worker操作
-    a. first_worker(global_cwq)
-        返回global_cwq->idle_list中的第一个worker,如果队列空,返回NULL. global_cwq管理worker
+** too_many_workers(worker_pool)
+   - 计算是否有太多的worker?
+   - 如果worker_pool->idle_list为空,返回false? 不够用的?!
+   - worker_pool->nr_idle表示空闲的worker, nr_workers表示工作中的
+   - nr_idle > 2 && (nr_idle - 2) * MAX_IDLE_WORKERS_RATIO >= nr_busy
 
-    b. wake_up_worker(global_cwq)
-        唤醒第一个空闲的worker, 这里就是简单的task操作,并没不等待队列的操作.
-        -> first_worker(global_cwq)
-        -> wake_up_process(worker->task_struct) 这个函数在sched.c中
+** first_worker(worker_pool)
+   - 返回第一个可用的worker 
+   - 如果worker_pool->idle_list为空, 返回NULL
+   > list_first_entry(&pool->idle_list, struct worker, entry)
 
-    c. wq_worker_waking_up(task_struct, cpu)
-        从task_struct中获取worker, 如果worker->flags表示它开始运行，则添加cpu上的gcwq_nr_running计数, 表示cpu上运行的worker数量, 这是try_to_wake_up中使用的回调函数, 它要唤醒参数task_struct.
-        -> kthread_data
-        -> get_gcwq_nr_running
+** wake_up_worker(worker_pool)
+   - 唤醒第一个worker?  没有任何保护?  
+   > first_worker(worker_pool)
+   > wake_up_process(worker->task_struct)
 
-    d. wq_worker_sleeping(task_struct, cpu)
-        这个函数竟然在schedule中调用,task_struct->flags & PF_WQ_WORKER表示这是一个worker. task_struct即将睡眠, 检查worker所在的global_cwq，它还有运行的worker(nr_running),而且工作队列不为空global_gcwq->worklist,唤醒它的第一个worker
-        -> get_gcwq(cpu)
-        -> get_gcwq_nr_running(global_cwq)
-        -> first_worker(global_cwq)
+** wq_worker_waking_up(task_struct, cpu)
+   - 回调函数, 在唤醒任务中调用
+   - task_struct->flags包含PF_WQ_WORKER,表示这个任务执行workqueue
+   - task_struct=>vfork_done是kthread->completion, kthread->data就是worker
+   - 如果worker->flags没有WORKER_NOT_RUNNING, 表示已经唤醒??
+   - 增加worker->worker_pool->nr_running
+   - cpu应该和worker->worker_pool->cpu相同
 
-    o. worker_set_flags(worker, flags, wakeup)
-        设置worker的flags,在worker_thread中使用(flags = WORKER_PREP). 如果原来没有WORKER_NOT_RUNNING(这个包含多个标志),而设置上WORKER_NOT_RUNNING,减少global_gcwq的运行的任务数量. 如果减到0，而且wakeup为真，唤醒global_gcwq上的一个worker.
-        -> get_gcwq_nr_running  这个返回的和global_cwq->nr_workers-nr_idles是否有关系?
-        -> wake_up_worker(global_cwq)
+** wq_worker_sleeping(task_struct, cpu)
+   - 在__schedule函数中调用, 应该是调度之前?
+   - 这个worker要去sleep?
+   - 如果worker->flags没有WORKER_NOT_RUNNING, 直接退出
+   - 如果cpu不是当前cpu, 直接退出?
+   - 减小worker_pool->nr_running, 如果减为0, 而且worker_pool->worklist还有任务?
+   - 需要唤醒下一个?  既然有任务,何必要调度?
+   > first_worker(worker_pool)
+   - 返回worker_pool->task, 后面会尝试唤醒这个任务??
 
-    p. woker_clr_flags(worker, flags)
-        这个和上面的函数正好相反，去掉WORKER_NOT_RUNNING,同时增加全局的计数.
+** worker_set_flags(worker, flgs, wakeup)
+   - 设置worker标志,更新worker_pool->nr_running计数
+   - worker必须是current执行的任务
+   - 设置worker->flags |= flags
+   - 如果flags中包含WORKER_NOT_RUNNING, 而且原来没有, 说明这个worker要变为idle状态?
+   - 减小worker_pool->nr_running
+   - 如果wakeup !=0, 检查是否还有工作, 而且没有worker在nr_running状态, 唤醒下一个任务
+   > wake_up_worker(worker_pool)
 
-    q. busy_worker_head(global_cwq, work_struct)
-        worker要放到global_cwq->busy_hash这个hash链表中,根据work_struct的指针计数hash值,返回global_cwq->busy_hash[]表头指针
+** worker_clr_flags(worker, flags)
+   - 和上面相反, 去掉worker->flags中的flags标志
+   - 因为WORKER_NOT_RUNNING包含多个标志
+   - 这里要保证worker->flags没有任何这些标志,才减小worker_pool->nr_running
 
-    r. __find_worker_executing_work(global_cwq, hlist_head, work_struct)
-        遍历hlist_head队列，队列上全是worker, 找到work_struct对应的worker. global_cwq打酱油， 这是和上面对应的。
+** find_worker_executing_work(worker_pool, work_struct)
+   - 查找worker_pool中正在执行work_struct的worker
+   - 遍历worker_pool->busy_hash链表
+   - 比较worker->current_work = work, worker->current_func == work_struct->func
+   - 这里比较2个是为了避免work_struct的重用? 重用也可能导致func也重用呢?
+
+** move_linked_works(work_struct, list_head, work_struct)
+   - 把work_struct->entry中的work_struct放到list_head中, 包括它自己
+   - work_struct->entry是单链表??
+   - 如果work_struct->data没有WORK_STRUCT_LINKED, 停止移动
+
+** get_pwq(pool_workqueue)
+   - 增加pool_workqueue->refcnt
+
+** put_pwq(pool_workqueue)
+   - 减小pool_workqueue->refcnt
+   - 如果减为0, 使用work_struct释放自己?? 
+   > schedule_work(pool_workqeueu->unbound_release_work)
+
+** put_pwq_unlocked(pool_workqueue)
+   - 锁住pool_workqueue->pool->lock, 锁住当前的worker_pool?
+   > put_pwq(pool_workqueue)
+
+** pwq_activate_delayed_work(work_struct)
+   - 把work_struct放到pool_workqueue->worker_pool->worklist队列中
+   - 获取pool_workqueue 
+   > get_work_pwq(work_struct)
+   > move_linked_works(work_struct, pool_workqueue->worker_pool->worklist, NULL)
+   - 去掉work_struct->data的WORK_STRUCT_DELAYED_BIT标志?
+   - 增加pool_workqueue->nr_active
+
+** pwq_activate_first_delayed(pool_workqueue)
+   - 唤醒pool_workqueue->delayed_works队列上的第一个work_struct
+   > pwq_activate_delayed_work(work_struct)
+
+** pwq_dec_nr_in_flight(pool_workqueue, color)
+   - work_struct完成,退出pool_workqueue?
+   - 处理workqueue的flush
+   - 如果color是WORK_NO_COLOR, 不处理flush, 直接释放pool_workqueue
+   - 减小pool_workqueue->nr_in_flight[color], pool_workqueue->nr_active
+   - 如果pool_workqueue还有work_struct, pool_workqueue->delayed_works队列中有work_struct
+   - 唤醒下一个work_struct ? 仅仅是队列操作?
+   > pwq_activate_first_delayed(pool_workqueue)
+   - 如果pool_workqueue->flush_color != color, 不处理flush操作
+   - 如果pool_workqueue->nr_in_flight[color] !=0, 也不处理???
+   - 设置pool_workqueue->flush_color = -1, flush完成? 
+   - 减小pool_workqueue->workqueue_struct->nr_pwqs_to_flush, 如果为0, 唤醒等待的flush操作 
+   > complete(&pwq->wq->first_flusher->done)
+   - 最后释放pool_workqueue 
+   > put_pwq(pool_workqueue)
+
+** try_to_grab_pending(work_struct, is_dwork, flags)
+   - 首先禁止中断 
+   > local_irq_save(flags)
+   - is_dwork表示work_struct是delayed_work
+   - 撤销计时器
+   > del_timer(delayed_work->timer)
+   - 设置work_struct->data的WORK_STRUCT_PENDING_BIT, 
+   - 如果原来, 说明当前任务设置这个标志??  直接返回0
+   > test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_struct->data)
+   - 否则这个work_struct已经被别人处理, 已经在队列中
+   - 获取pool_workqueue 和 worker_pool
+   > get_work_pool(work_struct)
+   > get_work_pwq(work_struct)
+   - 这里需要注意work_struct->data的数据,他里面不一定有pool_workqueue的指针, 所以这里使用worker_pool->lock保护起来
+   - 如果work_struct->data带标志WORK_STRUCT_DELAYED, 唤醒他? 
+   > pwq_activate_delayed_work(work_struct)
+   - 减小等待的任务数量? 
+   > pwq_dec_nr_in_flight(get_work_pwd(work_struct), get_work_color(work_struct))
+   - 再改变work_struct->data, 放上pool id, 而且让他等待? 
+   > set_work_pool_and_keep_pending(work_struct, worker_pool->id)
+   - 等待的位置改变了?? 
+   - 然后返回1, 表示什么?? 
+     
+** insert_work(pool_workqueue, work_struct, list_head, extra_flags)
+   - 把work_struct放到pool_workqueue->worker_pool中
+   > set_work_pwq(work_struct, pool_workqueue, extra_flags)
+   - 把work_struct->entry放到list_head中, 哪个队列?
+   > get_pwq(pool_workqueue)
+   - 检查worker_pool是否需要开始工作 worker_pool->nr_running == 0??
+   > __need_more_worker(worker_pool)
+   - 唤醒这个worker_pool的线程
+   > wake_up_worker(worker_pool)
+
+** __queue_work(cpu, workqueue_struct, work_struct)
+   - 这时中断必须是关闭的?
+   - 如果pool_workqueue->flags有__WQ_DRAINING, 而且workqueue_struct不是特殊的
+   - workqueue_struct已经释放,不再处理work_struct,直接返回
+   > is_chained_work(workqueue_struct)
+   - 选择cpu针对的pool_workqueue
+   - 如果参数cpu == WORK_CPU_UNBOUND, 使用当前cpu 
+   > raw_smp_processor_id()
+   - 如果workqueue_struct->flags有WQ_UNBOUND, 不限制cpu 
+   > unbound_pwq_by_node(workqueue_struct, cpu_to_node(cpu))
+   - 否则使用对应的pool_workqueue 
+   > per_cpu_ptr(workqueue_struct->cpu_pwqs, cpu)
+   - 再检查之前使用的worker对应的worker_pool
+   - 之前执行完毕,还会重复执行?
+   > get_work_pool(work_struct)
+   - 如果选出来的worker_pool和上面cpu对应的不一样, 检查worker?? 
+   > find_worker_executing_work(pool_workqueue, work_struct)
+   - 如果worker->pool_workqueue->workqueue_struct和参数一样,可以使用这个pool_workqueue
+   - 为何这么复杂??
+   - 检查work_struct->entry, 如果已经在某个队列中,直接退出?? 
+   - 否则开始放到队列 
+   - 增加pool_workqueue->nr_in_flight[pool_workqueue->work_color], 这个work_struct就使用这个color 
+   > work_color_to_flags(pool_workqueue->work_color)
+   - 如果当前pool_workqueue的任务太重,把它放到delayed_works链表中, 而且设置WORK_STRUCT_DELAYED标志
+   - pool_workqueue->nr_active < pool_workqueue->max_active
+   - 否则放到pool_workqueue->worker_pool->worklist中,而且增加pool_workqueue->nr_active
+   - 放到队列中 
+   > insert_work(pool_workqueue, work_struct, worklist, color_flags)
+
+** queue_work_on(cpu, workqueue_struct, work_struct)
+   - 使用中断保护队列操作
+   - 使用work_struct->data的WORK_STRUCT_PENDING_BIT同步这里的操作
+   - test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work_struct))
+   - 操作队列 
+   > __queue_work(cpu, pool_workqueue, work_struct)
+
+** delayed_work_timer_fn(data)
+   - 这是timer回调,必须在中断保护中使用 
+   - 参数是delayed_work
+   > __queue_work(delayed_work->cpu, delayed_work->workqueue_struct, delayed_work->work_struct)
+
+** __queue_delayed_work(cpu, workqueue_struct, delayed_work, delay)
+   - 安装计时器,经过一段延时,启动delayed_work
+   - 检查参数delayed_work->timer的回调函数必须是上面的delayed_work_timer_fn
+   - timer没有开始使用, work_struct没有在任何队列中
+   - 如果delay == 0, 直接插入队列 
+   > __queue_work(cpu, workqueue_struct, delayed_work->work_struct)
+   - 否则安装计时器, 如果cpu != WORK_CPU_UNBOUND, 使用特定的cpu
+   > add_timer_on(timer, cpu)
+   > add_time(timer)
+
+** queue_delayed_work_on(cpu, workqueue_struct, delayed_work, delay)
+   - 使用中断保护操作 
+   > local_irq_save(flags)
+   - 同样使用work_struct->data的WORK_STRUCT_PENDING_BIT同步 
+   > __queue_delayed_work(cpu, workqueue_struct, delayed_work, delay)
+
+** mod_delayed_work_on(cpu, workqueue_struct, delayed_work, delay)
+   - 处理一个未知状态的任务?
+   - 获取work_struct->data的WORK_STRUCT_PENDING_BIT 
+   > try_to_grab_pending(delayed_work->work_struct, true, flags)
+   - 如果获取到,进行队列操作 
+   > __queue_delayed_work(cpu, workqueue_struct, delayed_work, delay)
+
+** worker_enter_idle(worker)
+   - worker变为idle状态?
+   - 如果worker->flags有WORKER_IDLE 或者worker->entry在队列中, 而且worker->hentry在队列中
+   - 说明它已经是idle状态
+   - 否则修改worker状态
+   - 设置worker->flags的WORKER_IDLE, 增加pool_workqueue->nr_idle
+   - worker->last_active = jiffies
+   - 把worker->entry放到pool_workqueue->idle_list队列中
+   - 如果pool_workqueue的worker太多, 启动计时器, 应该是关闭worker?
+   > mod_timer(&pool_workqueue->idle_timer, jiffies + IDLE_WORKER_TIMEOUT)
+ 
+** worker_lease_idle(worker)
+   - worker变为不是idle的状态,开始工作,还是退出工作? 
+   - worker->flags应该有WORKER_IDLE
+   - 去掉worker->flags中的WORKER_IDLE标志 
+   > worker_clr_flags(worker, WORKER_IDLE)
+   - 减小pool_workqueue->nr_idle, 释放worker->entry链表
+
+** 
+
 
     s. find_worker_executing_work(global_qcwq, work_struct)
         何必很在两个函数中完成呢， 返回worker

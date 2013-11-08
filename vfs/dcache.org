@@ -1107,3 +1107,149 @@
    - 返回-EEXIST, 因为文件已经存在,不需要创建
    - 跳跃mountpoint 
    > follow_managed(path, nameidata->flags)
+   - 上面已经查找要目标文件path
+   - 如果path->dentry->d_inode == NULL, 说明是negative的,返回1? 
+   > path_to_nameidata(path, nameidata)
+   - 是否处理symlink 
+   > should_follow_link(inode, symlink_ok)
+   - 如果应该处理,而且是rcu模式,转为ref模式,返回1继续查找? 
+   > unlazy_walk(namiedata, path->dentry)
+   - 准备nameidata, inode
+   - 上面已经完成遍历, 
+   > complete_walk(nameidata)
+   - 检查权限
+   - 如果open_flag包含O_CREAT, 而且inode是dir, 返回-EISDIR
+   - 如果nameidata->flags包含LOOKUP_DIRECTORY, 但没有权限Lookup, 返回-ENOTDIR? 
+   > can_lookup(nameidata->inode)
+   - LOOKUP_DIRECTORY表示查找目标是目录
+   - 上面完成打开/创建的检查
+   - 组装file, 建立file的关键
+   > finish_open(file, nameidata->path->dentry, NULL, opened)
+   - 最后处理打开之后的操作
+   - 检查是否支持dio和O_DIRECT
+   > open_check_o_direct(file)
+   - 检查truncate 
+   > handle_truncate(file)
+   - 最后释放nameidata的资源? 
+   > terminate_walk(nameidata)
+
+** path_openat(dfd, filename, nameidata, open_flags, flags)
+   - 先准备file, 保存file->f_flags = open_flags->open_flag
+   > get_empty_filp() 
+   - 如果是创建临时文件
+   > do_tmpfile(dfd, pathname, nameidata, flags, open_flags, file, opened)
+   - 否则就是正常的打开操作
+   - 先初始化nameidata 
+   > path_init(dfd, pathname->name, flags | LOOKUP_PARENT, nameidata, file)
+   - 遍历路径 
+   > link_path_walk(pathname->name, nameidata)
+   - 然后处理路径的最后一段
+   > do_last(nameidata, path, file, open_flags, opened, pathname)
+   - 如果返回1, 表示最后一段是symlink?
+   > 如果nameidata->flags没有LOOKUP_FOLLOW, 返回-ELOOP, 不让处理symlink? 
+   - 检查inode是否支持symlink  
+   > may_follow_link(path, nameidata)
+   - 设置nameidata->flags的LOOKUP_PARENT
+   - 去掉LOOKUP_OPEN|LOOKUP_CREATE|LOOKUP_EXCL
+   - 遍历符号链接
+   > follow_link(path, nameidata, void)
+   - 剩下最后一段路径
+   > do_last(nameidata, path, file, open_flags, opened, pathname)
+   - 释放symlink的资源 
+   > put_link(nameidata, path, cookie)
+   - 上面会循环,知道返回的不是>0
+   - 最后返回file
+
+** do_filp_open(dfd, filename, open_flags)
+   - 创建file, 首先使用rcu模式
+   > path_openat(dfd, pathname, nameidata, open_flags, flags|LOOKUP_RCU)
+   - 如果返回-ECHILD, 使用普通的模式, 也就是open_flags->lookup_flags
+   > path_openat(dfd, pathname, nameidata, open_flags, flags)
+   - 如果返回-ESTALE, 使用LOOKUP_REVAL
+   > path_openat(dfd, pathname, nameidata, open_flags, flags | LOOKUP_REVAL)
+
+** do_file_open_root(dentry, vfsmount, char* name, open_flags)
+   - 这个函数提供查找的root, 而且从他开始
+   - 设置nameidata->root = {dentry, vfsmount)
+   - 使用的lookup_flag是 open_flags->lookup_flags | LOOKUP_ROOT
+   - 如果dentry->inode->i_op->follow_link有效, 而且open_flags->intent有LOOUP_OPEN, 返回-ELOOP?
+   - 然后开始打开操作, 和上面一样,尝试3种
+
+** kern_path_create(dfd, pathname, path, lookup_flags)
+   - 只是遍历路径, 使用的标志是
+   - lookup_flags & LOOKUP_REVAL | LOOKUP_PARENT, 只使用LOOKUP_PARENT, 可能使用LOOKUP_REVAL
+   > do_path_lookup(dfd, pathname, LOOKUP_PARENT|lookup_flags, nameidata)
+   - 如果nameidata->last_type不是LAST_NORM 返回-EEXIST
+   - 去掉nameidata->flags的LOOKUP_PARENT, 添加LOOKUP_CREATE|LOOKUP_EXCL
+   - 检查文件系统是否只读
+   > mnt_want_write(nameidata->path->vfsmount)
+   - 最后再查找一遍,同时会创建dentry 
+   > lookup_hash(nameidata)
+   - 如果dentry不是negative, dentry->inode有效, 返回-EEXIST
+   - 如果nameidata->last不是最后一段, 后面还有'/'?? 而且开始要求创建的不是目录, 返回-ENOENT
+   - LOOKUP_DIRECTORY表示查找目标是目录
+
+** done_path_create(path, dentry)
+   - 在创建完成之后的操作? 
+   > dput(dentry)
+   > mnt_drop_write(path->mnt)
+   > path_put(path)
+
+** user_path_create(dfd, pathname, path, lookup_flags)
+   > kern_path_create(dfd, filename->name, path, lookup_flags)
+
+** vfs_mknode(inode, dentry, mode, dev)
+   > inode->i_op->mknode(inode, dentry, mode, dev)
+
+** mknodat(dfd, filename, mode, dev)
+   - 首先创建dentry?  使用的lookup_flag是0
+   > user_path_create(dfd, filename, path, lookup_flags)
+   - 如果是普通文件, 最后一个参数是excl
+   > vfs_create(path->dentry->inode, dentry, mode, true)
+   - 如果是chr/blk设备 
+   > vfs_mknod(path->dentry->inode, dentry, mode, dev)
+   - 如果是fifo/sock 
+   > vfs_mknod(path->dentry->inode, dentry, mode, 0)
+   - 最后释放资源? 
+   > done_path_create(path, dentry)
+
+** vfs_mkdir(inode, dentry, mode)
+   - inode->i_op->mkdir(inode, dentry, mode)
+
+** mkdirat(dfd, pathname, mode)
+   - 遍历路径,创建dentry
+   - 查找的flags是LOOKUP_DIRECTORY?
+   - 可能会直接找到最后一段?? 
+   > user_path_create(dfd, pathname, path, lookup_flags)
+   - 创建目录
+   > vfs_mkdir(path->dentry->inode, dentry, mode)
+   > done_path_create(path, dentry)
+
+** dentry_unhash(dentry)
+   - 释放dentry的hash表关系, 前提是dentry->d_count == 1
+   > __d_drop(dentry)
+
+** vfs_rmdir(inode, dentry)
+   - 大量检查
+   - i_op->rmdir无效, 返回-EPERM
+   - dentry是mountpoint,返回-EBUSY
+   - 释放dentry 
+   > shrink_dcache_parent(dentry)
+   - 删除 
+   > inode->i_op->rmdir(inode, dentry)
+   - 设置dentry->inode->i_flags的S_DEAD??  dentry->d_flags的DCACHE_CANT_MOUNT
+   - 然后释放dentry 
+   > dput(dentry)
+   - 释放它, 应该是变为negative的? 或者变为unhash的?
+   > d_delete(dentry)
+ 
+** do_rmdir(dfd, pathname)
+   - 先遍历路径? lookup_flags = 0
+   > user_path_parent(dfd, pathname, nameidata, lookup_flags)
+   - 检查nameidata->last_type, 应该是LAST_NORM, 其他的返回相应的错误
+   - 找到要删除的dentry, 去掉nameidata->flags的LOOKUP_PARENT
+   > lookup_hash(nameidata)
+   - 删除目录 
+   > vfs_rmdir(nameidata->path->dentry->inode, dentry)
+   - 最后释放dentry, nameidata->path,  nameidata->root怎么处理?
+
