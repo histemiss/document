@@ -535,14 +535,164 @@
    - 如果pool_workqueue的worker太多, 启动计时器, 应该是关闭worker?
    > mod_timer(&pool_workqueue->idle_timer, jiffies + IDLE_WORKER_TIMEOUT)
  
-** worker_lease_idle(worker)
+** worker_leave_idle(worker)
    - worker变为不是idle的状态,开始工作,还是退出工作? 
    - worker->flags应该有WORKER_IDLE
    - 去掉worker->flags中的WORKER_IDLE标志 
    > worker_clr_flags(worker, WORKER_IDLE)
    - 减小pool_workqueue->nr_idle, 释放worker->entry链表
 
-** 
+** worker_maybe_bind_and_lock(worker_pool)
+   - 把当前任务绑定给worker_pool?
+   - 这里通过设定task_struct使用的cpu, 以及调度,实现current绑定给worker_pool 
+   - 如果worker_pool->flags没有POOL_DISASSOCIATED
+   - 需要特定的cpu? 
+   > set_cpus_allowed_ptr(current, worker_pool->attrs->cpumask)
+   - 如果worker_pool->flags有POOL_DISASSOCIATED， 直接退出? 那上面还设置什么?
+   - 检查current是否满足要求
+   - 当前cpu和worker_pool->cpu一样
+   > task_cpu(current)
+   > cpumask_equal(current->cpu_allowed, worker_pool->attrs->cpumask)
+   - 如果上面条件不满足, 重新调度 ? 
+   > cond_resched()
+
+** alloc_worker()
+   - 构造一个worker
+   - 开始设置worker->flags = WORKER_PREP
+
+** create_worker(worker_pool)
+   - 构造worker, 分配idr索引
+   > idr_alloc(worker_pool->worker_idr, NULL, 0, 0, GFP_NOWAIT)
+   > alloc_worker()
+   - 创建独立的线程,线程的名字根据cpu或id而定
+   - 如果worker_pool->cpu>=0, 他绑定到固定的cpu, 线程名字使用cpu:id, 否则使用id
+   > kthread_create_on_node(worker_thread, worker, worker_pool->node, 'kworker/id')
+   - 设置线程属性 
+   > set_user_nice(worker->task, worker_pool->attrs->nice)
+   > set_cpus_allowed_ptr(worker->task, worker_pool->attrs->cpumask)
+   - 还是worker->task_struct->flags的PF_NO_SETAFFINITY, 不需要改动绑定?
+   - 如果worker_pool->flags有POOL_DISASSOCIATED，不需要把任务绑定都cpu上面?
+   - 设定worker->flags的WORKER_UNBOUND
+   
+** start_worker(worker)
+   - 设定worker->flags的WORKER_STARTED
+   - 增加worker->worker_pool->nr_workers
+   - worker开始是idle状态? 
+   > worker_enter_idle(worker)
+   - 唤醒刚创建的线程
+   > wake_up_process(worker->task)
+
+** create_and_start_worker(worker_pool)
+   - 创建并启动一个worker 
+   > create_worker(worker_pool)
+   > start_worker(worker)
+
+** destroy_worker(worker)
+   - 销毁worker
+   - 先检查是否满足条件
+   - worker->current_work != NULL, 或者worker->scheduled不再链表中, 直接返回
+   - 如果worker->flags包含WORKER_STARTED, 减小worker_pool->nr_workers
+   - 如果worker->flags包含WORKER_IDLE, 减小worker_pool->nr_idle
+   - 释放worker->entry链表?? 设置worker->flags的WORKER_DIE?
+   - 释放idr索引, 关闭线程
+   - kthread_stop(worker->task_struct)
+   - 释放worker
+
+** idle_worker_timeout(pool)
+   - 这个函数是worker_pool->idle_timer的回调函数
+   - 在worker太多时,关闭多于的worker 
+   > too_many_worker(worker_pool)
+   - 从worker_pool->idle_list中取出最后一个
+   - 如果它睡眠太常时间
+   - worker->last_active + IDLE_WORKER_TIMEOUT < jiffies, 设置worker->flags的POOL_MANAGE_WORKERS, 唤醒它? 
+   > wake_up_worker(worker_pool)
+   - 否则让计时器继续
+
+** send_mayday(work_struct)
+   - 要唤醒workqueue_struct->rescure做什么?
+   - 从work_struct获取pool_workqueue, workqueue_struct
+   > get_work_pwq(work_struct)
+   - 如果workqueue_struct->rescuer为NULL, 没有rescuer, 直接退出
+   - 如果pool_workqueue->mayday_node链表为空, 把pool_workqueue->mayday_node放到workqueue_struct->maydays中
+   - 唤醒workqueue_struct->rescuer->task, 处理这个pool_workqueue? 
+
+** pool_mayday_timeout(pool)
+   - 这是worker_pool->mayday_timer的回调函数
+   - 检查是否需要worker_pool 
+   > need_to_create_worker(worker_pool)
+   - 这时不能再创建新的worker?
+   - 向所有的worker发送mayday求救信号
+   - 遍历worker_pool->worklist链表中的worker 
+   > send_mayday(work_struct)
+   - 重新安装计时器
+   > mod_timer(worker_pool->mayday_timer, jiffies + MAYDAY_INTERVAL)
+
+** maybe_create_worker(worker_pool)
+   - 创建一个新的worker
+   - 如果不需要,直接返回
+   > need_to_create_worker(worker_pool)
+   - 设置计时器,如果一段时间都无法建立worker, 发送求救信号
+   > mod_timer(worker_pool->mayday_timer, jiffiest + MAYDAY_INITIAL_TIMEOUT)
+   - 开始循环执行创建工作
+   > create_worker(worker_pool)
+   - 如果创建成功,取消worker_pool->mayday_timer
+   - 启动worker 
+   > start_worker(worker)
+   - 否则等待一段时间重新创建
+   > __set_current_state(TASK_INTERRUPTIBLE)
+   > schedule_timeout(CREATE_COOLDOWN)
+
+** maybe_destroy_workers(worker_pool)
+   - 关闭长时间不用的worker
+   - 这里会循环执行,直到没有多余的worker 
+   > too_many_workers(worker_pool)
+   - 获取worker_pool->idle链表最后一个work_struct
+   - 如果它睡眠太常时间 worker->last_active + IDLE_WORKER_TIMEOUT < jiffies, 关闭这个worker 
+   > destroy_worker(worker)
+   - 最后没有worker处理,重新安装worker_pool->idle_timer
+
+** manage_workers(worker)
+   - worker_pool的管理者任务,创建或关闭线程
+   - 使用worker_pool->manager_arb同步这些操作 
+   > mutex_trylock(worker_pool->manager_arb)
+   - 如果无法获取锁,别人在操作,直接返回
+   - 去掉worker_pool->flags的POOL_MANAGE_WORKERS标志?
+   - 同时获取worker_pool->manager_mutex, 防止别人创建worker?
+   - 开始创建或释放任
+   > maybe_destroy_workers(worker_pool)
+   > maybe_create_worker(worker_pool)
+   
+** process_one_work(worker, work_struct)
+   - 从work_struct获取pool_workqueue, worker_pool
+   - 检查cpu是否正确
+   - 如果worker->flags没有WORKER_UNBOUND, 而且worker_pool->flags没有POOL_DISASSOCIATED
+   - 判断worker_pool->cpu是否和当前的状态一样
+   > raw_smp_processor_id()
+   - 检查是否有冲突的worker? 
+   > find_worker_executing_work(worker_pool, work_struct)
+   - 如果找到??? 返回
+   > move_linked_works(work_struct, worker->scheduled, NULL)
+   - 开始处理work_struct 
+   - 把work_struct->hentry放到worker_pool->busy_hash中, 设置worker
+   - worker->current_pwd = pool_workqueue, 原来这2者不是绑定的?
+   - 释放work_struct->entry链表
+   - 如果pool_workqueue->worker_pool->flags包含WQ_CPU_INTENSIVE, 设置worker->flags的WORKER_CPU_INTENSIVE? 
+   > worker_set_flags(worker, WORKER_CPU_INTENSIVE, true)
+   - 如果是unbound的worker, worker->flags有WORKER_UNBOUND
+   - 不需要同步? 唤醒其他worker 
+   > need_more_worker(worker_pool)
+   > wake_up_worker(worker_pool)
+   - 更新work_struct的标志 
+   > set_work_pool_and_clear_pending(work_struct, worker_pool->id)
+   - 执行任务?
+   > worker->current_func(work_struct)
+   - 完成之后,开始恢复操作
+   - 释放worker->hentry, worker->current_work/current_func等
+   - 最后减小计数
+   > pwq_dec_nr_in_flight(pool_workqueue, work_color)
+
+** process_scheduled_works(worker)
+   - 
 
 
     s. find_worker_executing_work(global_qcwq, work_struct)
