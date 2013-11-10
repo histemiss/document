@@ -89,15 +89,15 @@
    #+begin_src 
 	/* on idle list while idle, on busy hash table while busy */
 	union {
-		struct list_head	entry;	/* L: while idle */
-		struct hlist_node	hentry;	/* L: while busy */ 在worker_pool->busy_hash表中
+		struct list_head	entry;	/* L: while idle */ //worker_pool->idle_list链表
+		struct hlist_node	hentry;	/* L: while busy */ //在worker_pool->busy_hash表中
 	};
 
 	struct work_struct	*current_work;	/* L: work being processed */
 	work_func_t		current_func;	/* L: current_work's fn */
 	struct pool_workqueue	*current_pwq; /* L: current_work's pwq */
 	bool			desc_valid;	/* ->desc is valid */
-	struct list_head	scheduled;	/* L: scheduled works */
+	struct list_head	scheduled;	/* L: scheduled works */  //连在一起的work_struct, flush work_struct
 
 	/* 64 bytes boundary on 64bit, 32 on 32bit */
 
@@ -105,9 +105,9 @@
 	struct worker_pool	*pool;		/* I: the associated pool */
 						/* L: for rescuers */
 
-	unsigned long		last_active;	/* L: last active timestamp */
+	unsigned long		last_active;	/* L: last active timestamp */ //每次进入idle状态时更新
 	unsigned int		flags;		/* X: flags */
-	int			id;		/* I: worker id */
+	int			id;		/* I: worker id */  //worker_pool->worker_idr中的索引
 
 	/*
 	 * Opaque string set with work_set_desc().  Printed out with task
@@ -119,35 +119,48 @@
 	struct workqueue_struct	*rescue_wq;	/* I: the workqueue to rescue */   
    #+end_src
 
+** workqueue_attrs
+   #+BEGIN_SRC 
+	int			nice;		/* nice level */
+	cpumask_var_t		cpumask;	/* allowed CPUs */
+	bool			no_numa;	/* disable NUMA affinity */   
+   #+END_SRC
+
 ** worker_pool 
+   - 使用workqueue_attrs区别, nice,cpumask
+   - 使用全局unbound_pool_hash表管理
+   - 默认有静态变量cpu_worker_pools, 属于每个cpu的worker_pool, 他们的workqueue_attrs也是限于这个cpu
+   - 在init_workqueues中初始化它们, 初始化时同时创建一个worker
+   - 使用idr和2个队列管理worker
+
    #+begin_src 
 	spinlock_t		lock;		/* the pool lock */
 	int			cpu;		/* I: the associated cpu */
 	int			node;		/* I: the associated node ID */
-	int			id;		/* I: pool ID */
+	int			id;		/* I: pool ID */ //全局变量worker_pool_idr中的索引
 	unsigned int		flags;		/* X: flags */
 
 	struct list_head	worklist;	/* L: list of pending works */
-	int			nr_workers;	/* L: total number of workers */
+	int			nr_workers;	/* L: total number of workers */  //它所有的worker的数量
 
 	/* nr_idle includes the ones off idle_list for rebinding */
-	int			nr_idle;	/* L: currently idle ones */
+	int			nr_idle;	/* L: currently idle ones */ //idle状态的worker数量
 
-	struct list_head	idle_list;	/* X: list of idle workers */
+	struct list_head	idle_list;	/* X: list of idle workers */  //worker->entry
 	struct timer_list	idle_timer;	/* L: worker idle timeout */
 	struct timer_list	mayday_timer;	/* L: SOS timer for workers */
 
 	/* a workers is either on busy_hash or idle_list, or the manager */
 	DECLARE_HASHTABLE(busy_hash, BUSY_WORKER_HASH_ORDER);
-						/* L: hash of busy workers */
+						/* L: hash of busy workers */ //worker->hentry
 
 	/* see manage_workers() for details on the two manager mutexes */
 	struct mutex		manager_arb;	/* manager arbitration */
 	struct mutex		manager_mutex;	/* manager exclusion */
-	struct idr		worker_idr;	/* MG: worker IDs and iteration */
+	struct idr		worker_idr;	/* MG: worker IDs and iteration */  //worker->id
 
-	struct workqueue_attrs	*attrs;		/* I: worker attributes */
-	struct hlist_node	hash_node;	/* PL: unbound_pool_hash node */
+	struct workqueue_attrs	*attrs;		/* I: worker attributes */  //会修改吗?
+	struct hlist_node	hash_node;	/* PL: unbound_pool_hash node */  //所有的worker_pool
 	int			refcnt;		/* PL: refcnt for unbound pools */
 
 	/*
@@ -165,18 +178,21 @@
    #+end_src
 
 ** pool_workqueue
+   - 它属于workqueue_struct->cpu_pwqs或者numa_pwq_tbl
+   - 它处于workqueue_struct和worker_pool, 提交了work_struct先到这里来,然后转给worker_pool所有的worker执行
+   
    #+begin_src 
 	struct worker_pool	*pool;		/* I: the associated pool */
 	struct workqueue_struct *wq;		/* I: the owning workqueue */
-	int			work_color;	/* L: current color */
+	int			work_color;	/* L: current color */ 
 	int			flush_color;	/* L: flushing color */
 	int			refcnt;		/* L: reference count */
 	int			nr_in_flight[WORK_NR_COLORS];
-						/* L: nr of in_flight works */
-	int			nr_active;	/* L: nr of active works */
+						/* L: nr of in_flight works */  //提交的work_struct的数量, color根据work_color而定, 在执行完成后减小
+	int			nr_active;	/* L: nr of active works */  //表示worker_pool->worklist中的work_struct的数量, 如果达到max_active, 其他的work_struct只能放到pool_workqueue->delayed_works. 和nr_in_flight同时变化
 	int			max_active;	/* L: max active works */
-	struct list_head	delayed_works;	/* L: delayed works */
-	struct list_head	pwqs_node;	/* WR: node on wq->pwqs */
+	struct list_head	delayed_works;	/* L: delayed works */  //work_struct
+	struct list_head	pwqs_node;	/* WR: node on wq->pwqs */ //同属于一个workqueue_struct
 	struct list_head	mayday_node;	/* MD: node on wq->maydays */
 
 	/*
@@ -196,10 +212,37 @@
 	struct completion	done;		/* flush completion */   
    #+end_src
 
+** workqueue_struct的标志
+   #+BEGIN_SRC 
+	WQ_NON_REENTRANT	= 1 << 0, /* guarantee non-reentrance */
+	WQ_UNBOUND		= 1 << 1, /* not bound to any cpu */
+	WQ_FREEZABLE		= 1 << 2, /* freeze during suspend */
+	WQ_MEM_RECLAIM		= 1 << 3, /* may be used for memory reclaim */
+	WQ_HIGHPRI		= 1 << 4, /* high priority */ //有2种,一种是0,一种是高优先级
+	WQ_CPU_INTENSIVE	= 1 << 5, /* cpu instensive workqueue */
+	WQ_SYSFS		= 1 << 6, /* visible in sysfs, see wq_sysfs_register() */
+
+	WQ_POWER_EFFICIENT	= 1 << 7, //默认情况下相当于非WQ_UNBOUND, 可使用内和参数控制
+
+	__WQ_DRAINING		= 1 << 16, /* internal: workqueue is draining */
+	__WQ_ORDERED		= 1 << 17, /* internal: workqueue is ordered */
+
+	WQ_MAX_ACTIVE		= 512,	  /* I like 512, better ideas? */
+	WQ_MAX_UNBOUND_PER_CPU	= 4,	  /* 4 * #cpus for unbound wq */
+	WQ_DFL_ACTIVE		= WQ_MAX_ACTIVE / 2,   
+   #+END_SRC
+
 ** workqueue_struct
+   - 外部接口,主要管理pool_workqueue
+   - 如果workqueue_struct->flags没有WQ_UNBOUND, 每个cpu使用一个pool_workqueue, 它关联cpu_worker_pools的对应cpu的pool_workqueue
+   - 如果workqueue_struct->flags有WQ_UNBOUND, 表示worker没有绑定cpu, 而是每个numa的node使用一个pool_workqueue.
+   - 这种pool_workqueue使用动态创建的,根据workqueue_attrs而定, 放到workqueue_struct->numa_pwq_tbl[node]中
+   - 还有一个workqueue_struct->dfl_pwq, 不限于node
+   - 如果支持内存回收, WQ_MEM_RECLAIM, 创建rescuer, 一个特殊的worker, 用来处理特殊的事情?
+
    #+begin_src 
-	struct list_head	pwqs;		/* WR: all pwqs of this wq */
-	struct list_head	list;		/* PL: list of all workqueues */
+	struct list_head	pwqs;		/* WR: all pwqs of this wq */  //所有的pool_workqueue
+	struct list_head	list;		/* PL: list of all workqueues */   //全局变量workqueues
 
 	struct mutex		mutex;		/* protects this wq */
 	int			work_color;	/* WQ: current work color */
@@ -213,7 +256,7 @@
 	struct worker		*rescuer;	/* I: rescue worker */
 
 	int			nr_drainers;	/* WQ: drain in progress */
-	int			saved_max_active; /* WQ: saved pwq max_active */
+	int			saved_max_active; /* WQ: saved pwq max_active */ //worker_pool->worklist中最多的work_struct, 默认是256
 
 	struct workqueue_attrs	*unbound_attrs;	/* WQ: only for unbound wqs */
 	struct pool_workqueue	*dfl_pwq;	/* WQ: only for unbound wqs */
@@ -228,7 +271,7 @@
 
 	/* hot fields used during command issue, aligned to cacheline */
 	unsigned int		flags ____cacheline_aligned; /* WQ: WQ_* flags */
-	struct pool_workqueue __percpu *cpu_pwqs; /* I: per-cpu pwqs */
+	struct pool_workqueue __percpu *cpu_pwqs; /* I: per-cpu pwqs */  //在非WQ_UNBOUND使用
 	struct pool_workqueue __rcu *numa_pwq_tbl[]; /* FR: unbound pwqs indexed by node */   
    #+end_src
 
@@ -236,7 +279,7 @@
    - 从worker_pool_idr中分配一个id, 索引worker_pool指针
 
 ** unbound_pwq_by_node(workqueue_struct, node)
-   - node应该对应cpu
+   - 对于WQ_UNBOUND的workqueue_struct, 为每个node构造pool_workqueue
    - 获取workqueue_struct->numa_pwq_tbl[node]
    - 使用rcu保护,或者pwq_lock, workqueue_struct->mutex
 
@@ -252,9 +295,9 @@
 
 ** set_work_data(work_struct, data, flags)
    - 设置work_struct->data的标志位
-   - work_struct当前必须在等待? work_struct->data必须有WORK_STRUCT_PENDING_BIT
+   - work_struct当前必须在等待,也就是没有调度执行 work_struct->data必须有WORK_STRUCT_PENDING_BIT
    > atomic_long_set(&work->data, data | flags | work_static(work))
-   - 最后需要留下WORK_STRUCT_STATIC?
+   - 最后需要留下WORK_STRUCT_STATIC, 用于debug使用
 
 ** set_work_pwq(work_struct, pool_workqueue, extra_flags)
    - 设置work_struct->data的标志位
@@ -1277,4 +1320,5 @@
    - system_freezable_wq, system_power_efficient_wq
    - system_power_efficient_wq, system_freezable_power_efficient_wq
    - 这些都谁使用??
+
 
