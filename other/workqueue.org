@@ -886,17 +886,19 @@
    - 如果原来work_struct是linked, 传递这个标志,同时执行后面的work_struct
 
 ** flush_workqueue_prep_pwqs(workqueue_struct, flush_color, work_color)
-   - 刷新一个workqueue_struct?
+   - 刷新一个workqueue_struct
+   - 这里有2个功能,一个设置所有的pool_workqueue->work_color
+   - 另一个是,如果pool_workqueue->nr_in_flight[flush_color] !=0, 需要等待这部分work_struct, 设置pool_workqueue->flush_color = flush_color
    - 如果flush_color >=0, 设置workqueue_struct->nr_pwqs_to_flush = 1
-   - 遍历workqueue_struct的pool_workqueue?
+   - 遍历workqueue_struct的pool_workqueue
    - 如果flush_color >=0, 而且pool_workqueue->nr_in_flight[flush_color] > 0
-   - 需要等待这个pool_workqueue?
+   - 需要等待这个pool_workqueue
    - 设置pool_workqueue->flush_color = flush_color
    - 增加workqueue_struct->nr_pwqs_to_flush
    - 如果work_color > 0
    - 设置pool_workqueue->work_color = work_color
-   - 最后如果flush_color >=0, 减小workqueue_struct->nr_pwqs_to_flush
-   - 如果它减为0, 说明flush完成? 
+   - 最后减小workqueue_struct->nr_pwqs_to_flush
+   - 如果它减为0, 说明flush完成
    > complete(workqueue_struct->first_flusher_done)
 
 ** wq_flusher
@@ -907,37 +909,47 @@
    #+END_SRC
 
 ** flush_workqueue(workqueue_struct)
-   - flush所有的work_struct ?
-   - 计算可使用的color? 
+   - flush整个work_struct, 根据color实现
+   - 计算可使用的work_color
    > work_next_work(workqueue_struct->work_color)
    - 如果color不是workqueue_struct->flush_color, color还没用完?
    - 设置wq_flusher->flush_color = workqueue_struct->work_color
    - 更新workqueue_struct->work_color = next_color, 就是上面计算的
-   - 如果workqueue_struct->first_flusher是NULL, 还没有flusher?
-   - 刷新workqueue_struct 
+   - 如果workqueue_struct->first_flusher是NULL, 当前是第一个flush
    > flush_workqueue_prep_pwqs(workqueue_struct, workqueue_struct->flush_color, workqueue_struct->work_color)
-   - 如果上面返回false, 说明没有work_struct ?
+   - 如果上面返回false, 说明没有work_struct, 更新workqueue_struct->flush_color = next_color, 也就是和work_color一致
    - 如果不是第一个wq_flusher
    - 把wq_flusher->list放到workqueue_struct->flusher_queue链表中
-   - 使用不同的参数等待? 
+   - 更新所有pool_workqueue->work_color
    > flush_workqueue_prep_pwqs(workqueue_struct, -1, workqueue_struct->work_color)
-   - 如果color空间不够用?
+   - 如果color空间不够用,next_color = workqueue_struct->flush_color
    - 把wq_flusher->list放到workqueue_struct->flusher_overflow链表
    - 等待wq_flusher->done 
    > wait_for_completion(wq_flusher->done)
-   - 被唤醒后, 如果workqueue_struct->first_flusher不是当前wq_flusher直接返回?
-   - 否则还要处理其他的wq_flusher? 
+   - 被唤醒后, 如果workqueue_struct->first_flusher不是当前wq_flusher直接返回, 它是被之前的wq_flusher唤醒的
+   - 否则还要处理后续的wq_flusher
    - 遍历workqueue_struct->flusher_queue, 
    - 如果wq_flusher->flush_color != workqueue_struct->flush_color?  它已经完成? 
    > complete(wq_flusher->done)
    - 然后处理workqueue_struct->flusher_overflow链表中的wq_flusher
-   - 让他们使用同一个flush_color
-   - 遍历workqueue_struct->flusher_overflow
+   - 唤醒使用同一个flush_color的
+   - 遍历workqueue_struct->flusher_overflow, 因为现在空出一个flush_color
    - 设置wq_flusher->flush_color = workqueue_struct->work_color
    - 设置workqueue_struct->work_color = next_color 
    > work_next_color(workqueue_struct->work_color)
    - 把workqueue_struct->flusher_overflow队列中的wq_flusher放到workqueue_struct->flusher_queue中
+   - 更新pool_workqueue->work_color
    - flush_workqueue_prep_pwqs(workqueue_struct, -1, workqueue->work_color)
+   - 然后检查第一个wq_flusher是否需要等待,可能它对应的work_struct也已经完成, 如果不需要同样会唤醒,然后处理后面的wq_flusher
+
+   - 这里和work_struct结束的处理相应
+   - 这2部分使用worker_pool->lock保持护持
+
+   - 先检查pool_workqueue->flush_color = color, 而且pool_workqueue->nr_in_flight[color] = 0, 然后设置pool_workqueue->flush_color = -1
+   - 唤醒pool_workqueue->first_flusher
+
+   - 检查是否需要等待 flush_workqueue_prep_pwqs 用来设置flush_color, 仅处理第一个wq_flush, 也就是安装wq_flusher
+   - 安装wq_flush, 如果需要等待work_struct, 设置flush_color, 增加workqueue_struct->nr_pwqs_to_flush
      
 ** drain_workqueue(workqueue_struct)
    - 刷新workqueue_struct, 不再接受新的work_struct 
