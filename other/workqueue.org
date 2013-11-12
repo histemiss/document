@@ -165,7 +165,7 @@
 	char			desc[WORKER_DESC_LEN];
 
 	/* used only by rescuers to point to the target workqueue */
-	struct workqueue_struct	*rescue_wq;	/* I: the workqueue to rescue */   
+	struct workqueue_struct	*rescue_wq;	/* I: the workqueue to rescue */    //resecuer的worker特有的
    #+end_src
 
 ** workqueue_attrs
@@ -962,20 +962,23 @@
    - 最后恢复, 减小workqueue_struct->nr_drainers, 去掉__WQ_DRAINING标志
 
 ** start_flush_work(work_struct, wq_barrier)
+   - flush一个work_struct, 而不是整个workqueue_struct
    - 获取work_struct的pool_workqueue, worker_pool
    > get_work_pool(work_struct)
    > get_work_pwq(work_struct)
    - worker_pool一定存在,但pool_workqueue不一定?
    - 如果worker_pool和pool_workqueue不一致,work_struct已经结束? 不再处理
-   - 如果pool_workqueue不存在,计算对应的worker 
+   - 如果pool_workqueue不存在, 通过pool_workqueue查找对应的worker 
    > find_worker_executing_work(worker_pool, work_struct)
    - 如果找不到,work_struct也结束,直接返回 
    - 否则使用worker->pool_workqueue
-   - 把wq_barrier插入到pool_workqueue 
+   - 把wq_barrier插入到pool_workqueue
+   - 可能去worker->scheduled, 表示即将被执行
+   - 可能work_pool->worklist或pool_workqueue->delayed_works, 表示在等待调度
    > insert_wq_barrier(pool_workqueue, wq_barrier, work_struct, worker)
    
 ** __flush_work(work_struct)
-   - 刷新一个work_struct?
+   - 刷新一个work_struct
    - 使用wq_barrier 
    > start_flush_work(work_struct, wq_barrier)
    - 等待wq_barrier 
@@ -988,9 +991,10 @@
    > __flush_work(work_struct)
 
 ** __cancel_work_timer(work_struct, is_dwork)
-   - 取消一个work_struct ? 
+   - 取消一个work_struct
+   - 先撤销等待的计时器, 或者从调度队列中释放
    > try_to_grab_pending(work_struct, is_dwork, flags)
-   - 如果找不到? 
+   - 如果找不到, 说明在执行?
    > flush_work(work_struct)
    - 设置取消标志? 
    > mark_work_canceling(work_struct)
@@ -1004,9 +1008,9 @@
 
 ** flush_delayed_work(delayed_work)
    - flush一个延时的work_struct 
-   - 取消计时器 
+   - 取消计时器
    > del_timer_sync(delayed_work->timer)
-   - 直接执行它? 
+   - 如果计时器没有到时,把它放到队列中执行
    > __queue_work(delayed_work->cpu, delayed_work->workqueue_struct, delayed_work->work_struct)
    - 然后等待它完成 
    > flush_work(delayed_work->work_struct)
@@ -1014,7 +1018,7 @@
 ** cancel_delayed_work(delayed_work)
    - 取消一个delayed_work 
    > try_to_grab_pending(delayed_work->work_struct, true, flags)
-   - 重新设置work_struct的标记
+   - 重新设置work_struct的标记, 直接设置取消标志??
    > set_work_pool_and_clear_pending(delayed_work->work_struct, get_work_pool_id(delayed_work->work_struct))
    
 ** cancel_delayed_work_sync(delayed_work)
@@ -1055,12 +1059,16 @@
    > free_workqueue_attrs(worker_pool->attrs)
 
 ** put_unbound_pool(worker_pool)
+   - worker_pool有2中,一种时静态的,绑定cpu的 
+   - 另一种是unbound, 和cpu无关, 也就是这里处理的
+   - 使用pool_workqueue->unbound_release_work释放pool_workqueue时会释放这里
+
    - 释放worker_pool, 减小worker_pool->refcnt
    - 如果不是0, 直接返回
    - 检查是否可以释放
    - worker_pool->flags没有POOL_DISASSOCIATED或者
    - worker_pool->worlist里面还有work_struct, 不能释放
-   - 释放全局的idr索引? 
+   - 释放全局的idr索引
    > idr_remove(worker_pool_idr, worker_pool->id)
    - 释放hash表 
    > hash_del(worker_pool->hash_node)
@@ -1082,7 +1090,7 @@
    - 查找和workqueue_attrs匹配的worker_pool
    - 遍历unbound_pool_hash里面的worker_pool
    - 比较worker_pool->attrs和workqueue_attrs
-   - 如果找不到,创建新一个 
+   - 如果找不到,创建新一个worker_pool
    > init_worker_pool(worker_pool)
    - 分配idr索引, 建立hahs表关系
    > worker_pool_assign_id(worker_pool)
@@ -1098,35 +1106,39 @@
    - 使用work_struct释放pool_workqueue
    - 使用system_wq
    - work_struct是pool_workqueue->unbound_release_work
-   - 如果workqueue_struct->flags没有WQ_UNBOUND, 不能释放?
-   - 释放pool_workqueue->pwqs_node链表?
-   - 这是workqueue_struct->pwqs?
-   - 释放pool_workqueue
+
+   - 如果workqueue_struct->flags没有WQ_UNBOUND, 这个pool_workqueue是workqueue_struct的静态per-cpu变量
+
+   - 释放pool_workqueue->pwqs_node链表, workqueue_struct->pwqs
+   - 减小pool_workqueue的使用计数, 可能会一块释放掉worker_pool
    > put_unbound_pool(worker_pool)
    > call_rcu_sched(pool_workqueue->rcu, rcu_free_pwq)
-   - 如果workqueue_struct->pwqs队列为空,没有pool_workqueue, 释放它自己
+   - 如果workqueue_struct->pwqs队列为空,没有pool_workqueue, 释放workqueue_struct
    > free_workqueue_attrs(workqueue_struct->unbound_attrs)
    > kfree(workqueue_struct)
 
 ** pwq_adjust_max_active(pool_workqueue)
-   - 更新pool_workqueue->max_active?
+   - 更新pool_workqueue->max_active, 如果增加,可调度更多的work_struct
    - pool_workqueue->worker_pool->flags没有POOL_FREEZING
    - 而且workqueue_struct->flags没有WQ_FREEZABLE
    - 设置pool_workqueue->max_active = workqueue_struct->saved_max_active
-   - 然后唤醒worker? 直到pool_workqueue->nr_active >= pool_workqueue->max_active 
+   - 转移pool_workqueue->delayed_works给worker_pool->worklist
+   - 直到pool_workqueue->nr_active >= pool_workqueue->max_active 
    > pwq_activate_first_delayed(pool_workqueue)
-   - 唤醒worker_pool的任务?? 
+   - 唤醒worker_pool的worker
    > wake_up_worker(pool_workqueue->worker_pool)
    - 如果上面freeze检查不满足, 仅设置pool_workqueue->max_active = 0
+   - 这里在停止冻结workqueue_struct之后使用
 
 ** init_pwq(pool_workqueue, workqueue_struct, worker_pool)
    - 初始化pool_workqueue
    - 设定pool_workqueue->worker_pool, workqueue_struct
-   - 设定pool_workqueue->unbound_release_work, 释放自己? 
+   - 设定pool_workqueue->unbound_release_work
 
 ** link_pwq(pool_workqueue)
+   - 在创建pool_workqueue时使用
    - 设置pool_workqueue->work_color = workqueue_struct->work_color
-   - 调整max_active? 
+   - 调整max_active
    > pwq_adjust_max_active(pool_workqueue)
    - 把pool_workqueue->pwqs_node放到workqueue_struct->pwqs
 
@@ -1138,74 +1150,79 @@
    > init_pwq(pool_workqueue, workqueue_struct, worker_pool)
 
 ** free_unbound_pwq(pool_workqueue)
+   - 没有释放关联的资源,在创建失败时使用
    - 释放pool_workqueue, 首先是worker_pool 
    > put_unbound_pool(pool_workqueue->worker_pool)
    - 然后是自己 
    > kmem_cache_free(pwq_cache, pool_workqueue)
 
 ** wq_calc_node_cpumask(workqueue_attrs, node, cpu_going_down, cpumask)
-   - 计算workqueue可以使用的cpumask?
-   - 如果不使用numa? 
+   - 计算一个pool_workqueue/worker_pool在一个node中可以使用的cpumask
+   - 如果不使用numa, 不再计算
    - wq_numa_enable==0, 或者workqueue_attrs->no_numa!=0, 直接使用workqueue_attrs->cpumask
-   - 否则 计算node对应的cpumask 
+   - 否则先使用node对应的cpumask的限制
    > cpumask_and(cpumask, cpumask_of_node(node), workqueue_attrs->cpumask)
    - 去掉cpu_goding_down中的cpumask 
    > cpumask_clear_cpu(cpu_going_down, cpumask)
-   - 然后使用wq_numa_possible_cpumask[node]过滤
+   - 然后使用wq_numa_possible_cpumask[node]限制
    > cpumask_add(cpumask, workqueue_attrs->cpumask, wq_numa_possible_cpumask[node])
 
 ** numa_pwq_tlb_install(workqueue_struct, node, pool_workqueue)
-   - 把pool_workqueue放到workqueue_struct中?
+   - 把pool_workqueue放到workqueue_struct中
    > link_pwq(pool_workqueue)
    - 设置workqueue_struct->numa_pwq_tbl[node] = pool_workqueue
 
 ** apply_workqueue_attrs(workqueue_struct, workqueue_attrs)
-   - 设置unbound的workqueue_struct?
+   - 在更新了wokrqueue_struct的参数或创建unoubnd的pool_workqueue时使用
+   - 设置unbound的workqueue_struct
    - 如果workqueue_struct->flags没有WQ_UNBOUND, 返回-EINVAL
-   - 构造pool_workqueue数组, 长度是wq_numa_tbl_len, 全局变量
-   - 构造workqueue_attrs, 保存参数workqueue_attrs
+   - 构造pool_workqueue数组, 长度是wq_numa_tbl_len, 全局变量, node的个数
+   - 构造workqueue_attrs, 使用参数workqueue_attrs, 里面只有nice
    > alloc_workqueue_attrs(GFP_KERNEL)
    > copy_workqueue_attrs(new_attrs, attrs)
    - 先准备一个默认的pool_workqueue 
    > alloc_unbound_pwq(workqueue_struct, workqueue_attrs)
    - 遍历所有的node
-   - 如果它的cpu可用? 
+   - 计算对应的workqueue_attrs的cpumask
    > wq_calc_node_cpumask(workqueue_struct, node, -1, workqueue_attrs->cpumask)
-   - 为node分配一个专用的pool_workqueue 
+   - 如果上面计算的cpumask和默认的一样,这个node只能使用默认的pool_workqueue
+   - 否则为它分配一个专用的pool_workqueue 
    > alloc_unbound_pwq(workqueue_struct, workqueue_attrs)
    - 否则使用默认的pool_workqueue
-   - 然后把上面的构造的pool_workqueue数组更新给workqueue_struct 
+   - 然后把上面的构造的pool_workqueue数组给workqueue_struct 
    > numa_pwq_tbl_install(workqueue_struct, node, pwq_tlb[node])
-   - 把默认的pool_workqueue放到哪里? 
+   - 把默认的pool_workqueue给workqueue_struct->dfl_pwq
    > link_pwq(default_pool_workqueue)
    
 ** wq_update_unbound_numa(workqueue_struct, cpu, online)
-   - 在cpu热插拔之后，更新numa affinity?
+   - 在cpu热插拔之后，更新workqueue_struct对应node的pool_workqueu的worker_pool的workqueue_attrs的cpumask
    - 如果没有使用numa affinity, 直接返回
    - wq_numa_enable==0 
-   - 或者 workqueue_struct->flags没有WQ_UNBOUND, 为什么是Unbound?
+   - 或者workqueue_struct->flags没有WQ_UNBOUND, 只有unbound的workqueue_struct才使用unbound的worker_pool/pool_workqueue
    - 或者workqueue_struct->unbound_attrs->no_numa !=0
-   - 使用workqueue_struct->unbound_attrs更新?
+   - 使用workqueue_struct->unbound_attrs的nice, 还有一个比较初始的cpumask
+   - 所有node的cpumask都是根据它计算的
    > copy_workqueue_attrs(workqueue_attrs, workqueue_struct->unbound_attrs)
    - 找到workqueue_struct->numa_pwq_tbl中node对应的pool_workqueue
    > unbound_pwq_by_node(workqueue_struct, node)
-   - 重新计算cpumask 
+   - 重新计算cpumask
    > wq_calc_node_cpumask(workqueue_struct->unbound_attrs, node, cpu_off, cpumask)
-   - 如果cpumask和现在的一样, 直接返回
-   > cpumask(cpumask, pool_workqueue->worker_pool->workqueue_attrs->cpumask)
-   - 重新构造新的pool_workqueue 
+   - 如果cpumask和现在的pool_workqueue->worker_pool->workqueue_attrs->cpumask一样, 直接返回, 不需要更新
+   > cpumask_equal(cpumask, pool_workqueue->worker_pool->workqueue_attrs->cpumask)
+   - 否则重新构造新的pool_workqueue 
    > alloc_unbound_pwq(workqueue_struct, workqueue_struct)
    - 给workqueue_struct 
    > numa_pwq_tbl_install(workqueue_struct, node, pool_workqueue)
+   - 如果上面计算的cpumask和初始的cpumask一样,把对应node的pool_workqueue改为workqueue_struct->dfl_pwq
    
 ** alloc_and_link_pwqs(workqueue_struct)
-   - 为workqueue_struct创建pool_workqueue?
+   - 为workqueue_struct创建pool_workqueue
    - 如果workqueue_struct->flags没有WQ_UNBOUND
-   - 创建cpu专有的pool_workqueue 
+   - 创建cpu专有的pool_workqueue
    - 遍历所有的cpu, 使用cpu_pools初始化pool_workqueue?
    > init_pwq(pool_workqueue, workqueue_struct, cpu_pools[highpri]
    > link_pwq(pool_workqueue)
-   - 如果有WQ_UNBOUND, 使用workqueue_attrs创建? 
+   - 如果有WQ_UNBOUND, 使用workqueue_attrs创建, 绑定node的pool_workqueue
    > apply_workqueue_attrs(workqueue_struct, unbound_std_wq_attrs[highpri])
 
 ** wq_clamp_max_active(max_active, flags, name)
@@ -1214,15 +1231,15 @@
    - 否则是(1, WQ_MAX_ACTIVE)
 
 ** __alloc_workqueue_key(fmt, flags, max_active, key, lock_name, ..)
-   - 创建workqueue_struct?
+   - 创建workqueue_struct
    - 如果flags有WQ_POWER_EFFICIENT, 而且wq_power_efficient有效,
-   - 设置flags的WQ_UNBOUND
-   - 如果flags有WQ_UNBOUND, 使用numa的pool_workqueue?
-   - 而且使用unbound_attrs 
+   - 设置flags的WQ_UNBOUND, 默认是不用它的
+   - 如果flags有WQ_UNBOUND, 使用numa绑定的的pool_workqueue, 否则是cpu绑定的pool_workqueue
+   - 如果是node绑定的, WQ_UNBOUND, 使用unbound_attrs, 里面的确只有nice?
    > alloc_workqueue_attrs(GFP_KERNEL)
    - 创建pool_workqueue 
    > alloc_and_link_pwqs(workqueue_struct)
-   - 如果flags有WQ_MEM_RECLAIM, 创建rescuer?
+   - 如果flags有WQ_MEM_RECLAIM, 创建rescuer
    - 表示会在回收内存时使用
    - 把创建的worker给workqueue_struct->rescuer
    - 设置每个pool_workqueue的max_active 
@@ -1236,7 +1253,9 @@
    - pool_workqueue->nr_in_flight[i] == 0
    - 关闭rescuer 
    > kthread_stop(workqueue_struct->rescuer->task)
-   - 释放所有的pool_workqueue
+   - 如果是cpu绑定的,需要释放percpu变量
+   - 否则是node绑定的, 还要释放一下
+   > put_pwq_unlocked(pool_workqueue)
 
 ** workqueue_set_max_active(workqueue_struct, max_active)
    - 设定workqueue_struct->saved_max_active
@@ -1250,7 +1269,7 @@
    > current_wq_worker()
 
 ** workqueue_congested(cpu, workqueue_struct)
-   - workqueue在某个cpu上阻塞?
+   - workqueue在某个cpu上阻塞, 只要检查它对应的pool_workqueue->delayed_works里面有work_struct
    - 如果参数cpu是WQ_CPU_UNBOUND, 使用当前cpu 
    > smp_processor_id()
    - 根据cpu获取pool_workqueue
@@ -1262,8 +1281,7 @@
 
 ** work_busy(work_struct)
    - 检查work_struct是否在等待或工作中
-   - 首先是等待中, work_struct->data有WORK_STRUCT_PENDING_BIT
-   - 返回WORK_BUSY_PENDING
+   - 首先是等待中, work_struct->data有WORK_STRUCT_PENDING_BIT,说明他已经调度, 对应WORK_BUSY_PENDING
    > work_pending(work_struct)
    - 查找是否有使用的worker, 返回WORK_BUSY_RUNNING
    > get_work_pool(work_struct)
@@ -1274,8 +1292,9 @@
    - 设定worker->desc_valid = true
 
 ** wq_unbind_fn(work_struct)
-   - 在cpu热插拔时,使worker调度到其他cpu?
+   - 在cpu热插拔时,使worker调度到其他cpu??
    - 遍历当前cpu上面的所有worker_pool, 根据cpu_worker_pools全局变量
+   - 这种是cpu绑定的worker_pool
    > smp_processor_id() 
    - 遍历所有的worker, 设置worker->flags的WORKER_UNBOUND
    - 根据worker_pool->worker_idr索引遍历
@@ -1283,6 +1302,7 @@
    - 设置worker_pool->nr_running = 0, 有什么影响?
    - 唤醒worker_pool的任务 
    > wake_up_worker(worker_pool)
+   - WORKER_UNBOUND什么意义? 只是在处理work_struct时会唤醒其他worker?
 
 ** rebind_workers(worker_pool)
    - 把worker_pool的所有worker绑定都某个cpu上
@@ -1295,26 +1315,28 @@
    - 设置worker->flags的WORKER_REBOUND, 去掉WORKER_UNBOUND标志
 
 ** restore_unbound_workers_cpumask(worker_pool, cpu)
+   - 把worker_pool的所有worker绑定都当前的cpu上
    - 如果cpu不在worker_pool->workqueue_attrs->cpumask中
    - 直接退出 
    > cpumask_test_cpu(cpu, worker_pool->workqueue_attrs->cpumask)
    - 重新计算cpumask? 哪里更新的cpu_online_mask?
    > cpumask_and(cpumask, worker_pool->workqueue_attrs->cpumask, cpu_online_mask)
-   - 上面计算了cpumask也没有使用?
-   - 遍历worker_pool的所有worker 
+   - 如果上面计算的cpumask有多个cpu, 没必要绑定
+   - 否则遍历worker_pool的所有worker 
    > set_cpus_allowed_ptr(worker->task, worker_pool->workqueue_attrs->cpumask)
 
 ** workqueue_cpu_up_callback(notifier_block, active, hcpu)
    - 处理cpu事件?
-   - 如果是CPU_UP_PREPARE事件, 遍历所有的worker_pool, 启动worker 
+   - 如果是CPU_UP_PREPARE事件, 遍历所有的worker_pool
+   - 如果worker_pool没有worker, 创建并启动它
    > craete_and_start_worker(worker_pool)
    - 如果是CPU_ONLINE事件, 遍历所有的worker_pool
-   - 如果worker_pool->cpu是当前cpu
+   - 如果worker_pool->cpu是当前cpu, 这个worker_pool应该是cpu绑定的
    - 去掉worker_pool->flags的POOL_DISASSOCIATED
    > rebind_workers(worker_pool)
-   - 否则worker_pool->cpu <0 
+   - 否则worker_pool->cpu <0, 应该是node绑定的
    > restore_unbound_workers_cpumask(worker_pool, cpu)
-   - 最后遍历所有的workqueue_struct 
+   - 最后遍历所有的workqueue_struct, 更新对应的workqueue_attrs的cupmask
    > wq_update_unbound_numa(workqueue_struct, cpu, true)
 
 ** workqueue_cpu_down_callback(notifier_block, action, hcpu)
@@ -1382,7 +1404,7 @@
    > hotcpu_notifier(workqueue_cpu_down_callback, CPU_PRI_WORKQUEUE_DOWN)
    - 初始化numa参数  
    > wq_numa_init()
-   - 初始化worker_pool?
+   - 初始化worker_pool, 应该的cpu绑定的worker_pool
    - 遍历cpu, 以及每个cpu的cpu_worker_pool[NR_STD_WORKER_POOLS]数组
    - 每个cpu有2个worker_pool?
    - 创建worker_pool 
@@ -1406,4 +1428,13 @@
    - system_power_efficient_wq, system_freezable_power_efficient_wq
    - 这些都谁使用??
 
+** 总结
+   - 看到这里,还没有弄明白,work_struct的任务是否可以sleep? 
 
+   - 这里可以把worker和work_struct分开, worker直接的表示task, work_struct最后要分配到worker上执行
+   - 但workqueue_struct不会直接的管理worker, worker却要通过workqueue_struct调度
+   - worker_pool管理所有的worker, 只能说worker_pool是全局的,它管理一个cpu和一个node的可用的worker的数量
+   - workqueue_struct通过pool_workqueue来使用worker_pool的task资源
+   - workqueue_struct这样就可以把work_struct分配给一个cpu或一个node
+   - workqueue_struct/pool_workqueue主要用来实现flush
+   - pool_workqueue和worker_pool主要来限制task均匀的使用cpu资源, 或者控制work_struct的调度数量，不用太多的worker造成过度的cpu调度
