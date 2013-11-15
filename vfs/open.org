@@ -218,3 +218,101 @@
           //打开的东西时state..
      }
      #+end_src
+
+* open.c 
+  
+
+** __get_file_write_access(inode, vfsmount)
+   - 增加inode和super_block的写计数
+   - 首先是inode->i_writecount
+   > get_write_access(inode)
+   - 然后是super_block 
+   > __mnt_want_write(vfsmount)
+
+** open_check_o_direct(file)
+   - 检查address_space_operations->direct_IO
+
+** do_entry_open(file, open, cred)
+   - 第二个参数是回调函数, 关联inode/file?
+   > open(inode, file)
+   - 设置file->f_mode, 根据file->f_flags, 加上FMODE_PREAD|FMODE_PWRITE
+   - 设置file->f_path, file->inode, address_space
+   > path_get(file->f_path)
+   - 如果要写文件,增加计数 
+   > __get_file_write_access(inode, file->path->mnt)
+   - 把file放到super_block链表中 
+   > file_sb_list_add(file, inode->i_sb)
+   - lease/lock等操作
+   > break_lease(inode, file->f_flags)
+   - 执行open, 如果参数无效,使用file_operations->open
+   > open(inode, file)
+   - 初始化readahead 
+   > file_ra_state_init(file->f_ra, address_space)
+
+** finish_open(file, dentry, open, opened)
+   - 这是在do_last或者文件系统的atomic_open中调用
+   - 设置file->path
+   > do_entry_open(file, open, cred)
+   - 在do_last中传递的是NULL
+
+   - 在nfs_aotmic_open不能使用NULL, 那就有许多重突操作,只是设置fscache的东西
+   - nfs4_file_open(inode, file)
+   - nfs4_atomic_open(inode dir, dentry, file, open_flags, mode, opened)
+   - 2者差的很多!!
+
+** finish_no_open(file, dentry)
+   - 没有打开操作?
+   - 打开directory时使用
+
+** dentry_open(path, flags, cred)
+   - 验证用户权限 
+   > validate_creds(cred)
+   - 获取file 
+   > get_empty_filp() 
+   - 设置file->path, flags
+   - 打开文件 
+   > do_dentry_open(file, NULL, cred)
+   - 检查O_DIRECT 
+   > open_check_o_direct(file)
+
+** build_open_flags(flags, mode, open_flags)
+   - 把open的2个参数包装到open_flags
+   - O_CREAT只能打开reg文件
+   - 过滤掉flags中没有意义的,给open_flags->open_flag, 后面应该给file->flags
+   - 把mode给open_flags->acc_mode
+   - open_flags->intent是2种,一种是LOOKUP_OPEN, 另一种是0, 取决于O_PATH
+   - 如果flags有O_CREAT, 设置open_flags->intent的LOOKUP_CREATE
+   - 如果flags有O_EXCL, 设置open_flags->intent的LOOKUP_EXCL
+   - 如果flags有O_DIRECTORY, 设置open_flags->lookup_flags的LOOKUP_DIRECTORY
+   - 如果flags没有O_NOFOLLOW, 设置open_flags->lookup_flags的LOOKUP_FOLLOW
+  
+** file_open_name(filename, flags, mode)
+   - 先构造open_flags
+   > build_open_flags(flags, mode, open_flags)
+   - 在打开文件
+   > do_filp_open(AT_FDCWD, name, open_flags)
+
+** filp_open(filename, flags, mode)
+   > file_open_name(filename, flags, mode)
+
+** file_open_root(dentry, vfsmount, filename, flags)
+   - 为何打开root??
+   - 构造open_flags 
+   > build_open_flags(flags, 0, open_flags)
+
+
+** do_sys_open(dfd, filename, flags, mode)
+   - 先构造open_flags
+   > build_open_flags(flags, mode, open_flags)
+   - 准备filename 
+   - 准备fd 
+   > get_unused_fd_flags(flags)
+   - 打开文件
+   > do_filp_open(dfd, filename, open_flags)
+   - 然后把file给fd 
+   > fd_install(fd, file)
+
+** open/openat syscall
+
+** filp_close(file, fl_owner_t)
+   - 
