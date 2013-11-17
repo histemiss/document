@@ -68,12 +68,42 @@
    #+end_src
    -在磁盘中,inode后面还有2块数据di_u, di_a, 他们的内容根据di_format/di_aformat而定.
 
+** di_format 
+   #+BEGIN_SRC 
+	XFS_DINODE_FMT_DEV,		/* xfs_dev_t */
+	XFS_DINODE_FMT_LOCAL,		/* bulk data */
+	XFS_DINODE_FMT_EXTENTS,		/* struct xfs_bmbt_rec */
+	XFS_DINODE_FMT_BTREE,		/* struct xfs_bmdr_block */
+	XFS_DINODE_FMT_UUID		/* uuid_t */   
+   #+END_SRC
+
+** di_flag
+   #+BEGIN_SRC 
+ */
+#define XFS_DIFLAG_REALTIME_BIT  0	/* file's blocks come from rt area */
+#define XFS_DIFLAG_PREALLOC_BIT  1	/* file space has been preallocated */
+#define XFS_DIFLAG_NEWRTBM_BIT   2	/* for rtbitmap inode, new format */
+#define XFS_DIFLAG_IMMUTABLE_BIT 3	/* inode is immutable */
+#define XFS_DIFLAG_APPEND_BIT    4	/* inode is append-only */
+#define XFS_DIFLAG_SYNC_BIT      5	/* inode is written synchronously */
+#define XFS_DIFLAG_NOATIME_BIT   6	/* do not update atime */
+#define XFS_DIFLAG_NODUMP_BIT    7	/* do not dump */
+#define XFS_DIFLAG_RTINHERIT_BIT 8	/* create with realtime bit set */
+#define XFS_DIFLAG_PROJINHERIT_BIT   9	/* create with parents projid */
+#define XFS_DIFLAG_NOSYMLINKS_BIT   10	/* disallow symlink creation */
+#define XFS_DIFLAG_EXTSIZE_BIT      11	/* inode extent size allocator hint */
+#define XFS_DIFLAG_EXTSZINHERIT_BIT 12	/* inherit inode extent size */
+#define XFS_DIFLAG_NODEFRAG_BIT     13	/* do not reorganize/defragment */   
+   #+END_SRC
+
 ** xfs_icdinode
+   - inode在磁盘上的格式
    #+begin_src 
 	__uint16_t	di_magic;	/* inode magic # = XFS_DINODE_MAGIC */
 	__uint16_t	di_mode;	/* mode and type of file */
 	__int8_t	di_version;	/* inode version */
-	__int8_t	di_format;	/* format of di_c data */
+
+	__int8_t	di_format;	/* format of di_c data */  //对于不同的文件类型(di_mode),解析不一样, 表示inode后面数据的内容
 	__uint16_t	di_onlink;	/* old number of links to file */
 	__uint32_t	di_uid;		/* owner's user id */
 	__uint32_t	di_gid;		/* owner's group id */
@@ -85,13 +115,13 @@
 	xfs_ictimestamp_t di_atime;	/* time last accessed */
 	xfs_ictimestamp_t di_mtime;	/* time last modified */
 	xfs_ictimestamp_t di_ctime;	/* time created/inode modified */
-	xfs_fsize_t	di_size;	/* number of bytes in file */
+	xfs_fsize_t	di_size;	/* number of bytes in file */  //eof
 	xfs_drfsbno_t	di_nblocks;	/* # of direct & btree blocks used */
-	xfs_extlen_t	di_extsize;	/* basic/minimum extent size for file */
+	xfs_extlen_t	di_extsize;	/* basic/minimum extent size for file */  //extent应该不受限制,这是最小限制?? 或者最小的磁盘分配空间
 	xfs_extnum_t	di_nextents;	/* number of extents in data fork */
-	xfs_aextnum_t	di_anextents;	/* number of extents in attribute fork*/
+	xfs_aextnum_t	di_anextents;	/* number of extents in attribute fork*/  //为什么属性也需要exetnt?
 	__uint8_t	di_forkoff;	/* attr fork offs, <<3 for 64b align */
-	__int8_t	di_aformat;	/* format of attr fork's data */
+	__int8_t	di_aformat;	/* format of attr fork's data */ //和di_format一样
 	__uint32_t	di_dmevmask;	/* DMIG event mask */
 	__uint16_t	di_dmstate;	/* DMIG state info */
 	__uint16_t	di_flags;	/* random flags, XFS_DIFLAG_... */
@@ -100,6 +130,7 @@
 	/* di_next_unlinked is the only non-core field in the old dinode */
 	xfs_agino_t	di_next_unlinked;/* agi unlinked list ptr */
 
+        //di_aformat表示extent data attribute数据的位置,偏移相对于di_crc开始, 好像是0x64
 	/* start of the extended dinode, writable fields */
 	__uint32_t	di_crc;		/* CRC of the inode */
 	__uint64_t	di_changecount;	/* number of attribute changes */
@@ -113,8 +144,17 @@
 	uuid_t		di_uuid;	/* UUID of the filesystem */
 
 	/* structure must be padded to 64 bit alignment */
-   
    #+end_src
+   - data fork是inode后面的数据,对于不同的mode/format, 内容不一样
+   - 如果是reg文件,data fork是表示数据磁盘空间的extent数据, 有2种extent:XFS_DINODE_FMT_EXTENTS和XFS_DINODE_FMT_BTREE
+   - 对于XFS_DINODE_FMT_EXTENTS, 这里存储的是xfs_bmbt_rec_t数组
+   - 对于XFS_DINODE_FMT_BTRFF, 这里存储的是btree根结点xfs_bmdr_block_t
+   - 如果是dir文件,data fork是direcotry entries, 有3种表示
+   - 对于XFS_DINODE_FMT_LOCAL, directory entries完全存在这里面,使用xfs_dir2_sf_t数组表示
+   - 对于XFS_DINODE_FMT_EXTENTS, 使用专门的extent表示. 注意这里不是使用一个fsb,而是一个extent, 所以这里是xfs_bmbt_rec_t数组. extent的数组怎么定?
+   - 对于XFS_DINODE_FMT_BTREE, 使用btree的叶子节点存储extent, btree操作应该复杂一些? 这里存储的是xfs_bmdr_block_t
+   - 如果是symlink, 有2中, XFS_DINODE_FMT_LOCAL/XFS_DINODE_FMT_EXTENTS
+   - 如果是block/chr文件,format应该是FXS_DINODE_FMT_DEV, 里面存储xfs_dev_t
 
 ** xfs_inode 
    #+begin_src 
@@ -268,8 +308,84 @@ typedef enum xfs_dinode_fmt {
    - 打开inode时的顺序是,根据ino找到xfs_imap, 得到具体的FSB地址和内部偏移, 然后读回对应的数据到xfs_buf, 验证xfs_dinode数据, 然后读回inode的数据给xfs_icdinode; 然后是xfs_ifork.
    - 在分配inode时,先创建xfs_dinode, 然后使用vfs结构创建inode,然后把参数设置xfs_inode
 
-* inode.c
+* xfs_inode.c
   - 这里管理xfs_ifork的数据. 
+
+** xfs_get_extsz_hint(xfs_inode)
+   - 获取inode的extent的默认大小, 没看出来哪里使用??
+   - 只有inode使用XFS_DIFLAG_EXTSIZE时,返回xfs_inode->xfs_dinode->di_extsize
+
+** xfs_ilock_map_shared(xfs_inode)
+   - 如果inode的data fork里面的数据是btree, 需要先把他们读进来
+   - 但读操作需要互斥
+   - xfs_dinode->di_format是XFS_DINODE_FMT_BTREE
+   - 而且xfs_inode->if_flags有XFS_IFEXTENTS!=0, 表示总的extent数量>0?
+   - 如果需要读这些数据,使用XFS_ILOCK_EXCL锁
+   - 否则使用XFS_ILOCK_SHARED锁 
+   > xfs_ilock(xfs_inode, lock_mode)
+
+** xfs_iunlock_map_shared(xfs_inode, lock_mode) 
+   > xfs_iunlock(xfs_inode, lock_mode)
+
+** xfs_ilock(xfs_inode, lock_flags)
+   - xfs inode使用2个锁: i_iolock, i_lock, 而且2个锁都是读写锁
+   - lock_flags可能包含2个锁
+     #+BEGIN_SRC 
+#define	XFS_IOLOCK_EXCL		(1<<0)
+#define	XFS_IOLOCK_SHARED	(1<<1)
+#define	XFS_ILOCK_EXCL		(1<<2)
+#define	XFS_ILOCK_SHARED	(1<<3)
+     #+END_SRC
+   - 首先操作i_iolock, 然后是i_lock锁
+   - 对于互斥锁
+   > mrupdate_nested(xfs_inode->i_iolock, XFS_IOLOCK_DEP(lock_flags))
+   - 对于共享锁 
+   > mraccess_nested(xfs_inode->i_iolock, XFS_IOLOCK_DEP(lock_flags)
+
+** xfs_ilock_nowait(xfs_inode, lock_flags)
+   - 和上面一样
+   - 不过锁操作不会等待,如果无法获取直接返回.
+   - 如果获取了i_iolock, 但无法获取i_lock, 就释放i_iolock
+
+** xfs_iunlock(xfs_inode, lock_flags)
+   - 接锁, 顺序没有关系
+   > trace_xfs_iunlock(xfs_inode, lock_flags, _RET_IP_)
+   
+** xfs_ilock_demote(xfs_inode, lock_flags)
+   - 释放互斥锁, 或者写锁
+   - lock_flags同样包括i_iolock和i_lock 
+   > mrdemote(xfs_inode->i_lock)
+   - 原来这些函数都是xfs包装的
+
+   - 上面的锁使用rw_semaphore, 操作是
+   > up_read()
+   > up_write()
+   > down_read_nested()
+   > down_write_nested()
+
+** xfs_isilocked(xfs_inode, lock_flags)
+   > rwsem_is_locked(xfs_inode->i_lock->mr_lock
+
+** __xfs_iflock(xfs_inode)
+   - inode的flush操作时使用的锁
+   - 等待xfs_inode->i_flags的__XFS_IFLOCK_BIT
+   > prepare_to_wait_exclusive(wait_queue_head_t, wait_queue, TASK_UNINTERRUPTIBLE)
+   - 检查上面的标志
+   > xfs_isiflocked(xfs_inode)
+   - 循环等待的条件时 
+   > xfs_iflock_nowait(xfs_inode)
+   - 也就是它结束等待后,也会锁住这个标志
+   - xfs_inode->i_flags使用xfs_inode->i_flags_lock
+
+** xfs_exntfmt
+   #+BEGIN_SRC 
+	XFS_EXTFMT_NOSTATE = 0,
+	XFS_EXTFMT_HASSTATE   
+   #+END_SRC
+
+** xfs_validate_extents(xfs_ifork, nrecs, xfs_exntfmt)
+
+
 
 * xfs_trans_inode.c
 
