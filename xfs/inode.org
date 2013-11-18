@@ -195,9 +195,12 @@
 	ushort		im_len;		/* length in BBs of inode chunk */
 	ushort		im_boffset;	/* inode offset in block in bytes */
    #+end_src
-   - 保存inode的磁盘位置信息.
+   - 保存inode的磁盘位置信息
+   - 为何这里不使用fsb, 而使用bb??
 
 ** xfs_ifork 
+   - 这个数据结构应该表示data fork, 或者extent attribute data
+   - 可以是local, extents, btree等形式
    #+begin_src 
 	int			if_bytes;	/* bytes in if_u1 */
 	int			if_real_bytes;	/* bytes allocated in if_u1 */
@@ -217,7 +220,7 @@
 		xfs_dev_t	if_rdev;	/* dev number if special */
 		uuid_t		if_uuid;	/* mount point value */
 	} if_u2;
-        //if_u1和if_u2的用途不同, if_u2给if_u1提供空间. 如果需要的空间很小, if_u1可直接使用if_u2的.
+        //if_u1和if_u2的用途不同,如果需要的空间很小, if_u1可直接使用if_u2的. 否则需要重新分配空间
    #+end_src
 
 ** xfs_dinode_fmt
@@ -382,9 +385,380 @@ typedef enum xfs_dinode_fmt {
 	XFS_EXTFMT_NOSTATE = 0,
 	XFS_EXTFMT_HASSTATE   
    #+END_SRC
+   - 为何extent还有2种格式
 
-** xfs_validate_extents(xfs_ifork, nrecs, xfs_exntfmt)
+** xfs_exntfmt_t
+   - 这里应该表示内存中extent的状态
+   #+BEGIN_SRC 
+	XFS_EXT_NORM, 
+	XFS_EXT_UNWRITTEN,  
+	XFS_EXT_DMAPI_OFFLINE, 
+	XFS_EXT_INVALID   
+   #+END_SRC
 
+** xfs_bmbt_rec 
+   #+BEGIN_SRC 
+	__be64			l0, l1;   
+/*
+ *  l0:63 is an extent flag (value 1 indicates non-normal).
+ *  l0:9-62 are startoff.                file offset 
+ *  l0:0-8 and l1:21-63 are startblock.  disk offset
+ *  l1:0-20 are blockcount.       
+ */
+   #+END_SRC
+
+** xfs_bmbt_irec
+   #+BEGIN_SRC 
+	xfs_fileoff_t	br_startoff;	/* starting file offset */
+	xfs_fsblock_t	br_startblock;	/* starting block number */
+	xfs_filblks_t	br_blockcount;	/* number of blocks */
+	xfs_exntst_t	br_state;	/* extent state */   
+   #+END_SRC
+   - xfs_fsblock_t怎么使用?  和 xfs_dfsbno_t 一样吗?
+
+** xfs_validate_extents(xfs_ifork, nrecs, xfs_exntfmt_t)
+   - xfs_ifork储存的是xfs_bmbt_irec数组, 长度是nrecs
+   - 检查xfs_bmbt_irec->br_bstate 和 xfs_exntfmt_t一致
+   - 如果xfs_exntfmt_t是XFS_EXT_NOSTATE, bt_bstate必须是XFS_EXT_NORM
+   - 这里xfs_bmbt_irec和xfs_bmbt_rec_host一致
+   - 遍历所有的xfs_bmbt_rec_host 
+   > xfs_iext_get_ext(xfs_ifork, i)
+   - 解析成xfs_bmbt_irec 
+   > xfs_bmbt_get_all(xfs_bmbt_rec_host, xfs_bmbt_irec)
+   - 检查xfs_bmbt_irec->br_state
+   - 解析时, br_state只有2种情况, 一种是XFS_EXT_NOR, 另一种是XFS_EXT_UNWRITTEN
+
+** xfs_inobp_check(xfs_mount, xfs_buf)
+   - xfs_buf中的inode的next不是0, 那应该是什么???
+   - xfs_buf是一个保存inode的extent? 大小是xfs_mount->m_inode_cluster_size?
+   - 计算一个cluster中inode的大小?  一个cluster是一个extent? 多大?? 
+   - xfs_mount->m_inode_cluster_size >> xfs_mount->xfs_sb->sb_inodelog
+   - 遍历xfs_buf中的xfs_dinode 
+   > xfs_buf_offset(xfs_buf, i*xfs_mount->xfs_sb->sb_inodesize)
+   - 如果xfs_dinode->di_next_unlinked是0,报错
+
+** xfs_inode_buf_verify(xfs_buf)
+   - 检查xfs_buf中的xfs_dinode的内容
+   - 这里计算xfs_buf的xfs_dinode的方法和上面不一样
+   - 首先转化xfs_buf的大小为fsb单位,然后获取每个fsb的inode的数量
+   > XFS_BB_TO_FSB(xfs_mount, xfs_buf->b_length) * xfs_mount->xfs_sb->sb_inopblock
+   - 遍历xfs_buf的xfs_dinode
+   > xfs_buf_offset(xfs_buf, i<<xfs_mount->xfs_sb->sb_inodelog)
+   - xfs_dinode->di_magic是XFS_DINODE_MAGIC  'IN'
+   - xfs_dinode->di_version是[1,3]
+   - 检查所有xfs_dinode的xfs_ifork? 已经在内存中??
+   > xfs_inobp_check(xfs_mount, xfs_buf)
+     
+** xfs_inode_buf_read_verify(xfs_buf)
+   > xfs_inode_buf_verify(xfs_buf)
+
+** xfs_inode_buf_write_verify(xfs_buf)
+   > xfs_inode_buf_verify(xfs_buf)
+
+** xfs_buf_ops xfs_inode_buf_ops
+   - 原来这里还是为了xfs_buf服务
+
+** xfs_imap_to_bp(xfs_mount, xfs_trans, xfs_imap, xfs_dinode dipp, xfs_buf bpp, buf_flags, iget_flags)
+   - 把一个inode读到内存中, 获取对应的xfs_dinode/xfs_buf指针
+   - 设置buf_flags的XBF_UNMAPPED??
+   - 使用transaction包装的函数读xfs_buf
+   > xfs_trans_read_buf(xfs_mount, xfs_trans, xfs_mount->m_ddev_targp, xfs_imap->im_blkno, xfs_imap->im_len, buf_flags, xfs_buf, xfs_inode_buf_ops)
+   - xfs_dinode的指针在xfs_buf上 
+   > xfs_buf_offset(xfs_buf, xfs_imap->im_boffset)
+
+** xfs_attr_shortform
+   #+BEGIN_SRC 
+	struct xfs_attr_sf_hdr {	/* constant-structure header block */
+		__be16	totsize;	/* total bytes in shortform list */
+		__u8	count;	/* count of active entries */
+	} hdr;
+	struct xfs_attr_sf_entry {
+		__uint8_t namelen;	/* actual length of name (no NULL) */
+		__uint8_t valuelen;	/* actual length of value (no NULL) */
+		__uint8_t flags;	/* flags bits (see xfs_attr_leaf.h) */
+		__uint8_t nameval[1];	/* name & value bytes concatenated */
+	} list[1];			/* variable sized array */   
+   #+END_SRC
+
+** xfs_iformat(xfs_inode, xfs_dinode)
+   - 把xfs_dinode的数据给xfs_inode
+   - 对于特殊文件, fifo,chr,blk,sock, 只需要rdev数据
+   - 放到xfs_inode->xfs_ifork->if_u2->if_rdev中, 数据是xfs_dev_t
+   > xfs_dinode_get_rdev(xfs_inode)
+   - 对于dir,link,reg文件, 根据xfs_dinode->di_format处理
+   - 如果XFS_DINODE_FMT_LOCAL, 数据在data fork中, 但xfs_dinode->di_mode不能是REG
+   - 看来普通文件数据不可能和inode放一块
+   - data fork数据大小是xfs_dinode->di_forkoff << 3, 如果它是0, 特殊一些??
+   > XFS_DFORK_DSIZE(xfs_dinode, xfs_mount)
+   - 但这是xfs_dinode->di_size不能超过上面data fork数据量
+   - 建立xfs_ifork??
+   > xfs_iformat_local(xfs_inode, xfs_dinode, XFS_DATA_FORK, xfs_dinode->di_size)
+   - 如果是XFS_DINODE_FMT_EXTENTS 
+   > xfs_iformat_extents(xfs_inode, xfs_dinode, XFS_DATA_FORK)
+   - 如果是XFS_DINODE_FMT_BTREE
+   > xfs_iformat_btree(xfs_inode, xfs_dinode, XFS_DATA_FORK)
+   - 然后处理attribute fork, 其他的metadata
+   - 如果xfs_dinode->di_forkoff ==0, 没有attribute fork??
+   - 首先准备xfs_inode->i_afp, 使用xfs_ifork_zone分配
+   - 根据xfs_dinode->di_aformat解析数据
+   - 数据位置是XFS_DFORK_APTR(xfs_dinode)
+   - 如果是XFS_DINODE_FMT_LOCAL, 里面是xfs_attr_shortform
+   > xfs_iformat_local(xfs_inode, xfs_dinode, XFS_ATTR_FORK, xfs_attr_shortform->xfs_attr_sf_hdr->totsize
+   - 如果是XFS_DINODE_FMT_EXTENTS
+   > xfs_iformat_extents(xfs_dinode, xfs_inode, XFS_ATTR_FORK)
+   - 如果是XFS_DINODE_FMT_BTREE 
+   > xfs_iformat_btree(xfs_inode, xfs_dinode, XFS_ATTR_FORK)
+   
+** xfs_iformat_local(xfs_inode, xfs_dinode, whichfork, size)
+   - whichfork区分普通的data fork和attribute fork
+   - 把数据全部放到xfs_ifork->if_u1->if_data中
+   - 所以xfs_ifork只是保存数据,具体的解析还需要根据数据的意义
+   - 如果size ==0, 设置xfs_ifork->if_u1->fi_data = NULL
+   - 如果size < sizeof(xfs_ifork->if_u2->if_inline_data), 把if_data指向if_inline_data
+   - 否则重新分配一块内存
+   - 设置xfs_ifork->if_bytes = size, xfs_ifork->if_real_bytes = roundup(size, 4)
+   - 设置xfs_ifork->if_flags的XFS_IFINLINE
+
+** xfs_iformat_extents(xfs_inode, xfs_dinode, whichfork)
+   - xfs_bmbt_rec不仅包含磁盘位置,还有文件位置, directory entries数据也需要??
+   - 首先计算extent的数量nex, xfs_dinode->di_nextents, xfs_dinode->di_anextents
+   > XFS_DFORK_NEXTENTS(xfs_dinode, whichfork)
+   - 如果nex ==0, 设置xfs_ifork->if_u1->if_extents = NULL
+   - 如果nex < XFS_INLINE_EXTS, 它是xfs_ifork->if_u2->if_inline_ext的长度
+   - 设置xfs_ifor->if_u1->if_extents = if_inline_ext
+   - 否则创建新的
+   > xfs_iext_add(xfs_ifork, 0, nex)
+   - 把xfs_dinode的data fork复制进来
+   - 先验证xfs_bmbt_rec, 检查xfs版本
+   > xfs_validate_extents(xfs_ifork, nex, XFS_EXTFMT_INODE(xfs_inode))
+   - 放到内存中的是经过大小端转化的
+   > xfs_iext_get_ext(xfs_ifork, i)
+   - 最后设置xfs_inode->if_flags的XFS_IFEXTENTS
+   - xfs_ifork->if_bytes表示实际的数据量, 这个数组扩展性就很差了
+   - 如果超过inline,每次变化都需要分配和释放内存
+
+** xfs_iformat_btree(xfs_inode, xfs_dinode, whichfork)
+   - data fork中是xfs_bmdr_block数据
+   - 计算btree使用的空间?? xfs_ifork->if_broot_bytes
+   > XFS_BMAP_BROOT_SPACE(xfs_mount, xfs_bmdr_block)
+   - 分配一块完整的内存给xfs_ifork->if_broot
+   - 搬运数据 
+   > xfs_bmdr_to_bmbt(xfs_inode, xfs_bmdr_block, XFS_DFORK_SIZE(xfs_inode, xfs_mount, whichfork), xfs_bmdr_block->if_broot, size)
+   - 设置xfs_ifork->if_flags的XFS_IFBROOT
+   - 上面只把btree的root节点复制到内存中, 而且XFS_IFEXTENTS,也只是把xfs_bmbt_rec复制到内存
+
+** xfs_dinode_from_disk(xfs_idcinode, xfs_dinode)
+   - xfs_idcinode是xfs_dinode内存中的表示形式, 两者只有数据类型不一样
+   - xfs_dinode的数据类型全是大端的
+   - 把xfs_dinode数据给xfs_icdinode
+   - xfs_icdinode在xfs_inode中
+
+** xfs_dinode_to_disk(xfs_dinode, xfs_idcinode)
+   - 上面的逆操作
+
+** _xfs_dic2xflags(di_flags)
+   - xfs_icdinode和xfs_dinode->di_flag还是完全相同的, 
+   - 它是XFS_DIFLAG_*, 转化为XFS_XFLAG_*
+
+** xfs_ip2xflags(xfs_inode)
+   - 获取xfs_inode->xfs_icdinode->di_flags
+   > _xfs_dic2xflags(di_flags) 
+   - 如果xfs_inode有attr数据,还要有XFS_XFLAG_HASATTR
+
+** xfs_dic2flags(xfs_dinode)
+   > _xfs_dic2xflags(be16_to_cpu(xfs_dinode->di_flags)) | XFS_XFLAG_HASATTR
+
+** xfs_dinode_verify(xfs_mount, xfs_inode, xfs_dinode)
+   - 验证xfs_dinode数据
+   - xfs_dinode->di_magic是cpu_to_be16(XFS_DINODE_MAGIC)
+   - xfs_dinode->di_version >= 3, 这个域是char, 不需要大小端
+   - 如果支持crc验证,计算checksum
+   > xfs_sb_version_hasrcr(xfs_mount->xfs_sb)
+   > xfs_verify_cksum(xfs_dinode, xfs_sb->sb_inodesize, offsetof(xfs_dinode, di_crc))
+   - 比较xfs_dinode->di_ino = xfs_inode->i_ino
+   - uuid比较, xfs_dinode->di_uuid
+
+** xfs_dinode_calc_crc(xfs_mount, xfs_dinode)
+   - 计算的对象是xfs_dinode->di_crc前面的数据, 结果给xfs_dinode->di_crc
+   > xfs_start_cksum(xfs_dinode, xfs_mount->xfs_sb->sb_inodesize, offsetof(xfs_dinode, di_crc))
+
+** iget_flags
+   #+BEGIN_SRC 
+#define XFS_IGET_CREATE		0x1
+#define XFS_IGET_UNTRUSTED	0x2
+#define XFS_IGET_DONTCACHE	0x4   
+   #+END_SRC
+
+** xfs_iread(xfs_mount, xfs_trans, xfs_inode, iget_flags)
+   - 计算xfs_imap信息, inode的磁盘位置
+   > xfs_imap(xfs_mount, xfs_trans, xfs_inode->i_ino, xfs_inode->i_imap, iget_flags)
+   - 如果iget_flags包含XFS_IGET_CREATE, 这里要创建inode?
+   - 初始化xfs_inode->xfs_icdinode
+   - 设置di_magic, di_gen = prandom_u32()
+   - 查找包含xfs_dinode的xfs_buf
+   > xfs_imap_to_bp(xfs_mount, xfs_trans, xfs_inode->xfs_imap, xfs_dinode, xfs_buf, 0, iget_flags)
+   - 验证xfs_dinode数据
+   > xfs_dinode_verify(xfs_mount, xfs_inode, xfs_dinode)
+   - 如果xfs_inode->di_mode !=0, 表示它已经存在
+   > xfs_dinode_from_disk(xfs_inode->xfs_icdinode, xfs_dinode)
+   > xfs_iformat(xfs_inode, xfs_dinode)
+   - 否则它是空的?? 先初始化xfs_icdinode
+   - 设置magic, version, gen, flushiter?
+   - 设置xfs_buf的XFS_INO_REF, 让他在内存中缓存一段时间 
+   > xfs_buf_set_ref(xfs_buf, XFS_INO_REF)
+   - xfs_buf读操作使用xfs_trans, 释放对应的资源?? 
+   > xfs_trans_brelse(xfs_trans, xfs_buf)
+
+** xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
+   - 读取btree_format的inode的data fork
+   - xfs_ifork必须是XFS_DINODE_FMT_BTREE
+   > XFS_IFORK_FORMAT(xfs_inode, whichfork)
+   - 在内存中, data fork完全使用XFS_IFEXTENTS存储?? 不会使用btree?
+   - 获取extent的数量nextents 
+   > XFS_IFORK_NEXTENTS(xfs_inode, whichfork)
+   - 创建extent数组
+   > xfs_bmap_read_extents(xfs_trans, xfs_inode, whichfork)
+   - 把btree中的leaf的内容都读取extent中?? 
+   > xfs_bmap_read_extents(xfs_trans, xfs_inode, whichfork)
+   - 验证这些extent数据, xfs_bmbt_rec
+   > xfs_validate_extents(xfs_ifork, nextents, XFS_EXTFMT_INODE(xfs_inode))
+
+** xfs_ialloc(xfs_trans, xfs_inode, mode, xfs_nlink_t, xfs_dev_t, prid_t, okalloc, xfs_buf, xfs_inode)
+   - 后面2个参数返回结果
+   - 第2个参数xfs_inode是父目录的inode
+   - 首先分配磁盘空间,储存xfs_dinode 
+   > xfs_dialloc(xfs_trans, xfs_inode->i_ino, mode, okalloc, xfs_buf, xfs_ino_t)
+   - 创建xfs_inode? 使用inode cache管理inode
+   > xfs_iget(xfs_mount, xfs_trans, xfs_ino, XFS_IGET_CREATE, XFS_ILOCK_EXCL, xfs_inode)
+   - 设置xfs_inode->xfs_icdinode, mode, di_onlink, di_nlink, uid, gid, projid
+   - 还有各种time, 基本的xfs_ifork
+   - 对于reg/dir文件,继承父目录的属性
+   - 但这里的继承处理收xfs_params影响,估计mount时设定??
+   - 同时初始化xfs_inode->xfs_ifork
+   - 设置xfs_inode->xfs_icdinode->di_format是XFS_DINODE_FMT_EXTENTS
+   - xfs_ifork->if_flags是XFS_IFEXTENTS
+   - 设置if_bytes = 0, 没有data fork
+   - 处理trans? 
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, XFS_ILOCK_EXCL)
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, flags)
+   - 初始化xfs_inode 
+   > xfs_setup_inode(xfs_inode)
+   - 最后是filestream??
+   > xfs_filestream_associate(xfs_inode, xfs_inode)
+   - 设置xfs_inode->i_flags的XFS_IFILESTREAM 
+   > xfs_iflags_set(xfs_inode, XFS_IFILESTREAM)
+
+** xfs_itruncate_extents(xfs_trans, xfs_inode, whichfork, xfs_fsize_t new_size)
+   - 释放文件的磁盘空间, 处理data fork和attribute data fork?
+   - 文件大小改为new_size, 转化为fsb, first_unmap_block
+   - 计算文件的最大值 last_block
+   > XFS_B_TO_FSB(xfs_mount, xfs_mount->super_block->s_maxbytes)
+   - 这里要释放的范围是(first_unmap_block, last_block)
+   - 循环处理磁盘空间
+   - 首先初始化xfs_bmap_free 
+   > xfs_bmap_init(xfs_bmap_free, xfs_fsblock_t)
+   - 调用底层的函数?? 
+   > xfs_bunmapi(xfs_trans, xfs_inode, first_unmap_block, unmap_len, xfs_bmapi_aflag(whichfork), XFS_ITRUNC_MAX_EXTENTS, first_block, xfs_bmap_free, done)
+   - 结束bmap? 
+   > xfs_bmap_finish(xfs_trans, xfs_bmap_free
+   - 提交xfs_trans? 
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 如果committed !=0, 设置inode的脏标志?? 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 完全忘记xfs部分
+   > xfs_trans_dup(xfs_trans)
+   - 提交刚才的操作 
+   > xfs_trans_commit(xfs_trans, 0)
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 重新reserve空间,释放磁盘空间 
+   > xfs_trans_reserve(xfs_trans, 0, XFS_ITRUNCATE_LOG_RES(xfs_mount), 0, XFS_TRANS_PERM_LOG_RES, XFS_ITRUNCATE_LOG_COUNT)
+   - 最后还要提交xfs_inode?? 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   
+** xfs_iunlink(xfs_trans, xfs_inode)
+   - 当inode->i_nlink变为0时使用
+   - 获取xfs_agi?
+   > xfs_read_agi(xfs_mount, xfs_trans, XFS_INO_TO_AGNO(xfs_mount, xfs_inode->i_ino), xfs_buf)
+   - 难道在buf中直接使用??
+   > XFS_BUF_TO_AGI(xfs_buf)
+   - xfs_agi->agi_unlinked是一个hash表,里面记录要删除的inode
+   - 这里的操作要把xfs_inode使用的xfs_dinode放到hash队列中
+   - 根据xfs_ino中的AGINO计算hash值
+   > XFS_INO_TO_AGINO(xfs_mount, xfs_inode->i_ino)
+   - ino包含3部分
+   - block内部偏移 xfs_sb->sb_inopblog
+   - ag内部偏移    xfs_sb->agblklog
+   - ag索引        xfs_sb->m_agno_log, 它根据所有ag的数量决定
+   - xfs_mount->m_agino_log, agi包含了ag内部偏移和block内部偏移
+   - 如果xfs_agi->agi_unlinked[bucket_index]不是NULLAGINO, 把他放到表头
+   - 修改当前inode对应的xfs_dinode 
+   > xfs_imap_to_bp(xfs_mount, xfs_trans, xfs_inode->xfs_imap, xfs_dinode, xfs_buf, 0, 0)
+   - 设置xfs_dinode->di_next_unlinked = xfs_agi->agi_unlinked[bucket_index]
+   - 重新计算crc 
+   > xfs_dinode_calc_crc(xfs_mount, xfs_dinode)
+   - 把上面的修改记录到log中 
+   > xfs_trans_inode_buf(xfs_trans, xfs_buf)
+   - 这里记录修改的域
+   > xfs_trans_log_buf(xfs_trans, xfs_buf, offset, offset + sizeof(xfs_agino_t) -1 )
+   - 遍历xfs_buf中的xfs_dinode, 检查每个xfs_dinode->di_next_unlinked, 不能为0
+   - 默认的是什么?? NULLAGINO
+   > xfs_inobp_check(xfs_mount, xfs_buf)
+   - 然后把当前的agino放到xfs_agi->agi_unlinked[bucket_index], 这里为何不使用agno??
+   - 把对xfs_agi的修改放到log中 
+   > xfs_trans_log_buf(xfs_trans, xfs_buf, offset, offset+sizeof(xfs_agino_t)-1)
+
+** xfs_iunlink_remove(xfs_trans, xfs_inode)
+   - 从unlink链表中释放inode?
+   - 获取xfs_agi
+   > xfs_read_agi(xfs_mount, xfs_trans, XFS_INO_TO_AGNO(xfs_mount, xfs_inode->i_ino), xfs_buf)
+   > XFS_BUF_TO_AGI(xfs_buf)
+   - 这里对xfs_agi的使用要注意大小端,因为在磁盘上直接读出来使用
+   - 不过xfs_agi的定义也是使用大端的类型
+   - 计算xfs_inode的agino
+   > XFS_INO_TO_AGINO(xfs_mount, xfs_inode->i_ino)
+   - 如果agino是xfs_agi->agi_unlinked[bucket_index], 可以仅仅修改xfs_agi 
+   > xfs_imap_to_bp(xfs_mount, xfs_trans, xfs_inode->xfs_imap, xfs_buf, xfs_inode, 0, 0)
+   - 获取下一个agino xfs_dinode->di_next_unlinked
+   - 如果下一个不是NULLAGINO, 修改当前的xfs_dinode->di_next_unlinked = NULLAGINO
+   - 把这些修改记录到log中 
+   > xfs_dinode_calc_crc(xfs_mount, xfs_dinode)
+   > xfs_trans_inode_buf(xfs_trans, xfs_buf)
+   > xfs_trans_log_buf(xfs_trans, xfs_buf, offset, offset+sizeof(xfs_agino_t)-1)
+   > xfs_inobp_check(xfs_mount, xfs_buf)
+   - 否则不用修改,直接释放xfs_buf的使用?? 
+   > xfs_trans_brelse(xfs_trans, xfs_buf)
+   - 修改xfs_agi, xfs_agi->agi_unlinked[bucket_index] = next_agi
+   - 把这些修改记录到log中
+   - offset = offset(xfs_agino_t, agi_unlinked) + sizeof(xfs_agino_t*) * bucket_index
+   > xfs_trans_log_buf(xfs_trans, xfs_buf, offset, offset+sizeof(xfs_agino_t)-1)
+   - 如果agino不是hash链表的第一个xfs_dinode, 需要遍历查找对应的xfs_dinode
+   - 使用xfs_imap查找xfs_dinode
+   - 根据agino构造ino
+   > XFS_AGINO_TO_INO(xfs_mount, agno, next_agino)
+   - 获取对应的xfs_imap
+   > xfs_imap(xfs_mount, xfs_trans, next_ino, xfs_imap, 0)
+   - 读取xfs_dinode所在的xfs_buf 
+   > xfs_imap_to_bp(xfs_mount, xfs_trans, xfs_imap, xfs_buf, xfs_dinode, 0, 0)
+   - 检查xfs_dinode->di_next_unlinked, 如果和上面的agino相同,查找循环结束
+   - 查找当前的xfs_dinode
+   > xfs_imap_to_bp(xfs_mount, xfs_trans, xfs_inode->i_imap, xfs_buf, xfs_dinode, 0, 0)
+   - 处理当前的xfs_dinode->di_next_unlinked, 如果下一个不是NULLAGINO, 需要设置为NULLAGINO
+   - 操作和上面类似,把改动放到log中
+   - 设置上一个xfs_dinode, 把更新放到log中
+
+** xfs_ifree_cluster(xfs_inode, xfs_trans, xfs_ino_t)
+   - 获取xfs_perag
+   > xfs_perag_get(xfs_mount, XFS_INO_TO_AGNO(xfs_mount, xfs_ino_t))
+   - xfs_dinode磁盘操作的单位是xfs_mount->m_inode_cluster_size(8192)
+   > XFS_INODE_CLUSTER_SIZE(xfs_mount)
+   - 如果fsb比m_inode_cluster_size大, 操作的个数是xfs_sb->sb_inopblock
+   - nbufs表示涉及的xfs_buf的数量??
+   > XFS_IALLOC_BLOCKS(xfs_mount)
+   - 如果xfs_sb->sb_blocksize比fsb大, 操作的个数是xfs_sb->sb_inopblock * blocks_per_cluster
+   - nbufs减小blks_per_cluster倍
+   - 遍历对应的xfs_buf
+   - 根据xfs_ino_t构造xfs_daddr_t 
+   > XFS_AGB_TO_DADDR(xfs_mount, XFS_INO_TO_AGNO(xfs_mount, inum), XFS_INO_TO_AGBNO(xfs_mount, inum))
 
 
 * xfs_trans_inode.c
