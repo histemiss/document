@@ -72,7 +72,8 @@
    > call_rcu(dentry->d_u->d_rcu, __d_free)
    - 否则直接释放 
    > __d_free(dentry->d_u.d_rcu)
-   - 在__d_rehash中设置,只要把它放到dentry_hashtable中就会设置
+
+   - 在__d_rehash中设置DCACHE_RCUACCESS,只要把它放到dentry_hashtable中就会设置
 
 ** dentry_rcuwalk_barrier(dentry)
    - 使rcu遍历方式失效, rcu模式也和seq配合使用
@@ -104,6 +105,8 @@
    - 变为negative的dentry
    - 和上面的区别是多了dentry->d_seq操作
 
+   - 在d_delete中使用,只是把dentry变为negative的,并没有释放
+
 ** dentry_lru_add(dentry)
    - 把dentry->d_lru放到super_block->s_dentry_lru队列中
    - 增加super_block->s_nr_dentry_unused计数
@@ -120,7 +123,8 @@
    - dentry->d_lru不仅仅放到super_block中,还有用来收集需要释放的dentry
    - 这里要把dentry从lru中释放,可能是因为又使用起来,也可能即将释放
    - DCACHE_SHRINK_LIST表示在临时的hash表中,即将释放
-   - 无论从什么lru队列中,都会占用super_block->s_nr_dentry_unused计数,因为在释放dentry时还会释放lru节点,改变这个计数
+   - 无论从什么lru队列中,都会占用super_block->s_nr_dentry_unused计数
+   - 在释放dentry时还会释放lru节点,改变这个计数
 
 ** dentry_lru_move_list(dentry, list_head)
    - list_head用来收集需要释放的dentry 
@@ -137,7 +141,7 @@
    - 释放自己
    > d_free(dentry) 
 
-   - 释放顺序是
+   - 释放顺序，从dentry_kill开始
    - dentry_operations->d_delete(dentry) 决定是否直接释放,还是缓存在lru中
    - d_count == 1, 而且unhash, 直接释放
    - 减小d_count
@@ -145,7 +149,7 @@
    - dentry_lru_del(dentry)
    - __d_drop(dentry)
    - parent->d_subdirs / parent->d_u->d_child
-   - dentry_iput(dentry)  释放inode
+   - dentry_iput(dentry)  释放inode, dentry_iput
    - dentry->d_op->d_release(dentry)
    - __d_free(dentry)   释放自己
 
@@ -204,7 +208,7 @@
    - 在revalidate操作无效后使用, 相当于错误处理
    - 如果dentry不在hash表中,则不处理, 已经无效
    - 如果dentry->d_subdirs不是空,有子dentry
-   - 去遍历它的子树，收集没有使用的释放
+   - 去遍历它的子树，没有使用的释放
    - shrink_dcache_parent(dentry) 
    - 如果dentry->d_count > 1, 而且inode有效, 而且是目录,返回-EBUSY
    - 释放hash表关系, 表示不在vfs的树中,只是没有释放
@@ -251,7 +255,7 @@
    - 先释放自己
    > dentry_kill(dentry, 0)
    - 如果parent->d_count>1,有别人使用它, 不再释放, 只减小计数
-   - 否则继续回朔释放
+   - 否则继续回朔释放父dentry
    - dentry_kill(dentry, 1)  
 
 ** 总结
