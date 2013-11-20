@@ -756,9 +756,70 @@ typedef enum xfs_dinode_fmt {
    > XFS_IALLOC_BLOCKS(xfs_mount)
    - 如果xfs_sb->sb_blocksize比fsb大, 操作的个数是xfs_sb->sb_inopblock * blocks_per_cluster
    - nbufs减小blks_per_cluster倍
-   - 遍历对应的xfs_buf
+   - 遍历inode的block所在的cluster
    - 根据xfs_ino_t构造xfs_daddr_t 
    > XFS_AGB_TO_DADDR(xfs_mount, XFS_INO_TO_AGNO(xfs_mount, inum), XFS_INO_TO_AGBNO(xfs_mount, inum))
+   - 获取xfs_buf, 他对应的磁盘空间是一个cluster
+   > xfs_trans_get_buf(xfs_trans, xfs_mount->m_ddev_targp, blkno, xfs_mount->m_bsize * blks_per_cluster)
+   - 设置xfs_buf->b_ops = xfs_inode_buf_ops
+   - xfs_buf->b_fspriv里面是xfs_log_item? 也是xfs_inode_log_item
+   - 遍历xfs_buf中的xfs_inode_log_item链表
+   - 设置xfs_log_item->li_cb = xfs_istale_done??
+   - 把log item放到lsn中? 
+   > xfs_trans_ail_copy_lsn(xfs_mount->m_ail, xfs_inode_log_item->ili_flush_lsn, xfs_inode_log_item->ili_item->li_lsn)
+   - 设置xfs_inode_log_item->ili_inode的标志 
+   > xfs_iflags_set(xfs_inode_log_item->ili_inode, XFS_ISTALE)
+   - 然后遍历xfs_dinode, 通过agino找到对应的xfs_inode ?? 
+   > radix_tree_lookup(xfs_perag->pag_ici_root, XFS_INO_TO_AGINO(xfs_mount, inum+i))
+   - 检查xfs_inode的i_ino, 必须是inum+1, 还有flags
+   - __xfs_iflags_test(xfs_inode, XFS_ISTALE)
+   - 上面radix_tree操作使用rcu锁,这里必须检查??
+   - 锁住这个inode, 这里需要注意参数传进来一个xfs_inode, 所以这个不用再锁 
+   > xfs_ilock_nowait(xfs_inode, XFS_ILOCK_EXCL)
+   - 再锁住inode的刷新操作?? 谁还会锁这里?
+   > xfs_iflock(xfs_inode)
+   - 设置flags
+   > xfs_iflags_set(xfs_inode, XFS_ISTALE)
+   - xfs_inode->i_itemp是xfs_inode_Log_item?
+   - 如果xfs_inode没有关联xfs_inode_log_item, 而且xfs_inode没有修改?? 
+   > xfs_inode_clean(xfs_inode)
+   - 不需要log? 直接释放锁处理下一个
+   - 否则是什么处理??
+   - 设置xfs_inode_log_item->ili_last_fields = xfs_inode_log_item->ili_fields
+   - xfs_inode_log_item->ili_logged = 1, 把它放到ail?? 
+   > xfs_trans_ail_copy_lsn(xfs_mount->xfs_ail, xfs_inode_log_item->ili_flush_lsn, xfs_inode_log_item->ili_item->li_lsn)
+   - 先ail中注册回调函数??
+   > xfs_buf_attach_iodone(xfs_buf, xfs_istale_done, xfs_log_item)
+   - xfs_trans的操作 
+   > xfs_trans_stale_inode_buf(xfs_trans, xfs_buf)
+   > xfs_trans_binval(xfs_trans, xfs_buf)
+
+** xfs_bmap_free 
+   #+BEGIN_SRC 
+	xfs_bmap_free_item_t	*xbf_first;	/* list of to-be-free extents */
+	int			xbf_count;	/* count of items on list */
+	int			xbf_low;	/* alloc in low mode */   
+   #+END_SRC
+   
+** xfs_ifree(xfs_trans, xfs_inode, xfs_bmap_free)
+   - 释放inode的磁盘空间, 给inode free list? 怎么管理它??
+   - 现在xfs_dinode在unlink链表中, 这里要释放链表,而且释放xfs_dinode使用的空间
+   - 检查xfs_inode的状态 
+   > xfs_isilocked(xfs_inode, XFS_ILOCK_EXCL)
+   - xfs_inode->xfs_icdinode->di_nlink是0, di_nextents是0, di_anextents也是0, di_size是0, di_nblocks也是0
+   - 释放unlinked链表 
+   > xfs_iunlink_remove(xfs_trans, xfs_inode)
+   - 释放空间? 下面的参数xfs_ino是cluster的第一个ino?? 在xfs_ialloc中实现的
+   > xfs_difree(xfs_trans, xfs_inode->ino, xfs_bmap_free, delete, xfs_ino_t first_ino)
+   - 重置xfs_inode->icdinode的di_mode = 0, 其他的都设为无效
+   - 把它放到xfs_trans中?? 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 如果delete !=0, 释放对应的cluster空间 
+   > xfs_ifree_cluster(xfs_inode, xfs_trans, first_ino)
+
+** xfs_iunpin(xfs_inode)
+   - 
+   
 
 
 * xfs_trans_inode.c
