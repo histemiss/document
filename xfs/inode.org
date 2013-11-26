@@ -1259,3 +1259,195 @@ typedef enum xfs_dinode_fmt {
    - 把flags存储到xfs_inode->xfs_inode_log_item->ili_fields中. 包括xfs_inode->xfs_inode_log_item->ili_last_fields
 
 
+* xfs_inode_item.c
+
+** xfs_log_item 
+   #+BEGIN_SRC 
+	struct list_head		li_ail;		/* AIL pointers */
+	xfs_lsn_t			li_lsn;		/* last on-disk lsn */
+	struct xfs_log_item_desc	*li_desc;	/* ptr to current desc*/
+	struct xfs_mount		*li_mountp;	/* ptr to fs mount */
+	struct xfs_ail			*li_ailp;	/* ptr to AIL */
+	uint				li_type;	/* item type */
+	uint				li_flags;	/* misc flags */
+	struct xfs_log_item		*li_bio_list;	/* buffer item list */
+	void				(*li_cb)(struct xfs_buf *,
+						 struct xfs_log_item *);
+							/* buffer item iodone */
+							/* callback func */
+	const struct xfs_item_ops	*li_ops;	/* function list */
+
+	/* delayed logging */
+	struct list_head		li_cil;		/* CIL pointers */
+	struct xfs_log_vec		*li_lv;		/* active log vector */
+	xfs_lsn_t			li_seq;		/* CIL commit seq */   
+   #+END_SRC
+
+** xfs_inode_log_item 
+   #+BEGIN_SRC 
+	xfs_log_item_t		ili_item;	   /* common portion */
+	struct xfs_inode	*ili_inode;	   /* inode ptr */
+	xfs_lsn_t		ili_flush_lsn;	   /* lsn at last flush */
+	xfs_lsn_t		ili_last_lsn;	   /* lsn at last transaction */
+	unsigned short		ili_lock_flags;	   /* lock flags */
+	unsigned short		ili_logged;	   /* flushed logged data */
+	unsigned int		ili_last_fields;   /* fields when flushed */
+	unsigned int		ili_fields;	   /* fields to be logged */
+	struct xfs_bmbt_rec	*ili_extents_buf;  /* array of logged
+						      data exts */
+	struct xfs_bmbt_rec	*ili_aextents_buf; /* array of logged
+						      attr exts */
+	xfs_inode_log_format_t	ili_format;	   /* logged structure */   
+   #+END_SRC
+
+** INODE_ITEM(xfs_log_item)
+   - xfs_log_item就是xfs_inode_log_item
+   > container_of
+
+** xfs_inode_item_size(xfs_log_item)
+   - 计算log一个inode使用的iovec
+   - xfs_log_item使用一个
+   - xfs_dinode使用一个
+   - data fork使用一个, 但需要检查data fork是否存在
+   - 对于XFS_DINODE_FMT_EXTENTS, xfs_inode_log_item->ili_fields有XFS_ILOG_DEXT, 而且xfs_icdinode->di_nextents > 0, 表示有extent数据??
+   - 对于XFS_DINODE_FMT_BTREE, xfs_inode_log_item->ili_fields 有XFS_ILOG_DBROOT, 而且xfs_icdinode->if_broot_bytes > 0, 表示有btree数据??
+   - 对于XFS_DINODE_FMT_LOCAL, 检查xfs_inode_log_item->ili_fields的XFS_ILOG_DDATA, xfs_inode->xfs_ifork->if_bytes > 0
+   - 对于XFS_DINODE_FMT_DEV, XFS_DINODE_FMT_UUID不会保存??
+   - 对于attribute data fork, 同样作上面的检查
+
+** xfs_inode_item_format_extents(xfs_inode, xfs_log_iovec, type)
+   - 把内存中的extents信息写回磁盘, 需要作大小端转化
+   - in-core => on-disk
+   - 由于延时分配, 内存中的extent信息和磁盘上的可能不同,使用磁盘上的为准, 也就是使用xfs_inode->xfs_icdinode 
+   > XFS_IFORK_SIZE(xfs_inode, whichfork)
+   - 分配内存保存xfs_bmbt_rec数组
+   - 把内存指针给xfs_inode->xfs_inode_log_item->ili_extents_buf??
+   - 使用xfs_log_iovec记录这些信息
+   - 设置xfs_log_iovec->i_type = 参数type
+   - xfs_iextents_copy(xfs_inode, ext_buffer, whichifork)
+   - 遍历xfs_ifork中的所有xfs_bmbt_rec_host, 对于attribute fork也使用extent??
+
+** xfs_inode_log_format 
+   #+BEGIN_SRC 
+	__uint16_t		ilf_type;	/* inode log item type */
+	__uint16_t		ilf_size;	/* size of this item */
+	__uint32_t		ilf_fields;	/* flags for fields logged */
+	__uint16_t		ilf_asize;	/* size of attr d/ext/root */
+	__uint16_t		ilf_dsize;	/* size of data/ext/root */
+	__uint64_t		ilf_ino;	/* inode number */
+	union {
+		__uint32_t	ilfu_rdev;	/* rdev value for dev inode*/
+		uuid_t		ilfu_uuid;	/* mount point value */
+	} ilf_u;
+	__int64_t		ilf_blkno;	/* blkno of inode buffer */
+	__int32_t		ilf_len;	/* len of inode buffer */
+	__int32_t		ilf_boffset;	/* off of inode in buffer */   
+   #+END_SRC
+
+** xfs_inode_item_format(xfs_log_item, xfs_log_iovec)
+   - 记录xfs_inode的信息
+   - 第一个xfs_log_iovec是xfs_inode_log_format信息,它的数据类型是大端的,可以直接存到磁盘
+   - xfs_inode_log_item->xfs_inode_log_format
+   - xfs_log_iovec->i_type = XFS_REG_TYPE_IFORMAT
+
+   - 第2个xfs_log_iovec是xfs_inode->xfs_icdinode信息, 但它没有大小端信息??
+   - xfs_log_iovec->i_type = XLOG_REG_TYPE_ICORE
+   - 第3个是data fork, 根据xfs_inode->xfs_icdinode->di_format分析
+   - 如果是XFS_DINODE_FMT_EXTENTS, 要保存extent信息
+   - xfs_inode_log_item->ili_fields有XFS_ILOG_DEXT, 而且xfs_icdinode->di_nextents > 0, 而且xfs_ifork->if_bytes > 0
+   - 如果xfs_icdinode->di_nextents是xfs_ifork中的extent数量
+   - xfs_inode->if_bytes / sizeof(xfs_bmbt_rec)
+   - 表示没有delayed, 可以直接使用xfs_ifork的内存
+   - xfs_ifork->if_u1->if_extents
+   - 如果使用indirect的存储??
+   - 否则需要遍历xfs_ifork的xfs_bmbt_rec
+   > xfs_inode_item_format_extents(xfs_inode, xfs_log_item, XFS_DATA_FORK, XLOG_REG_TYPE_IEXT)
+   - 如果是XFS_DINODE_FMT_BTREE, 只处理树根?? 
+   - 检查xfs_inode_log_item->ili_fields的XFS_ILOG_DBROOTxo
+   - xfs_ifork->if_broot, xfs_log_iovec->i_type = XLOG_REG_TYPE_IBROOT
+   - 如果是XFS_DINODE_FMT_LOCAL, 处理普通数据??
+   - 检查xfs_inode_log_item->ili_fields的XFS_ILOG_DDATA
+   - 数据是xfs_ifork->if_u1->if_data, 没有大小端
+   - xfs_log_iovec->i_type = XFS_REG_TYPE_ILOCAL
+   - 如果是XFS_DINODE_FMT_DEV/UUID
+   - 直接把xfs_ifork的数据放到xfs_inode_log_format->ilf_u->ilfu_rdev / ilfu_uuid
+
+   - 第4个xfs_log_iovec是attribute fork, 和上面一样
+
+** xfs_inode_item_pin(xfs_log_item)
+   - 获取对应的xfs_inode_log_item->xfs_inode
+   - 增加xfs_inode->i_pincount 
+
+** xfs_inode_item_unpin(xfs_log_item, remove)
+   - 减小xfs_inode->i_pincount
+   - 如果减为0, 唤醒等待xfs_inode->i_flags的__XFS_IPINNED_BIT
+
+** xfs_inode_item_push(xfs_log_item, list_head)
+   - 这是xfs_item_ops->iop_push的回调函数
+   - 根据xfs_log_item获取xfs_inode
+   - 如果xfs_inode->i_pincount > 0, 返回XFS_ITEM_PINNED, 被谁锁住??
+   - 锁住XFS_ILOCK_SHARED锁
+   - xfs_ilock_nowait(xfs_inode, XFS_ILOCK_SHARED)
+   - 如果xfs_inode无效， xfs_inode->i_flags有XFS_ISTALE, 返回XFS_ITEM_PINNED??
+   - 锁住flush操作,否则返回XFS_ITEM_FLUSHING
+   > xfs_iflock_nowait(xfs_inode)
+   - 刷新metadata数据??
+   > xfs_iflush(xfs_inode, xfs_buf)
+   - 把xfs_dinode使用的xfs_buf放到参数队列中 
+   > xfs_buf_delwri_queue(xfs_buf, list_head)
+
+** xfs_inode_item_unlock(xfs_log_item)
+   - 释放inode的锁?? 也是xfs_item_ops的回调
+   - 释放log过程中使用的临时缓存
+   - xfs_inode_log_item->ili_extents_buf / ili_aextents_buf, 他们用来转存xfs_ifork中的extent数据
+   - 释放inode锁, xfs_inode_log_item->ili_lock_flags
+   > xfs_iunlock(xfs_inode, lock_flags)
+
+** xfs_inode_item_committed(xfs_log_item, xfs_lsn_t)
+   - 用来返回xfs_inode在log中的最新的位置?? 
+   - 直接返回参数xfs_lsn_t
+   - 如果xfs_inode->i_flags有XFS_ISTALE, 表示inode已经释放?? 返回-1
+
+** xfs_inode_item_committing(xfs_log_item, xfs_lsn_t)
+   - 设置xfs_inode->ili_last_lsn = xfs_lsn_t
+
+** xfs_inode_item_init(xfs_inode, xfs_mount)
+   - 创建xfs_inode->xfs_inode_log_item
+   - 初始化xfs_log_item 
+   > xfs_log_item_init(xfs_mount, xfs_inode_log_item->xfs_log_item, XFS_LI_INODE, xfs_inode_item_ops)
+   - 初始化xfs_inode_log_item->xfs_inode_log_format, 里面包括ino, xfs_imap
+   - 为何要有xfs_imap信息?? 定位锁在的cluster? 使用ino就可以定位??
+
+** xfs_inode_item_destroy(xfs_inode)
+   - 释放xfs_inode->xfs_inode_log_item 
+
+** xfs_iflush_done(xfs_buf, xfs_log_item)
+   - 在flush操作完成后调用,可能会在中断上下文中??
+   - 如果indoe还在ail中,可以直接删除, 不用再写到cil中??
+   - 遍历xfs_buf中的xfs_dinode, 这是xfs_inode_log_item链表
+   - 这里很奇怪, 如果xfs_log_item->li_cb是xfs_iflush_done, 只是空遍历??
+   - 否则把xfs_buf的xfs_log_item链表全部放到xfs_log_item->li_bio_list链表中
+   - 如果他们在ail中,而且没有新的改动
+   - 也就是xfs_log_item->li_lsn == xfs_inode_log_item->ili_flush_lsn, 可以直接释放他们??
+   > xfs_trans_ail_delete_bulk(xfs_ail, xfs_log_item, i, SHUTDOWN_CORRUPT_INCORE)
+   - 恢复log使用的变量
+   - xfs_inode_log_item->ili_last_fields = 0, ili_logged = 0
+   - 释放xfs_inode的flush操作的锁
+   > xfs_ifunlock(xfs_inode_log_item->xfs_inode)
+
+** xfs_iflush_abort(xfs_inode, stale)
+   - flush abort操作? 在关闭文件系统中使用?
+   - 从ail中释放xfs_log_item? 
+   - xfs_log_item->li_flags有XFS_LI_IN_AIL 
+   > xfs_trans_ail_delete(xfs_ail, xfs_log_item, SHUTDOWN_LOG_IO_ERROR/SHUTDOWN_CORRUPT_INCORE)
+   - 然后恢复xfs_inode_log_item的成员, ili_logged / ili_last_fields / ili_fields
+   - 释放flush锁 
+   > xfs_ifunlock(xfs_inode)
+
+** xfs_istale_done(xfs_buf, xfs_log_item)
+   > xfs_iflush_abort(xfs_inode, true)
+
+** xfs_inode_item_format_convert(xfs_log_iovec, xfs_inode_format)
+   - 把xfs_log_iovec中的数据转移到xfs_inode_log_format, 
+   - 在xfs_log_iovec中, 可能是32位,也可能是64位
+   - xfs_inode_log_format_32 / xfs_inode_log_format_64, 但他们都是没有大小端信息的
