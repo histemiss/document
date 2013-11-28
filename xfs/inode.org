@@ -1258,7 +1258,6 @@ typedef enum xfs_dinode_fmt {
    - 设置xfs_trans->t_flags的XFS_TRANS_DIRTY, xfs_inode->xfs_inode_log_item->xfs_log_item->xfs_log_item_desc->lid_flags的XFS_LID_DIRTY
    - 把flags存储到xfs_inode->xfs_inode_log_item->ili_fields中. 包括xfs_inode->xfs_inode_log_item->ili_last_fields
 
-
 * xfs_inode_item.c
 
 ** xfs_log_item 
@@ -1451,3 +1450,4 @@ typedef enum xfs_dinode_fmt {
    - 把xfs_log_iovec中的数据转移到xfs_inode_log_format, 
    - 在xfs_log_iovec中, 可能是32位,也可能是64位
    - xfs_inode_log_format_32 / xfs_inode_log_format_64, 但他们都是没有大小端信息的
+
