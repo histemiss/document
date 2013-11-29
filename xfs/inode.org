@@ -198,6 +198,19 @@
    - 保存inode的磁盘位置信息
    - 为何这里不使用fsb, 而使用bb??
 
+** xfs_bmbt_rec_host
+   #+BEGIN_SRC 
+	__uint64_t		l0, l1;   
+   #+END_SRC
+
+** xfs_ext_irec_t
+   - XFS_IFEXTIREC, indirection array of extent blocks
+   #+BEGIN_SRC 
+	xfs_bmbt_rec_host *er_extbuf;	/* block of extent records */ //这里是数组, 每项已经有了文件偏移?为何外面还有?
+	xfs_extnum_t	er_extoff;	/* extent offset in file */
+	xfs_extnum_t	er_extcount;	/* number of extents in page/block */   
+   #+END_SRC
+
 ** xfs_ifork 
    - 这个数据结构应该表示data fork, 或者extent attribute data
    - 可以是local, extents, btree等形式
@@ -285,12 +298,12 @@ typedef enum xfs_dinode_fmt {
    #+end_src
    
 ** xfs_bmbt_irec
+   - extent信息的内存表示
    #+begin_src 
 	xfs_fileoff_t	br_startoff;	/* starting file offset */
 	xfs_fsblock_t	br_startblock;	/* starting block number */
 	xfs_filblks_t	br_blockcount;	/* number of blocks */
 	xfs_exntst_t	br_state;	/* extent state */
-	//文件的extent数据
    #+end_src
 
 ** xfs_exntfmt 
@@ -749,79 +762,482 @@ typedef enum xfs_dinode_fmt {
 ** xfs_ifree_cluster(xfs_inode, xfs_trans, xfs_ino_t)
    - 获取xfs_perag
    > xfs_perag_get(xfs_mount, XFS_INO_TO_AGNO(xfs_mount, xfs_ino_t))
-   - xfs_dinode磁盘操作的单位是xfs_mount->m_inode_cluster_size(8192)
+   - xfs_dinode的存储管理单位是xfs_mount->m_inode_cluster_size(8192),也就是cluster. 但buf缓存这些存储的单位是xfs_mount->m_ialloc_blks
+   - 这里需要操作的数据量是xfs_mount->m_ialloc_blks * fsb
+   - 如果cluster比fsb小, 每次使用的xfs_buf操作的一个fsb, 包含多个cuslter
+   - 否则每次使用的xfs_buf操作多个fsb, 包含一个cluster
+   - 获取cluster的大小 xfs_mount->m_inode_cluster_size, fsb大小是super_block->sb_blocksize
    > XFS_INODE_CLUSTER_SIZE(xfs_mount)
-   - 如果fsb比m_inode_cluster_size大, 操作的个数是xfs_sb->sb_inopblock
-   - nbufs表示涉及的xfs_buf的数量??
+   - nbufs表示操作xfs_buf的循环数,它由ialloc的缓存单位决定
    > XFS_IALLOC_BLOCKS(xfs_mount)
-   - 如果xfs_sb->sb_blocksize比fsb大, 操作的个数是xfs_sb->sb_inopblock * blocks_per_cluster
-   - nbufs减小blks_per_cluster倍
-   - 遍历inode的block所在的cluster
+   - 如果xfs_sb->sb_blocksize比fsb大, 每次xfs_buf包含多个cluster, blks_per_cluster是1, 表示它使用一个fsb, nbufs是xfs_mount->m_ialloc_blks, 
+   - 否则使用的xfs_buf大小是cluster的数据量, blks_per_cluster是xfs_mount->m_inode_cluster_size / fsb, nbufs是xfs_mount->m_ialloc_blks / blks_per_cluster
+   - 遍历对应的磁盘空间,使用xfs_buf
    - 根据xfs_ino_t构造xfs_daddr_t 
    > XFS_AGB_TO_DADDR(xfs_mount, XFS_INO_TO_AGNO(xfs_mount, inum), XFS_INO_TO_AGBNO(xfs_mount, inum))
-   - 获取xfs_buf, 他对应的磁盘空间是一个cluster
-   > xfs_trans_get_buf(xfs_trans, xfs_mount->m_ddev_targp, blkno, xfs_mount->m_bsize * blks_per_cluster)
+   - xfs_trans_get_buf(xfs_trans, xfs_mount->m_ddev_targp, blkno, xfs_mount->m_bsize * blks_per_cluster, XBF_UNMAPPED)
+   - 上面的磁盘空间为何不用super_block->sb_blocksize?
    - 设置xfs_buf->b_ops = xfs_inode_buf_ops
-   - xfs_buf->b_fspriv里面是xfs_log_item? 也是xfs_inode_log_item
-   - 遍历xfs_buf中的xfs_inode_log_item链表
-   - 设置xfs_log_item->li_cb = xfs_istale_done??
-   - 把log item放到lsn中? 
-   > xfs_trans_ail_copy_lsn(xfs_mount->m_ail, xfs_inode_log_item->ili_flush_lsn, xfs_inode_log_item->ili_item->li_lsn)
-   - 设置xfs_inode_log_item->ili_inode的标志 
-   > xfs_iflags_set(xfs_inode_log_item->ili_inode, XFS_ISTALE)
-   - 然后遍历xfs_dinode, 通过agino找到对应的xfs_inode ?? 
-   > radix_tree_lookup(xfs_perag->pag_ici_root, XFS_INO_TO_AGINO(xfs_mount, inum+i))
-   - 检查xfs_inode的i_ino, 必须是inum+1, 还有flags
-   - __xfs_iflags_test(xfs_inode, XFS_ISTALE)
-   - 上面radix_tree操作使用rcu锁,这里必须检查??
-   - 锁住这个inode, 这里需要注意参数传进来一个xfs_inode, 所以这个不用再锁 
-   > xfs_ilock_nowait(xfs_inode, XFS_ILOCK_EXCL)
-   - 再锁住inode的刷新操作?? 谁还会锁这里?
+   - 遍历xfs_buf的xfs_inode, 使用xfs_inode_log_item遍历?
+   > xfs_trans_ail_copy_lsn(xfs_mount->xfs_ail, xfs_inode_log_item->ili_flush_lsn, xfs_inode_log_item->xfs_log_item->li_lsn)
+   - 设置xfs_inode的XFS_ISTALE标志?? 
+   > xfs_iflags_set(xfs_inode_log_item->xfs_inode, XFS_ISTALE)
+   - 遍历里面的xfs_dinode, 个数是blks_per_cluster * xfs_sb->sb_inopblog
+   - 根据agino获取缓存的xfs_inode? 和上面什么区别?
+   - radix_tree_lookup(xfs_perag->pag_ici_root, XFS_INO_TO_AGINO(xfs_mount, inum))
+   - 锁住xfs_inode, XFS_ILOCK_EXCL, 还有flush锁 
+   > xfs_ilock_nowait(xfs_inode, XFS_ILOCK_EXCL) 
    > xfs_iflock(xfs_inode)
-   - 设置flags
-   > xfs_iflags_set(xfs_inode, XFS_ISTALE)
-   - xfs_inode->i_itemp是xfs_inode_Log_item?
-   - 如果xfs_inode没有关联xfs_inode_log_item, 而且xfs_inode没有修改?? 
-   > xfs_inode_clean(xfs_inode)
-   - 不需要log? 直接释放锁处理下一个
-   - 否则是什么处理??
-   - 设置xfs_inode_log_item->ili_last_fields = xfs_inode_log_item->ili_fields
-   - xfs_inode_log_item->ili_logged = 1, 把它放到ail?? 
-   > xfs_trans_ail_copy_lsn(xfs_mount->xfs_ail, xfs_inode_log_item->ili_flush_lsn, xfs_inode_log_item->ili_item->li_lsn)
-   - 先ail中注册回调函数??
-   > xfs_buf_attach_iodone(xfs_buf, xfs_istale_done, xfs_log_item)
-   - xfs_trans的操作 
+   - 设置xfs_inode的XFS_ISTALE标志 
+   > xfs_iflags_set(xfs_node, XFS_ISTALE)
+   - 设置xfs_inode->xfs_inode_log_item, 如果不存在不再处理
+   - 设置xfs_inode_log_item->ili_last_fields = xfs_inode_log_item->ili_fields, ili_fields = 0, ili_logged = 1
+   - 把xfs_inode_log_item放到xfs_ail中 
+   > xfs_trans_ail_copy_lsn(xfs_mount->xfs_ail, xfs_inode_log_item->ili_flush_lsn, xfs_inode_log_item->xfs_log_item->li_lsn)
+   - 注册回调函数?? 
+   > xfs_buf_attach_iodone(xfs_buf, xfs_istale_done, xfs_inode_log_item->xfs_log_item)
+   - 然后设置xfs_buf的标志?? 什么意思??
    > xfs_trans_stale_inode_buf(xfs_trans, xfs_buf)
+   - 无效这个xfs_buf
    > xfs_trans_binval(xfs_trans, xfs_buf)
 
-** xfs_bmap_free 
-   #+BEGIN_SRC 
-	xfs_bmap_free_item_t	*xbf_first;	/* list of to-be-free extents */
-	int			xbf_count;	/* count of items on list */
-	int			xbf_low;	/* alloc in low mode */   
-   #+END_SRC
-   
 ** xfs_ifree(xfs_trans, xfs_inode, xfs_bmap_free)
-   - 释放inode的磁盘空间, 给inode free list? 怎么管理它??
-   - 现在xfs_dinode在unlink链表中, 这里要释放链表,而且释放xfs_dinode使用的空间
-   - 检查xfs_inode的状态 
-   > xfs_isilocked(xfs_inode, XFS_ILOCK_EXCL)
-   - xfs_inode->xfs_icdinode->di_nlink是0, di_nextents是0, di_anextents也是0, di_size是0, di_nblocks也是0
-   - 释放unlinked链表 
+   - 释放xfs_inode的磁盘空间?
+   - 现在xfs_dinode已经在unlink列表中
+   - 检查xfs_inode->xfs_icdinode的状态
+   - xfs_icdinode->di_nlink是0, nextents是0, anextents也是0, di_size是0, di_nblocks是0, 它的所有数据都已经删除
+   - 在哪里删除的??
+   - 从unlink链表中释放inode 
    > xfs_iunlink_remove(xfs_trans, xfs_inode)
-   - 释放空间? 下面的参数xfs_ino是cluster的第一个ino?? 在xfs_ialloc中实现的
-   > xfs_difree(xfs_trans, xfs_inode->ino, xfs_bmap_free, delete, xfs_ino_t first_ino)
-   - 重置xfs_inode->icdinode的di_mode = 0, 其他的都设为无效
-   - 把它放到xfs_trans中?? 
-   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
-   - 如果delete !=0, 释放对应的cluster空间 
+   - 释放磁盘空间? 
+   > xfs_difree(xfs_trans, xfs_inode->i_ino, xfs_bmap_free, delete, first_ino)
+   - 这里还返回first ino??
+   - 重置xfs_icdinode的变量, di_mode = 0
+   - 把它放到trans中? 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE) 
+   - 如果上面的delete返回1,释放cluster的磁盘空间??
+   - 这里传递的是cluster的第一个ino??
    > xfs_ifree_cluster(xfs_inode, xfs_trans, first_ino)
 
+** xfs_iroot_realloc(xfs_inode, rec_diff, whichfork)
+   - xfs_ifork的数据是btree时,修改根结点大小? 
+   - xfs_ifork的数据在内存中的格式是什么?? 和磁盘完全一致?
+   - whichfork表示要操作的xfs_ifork 
+   > XFS_IFORK_PTR(xfs_inode, whichfork)
+   - 如果rec_diff>0, 而且xfs_ifork->if_broot_bytes = 0
+   - 这是创建xfs_btree_block
+   - 计算根结点大小?  new_size
+   > XFS_BMAP_BTREE_SPACE_CALC(xfs_mount, rec_diff)
+   - 直接使用kmalloc分配内存, 设置xfs_ifork->if_broot_bytes = new_size
+   - 如果xfs_ifork->if_broot_bytes > 0, 表示增长空间
+   - 计算原来的大小? 
+   > xfs_bmbt_maxrecs(xfs_mount, blocklen, 0)
+   - 重新分配内存, 然后需要移动节点中的vallue, key不用移动
+   > XFS_BMAP_BROOT_PTR_ADDR(xfs_mount, xfs_btree_block, 1, xfs_ifork->if_broot_bytes)
+   - 如果是减小空间? rec_diff < 0
+   - 如果减为0, 直接释放xfs_btree_block
+   - 否则重新分配内存,并移动数据??包括record，pointer??
+   - 如果减为0 去掉xfs_ifork->if_flags的XFS_IFBROOT
+
+** xfs_idata_realloc(xfs_inode, bytes_diff, whichfork)
+   - 这是xfs_ifork在使用local方式保存数据??
+   - bytes_diff表示xfs_ifork需要改变的空间?? 
+   - 也就是xfs_ifork->if_bytes的空间
+   - 获取操作的xfs_ifork 
+   > XFS_IFORK_PTR(xfs_inode, whichfork)
+   - 如果空间减为0, 直接释放xfs_ifork->if_u1->if_data
+   - 如果它不是xfs_ifork->if_u2->if_inline_data, 直接释放空间
+   - 如果新的空间不超过if_inline_data的长度,检查原来的空间量
+   - 如果原来使用分配的动态内存,需要搬运数据,并释放空间
+   - 如果原来是0, 直接修改内存指针
+   - 否则变为使用动态内存, 使用xfs_ifork->if_real_bytes表示内存大小, 同样需要考虑原来的情况,可能是NULL,可能是inlien,可能是动态内存
+
+** xfs_idestroy_fork(xfs_inode, whichfork)
+   - 释放xfs_ifork?
+   - 释放xfs_ifork->xfs_btree_block,并没有考虑XFS_IFBROOT??
+   - 如果xfs_inode的磁盘格式是XFS_DINODE_FMT_LOCAL
+   - 没有extent资源, 只需要释放xfs_ifork->if_u1->if_data
+   - 如果它没有使用inline空间,需要释放内存
+   - 如果使用extent的格式??
+   - 如果xfs_ifork->if_flags有XFS_IFEXTENTS,而且
+   - xfs_ifork->if_flags有XFS_IFEXTIREC或者xfs_ifork->if_u1->if_extents使用动态内存, 释放extent数据?? 
+   > xfs_iext_destroy(xfs_ifork)
+   - 如果是attribute的xfs_ifork, 直接释放它 
+   > kmem_zone_free(xfs_ifork_zone, xfs_inode->i_afp)
+
 ** xfs_iunpin(xfs_inode)
-   - 
+   - 在cil中使用??
+   - xfs_log_force_lsn(xfs_inode->xfs_mount, xfs_inode->xfs_inode_log_item->ili_last_lsn, 0)
+   - 刷新log??
+
+** __xfs_iunpin_wait(xfs_inode)
+   - 等待xfs_inode->i_flags的__XFS_IPINNED_BIT
+   - 但等待结束的条件是xfs_inode->i_pincount == 0
+   - 这里使用公共的等待队列
+
+** xfs_iunpin_wait(xfs_inode)
+   - 先检查xfs_inode->i_pincount 
+   > xfs_ipincount(xfs_inode)
+   - 如果不是0去等待
+   > __xfs_iunpin_wait(xfs_inode)
+
+** xfs_iextents_copy(xfs_inode, xfs_bmbt_rec_t, whichfork
+   - 把xfs_ifork的extents信息放到xfs_bmbt_rec数组中
+   - 总的数据量是xfs_ifork->if_bytes
+   - 在xfs_ifork中的格式没有大小端信息, 放到xfs_bmbt_rec中转化到be
+   - 从xfs_ifork中取出xfs_bmbt_rec_host
+   > xfs_iext_get_ext(xfs_ifork, i)
+   - 检查磁盘位置, 如果是null, 直接返回
+   > xfs_bmbt_get_startblock(xfs_bmbt_rec_host)
+   - 然后把数据放到xfs_bmbt_rec中
+   - 最后还要检查xfs_dinode中的数据有效性
+   > xfs_validate_extents(xfs_ifork, copied, XFS_EXTFMT_INODE(xfs_inode))
+
+** xfs_iflush_fork(xfs_inode, xfs_dinode, xfs_inode_log_item, whichfork, xfs_buf)
+   - 把xfs_ifork的数据给磁盘??
+   - 操作的xfs_ifork是 
+   > XFS_IFORK_PTR(xfs_inode, whichfork)
+   - 计算对应的buf空间 
+   > XFS_DFORK_PTR(xfs_dinode, whichfork)
+   - 检查xfs_dinode的格式
+   - 如果是XFS_DINODE_FMT_LOCAL, 需要备份xfs_ifork->if_u1->if_data数据
+   - 检查xfs_inode_log_item->ili_fields包含XFS_ILOG_DDATA/XFS_ILOG_ADATA, 需要把数据复制到xfs_buf中
+   - 如果是XFS_DINODE_FMT_EXTENTS, 需要备份什么数据?
+   - 只有xfs_inode_log_item->ili_fields包含XFS_ILOG_DEXT/XFS_ILOG_AEXT才备份 
+   > xfs_iextents_copy(xfs_inode, xfs_bmbt_rec, whichfork)
+   - 如果是XFS_DINODE_FMT_BTREE, 备份btree的数据?
+   - xfs_inode_log_item->ili_fields包含XFS_ILOG_DBROOT/XFS_ILOG_ABROOT 
+   > xfs_bmbt_to_bmdr(xfs_mount, xfs_ifork->if_broot, xfs_ifork->if_broot_bytes, xfs_bmdr_block_t, XFS_DFORK_SIZE(xfs_inode, xfs_mount, whichfork))
+   - 如果是XFS_DINODE_FMT_DEV, 而且xfs_inode_log_item->ili_fields包含XFS_ILOG_DEV
+   - 把xfs_ifork的dev_t复制到xfs_dinode中 
+   > xfs_dinode_put_rdev(xfs_dinode, xfs_ifork->i_df->if_u2->if_rdev)
+   - 如果是XFS_DINODE_FMT_UUID,对应XFS_ILOG_UUID
+   - 这里就是把xfs_ifork的数据往回写给xfs_dinode
+   - log的标志决定写那些数据
+
+** xfs_iflush_cluster(xfs_inode, xfs_buf)
+   - flush一些xfs_inode?
+   - 根据xfs_inode->i_ino找到xfs_perag 
+   > xfs_perag_get(xfs_mount, XFS_INO_TO_AGNO(xfs_mount, xfs_inode->i_ino))
+   - 准备当前cluster所有的xfs_inode, 个数是 inodes_per_cluster
+   > XFS_INODE_CLUSTER_SIZE(xfs_mount) >> xfs_sb->sb_inodelog 
+   - 上面cluster的单位是什么??
+   - 查找radix, 找到第一个ino
+   > XFS_INO_TO_AGINO(xfs_mount, xfs_inode->i_ino)
+   > radix_tree_gang_lookup(xfs_perag->pag_ici_root, ilist, first_index, inodes_per_cluster)
+   - 遍历这些xfs_inode
+   - 检查是否需要flush?
+   - 如果xfs_inode没有关联xfs_inode_log_item??
+   > xfs_inode_clean(xfs_inode) 
+   - 或者没有pin?
+   > xfs_ipincount(xfs_inode)
+   - 锁住xfs_inode, 为何使用shared锁?
+   > xfs_ilock_nowait(xfs_inode, XFS_ILOCK_SHARED)
+   - 锁住flush操作? 和当前的flush是一回事么?
+   - 如果pincount > 0， 不能flush??
+   - 如果xfs_inode不是clean 
+   > xfs_iflush_int(xfs_inode, xfs_buf)
+
+** xfs_iflush(xfs_inode, xfs_buf)
+   - 把metadata数据写回磁盘
+   - 首先等待pin操作? 或者log操作? 
+   > xfs_iunpin_wait(xfs_inode) 
+   - 如果xfs_inode无效? 直接返回  
+   > xfs_iflags_test(xfs_inode, XFS_ISTALE)
+   - 找到对应的xfs_buf, 包含对应的xfs_dinode 
+   > xfs_imap_to_bp(xfs_mount, NULL, xfs_inode->xfs_imap, xfs_dinode, xfs_buf, XBF_TRYLOCK, 0)
+   - flush 
+   > xfs_iflush_int(xfs_inode, xfs_buf)
+   - 如果xfs_inode在log中 ?? 
+   > xfs_buf_ispinned(xfs_buf)
+   - 启动log? 
+   > xfs_log_force(xfs_mount, 0)
+   - flush cluster
+   > xfs_iflush_cluster(xfs_inode, xfs_buf)
+
+** xfs_iflush_int(xfs_inode, xfs_buf)
+   - 找到对应的xfs_dinode 
+   > xfs_buf_offset(xfs_buf, xfs_inode->xfs_imap->im_boffset)
+   - 检查数据有效性
+   - xfs_dinode->di_magic, xfs_inode->xfs_icdinode->di_magic
+   - xfs_dinode->di_mode, xfs_dinode->di_format
+   - 把xfs_inode->xfs_icdinode的数据写回xfs_dinode
+   - 整个写回..
+   > xfs_dinode_to_disk(xfs_dinode, xfs_inode->xfs_icdinode)
+   - 写回xfs_ifork, 需要根据xfs_inode_log_item的标志写回
+   > xfs_iflush_fork(xfs_inode, xfs_dinode, xfs_inode_log_item, XFS_DATA_FORK, xfs_buf)
+   > xfs_iflush_fork(xfs_inode, xfs_dinode, xfs_inode_log_item, XFS_ATTR_FORK, xfs_buf)
+   - 检查xfs_dinode 
+   > xfs_inobp_check(xfs_mount, xfs_buf)
+   - 上面使用xfs_inode_log_item->ili_fields表示metadata的修改, 所以在log写回之前,是不能再修改inode
+   - 根据注释,这里把log使用的保存到xfs_inode_log_item->ili_last_fields 
+   - 提交ail数据??
+   > xfs_trans_ail_copy_lsn(xfs_mount->xfs_ail, xfs_inode_log_item->ili_flush_lsn, xfs_inode_log_item->xfs_log_item->li_lsn)
+   - 注册ail回调函数? 
+   > xfs_buf_attach_iodone(xfs_buf, xfs_iflush_done, xfs_inode_log_item->xfs_log_item)
+   - 构造xfs_dinode的crc? 
+   > xfs_dinode_calc_crc(xfs_mount, xfs_dinode)
+
+** xfs_iext_get_ext(xfs_ifork, xfs_extnum_t idx)
+   - 查找xfs_ifork中的xfs_bmbt_rec_host? 
+   - 对于文件数据,应该是xfs_extnum_t索引的extent信息
+   - 如果使用XFS_IFEXTIREC, 而且idx=0
+   - 快捷操作, 第一个xfs_ext_irec的第一个xfs_bmbt_rec_host
+   > xfs_ifork->if_u1->xfs_ext_irec->xfs_bmb_rec_host
+   - 如果idx != 0, 先找到对应的xfs_ext_irec 
+   > xfs_iext_idx_to_irec(xfs_ifork, xfs_extnum_t page_idx, idx, 0)
+   - 返回xfs_ext_irec->xfs_bmbt_rec_host[page_idx)
+   - 如果不使用XFS_IFEXTIREC, ext信息保存在xfs_ifork->if_u1->if_extents中 
+
+** xfs_iext_insert(xfs_inode, xfs_extnum_t idx, xfs_extnum_t count, xfs_bmbt_irec_t, state)
+   - 插入extent数据
+   - 首先扩展xfs_ifork 
+   > xfs_iext_add(xfs_ifork, idx, count) 
+   - 然后遍历idx, 把xfs_bmbt_irec数据转化为xfs_bmbt_rec_host
+   > xfs_bmbt_set_all(xfs_iext_get_ext(xfs_ifork, i), xfs_bmbt_irec)
+
+** xfs_iext_add(xfs_ifork, xfs_extnum_t idx, ext_diff)
+   - 改版xfs_ifork的保存extent的内存大小
+   - xfs_ifork->if_bytes表示extent使用的内存量
+   - 改变之前的extent数量是
+   - xfs_ifork->if_bytes / sizeof(xfs_bmbt_rec)
+   - xfs_bmbt_rec和xfs_bmbt_rec_host一样大??
+   - 如果增大后的extent的数量不超过XFS_INLINE_EXTS (2)
+   - 使用xfs_ifork->if_u2->if_inline_ext
+   - 如果idx和目前的extent重合,需要搬运数据
+   - 设置xfs_ifork->if_real_bytes = 0
+   - 如果不超过XFS_LINEAR_EXTS
+   - 分配内存保存这些xfs_bmbt_rec
+   > xfs_iext_realloc_direct(xfs_ifork, new_size)
+   - 需要释放原来的xfs_ifork->if_u1->if_extents, 而且搬运数据
+   - 否则使用xfs_ext_irec数组保存xfs_bmbt_rec_host
+   - 如果原来不是XFS_IFEXTIREC, 需要初始化xfs_ext_irec 
+   > xfs_iext_irec_init(xfs_ifork)
+   - 否则找到对应的xfs_ext_irec 
+   > xfs_iext_idx_to_irec(xfs_ifork, page_idx, ext_idx, 1)
+   - 如果xfs_ext_irec还有包含xfs_bmbt_rec_host, 也就是xfs_ext_irec->er_extcount + ext_diff < XFS_LINEAR_EXTS
+   - 更新这个xfs_ext_irec, 搬运数据
+   - 设置xfs_ext_irec->er_extcount
+   - 更新后面的xfs_ext_irec->er_extoff
+   - 这个数表示当前的xfs_ext_irec的第一个ext的索引
+   > xfs_iext_irec_update_extoffs(xfs_ifork, xfs_extnum_t, ext_diff)
+   - 否则添加新的xfs_ext_irec数组，这样就复杂了,可能把当前的xfs_ext_irec拆分??
+   > xfs_iext_add_indirect_multi(xfs_ifork, erp_idx, page_idx, ext_diff)
+   - 如果之前没有xfs_ext_irec, 创建新的, 不用搬运数据
+   > xfs_iext_irec_new(xfs_ifork, erp_idx) 
+   - 创建后设定xfs_ext_irec的er_extcount, er_idx, 虽然里面还没有有效的xfs_bmbmt_rec_host
+
+** xfs_iext_add_indirect_multi(xfs_ifork, erp_idx, xfs_extnum_t, count)
+   - 增加xfs_ext_irec中xfs_bmbt_rec_host的数量
+   - erp_idx索引xfs_ext_irec, xfs_extnum_t索引里面的xfs_bmbt_rec_host
+   - 当然xfs_ext_irec不够用的
+   - 如果xfs_extnum_t索引xfs_ext_irec的中间,后一部分的数据需要搬运, 先保存到一个临时地方
+   - 首先把erp_idx填满, 这个xfs_ext_irec->er_extcount已经减去需要搬运的xfs_bmbt_rec_host
+   - count -= (XFS_LINEAR_EXTS - xfs_ext_irec->er_extcount)
+   - 然后添加新的xfs_ext_irec 
+   > xfs_iext_irec_new(ifork, erp_idx)
+   - 上面每次修改,都回更新其他xfs_ext_irec->er_extoffs
+   - 然后把临时保存起来的xfs_bmbt_rec_host数组填充进来
+   - 首先考虑新的xfs_ext_irec, 如果它的空间足够, 就直接放进来
+   - 如果不够,检查下一个xfs_ext_irec, 否则创建新的
+   - 但就是不会分裂？？
+   > xfs_iext_irec_new(xfs_ifork, erp_idx)
+  
+** xfs_iext_remove(xfs_inode, xfs_extnum_t, ext_diff, state)
+   - xfs_ifork保存in core xfs_bmbt_rec_host的内存减小
+   - 首先计算减小后的空间
+   - xfs_ifork->if_bytes / sizeof(xfs_bmbt_rec) - ext_diff
+   - 如果减为0, 直接释放所有的ext数据
+   > xfs_iext_destroy(xfs_ifork)
+   - 如果现在使用XFS_IFEXTIREC, 减小xfs_ext_irec数组 
+   > xfs_iext_remove_indirect(xfs_ifork, idx, ext_diff)
+   - 如果不使用XFS_IFEXTIREC, 而且之前使用动态内存
+   - xfs_ifork->if_real_bytes > 0, 减小动态内存,可能回转为使用inline内存 
+   > xfs_iext_remove_direct(xfs_ifork, idx, ext_diff)
+   - 否则直接修改inline的使用量 
+   > xfs_iext_remove_inline(xfs_ifork, idx, ext_diff)
+   - 最后更新xfs_ifork->if_bytes = new_size
+
+** xfs_iext_remove_inline(xfs_ifork, xfs_extnum_t, ext_diff)
+   - 现在xfs_ifork使用inline保存xfs_bmbt_rec_host数组
+   - 检查xfs_ifork->if_flags没有XFS_IFEXTIREC
+   - idx和修改后的ext数据量都不超过XFS_INLINE_EXTS
+   - 如果需要删除的不再最后,需要搬运数据
+   - 而且清空释放的内存
+
+** xfs_iext_remove_direct(xfs_ifork, xfs_extnum_t, ext_diff)
+   - 现在xfs_ifork使用动态内存保存xfs_bmbt_rec_host数据
+   - xfs_ifork->if_flags没有XFS_IFEXTIREC
+   - 首先删除的部分是否在最后, 不用移动数据
+   - 否则先移动数据, 而且清空??
+   - 调整使用的内存,如果太少,转为使用inline内存 
+   > xfs_iext_realloc_direct(xfs_ifork, new_size)
+   - 设置xfs_ifork->if_bytes = new_size
+
+** xfs_iext_remove_indirect(xfs_ifork, xfs_extnum_t, count)
+   - 现在xfs_ifork使用xfs_ext_irec存储xfs_bmbt_rec_host
+   - 遍历参数覆盖的xfs_ext_irec
+   - 第一个和最后一个应该是减小长度，可能回搬运数据
+   - 中间的直接删除xfs_ext_irec
+   - 首先第一个xfs_ext_irec的索引,和它内部的xfs_bmbt_rec_host的索引
+   > xfs_iext_idx_to_irec(xfs_ifork, page_idx, erp_idx, 0)
+   - 对于需要删除整个xfs_ext_irec的 
+   > xfs_iext_irec_remove(xfs_ifork, erp_idx)
+   - 它不仅释放xfs_ext_irec, 也会更新xfs_ifork->if_u1->if_ext_irec
+   - 对于删除一部分的, 只需要搬运后一部分
+   - 更新当前xfs_ext_irec, er_extcount
+   - 更新后面的xfs_ext_irec的ex_extoffs
+   > xfs_iext_irec_update_extoffs(xfs_ifork, idx, -ext_diff)
+   - 最后更新xfs_ifork->if_bytes -= count * sizeof(xfs_bmbt_rec), 它表示xfs_bmbt_rec的数据量
+   - 如果xfs_bmbt_rec太少,可切换为linear或inline的存储方式 
+   > xfs_iext_irec_compact(xfs_ifork)
+
+** xfs_iext_realloc_direct(xfs_ifork, new_size)
+   - 更新使用linear方式存储的xfs_ifork
+   - 现在它必须是linear(direct)释放存储
+   - xfs_ifork->if_flags没有XFS_IFEXTIREC
+   - 如果new_size == 0, 释放释放 
+   > xfs_iext_destroy(xfs_ifork)
+   - 如果xfs_ifork->if_real_bytes > 0, 原来使用动态内存
+   - 如果new_size <= XFS_INLINE_EXTS * sizeof(xfs_bmbt_rec), 改为使用inline方式
+   > xfs_iext_direct_to_inline(xfs_ifork, new_size / sizeof(xfs_bmbt_rec))
+   - 否则更新原来的动态内存, 但这里分配的内存是2的幂次方对齐
+   - 如果原来没有使用分配的动态内存,也就是inline存储 
+   > xfs_iext_inline_to_direct(xfs_ifork, rnew_size)
+   - 更新xfs_ifork->if_real_bytes = rnew
+   - xfs_ifork->if_bytes = new_size
+
+** xfs_iext_direct_to_inline(xfs_ifork, xfs_extnum_t)
+   - 现在使用动态内存存储,转为使用inline内存
+   - 直接把xfs_ifork->if_u1->if_extents中的数据复制给xfs_ifork->if_u2->if_inline_ext
+   - 设置xfs_ifork->if_real_bytes = 0
+
+** xfs_iext_inline_to_direct(xfs_ifork, new_size)
+   - 现在是inline方式,转为动态内存方式
+   - 分配内存, 搬运数据
+   - 设置xfs_ifork->if_real_bytes = new_size
+
+** xfs_iext_realloc_indirect(xfs_ifork, new_size)
+   - 现在xfs_ifork使用indirect方式存储
+   - xfs_ifork->if_flags必须有XFS_IFEXTIREC
+   - new_size表示xfs_ifork->if_u1->if_ext_irec数组的新的长度, 改变它的长度
+   - xfs_ifork->if_real_bytes表示它, 但需要计算
+   - xfs_ifork->if_real_bytes / XFS_IEXT_BUFSZ * sizeof(xfs_ext_irec)
+   - if_real_bytes表示能容纳的xfs_bmbt_rec的数量
+   - if_bytes表示使用保存的xfs_bmbt_rec的数量
+
+** xfs_iext_indirect_to_direct(xfs_ifork)
+   - 从indirection方式变为linear/direct方式
+   - 现在xfs_ifork->if_flags包含XFS_IFEXTIREC
+   - 而且xfs_ifork中的xfs_bmbt_rec的数量 <= XFS_INLINE_EXTS
+   - xfs_ifork->if_bytes / sizeof(xfs_bmbt_rec)
+   - 首先压缩xfs_ext_irec?
+   > xfs_iext_irec_compact_pages(xfs_ifork)
+   - 而且是压缩成一个 xfs_ifork->if_real_bytes = XFS_IEXT_BUFSZ
+   - 然后直接利用xfs_ext_irec->xfs_bmbm_rec的内存
+   - xfs_ifork->if_u1->if_ext_irec = xfs_ifork->if_u1->if_ext_irec->er_extbuf
+   - 释放xfs_ext_irec数组
+   - 如果xfs_bmbt_ext数量太少,更新它的长度 
+   > xfs_iext_realloc_direct(xfs_ifork, size)
+
+** xfs_iext_destroy(xfs_ifork)
+   - 释放extent数据,包括
+   - indirect模式下的xfs_ext_irec数组
+   > xfs_iext_irec_remove(xfs_ifork, idx)
+   - direct模式下的xfs_ifork->if_u1->if_extents数组
+   - inline模式下只会重写xfs_ifork->if_u2->if_inline_ext
+   - 最后设置if_real_bytes, if_bytes
+
+** xfs_iext_bno_to_ext(xfs_ifork, xfs_fileoff_t bno, xfs_extnum_t)
+   - 查找bno对应的xfs_bmbt_rec_host??
+   - 这里没有把结果考出来,而是找到对应的索引,可以向前遍历
+   - 对于indirection模式, 找到对应的xfs_ext_irec 
+   - 然后在xfs_ext_irec->er_extbuf中遍历
+   > xfs_iext_bno_to_irec(xfs_ifork, bno, erp_idx)
+   - 对于其他的,从xfs_ifork->if_u1->if_extents开始遍历
+   - 使用2分查找
+   - 对于xfs_bmbt_rec_host, 需要计算文件偏移和长度
+   > xfs_bmbt_get_startoff(xfs_bmbt_rec_host)
+   > xfs_bmbt_get_blockcount(xfs_bmbt_rec_host)
+   - 最好找到的xfs_bmbt_rec_host,要不覆盖bno, 要不就在bno的后面
+   - xfs_extnum_t返回这个xfs_bmbt_rec_host的索引
+
+** xfs_iext_bno_to_irec(xfs_ifork, xfs_fileoff_t bno, erp_idx)
+   - 查找xfs_ext_irec, 它的xfs_bmbt_rec_host覆盖bno
+   - 同样使用2分查找方式
+   - 比较xfs_ext_irec的第一个xfs_bmbt_rec_host的文件偏移
+
+** xfs_iext_idx_to_irec(xfs_ifork, xfs_extnum_t, erp_idx, realloc)
+   - 采用2分查找方式
+   - 这里需要处理realloc
+   - 如果realloc == 0, 表示要查找对应的xfs_bmbt_rec, 必须精确
+   - 如果realloc !=0, 表示要改变空间? 如果对应的xfs_bmbt_rec前面的xfs_ext_irec有空闲,就返回空闲的xfs_bmbt_rec的索引
+
+** xfs_iext_irec_init(xfs_ifork)
+   - 初始化xfs_ifork->if_u1->xfs_ext_irec数组
+   - 数组长度为1,里面有XFS_IEXT_BUFSZ的xfs_bmbt_rec
+   - 这是不确定xfs_ifork使用什么模式保存xfs_bmbt_rec
+   - 如果还没有, 直接创建xfs_ext_irec->er_extbuf数组, 但它创建了给xfs_ifork->if_u1->if_extents
+   - 如果原来是inline模式, 先变为inline模式 
+   > xfs_iext_inline_to_direct(xfs_ifork, XFS_IEXT_BUFSZ)
+   - 如果原来是linear模式,改变xfs_bmbt_rec长度
+   > xfs_iext_realloc_direct(xfs_ifork, XFS_IEXT_BUFSZ)
+   - 上面这些操作都是为了准备好xfs_ifork->if_u1->if_extents, 让第一个xfs_ext_irec->er_extbuf使用它
+   - 设置xfs_ifork->if_flags的XFS_IFEXTIREC
+   - if_real_bytes = XFS_IEXT_BUFSZ
+   - if_bytes = nextents * sizeof(xfs_bmbt_rec_t)
+
+** xfs_iext_irec_new(xfs_ifork, erp_idx)
+   - 在xfs_ifork->if_u1->xfs_ext_irec数组中erp_idx处添加一个新的
+   - 首先增加xfs_ext_irec数组的大小 
+   > xfs_iext_realloc_indirect(xfs_ifork, nlists * sizeof(xfs_ext_irec))
+   - 移动数组后半部分的数据
+   - 初始化当前的xfs_ext_irec 
+   - 创建xfs_bmbt_irec数组, er_extcount = 0, er_extoff根据前一个xfs_ext_irec计算
+
+** xfs_iext_irec_remove(xfs_ifork, erp_idx)
+   - 删除erp_idx索引的xfs_ext_irec
+   - 首先如果xfs_ext_irec->er_extcount > 0, 修改它后面的xfs_ext_irec的索引 
+   > xfs_iext_irec_update_extoffs(xfs_ifork, idx, - xfs_ext_irec->er_extcount)
+   - 移动xfs_ext_irec数组内容
+   - 修改数组长度 
+   > xfs_iext_realloc_indirect(xfs_ifork, nlists * sizeof(xfs_ext_irec)
+   - 更新xfs_ifork->if_real_bytes = nlist * XFS_IEXT_BUFSZ
+
+** xfs_iext_irec_compact(xfs_ifork)
+   - xfs_ifork当前使用indirect模式,而且它的extent比较少,检查是否变为其他模式
+   - 它的xfs_bmbt_rec数量是 xfs_ifork->if_bytes / sizeof(xfs_bmbt_rec)
+   - 如果为0, 释放释放 
+   > xfs_iext_destroy(xfs_ifork)
+   - 如果<= XFS_INLINE_EXTS
+   - 首先变为direct模式, 这里没有制定nextents的数量, 因为回直接使用if_bytes
+   > xfs_iext_indirect_to_direct(xfs_ifork)
+   - 然后变为inline模式, 实际上这一步是多余的!!
+   > xfs_iext_direct_to_inline(xfs_ifork, nextents)
+   - 如果 <= XFS_LINEAR_EXTS, 变为direct
+   > xfs_iext_indirect_to_direct(xfs_ifork)
+   - 最后如果xfs_ext_irec使用率太低, 50%,压缩xfs_ext_irec 
+   > xfs_iext_irec_compact_pages(xfs_ifork)
+
+** xfs_iext_irec_compact_pages(xfs_ifork)
+   - 这里的压缩之检查相邻的2个xfs_ext_irec
+   - 如果一个xfs_ext_irec能合并下一个, 就释放下一个
+   > xfs_iext_irec_remove(xfs_ifork, idx)
+   - 而不会完全压缩
+
+** xfs_iext_irec_update_extoffs(xfs_ifork, erp_idx, ext_diff)
+   - 在indirect模式下,如果中间的一个xfs_ext_irec->er_extcount改变
+   - 它后面的xfs_ext_irec->er_extoff必须相应的改变
+   - 遍历这些xfs_ext_irec 
+   > xfs_ifork->if_u1->if_ext_irec[i]->ex_extoff += ext_diff
+
+** xfs_can_free_eofblocks(xfs_inode, force)
+   - 是否需要释放多余的extent/block??
+   - xfs_inode->xfs_ifork->if_flags的XFS_IFEXTENTS表示已经把extents信息复制到xfs_ifork中
+   - 如果没有XFS_IFEXTENTS, 不需要释放?
+   - 对于preallocation,或者append? 如果不是force或没有延时分配,也不需要??
+   - xfs_inode->i_delayed_blks == 0
    
-
-
 * xfs_trans_inode.c
 
 ** xfs_trans_ijoin(xfs_trans, xfs_inode, lock_flags)
@@ -842,4 +1258,196 @@ typedef enum xfs_dinode_fmt {
    - 设置xfs_trans->t_flags的XFS_TRANS_DIRTY, xfs_inode->xfs_inode_log_item->xfs_log_item->xfs_log_item_desc->lid_flags的XFS_LID_DIRTY
    - 把flags存储到xfs_inode->xfs_inode_log_item->ili_fields中. 包括xfs_inode->xfs_inode_log_item->ili_last_fields
 
+* xfs_inode_item.c
+
+** xfs_log_item 
+   #+BEGIN_SRC 
+	struct list_head		li_ail;		/* AIL pointers */
+	xfs_lsn_t			li_lsn;		/* last on-disk lsn */
+	struct xfs_log_item_desc	*li_desc;	/* ptr to current desc*/
+	struct xfs_mount		*li_mountp;	/* ptr to fs mount */
+	struct xfs_ail			*li_ailp;	/* ptr to AIL */
+	uint				li_type;	/* item type */
+	uint				li_flags;	/* misc flags */
+	struct xfs_log_item		*li_bio_list;	/* buffer item list */
+	void				(*li_cb)(struct xfs_buf *,
+						 struct xfs_log_item *);
+							/* buffer item iodone */
+							/* callback func */
+	const struct xfs_item_ops	*li_ops;	/* function list */
+
+	/* delayed logging */
+	struct list_head		li_cil;		/* CIL pointers */
+	struct xfs_log_vec		*li_lv;		/* active log vector */
+	xfs_lsn_t			li_seq;		/* CIL commit seq */   
+   #+END_SRC
+
+** xfs_inode_log_item 
+   #+BEGIN_SRC 
+	xfs_log_item_t		ili_item;	   /* common portion */
+	struct xfs_inode	*ili_inode;	   /* inode ptr */
+	xfs_lsn_t		ili_flush_lsn;	   /* lsn at last flush */
+	xfs_lsn_t		ili_last_lsn;	   /* lsn at last transaction */
+	unsigned short		ili_lock_flags;	   /* lock flags */
+	unsigned short		ili_logged;	   /* flushed logged data */
+	unsigned int		ili_last_fields;   /* fields when flushed */
+	unsigned int		ili_fields;	   /* fields to be logged */
+	struct xfs_bmbt_rec	*ili_extents_buf;  /* array of logged
+						      data exts */
+	struct xfs_bmbt_rec	*ili_aextents_buf; /* array of logged
+						      attr exts */
+	xfs_inode_log_format_t	ili_format;	   /* logged structure */   
+   #+END_SRC
+
+** INODE_ITEM(xfs_log_item)
+   - xfs_log_item就是xfs_inode_log_item
+   > container_of
+
+** xfs_inode_item_size(xfs_log_item)
+   - 计算log一个inode使用的iovec
+   - xfs_log_item使用一个
+   - xfs_dinode使用一个
+   - data fork使用一个, 但需要检查data fork是否存在
+   - 对于XFS_DINODE_FMT_EXTENTS, xfs_inode_log_item->ili_fields有XFS_ILOG_DEXT, 而且xfs_icdinode->di_nextents > 0, 表示有extent数据??
+   - 对于XFS_DINODE_FMT_BTREE, xfs_inode_log_item->ili_fields 有XFS_ILOG_DBROOT, 而且xfs_icdinode->if_broot_bytes > 0, 表示有btree数据??
+   - 对于XFS_DINODE_FMT_LOCAL, 检查xfs_inode_log_item->ili_fields的XFS_ILOG_DDATA, xfs_inode->xfs_ifork->if_bytes > 0
+   - 对于XFS_DINODE_FMT_DEV, XFS_DINODE_FMT_UUID不会保存??
+   - 对于attribute data fork, 同样作上面的检查
+
+** xfs_inode_item_format_extents(xfs_inode, xfs_log_iovec, type)
+   - 把内存中的extents信息写回磁盘, 需要作大小端转化
+   - in-core => on-disk
+   - 由于延时分配, 内存中的extent信息和磁盘上的可能不同,使用磁盘上的为准, 也就是使用xfs_inode->xfs_icdinode 
+   > XFS_IFORK_SIZE(xfs_inode, whichfork)
+   - 分配内存保存xfs_bmbt_rec数组
+   - 把内存指针给xfs_inode->xfs_inode_log_item->ili_extents_buf??
+   - 使用xfs_log_iovec记录这些信息
+   - 设置xfs_log_iovec->i_type = 参数type
+   - xfs_iextents_copy(xfs_inode, ext_buffer, whichifork)
+   - 遍历xfs_ifork中的所有xfs_bmbt_rec_host, 对于attribute fork也使用extent??
+
+** xfs_inode_log_format 
+   #+BEGIN_SRC 
+	__uint16_t		ilf_type;	/* inode log item type */
+	__uint16_t		ilf_size;	/* size of this item */
+	__uint32_t		ilf_fields;	/* flags for fields logged */
+	__uint16_t		ilf_asize;	/* size of attr d/ext/root */
+	__uint16_t		ilf_dsize;	/* size of data/ext/root */
+	__uint64_t		ilf_ino;	/* inode number */
+	union {
+		__uint32_t	ilfu_rdev;	/* rdev value for dev inode*/
+		uuid_t		ilfu_uuid;	/* mount point value */
+	} ilf_u;
+	__int64_t		ilf_blkno;	/* blkno of inode buffer */
+	__int32_t		ilf_len;	/* len of inode buffer */
+	__int32_t		ilf_boffset;	/* off of inode in buffer */   
+   #+END_SRC
+
+** xfs_inode_item_format(xfs_log_item, xfs_log_iovec)
+   - 记录xfs_inode的信息
+   - 第一个xfs_log_iovec是xfs_inode_log_format信息,它的数据类型是大端的,可以直接存到磁盘
+   - xfs_inode_log_item->xfs_inode_log_format
+   - xfs_log_iovec->i_type = XFS_REG_TYPE_IFORMAT
+
+   - 第2个xfs_log_iovec是xfs_inode->xfs_icdinode信息, 但它没有大小端信息??
+   - xfs_log_iovec->i_type = XLOG_REG_TYPE_ICORE
+   - 第3个是data fork, 根据xfs_inode->xfs_icdinode->di_format分析
+   - 如果是XFS_DINODE_FMT_EXTENTS, 要保存extent信息
+   - xfs_inode_log_item->ili_fields有XFS_ILOG_DEXT, 而且xfs_icdinode->di_nextents > 0, 而且xfs_ifork->if_bytes > 0
+   - 如果xfs_icdinode->di_nextents是xfs_ifork中的extent数量
+   - xfs_inode->if_bytes / sizeof(xfs_bmbt_rec)
+   - 表示没有delayed, 可以直接使用xfs_ifork的内存
+   - xfs_ifork->if_u1->if_extents
+   - 如果使用indirect的存储??
+   - 否则需要遍历xfs_ifork的xfs_bmbt_rec
+   > xfs_inode_item_format_extents(xfs_inode, xfs_log_item, XFS_DATA_FORK, XLOG_REG_TYPE_IEXT)
+   - 如果是XFS_DINODE_FMT_BTREE, 只处理树根?? 
+   - 检查xfs_inode_log_item->ili_fields的XFS_ILOG_DBROOTxo
+   - xfs_ifork->if_broot, xfs_log_iovec->i_type = XLOG_REG_TYPE_IBROOT
+   - 如果是XFS_DINODE_FMT_LOCAL, 处理普通数据??
+   - 检查xfs_inode_log_item->ili_fields的XFS_ILOG_DDATA
+   - 数据是xfs_ifork->if_u1->if_data, 没有大小端
+   - xfs_log_iovec->i_type = XFS_REG_TYPE_ILOCAL
+   - 如果是XFS_DINODE_FMT_DEV/UUID
+   - 直接把xfs_ifork的数据放到xfs_inode_log_format->ilf_u->ilfu_rdev / ilfu_uuid
+
+   - 第4个xfs_log_iovec是attribute fork, 和上面一样
+
+** xfs_inode_item_pin(xfs_log_item)
+   - 获取对应的xfs_inode_log_item->xfs_inode
+   - 增加xfs_inode->i_pincount 
+
+** xfs_inode_item_unpin(xfs_log_item, remove)
+   - 减小xfs_inode->i_pincount
+   - 如果减为0, 唤醒等待xfs_inode->i_flags的__XFS_IPINNED_BIT
+
+** xfs_inode_item_push(xfs_log_item, list_head)
+   - 这是xfs_item_ops->iop_push的回调函数
+   - 根据xfs_log_item获取xfs_inode
+   - 如果xfs_inode->i_pincount > 0, 返回XFS_ITEM_PINNED, 被谁锁住??
+   - 锁住XFS_ILOCK_SHARED锁
+   - xfs_ilock_nowait(xfs_inode, XFS_ILOCK_SHARED)
+   - 如果xfs_inode无效， xfs_inode->i_flags有XFS_ISTALE, 返回XFS_ITEM_PINNED??
+   - 锁住flush操作,否则返回XFS_ITEM_FLUSHING
+   > xfs_iflock_nowait(xfs_inode)
+   - 刷新metadata数据??
+   > xfs_iflush(xfs_inode, xfs_buf)
+   - 把xfs_dinode使用的xfs_buf放到参数队列中 
+   > xfs_buf_delwri_queue(xfs_buf, list_head)
+
+** xfs_inode_item_unlock(xfs_log_item)
+   - 释放inode的锁?? 也是xfs_item_ops的回调
+   - 释放log过程中使用的临时缓存
+   - xfs_inode_log_item->ili_extents_buf / ili_aextents_buf, 他们用来转存xfs_ifork中的extent数据
+   - 释放inode锁, xfs_inode_log_item->ili_lock_flags
+   > xfs_iunlock(xfs_inode, lock_flags)
+
+** xfs_inode_item_committed(xfs_log_item, xfs_lsn_t)
+   - 用来返回xfs_inode在log中的最新的位置?? 
+   - 直接返回参数xfs_lsn_t
+   - 如果xfs_inode->i_flags有XFS_ISTALE, 表示inode已经释放?? 返回-1
+
+** xfs_inode_item_committing(xfs_log_item, xfs_lsn_t)
+   - 设置xfs_inode->ili_last_lsn = xfs_lsn_t
+
+** xfs_inode_item_init(xfs_inode, xfs_mount)
+   - 创建xfs_inode->xfs_inode_log_item
+   - 初始化xfs_log_item 
+   > xfs_log_item_init(xfs_mount, xfs_inode_log_item->xfs_log_item, XFS_LI_INODE, xfs_inode_item_ops)
+   - 初始化xfs_inode_log_item->xfs_inode_log_format, 里面包括ino, xfs_imap
+   - 为何要有xfs_imap信息?? 定位锁在的cluster? 使用ino就可以定位??
+
+** xfs_inode_item_destroy(xfs_inode)
+   - 释放xfs_inode->xfs_inode_log_item 
+
+** xfs_iflush_done(xfs_buf, xfs_log_item)
+   - 在flush操作完成后调用,可能会在中断上下文中??
+   - 如果indoe还在ail中,可以直接删除, 不用再写到cil中??
+   - 遍历xfs_buf中的xfs_dinode, 这是xfs_inode_log_item链表
+   - 这里很奇怪, 如果xfs_log_item->li_cb是xfs_iflush_done, 只是空遍历??
+   - 否则把xfs_buf的xfs_log_item链表全部放到xfs_log_item->li_bio_list链表中
+   - 如果他们在ail中,而且没有新的改动
+   - 也就是xfs_log_item->li_lsn == xfs_inode_log_item->ili_flush_lsn, 可以直接释放他们??
+   > xfs_trans_ail_delete_bulk(xfs_ail, xfs_log_item, i, SHUTDOWN_CORRUPT_INCORE)
+   - 恢复log使用的变量
+   - xfs_inode_log_item->ili_last_fields = 0, ili_logged = 0
+   - 释放xfs_inode的flush操作的锁
+   > xfs_ifunlock(xfs_inode_log_item->xfs_inode)
+
+** xfs_iflush_abort(xfs_inode, stale)
+   - flush abort操作? 在关闭文件系统中使用?
+   - 从ail中释放xfs_log_item? 
+   - xfs_log_item->li_flags有XFS_LI_IN_AIL 
+   > xfs_trans_ail_delete(xfs_ail, xfs_log_item, SHUTDOWN_LOG_IO_ERROR/SHUTDOWN_CORRUPT_INCORE)
+   - 然后恢复xfs_inode_log_item的成员, ili_logged / ili_last_fields / ili_fields
+   - 释放flush锁 
+   > xfs_ifunlock(xfs_inode)
+
+** xfs_istale_done(xfs_buf, xfs_log_item)
+   > xfs_iflush_abort(xfs_inode, true)
+
+** xfs_inode_item_format_convert(xfs_log_iovec, xfs_inode_format)
+   - 把xfs_log_iovec中的数据转移到xfs_inode_log_format, 
+   - 在xfs_log_iovec中, 可能是32位,也可能是64位
+   - xfs_inode_log_format_32 / xfs_inode_log_format_64, 但他们都是没有大小端信息的
 

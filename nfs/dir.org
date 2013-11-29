@@ -1,0 +1,313 @@
+* dir.c
+
+** nfs_open_dir_context
+   #+BEGIN_SRC 
+	struct rpc_cred *cred;
+	unsigned long attr_gencount;
+	__u64 dir_cookie;
+	__u64 dup_cookie;
+	signed char duped;   
+   #+END_SRC
+
+** alloc_nfs_open_dir_context(inode, rpc_cred)
+   - 构造nfs_open_dir_context, 但没有关联file/inode
+   > get_rpccred(rpc_cred)
+   - 填充nfs_open_dir_context->attr_gencount = nfs_inode->attr_gencount
+
+** put_nfs_open_dir_context(nfs_open_dir_context)
+   > put_rpccred(nfs_open_dir_context->rpc_cred)
+
+** nfs_opendir(inode, file)
+   - 打开dirn文件
+   - 获取rpc_cred 
+   > rpc_lookup_cred()
+   - 构造nfs_open_dir_context 
+   > alloc_nfs_open_dir_context(inode, rpc_cred)
+   - 设置file->private_data = nfs_open_dir_context
+
+** nfs_closedir(inode, file) 
+   > put_nfs_open_dir_context(file->private_data)
+
+** nfs_cache_array_entry
+   #+BEGIN_SRC 
+	u64 cookie;
+	u64 ino;
+	struct qstr string;
+	unsigned char d_type;   
+   #+END_SRC
+
+** nfs_cache_array 
+   #+BEGIN_SRC 
+	int size;
+	int eof_index;
+	u64 last_cookie;
+	struct nfs_cache_array_entry array[0];   
+   #+END_SRC
+
+** nfs_entry
+   #+BEGIN_SRC 
+	__u64			ino;
+	__u64			cookie,
+				prev_cookie;
+	const char *		name;
+	unsigned int		len;
+	int			eof;
+	struct nfs_fh *		fh;
+	struct nfs_fattr *	fattr;
+	struct nfs4_label  *label;
+	unsigned char		d_type;
+	struct nfs_server *	server;   
+   #+END_SRC
+
+** decode_dirent_t(xdr_stream, nfs_entry, int)
+   - 这是回调函数
+
+** dir_context
+   #+BEGIN_SRC 
+	const filldir_t actor;
+	loff_t pos;   
+   #+END_SRC
+
+** nfs_readdir_descriptor_t
+   #+BEGIN_SRC 
+	struct file	*file;
+	struct page	*page;
+	struct dir_context *ctx;
+	unsigned long	page_index;
+	u64		*dir_cookie;
+	u64		last_cookie;
+	loff_t		current_index;
+	decode_dirent_t	decode;
+
+	unsigned long	timestamp;
+	unsigned long	gencount;
+	unsigned int	cache_entry_index;
+	unsigned int	plus:1;
+	unsigned int	eof:1;   
+   #+END_SRC
+
+** nfs_readdir_get_array(page)
+   - readdir的结果的数据结构是nfs_cache_array??
+   - page中的数据就是nfs_cache_array
+
+** nfs_readdir_release_array(page)
+   > kunmap(page)
+
+** nfs_readdir_clear_array(page)
+   - 和上面一样, page中是nfs_cache_array
+   - 遍历nfs_cache_entry->array中的nfs_cache_array_entry
+   - 释放nfs_cache_array_entry->string->name
+
+** nfs_readdir_make_qstr(qstr, name, len)
+   - 根据name/len构造一个qstr
+   - qstr->name使用新的内存
+
+** nfs_readdir_add_to_array(nfs_entry, page)
+   - page中是nfs_cache_array
+   - 把nfs_entry添加到nfs_cache_array->array的最后一个nfs_cache_array_entry中
+   - 建立page影射 
+   > nfs_readdir_get_array(page)
+   - 把nfs_entry的数据格式化给nfs_cache_array_entry
+   - 包括cookie, ino, type, name
+   - 更新nfs_cache_array->last_cookie, size
+   - 释放page影射 
+   > nfs_readdir_release_array(page)
+
+** nfs_readdir_search_for_pos(nfs_cache_array, nfs_readdir_descriptor_t)
+   - 初始化nfs_readdir_descriptor_t->dir_cookie
+   - 它索引的nfs_cache_array->array中的nfs_cache_array_entry
+   - 索引是nfs_readdir_descriptor_t->dir_context->pos - nfs_readdir_descriptor_t->current_index
+   - 设置nfs_readdir_descriptor_t->dir_cookie = nfs_cache_array_entry->cookie
+   - 设置nfs_readdir_descriptor_t->cache_entry_index
+
+** nfs_readdir_search_for_cookie(nfs_cache_array, nfs_readdir_descriptor_t)
+   - 在nfs_cache_array->array中查找nfs_cache_array_entry
+   - 它和参数nfs_readdir_descriptor_t使用相同的cookie
+   - 检查目录inode是否有变化
+   - 从nfs_readdir_descriptor_t->file->private_data获取nfs_open_dir_context
+   - 检查nfs_open_dir_context->attr_gencount 和 nfs_inode->attr_gencount
+   - 如果不相同, 或者nfs_inode->cache_validity有NFS_INO_INVALID_ATTR|NFS_INO_INVALID_DATA
+   - 变化了没有重新查找??
+   - 设置nfs_open_dir_context->duped = 0, attr_gencount = nfs_inode->attr_gencount??
+   - 如果没有变化,但是nfs_readdir_descriptor_t->current_index+i < nfs_open_dir_context->pos, 严重错误??
+   - 设置nfs_readdir_descriptor_t->nfs_open_dir_context->pos = new_pos??
+   - 设置nfs_readdir_descriptor_t->cache_entry_index = i
+
+** nfs_readdir_search_array(nfs_readdir_descriptor_t)
+   - 从nfs_readdir_descriptor_t->page中查找对应的nfs_cache_array_entry
+   - 但没有什么操作??
+   - 如果nfs_readdir_descriptor_t->dir_cookie ==0
+   - 先找到cache_entry_index和dir_cookie
+   > nfs_readdir_search_for_pos(nfs_cache_array, nfs_readdir_descriptor_t)
+   - 否则根据dir_cookie查找索引, 设定dir_context->pos = new_pos??
+   > nfs_readdir_search_for_cookie(nfs_cache_array, nfs_readdir_descriptor_t)
+
+   - 最后释放page影射 
+   > nfs_readdir_release_array(nfs_readdir_descriptor_t->page)
+   
+** nfs_readdir_xdr_filler(pages, nfs_readdir_descriptor_t, nfs_entry, file, inode)
+   - 发送rpc请求 
+   > nfs_rpc_ops->readdir(file->path->dentry, rpc_cred, nfs_entry->cookie, pages, nfs_server->dtsize, nfs_readdir_descriptor_t->plus)
+   - nfs_readdir_descriptor_t的timestamp / gencount
+
+** xdr_decode(nfs_readdir_descriptor_t, nfs_entry, xdr_stream)
+   > nfs_readdir_descriptor_t->decode(xdr, nfs_entry, nfs_readdir_descriptor_t->plus)
+   - 把nfs_readdir_descriptor->timestamp / gencount给nfs_entry->nfs_fattr->time_start, gencount 
+
+** nfs_same_file(dentry, nfs_entry)
+   - 比较dentry和nfs_entry是否同一个文件
+   - 比较filehandle  nfs_entry->fh, nfs_inode->fh
+
+** nfs_use_readdirplus(inode, dir_context)
+   - 是否使用readdirplus
+
+** nfs_advise_use_readdirplus(inode)
+   - 设置nfs_inode->flags的NFS_INO_ADVISE_RDPLUS
+
+** nfs_prime_dcache(dentry, nfs_entry)
+   - 处理nfs_entry的结果数据
+   - 根据nfs_entry->name查找dentry 
+   > d_lookup(dentry, filename)
+   - 如果找到, 比较filehandle
+   > nfs_same_file(dentry, nfs_entry)
+   - 如果是一个, 更新dentry->inode 
+   - 设置dentry->d_time
+   > nfs_set_verifier(dentry, nfs_save_change_attribute(nfs_entry))
+   > nfs_refresh_inode(dentry->inode, nfs_entry->nfs_fattr)
+   - 否则释放这个dentry 
+   > d_invalidate(dentry)
+   > dput(dentry)
+   - 如果美找到构造一个dentry 
+   > d_alloc(dentry, filename)
+   - 构造nfs_inode 
+   > nfs_fhget(dentry->super_block, nfs_fh, nfs_fattr, nfs_entry->label)
+   - 关联inode/dentry
+   > d_materialise_unique(dentry, inode)
+   - 设置dentry->d_time
+   > nfs_set_verifier(dentry, nfs_save_change_attribute(dentry))
+
+** nfs_readdir_page_filler(nfs_readdir_descriptor_t, nfs_entry, xdr_pages, page, buflen)
+   - 解析xdr_pages中的数据
+   - 使用xdr_buf/xdr_stream解析 
+   - 先调用nfs_readdir_descriptor->decode函数
+   - 使用是填充nfs_entry
+   > xdr_decode(nfs_readdir_descriptor_t, nfs_entry, xdr_stream)
+   - 如果是readdirplus,nfs_readdir_descriptor_t->plus !=0
+   - 构造nfs_inode 
+   > nfs_prime_dcache(nfs_readdir_descriptor_t->file->path->dentry, nfs_entry)
+   - 然后把nfs_entry放到结果page中
+   > nfs_readdir_add_to_array(nfs_entry, page)
+   - 循环处理,直到nfs_entry->eof = 0
+
+** nfs_readdir_free_pagearray(pages, npages)
+   - 释放page指针数组
+   > put_page(pages[i])
+
+** nfs_readdir_free_large_page(ptr, pages, npages)
+   > nfs_readdir_free_pagearray(pages, npages)
+
+** nfs_readdir_large_page(pages, npages)
+   - 构造page指针数组
+
+** nfs_readdir_xdr_to_array(nfs_readdir_descriptor_t, page, inode)
+   - 要读取的dentes在nfs_readdir_descriptor_t中说明??
+   - 准备pages数组，保存rpc结果
+   > nfs_readdir_large_page(pages, array_size)
+   - 准备nfs_page
+   - 设置page中的nfs_cache_array
+   - 循环发送请求 
+   > nfs_readdir_xdr_filler(pages, nfs_readdir_descriptor_t, nfs_entry, file, inode)
+   - 把结果转存到nfs_cache_array和inode/dentry 
+   > nfs_readir_page_filler(nfs_readdir_descriptor_t, nfs_entry, pages, page, pglen)
+   - 循环结束条件是 nfs_cache_array->eof_index >= 0
+   - 然后释放pages数组, nfs_cache_array的page影射 
+   > nfs_readdir_free_pagearray(..)
+   > nfs_readdir_release_array(..)
+
+** nfs_readdir_filler(nfs_readdir_descriptor_t, page)
+   - 请求readdir数据，把结果放到pagecache中缓存
+   > nfs_readdir_xdr_to_array(nfs_readdir_descriptor_t, page, inode)
+   - 设置PG_uptodate 
+   - 为何要释放多于的pagecache?? 岂不重复??
+   > invalidate_inode_pages2_range(inode->address_space, page->index + 1, -1)
+
+** cache_page_release(nfs_readdir_descriptor_t)
+   > 如果nfs_readdir_descriptor_t->page->address_space == NULL 
+   - 这个page是临时的?? 
+   > nfs_readdir_clear_array(nfs_readdir_descriptor_t->page)
+   > page_cache_release(nfs_readdir_descriptor_t->page)
+
+** get_cache_page(nfs_readdir_descriptor_t)
+   > read_cache_page(nfs_readdir_descriptor_t->file->path->dentry->inode->address_space, nfs_readdir_descriptor_t->page_index, nfs_readdir_filler, nfs_readdir_descriptor_t)
+   - 使用pagecache的读的方式,填充entries数据
+   - nfs_readdir_descriptor_t->page_index是怎么定的???
+
+** find_cache_page(nfs_readdir_descriptor_t)
+   - 读取一个page的entries数据
+   > get_cache_page(nfs_readdir_descriptor_t)
+   - 然后在里面搜索什么?? 
+   > nfs_readdir_search_array(nfs_readdir_descriptor_t)
+
+** readdir_search_pagecache(nfs_readdir_descriptor_t)
+   - 如果nfs_readdir_descriptor_t->page_index = 0,
+   - 设置current_index = 0, last_cookie = 0 ??
+   - 循环读取数据 
+   > find_cache_page(nfs_readdir_descriptor_t)
+
+** nfs_do_filldir(nfs_readdir_descriptor_t)
+   - 遍历nfs_cache_array->array中的nfs_cache_array_entry
+   - 但遍历从nfs_readdir_descriptor->cache_entry_index开始? 
+   - 把entry信息传递给dir_context->actor,返回给userspace
+   > dir_emit(dir_context, nfs_cache_array_entry->string, len, ino, type)
+   
+** uncached_readdir(nfs_readdir_descriptor_t)
+   - 这里使用临时page,保存nfs_entry 
+   > alloc_page(GFP_HIGHUSER)
+   - 初始化nfs_readdir_descriptor_t
+   - page_index = 0, last_cookie = dir_cookie?
+   - 发送rpc请求
+   > nfs_readdir_xdr_to_array(nfs_readdir_descriptor_t, page, inode)
+   - 向上传递数据
+   > nfs_do_filldir(nfs_readdir_descriptor_t)
+
+** nfs_readdir(file, dir_context)
+   - 构造nfs_readdir_descriptor
+   - 设置相关的参数, file, dir_context
+   - dir_cookie = dir_context->dir_cookie ??
+   - decode回调函数是 nfs_rpc_ops->decode_dirent
+   - 使用pagecache缓存nfs_entry 
+   > readdir_search_pagecache(nfs_readdir_descriptor_t)
+   - 如果返回-EBADCOOKIE ??
+   - 使用临时page 
+   > uncached_readdir(nfs_readdir_descriptor_t)
+
+** nfs_llseek_dir(file, offset, whence)
+   - 设置file->f_pos = offset
+   - nfs_open_dir_context->dir_cookie = 0 ??? 
+
+** nfs_fsync_dir(file, start, end, datasync)xo
+   - 空函数
+
+** nfs_force_lookup_revalidate(inode dir)
+   > nfs_inode->cache_change_attribute ++
+
+** nfs_check_verifier(inode, dentry)
+   - 检查父文件夹是否变化??
+
+** nfs_is_exclusive_create(dir, flags)
+   - 文件创建在这里?? 
+
+** nfs_lookup_verify_inode(inode, flags)
+   - 检查是否需要验证inode的数据
+   - 如果flags中包含LOOKUP_REVAL, 必须重新验证
+   - 如果flags中包含LOOKUP_OPEN, 而且mount没有cto, 必须去验证
+   - 也就是打开操作之前
+   > __nfs_reavalidate_inode(nfs_server, inode)
+
+** nfs_neg_need_reval(inode, dentry, flags)
+   - 是否需要重新验证???
+
+** nfs_lookup_revalidate(dentry, flags)
+   - 这是dentry->revalidate操作
+   - 使用lookup操作
+   
