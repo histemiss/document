@@ -1,0 +1,51 @@
+* xfs_icache.c 
+
+** xfs_inode_alloc 
+   - 分配xfs_inode, 只制定ino 
+   - 初始化inode
+   > xfs_init_always(xfs_mount->super_block, inode)
+   - 清空xfs_ifork, xfs_icdinode
+
+** xfs_inode_free_callback(rcu_head)
+   - 释放xfs_inode的内存 
+
+** xfs_inode_free(xfs_inode)
+   - 对于普通文件, reg/dir/link, 释放xfs_ifork 
+   > xfs_idestroy_fork(xfs_inode, XFS_DATA_FORK)
+   - 然后是attribute fork 
+   > xfs_idestroy_fork(xfs_inode, XFS_ATTR_FORK)
+   - 如果还关联xfs_inode_log_item, 释放它
+   > xfs_inode_item_destroy(xfs_inode)
+   - 设置xfs_inode->i_flags的XFS_IRECLAIM, 重置ino 
+   > call_rcu(xfs_inode->inode->i_rcu, xfs_inode_free_callback)
+
+** xfs_iget_cache_hit(xfs_perag, xfs_inode, xfs_ino, flags, lock_flags)
+   - 验证cache的xfs_inode??
+   - 放置rcu锁的漏洞??
+   - 首先检查xfs_ino和xfs_inode->i_ino
+   - 检查xfs_inode->i_flags的XFS_INEW|XFS_IRECLAIM, 这个inode已经释放
+   - 如果xfs_inode->xfs_icdinode->di_mode是0, 而且参数flags没有XFS_IGET_CREATE?
+   - 说明inode在释放中?? unlink ?
+   - 如果xfs_inode->i_flags包含XFS_IRECLAIMABLE, 哪里设置??
+   - 这时inode已经销毁, 设置xfs_inode->i_flags的XFS_IRECLAIM ??
+   - 重新初始化inode 
+   > inode_init_always(xfs_mount->super_block, inode)
+   - 去掉xfs_inode->i_flags的XFS_IRECLAIM_RESET_FLAGS, 设置XFS_INEW
+   - 从radix上释放关系?? 
+   > __xfs_inode_clear_reclaim_tag(xfs_mount, xfs_perag, xfs_inode)
+   - 设置xfs_inode->inode->i_state的I_NEW??
+   - 如果没有XFS_IRECLAIMABLE标志, 说明什么?
+   - 可以直接获取inode ?? 
+   > igrab(inode)
+
+** xfs_iget_cache_miss(xfs_mount, xfs_perag, xfs_trans, xfs_ino, xfs_inode, flags, lock_flags)
+   - 先分配一个xfs 
+   > xfs_inode_alloc(xfs_mount, ino)
+   - 读取磁盘的xfs_dinode?
+   > xfs_iread(xfs_mount, xfs_trans, xfs_inode, flags)
+   - 如果xfs_inode->xfs_icdinode->di_mode是0, 而且flags没有XFS_IGET_CREATE, 返回ENOENT
+   - 设置xfs_inode->flags的XFS_INEW 
+   > xfs_iflags_set(xfs_inode, iflags)
+   - 把它放到xfs_perag的radix中
+   > radix_tree_insert(xfs_perag->pag_ici_root, agino, xfs_inode)
+   - 
