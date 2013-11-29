@@ -1442,3 +1442,5 @@
    - 最后释放dentry, nameidata->path
 
 
+** 总结
+   - 对于改变文件属性的操作,不会打开文件, 比如truncate/chown等. 他会只会定位dentry直接操作
