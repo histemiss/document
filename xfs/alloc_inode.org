@@ -39,7 +39,7 @@
    > igrab(inode)
 
 ** xfs_iget_cache_miss(xfs_mount, xfs_perag, xfs_trans, xfs_ino, xfs_inode, flags, lock_flags)
-   - 先分配一个xfs 
+   - 先分配xfs_inode
    > xfs_inode_alloc(xfs_mount, ino)
    - 读取磁盘的xfs_dinode?
    > xfs_iread(xfs_mount, xfs_trans, xfs_inode, flags)
@@ -48,4 +48,233 @@
    > xfs_iflags_set(xfs_inode, iflags)
    - 把它放到xfs_perag的radix中
    > radix_tree_insert(xfs_perag->pag_ici_root, agino, xfs_inode)
-   - 
+
+** xfs_iget(xfs_mount, xfs_trans, xfs_ino_t, flags, lock_flags, xfs_inode)
+   - 根据xfs_ino_t查找xfs_inode
+   - 现在cache中查找,它是radix树? 如果找到需要初始化inode
+   - 如果cache中没有,去磁盘中查找
+   - 先查找radix
+   > xfs_perag_get(xfs_mount, XFS_INO_TO_AGNO(xfs_mount, ino))
+   > radix_tree_lookup(xfs_perag->pag_ici_root, agino)
+   - 如果找到,初始化inode
+   > xfs_iget_cache_hit(xfs_perag, xfs_inode, ino, flags, lock_flags)
+   - 否则读取磁盘的数据
+   > xfs_iget_cache_miss(xfs_mount, xfs_perag, xfs_trans, ino, xfs_inode, flags, lock_flags)
+   - 如果文件已经存在,而且inode是刚创建的, 设置inode
+   - xfs_iflags_test(xfs_inode, XFS_INEW)
+   - 有XFS_INEW标志,而且xfs_inode->xfs_icdinode->di_mode !=0
+   > xfs_setup_inode(xfs_inode)
+   - 这个文件肯定不是刚创建的!!
+
+** xfs_inode_ag_walk_grab(xfs_inode)
+   - inode查找磁盘时是批量处理的,减小radix查找和锁的次数?
+   - 首先检查xfs_inode
+   - xfs_inode->i_ino不能是0
+   - xfs_inode->i_flags不能包含XFS_INEW|XFS_IRECLAIMABLE|XFS_IRECLAIM? 
+   > __xfs_iflags_test(xfs_inode, XFS_INEW|XFS_IRECLAIMABLE|XFS_IRECLAIM)
+   - 增加inode计数 ?? 
+   > igrab(inode)
+   
+** xfs_inode_ag_walk(xfs_mount, xfs_perag, execute, flags, args, tag)
+   - 遍历所有的inode? 执行execute函数
+   > execute(xfs_inode, xfs_perag, flag, args)
+   - tag用来过滤radix中的xfs_inode 
+   - 遍历xsf_perag->pag_ici_root中的xfs_inode 
+   > radix_tree_gang_lookup_tag(xfs_perag->pag_ici_root, xfs_inode, first_index, XFS_LOOKUP_BATCH, tag)
+   - 每次处理32个, 处理之前增加inode计数
+   > xfs_inode_ag_walk_grab(xfs_inode)
+   - 然后执行回调函数
+   > execute(xfs_inode, xfs_perag, flags, args)
+
+** xfs_queue_eofblocks(xfs_mount)
+   - xfs_mount->m_perag_tree是什么?
+   - 如果它有标志XFS_ICI_EOFBLOCKS_TAG, 启动xfs_mount->m_eofblocks_work任务 
+   > radix_tree_tagged(xfs_mount->m_perag_tree, XFS_ICI_EOFBLOCKS_TAG)
+   > queue_delayed_work(xfs_mount->m_eofblocks_workqueue, xfs_mount->m_eofblocks_work, xfs_eofb_secs)
+   - xfs_eofb_secs单位是秒
+   - sec = 1000 msec = 1000*1000 usec
+
+** xfs_inode_ag_iterator(xfs_mount, execute, args, flags)
+   - 遍历xfs_mount的所有xfs_perag
+   - 遍历xfs_perag的所有xfs_inode 
+   > xfs_perag_get(xfs_mount, ag) 
+   - tag是-1, flags是和args一块的
+   > xfs_inode_ag_walk(xfs_mount, xfs_perag, execute, flags, args, -1)
+
+** xfs_inode_ag_iterator_tag(xfs_mount, execute, flags, args, tag) 
+   - 这里传递了tag
+   > xfs_inode_ag_walk(xfs_mount, xfs_perag, execute, flags, args, tag)
+
+** xfs_reclaim_work_queue(xfs_mount)
+   - 如果系统中存在xfs_perag, 它需要回收inode?
+   - 启动对应的xfs_mount->m_reclaim_work? 
+   > radix_tree_tagged(xfs_mount->m_perag_tree, XFS_ICI_RECLAIM_TAG)
+   > queue_delayed_work(xfs_mount->m_reclaim_workqueue, xfs_mount->m_reclaim_work, xfs_syncd_centisecs)
+
+** xfs_reclaim_worker(work_struct)
+   - 回收xfs_inode cache? 
+   - work_struct是xfs_mount->m_reclaim_work
+   > xfs_reclaim_inodes(xfs_mount, SYNC_TRYLOCK)
+   - 然后检查是否还需要运行work_struct 
+   > xfs_reclaim_work_queue(xfs_mount)
+
+** __xfs_inode_set_reclaim_tag(xfs_perag, xfs_inode)
+   - 设置xfs_perag->pag_ici_root中xfs_inode对应的标志XFS_ICI_RECLAIM_TAG
+   > radix_tree_tag_set(xfs_perag->pag_ici_root, XFS_INO_TO_AGNO(xfs_mount, xfs_inode->i_ino), XFS_ICI_RECLAIM_TAG)
+   - 如果xfs_perag->pag_ici_reclaimable ==0? 设置对应的xfs_mount的标志 
+   - 使用一样的标志??
+   > radix_tree_tag_set(xfs_mount->m_perag_tree, XFS_INO_TO_AGNO(xfs_mount, xfs_inode->i_ino), XFS_ICI_RECLAIM_TAG)
+   - 启动work_struct 
+   > xfs_reclaim_work_queue(xfs_mount)
+   - 最后增加xfs_perag->pag_ici_reclaimable ?? 
+
+** xfs_inode_set_reclaim_tag(xfs_inode)
+   - 设置xfs_inode->i_flags的XFS_IRECLAIMABLE
+   > __xfs_inode_set_reclaim_tag(xfs_perag, xfs_inode)
+   > __xfs_iflags_set(xfs_inode, XFS_IRECLAIMABLE)
+
+** __xfs_inode_clear_reclaim(xfs_perag, xfs_inode)
+   - 操作的是xfs_perag
+   - 减小xfs_perag->pag_ici_reclaimable
+   - 如果减为0, 修改对应radix的标志
+   > radix_tree_tag_clear(xfs_inode->xfs_mount->m_perag_tree, XFS_INO_TO_AGNO(xfs_inode->xfs_mount, xfs_inode->i_ino), XFS_ICI_RECLAIM_TAG)
+   - 这个和上面是对应的,操作inode时使用 
+
+** __xfs_inode_clear_reclaim_tag(xfs_mount, xfs_perag, xfs_inode)
+   - 先修改xfs_perag的radix树 
+   > radix_tree_tag_clear(xfs_perag->pag_ici_root, XFS_INO_TO_AGINO(xfs_mount, xfs_inode->i_ino), XFS_ICI_RECLAIM_TAG)
+   > __xfs_inode_clear_reclaim(xfs_perag, xfs_inode)
+
+** xfs_reclaim_inode_grab(xfs_inode, flags)
+   - 这里应该是回收过程中设置的,而不是标记为可回收的reclaimable
+   - 如果flags包含SYNC_TRYLOCK, 而且xfs_inode->i_flags有XFS_IFLOCK|XFS_IRECLAIM
+   - 直接返回,因为锁不住??
+   - 如果xfs_inode没有XFS_IRECLAIMABLE, 直接返回
+   - 如果xfs_inode有XFS_IRECLAIM, 直接返回
+   - 设置xfs_inode->flags的XFS_IRECLAIM 
+   > __xfs_iflags_set(xfs_inode, XFS_IRECLAIM)
+   - 这里没有grab操作??
+
+** xfs_reclaim_inode(xfs_inode, xfs_perag, sync_mode)
+   - 回收inode? 但inode的状态不确定? 需要检查xfs_inode的状态
+   - 首先锁住inode 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL)
+   - 检查flush lock 
+   > xfs_iflock_nowait(xfs_inode)
+   - 如果需要等待锁,而sync_mode没有SYNC_WAIT, 直接返回
+   - 否则等待完成 
+   > xfs_iflock(xfs_inode)
+   - 如果inode是bad? 回收inode ?
+   > is_bad_inode(xfs_inode->inode)
+   - 如果inode在ail中? 需要等待log操作?
+   > xfs_ipincount(xfs_inode)
+   - 如果sync_mode没有SYNC_WAIT，直接返回
+   - 否则等待pincount 
+   > xfs_iunpin_wait(xfs_inode)
+   - 如果inode是无效的? 已经删除? 直接去回收
+   > xfs_iflags_test(xfs_inode, XFS_ISTALE)
+   - 检查xfs_inode是否是dirty/clean, 表示有metadata需要写回
+   > xfs_inode_clean(xfs_inode)
+   - 如果是clean, 直接去回收
+   - 然后开始flush, 如果sync_mode没有SYNC_WAIT，直接返回 
+   > xfs_iflush(xfs_inode, xfs_buf)
+   - 写回xfs_buf? 
+   > xfs_bwrite(xfs_buf)
+   - 通过flush lock等待写完?? 
+   > xfs_iflock(xfs_inode)
+   - 开始reclaim操作
+   - 释放flush lock, XFS_ILOCK_EXCL锁? 是什么保证xfs_inode不会再被使用? XFS_ISTALE?
+   - 释放radix索引 
+   > radix_tree_delete(xfs_perag->pag_ici_root, XFS_INO_TO_AGINO(xfs_mount, xfs_inode->i_ino))
+   - 去掉claim标志? 
+   > __xfs_inode_clear_reclaim(xfs_perag, xfs_inode)
+   - 再此锁住inode? 操作quota 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL)
+   > xfs_qm_dqdetch(xfs_inode)
+   - 最后释放xfs_inode 
+   > xfs_inode_free(xfs_inode)
+
+** xfs_reclaim_inodes_ag(xfs_mount, flags, nr_to_scan)
+   - 遍历xfs_mount的所有xfs_perag, 还有所有的xfs_inode
+   - 回收带有XFS_ICI_RECLAIM_TAG标志的inode
+   > xfs_perag_get_tag(xfs_mount, ag, XFS_ICI_RECLAIM_TAG)
+   > radix_tree_gang_lookup_tag(xfs_perag->pag_ici_root, xfs_inode, first_index, XFS_LOOKUP_BATCH, XFS_ICI_RECLAIM_TAG)
+   - 检查xfs_inode的标志
+   > xfs_reclaim_inode_grab(xfs_inode, flags)
+   - 回收 
+   > xfs_reclaim_inode(xfs_inode, xfs_perag, flags)
+   - 上面遍历过程中,如果flags包含SYNC_WAIT,而且处理的xfs_inode不满足nr_to_scan,可能回遍历2遍
+   - 第一遍如果锁不住xfs_perag不会等待, 第2遍回等待锁
+
+** xfs_reclaim_inodes(xfs_mount, mode)
+   > xfs_reclaim_inodes_ag(xfs_mount, mode, INT_MAX)
+
+** xfs_reclaim_inodes_nr(xfs_mount, nr_to_scan)
+   - 同步释放? 
+   - 为何启动回收工作?
+   > xfs_reclaim_work_queue(xfs_mount)
+   - 写回log ? 
+   > xfs_ail_push_all(xfs_mount->xfs_ail)
+   - 回收xfs_inode 
+   > xfs_reclaim_inodes_ag(xfs_mount, SYNC_TRYLOCK|SYNC_WAIT, nr_to_scan)
+
+** xfs_reclaim_inodes_count(xfs_mount)
+   - 累计可回收的xfs_inode的个数?
+   - 遍历XFS_ICI_RECLAIM_TAG的xfs_perag 
+   > xfs_perag_get_tag(xfs_mount, xfs_perag, XFS_ICI_RECLAIM_TAG)
+   - 累加xfs_perag->pag_ici_reclaimable
+
+** xfs_eofblocks
+   - 和pre-allocate有关?
+
+   #+BEGIN_SRC 
+	__u32		eof_version;
+	__u32		eof_flags;
+	uid_t		eof_uid;
+	gid_t		eof_gid;
+	prid_t		eof_prid;
+	__u32		pad32;
+	__u64		eof_min_file_size;
+	__u64		pad64[12];   
+   #+END_SRC
+
+** xfs_inode_match_id(xfs_inode, xfs_eofblocks)
+   - 使用xfs_eofblocks过滤xfs_inode
+   - 使用uid/gid/eof_prid信息过滤
+
+** xfs_inode_free_eofblocks(xfs_inode, xfs_perag, flags, args)
+   - args就是xfs_eofblocks
+   - 先检查什么? 
+   > xfs_can_free_eofblocks(xfs_inode, false)
+   - 如果address_space_mapping中有PAGECACHE_TAG_DIRTY, 写回数据需要等待
+   - 如果flags没有SYNC_WAIT, 直接返回
+   - 使用args过滤xfs_inode，如果不满足之家返回
+   > xfs_inode_match_id(xfs_inode, xfs_eofblocks)
+   - 如果xfs_eofblocks->eof_flags包含XFS_EOF_FLAGS_MINFILESIZE, 而且文件大小太小,直接返回 
+   > XFS_ISIZE(xfs_inode) < xfs_eofblocks->eof_min_file_size
+   - 文件大小是inode->i_size
+   - 回收eof blocks 
+   > xfs_free_eofblocks(xfs_mount, xfs_inode, true)
+
+** xfs_icache_free_eofblocks(xfs_mount, xfs_eofblocks)
+   - 遍历xfs_inode, 回收什么? 
+   - 如果xfs_eofblocks->eof_flags包含XFS_EOF_FLAGS_SYNC, 遍历使用SYNC_WAIT方式 
+   > xfs_inode_ag_iterator_tag(xfs_mount, xfs_inode_free_eofblocks, flags, xfs_eofblocks, XFS_ICI_EOFBLOCKS_TAG)
+
+** xfs_inode_set_eofblocks_tag(xfs_inode)
+   - 设置XFS_ICI_EOFBLOCKS_TAG, 在pre-allocation中设置 
+   - 获取xfs_perag 
+   > xfs_perag_get(xfs_mount, XFS_INO_TO_AGNO(xfs_mount, xfs_inode->i_ino))
+   - 设置xfs_inode对应的标志 
+   > radix_tree_tag_set(xfs_perag->pag_ici_root, XFS_INO_TO_AGINO(xfs_mount, xfs_inode->i_ino), XFS_ICI_EOFBLOCKS_TAG)
+   - 如果原来xfs_perag在xfs_mount的radix树中没有设置, 这里同样要设置 
+   > radix_tree_tag_set(xfs_mount->m_perag_tree, XFS_INO_TO_AGNO(xfs_mount, xfs_inode->i_ino), XFS_ICI_EOFBLOCKS_TAG)
+   
+** xfs_inode_clear_eofblocks_tag(xfs_inode)
+   - 先去掉xfs_inode对应的标志  
+   > radix_tree_tag_clear(xfs_perag->pag_ici_root, XFS_INO_TO_AGINO(xfs_mount, xfs_inode->i_ino), XFS_ICI_EOFBLOCKS_TAG)
+   - 如果xfs_perag->pag_ici_root中没有xfs_inode使用这个标志, 去掉xfs_perag对应的标志  
+   > radix_tree_tag_clear(xfs_mount->m_perag_tree, XFS_INO_TO_AGNO(xfs_mount, xfs_inode->i_ino), XFS_ICI_EOFBLOCKS_TAG)
+   - 这里只是修改标志, 不想上面reclaim那么复杂!!
+
+* 
