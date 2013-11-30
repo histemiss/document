@@ -168,3 +168,289 @@
    - 释放xfs_sb的变量,同样需要log记录这些修改.. 
    > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_ICOUNT, newlen)
    > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_IFREE, newlen)
+
+** xfs_ialloc_next_ag(xfs_mount) 
+   - 增加xfs_mount->m_agirotor, 如果达到xfs_mount->m_maxagi变为0
+
+** xfs_ialloc_ag_select(xfs_trans, xfs_ino_t parent, mode, okalloc)
+   - 找一个xfs_perag分配xfs_dinode使用的block
+   - 遍历所有的xfs_perag
+   - 如果是dir文件， 使用xfs_mount->m_agirotor 
+   > xfs_ialloc_next_ag(xfs_mount)
+   - 否则使用parent的xfs_perag 
+   > XFS_INO_TO_AGNO(xfs_mount, parent)
+   - 检查xfs_perag->pagi_inodeok ==0, 什么意思, 不能给inode使用??
+   > xfs_ialloc_next_ag(xfs_mount)
+   - 如果xfs_perag->pagei_init ==0, 先初始化什么?? 
+   > xfs_ialloc_pagi_init(xfs_mount, xfs_trans, agno)
+   - 如果xfs_perag->pagi_freecount > 0, 可以使用这个xfs_perag?
+   - 如果okalloc ==0, 不会分配??
+   - 下面要检查这个xfs_perag的空间足够,分配block ?
+   - 如果xfs_perag->pagf_init ==0, 先去分配什么?
+   > xfs_alloc_pagf_init(xfs_mount, xfs_trans, agno, flags)
+   - 要分配的空间是cluster大小indeed ?
+   > XFS_IALLOC_BLOCKS(xfs_mount)
+   - 比较xfs_perag->pagf_freeblks > indeed, xfs_perag->pagf_longest > indeed
+
+** xfs_ialloc_next_rec(xfs_btree_cur, xfs_inobt_rec_incore, done, left)
+   - 移动xfs_btree_cur, 如果left>0, 减小,否则增加 
+   > xfs_btree_decrement(xfs_btree_cur, 0, i)
+   > xfs_btree_increment(xfs_btree_cur, 0, i)
+   - 然后把btree中的记录放到参数中 
+   > xfs_inobt_get_rec(xfs_btree_cur, xfs_inobt_rec_incore, i)
+
+** xfs_ialloc_get_rec(xfs_btree_cur, xfs_agino_t, xfs_inobt_rec_incore, done)
+   - 在btree中查找agino对应的xfs_inobt_rec_incore 
+   > xfs_inobt_lookup(xfs_btree_cur, agino, XFS_LOOKUP_EQ, i)
+   > xfs_inobt_get_rec(xfs_btree_cur, xfs_inobt_rec_incore, i)
+
+** xfs_dialloc_ag(xfs_trans, xfs_buf, xfs_ino_t parent, xfs_ino_t inop)
+   - 分配xfs_dinode??
+   - xfs_buf中是agi, 也就是allocate group information
+   - 准备xfs_btree_cur, 遍历inode btree
+   - 如果parent为0, 使用xfs_agi->agi_newino开始查找
+   - 验证btree中的空闲节点的个数??
+   - xfs_check_agi_freecount(xfs_btree_cur, agi)
+   - 如果parent所在的ag就是xfs_buf指向的ag, 查找一个parent接近的ion
+   > xfs_inobt_lookup(xfs_btree_cur, pagino, XFS_LOOKUP_LE, i) 
+   - 这样查找的是inode trunk
+   > xfs_inobt_get_rec(xfs_btree_cur, xfs_inobt_rec_incore, i)
+   - 如果xfs_inobt_rec_incore->ir_freecount > 0, 去分配inode
+   - 否则需要查找2边的btree节点
+   - 如果parent agino是xfs_perag->pagl_pagino, 而且xfs_perag->pagl_leftrec和xfs_perag->pagl_rightrec不是NULLAGINO
+   - 这些是上次分配的记录,这次继续从那些点分配 
+   > xfs_ialloc_get_rec(xfs_btree_cur, xfs_perag->pagl_leftrec, xfs_inobt_rec_incore, done)
+   > xfs_ialloc_get_rec(xfs_btree_cur, xfs_perag->pagl_rightrec, xfs_inobt_rec_incore, done)
+   - 否则遍历2边的xfs_btree_cur 
+   > xfs_ialloc_next_rec(xfs_btree_cur, xfs_inobt_rec_incore, done, 1)
+   - 在遍历时,选择近的inode trunk
+   - 如果没有合适的xfs_inobt_rec_incore, 继续移动xfs_btree_cur, 直到查找10次
+   - 如果上面查找结束前没有找到xfs_inobt_rec_incore, 从0开始遍历 
+   > xfs_inobt_lookup(xfs_btree_cur, 0, XFS_LOOKUP_GE, i)
+   - 遍历到最后,直到碰到一个xfs_inobt_rec_incore 
+   > xfs_btree_increment(xfs_btree_cur, 0, i)
+   - 如果找到xfs_inobt_rec_incore, 查找ir_free中空闲的一位, 标志表记
+   - 写回xfs_inobt_rec_incore 
+   > xfs_inobt_update(xfs_btree_cur, xfs_inobt_rec_incore)
+   - 减小xfs_agi->agi_freecount, 而且记录这个修改 
+   > xfs_ialloc_log_agi(xfs_trans, xfs_buf, XFS_AGI_FREECOUNT)
+   - 减小xfs_perag->pagi_freecount
+   - 修改xfs_trans中的计数 ?? 
+   > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_IFREE, -1)
+  
+** xfs_dialloc(xfs_trans, xfs_ino_t parent, umode_t, okalloc, xfs_buf, xfs_ino_t)
+   - 根据注释，这个函数回调用2次，第一次不会分配block给inode chunk
+   - 如果xfs_buf不是空,直接去分配??
+   - 否则xfs_buf是空, 只能去查找可用的inode chunk
+   - 先查找一个xfs_agi 
+   > xfs_ialloc_ag_select(xfs_trans, parent, umode_t, okalloc)
+   - 检查inode使用的block达到上限 
+   > xfs_mount->xfs_sb + XFS_IALLOC_INODES(xfs_mount) > xfs_mount->m_maxicount
+   - 不能再分配block, okalloc = 0, noroom = 1
+   - 如果上面没有找到, 为何还要重新查找?? 
+   - 下面的处理应该和上面的查找类似
+   > xfs_perag_get(xfs_mount, agno)
+   - 如果xfs_perag->pagi_init ==0, 跳过处理下一个
+   - 如果xfs_perag->pagi_freecount ==0, 而且okalloc ==0, 跳过,不允许分配block
+   - 获取agi对应的xfs_buf  
+   > xfs_ialloc_read_agi(xfs_mount, xfs_trans, agno, xfs_buf)
+   - 如果xfs_perag->pagi_freecount >0, 使用这个agi, 调到最后分配xfs_dinode
+   - 否则分配block 
+   > xfs_ialloc_ag_alloc(xfs_trans, xfs_buf, ialloced)
+   - 如果分配成功返回xfs_buf, 但回返ino为NULLFSINO, 还得调用一次
+   - 否则释放xfs_buf, 继续查找 
+   > xfs_trans_brelse(xfs_trans, xfs_buf)
+   - 如果找到合适的xfs_agi, 分配xfs_dinode
+   > xfs_dialloc_ag(xfs_trans, xfs_buf, parent, inop)
+   - 如果要分配block, 就要调用2次,为了提交xfs_trans
+
+** xfs_bmap_free_item 
+   #+BEGIN_SRC 
+	xfs_fsblock_t		xbfi_startblock;/* starting fs block number */
+	xfs_extlen_t		xbfi_blockcount;/* number of blocks in extent */
+	struct xfs_bmap_free_item *xbfi_next;	/* link to next entry */   
+   #+END_SRC
+
+** xfs_bmap_free 
+   #+BEGIN_SRC 
+	xfs_bmap_free_item_t	*xbf_first;	/* list of to-be-free extents */
+	int			xbf_count;	/* count of items on list */
+	int			xbf_low;	/* alloc in low mode */   
+   #+END_SRC
+
+** xfs_difree(xfs_trans, xfs_ino_t, xfs_bmap_free_t, delete, xfs_ino_t first_in)
+   - 释放xfs_ino_t对应的xfs_dinode?
+   - 解析agno, agino
+   - 找到xfs_dinode所在的xfs_buf 
+   > xfs_ialloc_read_agi(xfs_mount, xfs_trans, agno, xfs_buf)
+   - 还有找到对应的xfs_inobt_rec 
+   - 准备xfs_btree_cur 
+   > xfs_inobt_init_cursor(xfs_mount, xfs_trans, xfs_buf, agno)
+   - 检查freecount 
+   > xfs_check_agi_freecount(xfs_btree_cur, xfs_agi)
+   - 根据agino查找xfs_inobt_rec 
+   > xfs_inobt_lookup(xfs_btree_cur, agino, XFS_LOOKUP_LE, i)
+   - 获取xfs_inobt_rec_incore 
+   > xfs_inobt_get_rec(xfs_btree_cur, xfs_inobt_rec_incore, i)
+   - 修改ir_free / ir_freecount
+   - 如果xfs_mount没有XFS_MOUNT_IKEEP, 而且xfs_inobt_rec_incore->ir_freecount达到最大值XFS_IALLOC_INODES, 可以释放这个xfs_buf?
+   - 修改xfs_agi->agi_count / agi_freecount
+   > xfs_ialloc_log_agi(xfs_trans, xfs_buf, XFS_AGI_COUNT | XFS_AGI_FREECOUNT)
+   - 减小xfs_perag->pagi_freecount 
+   > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_ICOUNT, -ilen)
+   > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_IFREE, -ilen)
+   - 释放xfs_inobt_rec 
+   > xfs_btree_delete(xfs_btree_cur)
+   - 释放xfs_buf 
+   > xfs_bmap_add_free(XFS_AGB_TO_FSB(xfs_mount, agno, XFS_INO_TO_AGBNO(xfs_mount, xfs_inobt_rec->ir_startino)), XFS_IALLOC_BLOCKS(xfs_mount), xfs_bmap_free, xfs_mount)
+   - 如果不需要释放,可能因为XFS_MOUNT_IKEEP, 或者xfs_inobt_rec还有使用的位 
+   - 更新xfs_inobt_rec 
+   > xfs_inobt_update(xfs_btree_cur, xfs_inobt_rec)
+   - 更新其他计数
+   - xfs_agi->agi_freecount , xfs_perag->pagi_freecount
+
+** xfs_imap_lookup(xfs_mount, xfs_trans, xfs_agnumber_t, xfs_agino_t, xfs_agblock_t agbno, xfs_agblock_t chunk_agbno, xfs_agblock_t offset_agbno)
+   - 根据xfs_agnumber_t读回xfs_agi使用的xfs_buf 
+   > xfs_ialloc_read_agi(xfs_mount, xfs_trans, agno, xfs_buf)
+   - 查找inode btree, 准备xfs_btree_cur 
+   > xfs_inobt_init_cursor(xfs_mount, xfs_trans, xfs_buf, xfs_agnumber_t)
+   - 根据xfs_agino_t查找xfs_inobt_rec_incore
+   > xfs_inobt_lookup(xfs_btree_cur, xfs_agino_t, XFS_LOOKUP_LE, i)
+   > xfs_inobt_get_rec(xfs_btree_cur, xfs_inobt_rec_incore, i)
+   - 获取agi的xfs_buf是为了查找btree做准备?? 
+   - 释放xfs_buf
+   > xfs_trans_brelse(xfs_trans, xfs_buf)
+   - 根据xfs_inobt_rec_incore, 获取chunk_agbno, 它是inode chunk使用的block的起始地址 
+   > XFS_AGINO_TO_AGBNO(xfs_mount, xfs_inobt_rec_incore->ir_stateino)
+   - 还有参数agbno对应它的偏移？？
+
+** xfs_imap 
+   #+BEGIN_SRC 
+	xfs_daddr_t	im_blkno;	/* starting BB of inode chunk */
+	ushort		im_len;		/* length in BBs of inode chunk */
+	ushort		im_boffset;	/* inode offset in block in bytes */   
+   #+END_SRC
+
+** xfs_imap(xfs_mount, xfs_trans, xfs_ino_t, xfs_imap, flags)
+   - 查找xfs_ino_t对应的xfs_dinode使用的xfs_imap
+   - inode chunk和cluster什么关系??
+   - 为什么不可以直接根据inode获取chunk对齐的第一个ino对应的xfs_buf? 然后根据偏移定位xfs_dinode?
+   - 首先获取一个cluster包含的block个数  blks_per_cluster
+   > XFS_INODE_CLUSTER_SIZE(xfs_mount) >> xfs_sb->sb_blocklog
+   - 如果flags有FSX_IGET_UNTRUSTED, 什么意思?? 
+   > xfs_imap_lookup(xfs_mount, xfs_trans, agno, agino, agbno, chunk_agbno, offset_agbno, flags)
+   - 否则使用其他方法获取imap?
+   - 如果cluster < xfs_sb->sb_blocksize
+   > XFS_INODE_CLUSTER_SIZE(xfs_mount)
+   - 可以直接计算出来, 一个inode cluster就是一个fsb, 即使它有多个inode chunk
+   > im_blkno = XFS_AGB_TO_DADDR(xfs_mount, agno, agbno)
+   > im_len = XFS_FSB_TO_BB(xfs_mount, 1)
+   > im_boffset = XFS_INO_TO_OFFSET(xfs_mount, ino) << xfs_sb->sb_inodelog
+   - 否则一个cluster使用多个block? 要尽量精确到某个block?
+   - 如果chunk大小是对齐的? 可以定位这个chunk的位置, 它可以使用一个xfs_buf来访问?
+   - offset_agbno = agbno & xfs_mount->m_inoalign_mask
+   - chunk_agbno = agbno - offset_agbno
+   - 否则还得查找btree 
+   > xfs_imap_lookup(xfs_mount, xfs_trans, agno, agino, agbno, chunk_agbno, offset_agbno, flags)
+   - 然后根据chunk的位置构造cluster地址? 一个chunk包含多个cluster? 
+   - cluster_agbno = chunk_agbno + (offset_agbno / blks_per_cluster) * blks_per_cluster
+   - offset = (agbno - cluster_agbno) * xfs_sb->sb_inopblock + XFS_INO_TO_OFFSET(xfs_mount, ino)
+   - 偏移包括cluster内部偏移和block内部偏移
+   - 然后根据cluster构造xfs_imap
+   - im_blkno = XFS_AGB_TO_DADDR(xfs_mount, agno, cluster_agbno)
+   - im_len = XFS_FSB_TO_BB(xfs_mount, blks_per_cluster)
+   - im_boffset = offset << xfs_sb->sb_inodelog
+
+** xfs_ialloc_compute_maxlevels(xfs_mount)
+   - 先计算可能最多的xfs_inobt_rec, maxleafents
+   - 根据xfs_mount->m_agino_log,m_agino_log应该根据ag的大小计算出来
+   > 1<<XFS_INO_AGINO_BITS(xfs_mount) >> XFS_INODES_PER_CHUNK_LOG
+   - xfs_mount->m_alloc_mnr[2]表示btree中节点最少的记录数?
+   - 逐层计算所需要的最多的节点数 
+   > maxblocks = maxleafents / minnoderecs
+   > maxblocks = maxblocks / minnoderecs
+
+** xfs_ialloc_log_agi(xfs_trans, xfs_buf, fields)
+   - xfs_buf中是xfs_agi, 记录它特殊的成员修改
+   - 包括migac,versionnum,agi_setno,agi_length, . 
+   - 根据修改的域,计算返回
+   > xfs_btree_offsets(fields, offsets, XFS_AGI_NUM_BITS, first, last)
+   > xfs_trans_buf_set_type(xfs_trans, xfs_buf, XFS_BLFL_AGI_BUF)
+   > xfs_trans_log_buf(xfs_trans, xfs_buf, first, last)
+
+** xfs_agi 
+   #+BEGIN_SRC 
+	/*
+	 * Common allocation group header information
+	 */
+	__be32		agi_magicnum;	/* magic number == XFS_AGI_MAGIC */
+	__be32		agi_versionnum;	/* header version == XFS_AGI_VERSION */
+	__be32		agi_seqno;	/* sequence # starting from 0 */
+	__be32		agi_length;	/* size in blocks of a.g. */
+	/*
+	 * Inode information
+	 * Inodes are mapped by interpreting the inode number, so no
+	 * mapping data is needed here.
+	 */
+	__be32		agi_count;	/* count of allocated inodes */
+	__be32		agi_root;	/* root of inode btree */
+	__be32		agi_level;	/* levels in inode btree */
+	__be32		agi_freecount;	/* number of free inodes */
+
+	__be32		agi_newino;	/* new inode just allocated */
+	__be32		agi_dirino;	/* last directory inode chunk */
+	/*
+	 * Hash table of inodes which have been unlinked but are
+	 * still being referenced.
+	 */
+	__be32		agi_unlinked[XFS_AGI_UNLINKED_BUCKETS];
+
+	uuid_t		agi_uuid;	/* uuid of filesystem */
+	__be32		agi_crc;	/* crc of agi sector */
+	__be32		agi_pad32;
+	__be64		agi_lsn;	/* last write sequence */
+
+	/* structure must be padded to 64 bit alignment */   
+   #+END_SRC
+
+** xfs_agi_verify(xfs_buf)
+   - xfs_buf中是xfs_agi, 验证数据有效性
+   - 首先是version/crc/uuid
+   > xfs_sb_version_hascrc(xfs_mount->xfs_sb)
+   - uuid和xfs_sb->sb_uuid比较
+   - 检查magic/version
+   - 检查xfs_agi->agi_seqno和xfs_perag->pag_agno
+   - 检查unlinked链表, 不能是0??
+   > xfs_check_agi_unlinked(xfs_agi)
+
+** xfs_agi_ready_verify(xfs_buf)
+   > xfs_agi_verify(xfs_buf)
+
+** xfs_agi_write_verify(xfs_buf)
+   - 验证数据有效性
+   > xfs_agi_verify(xfs_buf)
+   - 如果有错误,返回EFSCORRUPTED? 
+   > xfs_buf_ioerror(xfs_buf, EFSCORRUPTED)
+   - 设置xfs_agi->agi_lsn = xfs_buf_log_item->xfs_lig_item->li_lsn??
+   - 检查checksum 
+   > xfs_update_cksum(xfs_buf->b_addr, BBTOB(xfs_buf->b_length), offsetof(xfs_agi, agi_crc)
+
+** xfs_read_agi(xfs_mount, xfs_trans, xfs_agnumber_t, xfs_buf)
+   - 读取xfs_agnumber_t对应的ag的xfs_agi 
+   > xfs_trans_read_buf(xfs_mount, xfs_trans, xfs_mount->m_ddev_targp, XFS_AG_DADDR(xfs_mount, agno, XFS_AGI_DADDR(xfs_mount)), XFS_FSS_TO_BB(xfs_mount, 1), 0, xfs_buf, xfs_agi_buf_ops)
+   - 设置XFS_AGI_REF? 
+   > xfs_buf_set_ref(xfs_buf, XFS_AGI_REF)
+
+** xfs_ialloc_read_agi(xfs_mount, xfs_trans, xfs_agnumber_t, xfs_buf)
+   - 读取数据
+   > xfs_read_agi(xfs_mount, xfs_trans, agno, xfs_buf)
+   - 获取xfs_perag? 
+   > xfs_perag_get(xfs_mount, agno)
+   - 如果xfs_perag->pagi_init ==0, 初始化它?
+   - 设置xfs_perag->pagi_freecount = xfs_agi->agi_freecount
+   - apgi_count = xfs_agi->agi_count, pagi_init = 1, 算是一段缓存
+   
+** xfs_ialloc_pagi_init(xfs_mount, xfs_trans, xfs_agnumber_t)
+   - 初始化xfs_agnumber_t对应的xfs_perag 
+   > xfs_ialloc_read_agi(xfs_mount, xfs_trans, xfs_agnumber_t, xfs_buf)
+   > xfs_trans_brelse(xfs_trans, xfs_buf)
