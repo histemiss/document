@@ -1,0 +1,170 @@
+* xfs_ialloc.c
+
+** xfs_alloc_arg
+   - 分配xfs_dinode也像分配block一样?? 需要这么多参数??
+
+   #+begin_src 
+	struct xfs_trans *tp;		/* transaction pointer */
+	struct xfs_mount *mp;		/* file system mount point */
+	struct xfs_buf	*agbp;		/* buffer for a.g. freelist header */
+	struct xfs_perag *pag;		/* per-ag struct for this agno */
+	xfs_fsblock_t	fsbno;		/* file system block number */
+	xfs_agnumber_t	agno;		/* allocation group number */
+	xfs_agblock_t	agbno;		/* allocation group-relative block # */
+	xfs_extlen_t	minlen;		/* minimum size of extent */
+	xfs_extlen_t	maxlen;		/* maximum size of extent */
+	xfs_extlen_t	mod;		/* mod value for extent size */
+	xfs_extlen_t	prod;		/* prod value for extent size */
+	xfs_extlen_t	minleft;	/* min blocks must be left after us */
+	xfs_extlen_t	total;		/* total blocks needed in xaction */
+	xfs_extlen_t	alignment;	/* align answer to multiple of this */
+	xfs_extlen_t	minalignslop;	/* slop for minlen+alignment calcs */
+	xfs_extlen_t	len;		/* output: actual size of extent */
+	xfs_alloctype_t	type;		/* allocation type XFS_ALLOCTYPE_... */
+	xfs_alloctype_t	otype;		/* original allocation type */
+	char		wasdel;		/* set if allocation was prev delayed */
+	char		wasfromfl;	/* set if allocation is from freelist */
+	char		isfl;		/* set if is freelist blocks - !acctg */
+	char		userdata;	/* set if this is user data */
+	xfs_fsblock_t	firstblock;	/* io first block allocated */   
+   #+end_src
+
+** xfs_ialloc_cluster_alignment(xfs_alloc_arg)
+   - 获取最小分配空间??
+   - 如果xfs的版本要求对齐? 
+   > xfs_sb_version_hasalign(xfs_alloc_arg->xfs_mount->xfs_sb)
+   - 而且xfs_alloc_arg->xfs_mount->xfs_sb->sb_inoalignment > cluster size
+   > XFS_INODE_CLUSTER_SIZE(xfs_alloc_arg->xfs_mount)
+   - 使用xfs_sb->sb_inoalignment, 他在xfs_dsb中,表示inode chunk的开始地址对齐的标准??
+   - 否则返回1
+
+** xfs_lookup
+   - 大于小于等于??
+
+   #+begin_src 
+	XFS_LOOKUP_EQi, XFS_LOOKUP_LEi, XFS_LOOKUP_GEi   
+   #+end_src
+
+** xfs_inobt_lookup(xfs_btree_cur, xfs_agino, xfs_lookup, stat)
+   - 使用xfs_btree_cur查找btree, 目标节点指向xfs_agino
+   - xfs_agino是inode在ag内部的id
+   - 设置xfs_btree_cur->bc_rec->xfs_inobt_rec_incore->ir_startino = xfs_agino
+   - 查找btree 
+   > xfs_btree_lookup(xfs_btree_cur, xfs_lookup, stat)
+
+** xfs_inobt_rec 
+   #+begin_src 
+	__be32		ir_startino;	/* starting inode number */
+	__be32		ir_freecount;	/* count of free inodes (set bits) */
+	__be64		ir_free;	/* free inode mask */   
+   #+end_src
+
+** xfs_inobt_rec_incore
+   #+begin_src 
+	xfs_agino_t	ir_startino;	/* starting inode number */
+	__int32_t	ir_freecount;	/* count of free inodes (set bits) */
+	xfs_inofree_t	ir_free;	/* free inode mask */   
+   #+end_src
+
+   - 这是inode的btree上的叶子节点中的value
+   - 上面是磁盘中的格式,使用大端数据类型
+   - 下面是内存中的格式
+
+** xfs_btree_rec 
+   #+begin_src 
+	xfs_bmbt_rec_t		bmbt;
+	xfs_bmdr_rec_t		bmbr;	/* bmbt root block */
+	xfs_alloc_rec_t		alloc;
+	xfs_inobt_rec_t		inobt;   
+   #+end_src
+   
+   - generic btree record, 也就是btree中保存的value, 包括data extent?, free extent, inode cluster..
+   - 这里只会使用到xfs_inobt_rec
+
+** xfs_inobt_update(xfs_btree_cur, xfs_inobt_rec_incore)
+   - 把xfs_inobt_rec_incore的数据给xfs_btree_cur指向的xfs_btree_rec
+   - 构造一个临时的xfs_btree_rec, 使用inobt保存xfs_inobt_rec_incore的数据
+   - 经过大小端转化
+   - 然后更新到btree中?? btree直接操作block buf?  
+   > xfs_btree_update(xfs_btree_cur, xfs_btree_rec
+
+** xfs_inobt_get_rec(xfs_btree_cur, xfs_inobt_rec_incore, stat)
+   - 获取xfs_btree_cur指向的xfs_btree_rec 
+   > xfs_btree_get_rec(xfs_btree_cur, xfs_btree_rec, stat)
+   - 数据转化大小端,给xfs_btree_rec_incore
+
+** xfs_check_agi_freecount(xfs_btree_cur, xfs_agi)
+   - xfs_btree_cur->bc_nlevels必须是1??? 必须指向最下层的内部节点?
+   - 让xfs_btree_cur指向第一个叶子节点?? 
+   > xfs_inobt_lookup(xfs_btree_cur, 0, XFS_LOOKUP_GE, &i)
+   - 取出对应的xfs_inobt_rec_incore
+   - 然后继续遍历 
+   > xfs_btree_increment(xfs_btree_cur, 0, &i)
+   - 累加xfs_inobt_rec_incore->ir_freecount, 它必须和xfs_agi->agi_freecount
+
+** xfs_ialloc_inode_init(xfs_mount, xfs_trans, list_head, xfs_agnumber_t agno, xfs_agblock_t agbno, xfs_agblock_t length, gen)
+   - 分配xfs_dinode使用的空间,初始化必要的成员变量
+   - 空间是(agbno, length), 对于v3的xfs, ino根据agbno而定
+   - 遍历时以cluster/fsb为单位
+   - 如果xfs_sb->sb_blocksize > cluster size, 遍历次数nbufs是length, 每次遍历的大小是1, 包含的xfs_dinode数量是xfs_sb->sb_inopblock
+   - 否则,遍历次数nbufs是length / cluser size, 每次遍历的大小blks_per_cluster是cluster size / xfs_sb->sb_blocksize, 需要转化为fsb, 包含的inode数量是blks_per_cluster * xfs_sb->sb_inopblock
+   - log the initialisation?? 
+   > xfs_icreate_log(xfs_trans, agno, agbno, XFS_IALLOC_INODES(xfs_mount), xfs_sb->sb_inodesize, length, gen)
+   - 遍历所有的cluster
+   - 首先获取对应的xfs_buf, 没有根据ino, 而是根据参数agbno 
+   > XFS_AGB_TO_DADDR(xfs_mount, agno, agbno + (j * blks_per_cluster))
+   - 使用xfs_trans读回数据??
+   > xfs_trans_get_buf(xfs_trans, xfs_mount->m_ddev_targp, d, xfs_mount->m_bsize * blks_per_cluster, XBF_UNMAPPED)
+   - 设置xfs_buf->b_ops = xfs_inode_buf_ops
+   - 清空整个空间? 
+   > xfs_buf_zero(xfs_buf, 0, BBTOB(xfs_buf->b_length))
+   - 遍历里面的xfs_dinode
+   > xfs_make_iptr(xfs_mount, xfs_buf, i)
+   - 设置di_magic / di_version / di_gen / di_next_unlinked / uuid / di_ino, 还有crc
+   - 根据version, xfs_trans的处理不一样??
+   > xfs_trans_inode_alloc_buf(xfs_trans, xfs_buf)
+   > xfs_trans_ordered_buf(xfs_trans, xfs_buf)
+   > xfs_trans_log_buf(xfs_trans, xfs_buf, 0, BBTOB(xfs_buf->b_length)-1)
+   - 如果没有xfs_trans, 就把xfs_buf放到参数的list_head中??
+
+** xfs_ialloc_ag_alloc(xfs_trans, xfs_buf, alloc)
+   - 在ag中分配xfs_dinode使用的空间
+   - xfs_buf什么作用? 
+   - 检查系统inode是否太多?
+   > XFS_IALLOC_INODE(xfs_mount)
+   - xfs_mount->m_ialloc_inos + xfs_sb->sb_icount > xfs_mount->m_maxicount
+   - xfs_alloc_arg->minlen / maxlen 是空间大小?  xfs_mount->m_ialloc_blks
+   > XFS_IALLOC_BLOCKS(xfs_mount)
+   - 开始准备xfs_alloc_arg, 去申请空间
+   - 如果xfs_agi->agi_newino不是NULLAGINO, 使用他作为分配的其实地址?
+   - 计算空间位置, 是否超过AG边界 xfs_agi->agi_length
+   > XFS_AGINO_TO_AGBNO(xfs_alloc_arg->mount, newino) + XFS_IALLOC_BLOCKS(xfs_mount)
+   - 设置xfs_alloc_arg, 表示这个空间, 为何添加偏移??
+   - fsbno = XFS_AGB_TO_FSB(xfs_mount, agno, agbno)
+   - xfs_alloc_arg->type = XFS_ALLOCTYPE_THIS_BNO
+   - 设置xfs_alloc_arg->minalignslop, 什么对齐??
+   > xfs_ialloc_cluster_alignment(xfs_alloc_arg)
+   > xfs_alloc_vextent(xfs_alloc_arg)
+   - xfs_alloc_arg->fsbno表示分配的结果
+   - 这里会分配3次,每次对应不同的策略,依次尝试,直到成功分配
+   - 然后初始化对应的buf 
+   > xfs_ialloc_inode_init(xfs_alloc_arg->xfs_mount, xfs_trans, NULL, agno, xfs_alloc_arg->agbno, xfs_alloc_arg->len, randome())
+   - 增加xfs_agi的agi_count, agi_freecount
+   - 增加xfs_perag->pagi_freecount
+   - 设置xfs_agi->agi_newino, 下次分配使用
+   - 把分配的空间插入到ialloc的btree中
+   - 初始化xfs_btree_cur
+   > xfs_inobt_init_cursor(xfs_alloc_arg->xfs_mount, xfs_trans, xfs_buf, agno)
+   - 虽然分配一个cluster, 但还是分成多个chunk
+   - 每个对应xfs_inobt_rec, 遍历这些chunk
+   - 查找对应的btree, 确认没有重复的 
+   > xfs_btree_lookup(xfs_btree_cur, XFS_LOOKUP_EQ, i)
+   > xfs_btree_insert(xfs_btree_cur, i)
+   - xfs_btree_cur中的数据却使用的xfs_inobt_rec_host
+   - 最后释放xfs_btree_cur 
+   > xfs_btree_del_cursor(xfs_btree_cur, XFS_BTREE_NOERROR)
+   - 最后创建什么log?? 
+   > xfs_ialloc_log_agi(xfs_trans, xfs_buf, XFS_AGI_COUNT|XFS_AGI_FREECOUNT|XFS_AGI_NEWINO)
+   - 释放xfs_sb的变量,同样需要log记录这些修改.. 
+   > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_ICOUNT, newlen)
+   > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_IFREE, newlen)
