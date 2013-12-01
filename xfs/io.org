@@ -1,0 +1,183 @@
+
+* xfs_aops.c
+
+** xfs_count_page_state(page, delalloc, unwritten)
+   - 检查page的状态
+   - 遍历page的buffer_header 
+   > page_buffers(page)
+   - 检查buffer_head的状态
+   - 如果存在BH_Unwritten, unwritten = 1
+   > buffer_unwritten(buffer_head)
+   - 如果存在BH_Delay, delalloc = 1 
+   > buffer_delay(buffer_head)
+
+** xfs_find_bdev_for_inode(inode)
+   - 查找inode的数据使用的磁盘
+   - 如果是realtime inode，使用xfs_mount->m_rtdev_targp
+   - 否则使用xfs_mount->m_ddev_targp->bt_bdev
+
+** xfs_ioend 
+   #+BEGIN_SRC 
+	struct xfs_ioend	*io_list;	/* next ioend in chain */
+	unsigned int		io_type;	/* delalloc / unwritten */
+	int			io_error;	/* I/O error code */
+	atomic_t		io_remaining;	/* hold count */
+	unsigned int		io_isasync : 1;	/* needs aio_complete */
+	unsigned int		io_isdirect : 1;/* direct I/O */
+	struct inode		*io_inode;	/* file being written to */
+	struct buffer_head	*io_buffer_head;/* buffer linked list head */
+	struct buffer_head	*io_buffer_tail;/* buffer linked list tail */
+	size_t			io_size;	/* size of the extent */
+	xfs_off_t		io_offset;	/* offset in the file */
+	struct work_struct	io_work;	/* xfsdatad work queue */
+	struct xfs_trans	*io_append_trans;/* xact. for size update */
+	struct kiocb		*io_iocb;
+	int			io_result;   
+   #+END_SRC
+
+** xfs_destroy_ioend(xfs_ioend)
+   - IO完成后释放xfs_ioend, 需要释放buffer_head, bio, inode?
+   - 遍历io_buffer_head队列的buffer_head 
+   > buffer_head->b_end_io(buffer_head, xfs_ioend->io_error)
+   - 如果xfs_ioend->io_iocb有效, 才调用回调??
+   > inode_dio_done(xfs_ioend->io_inode)
+   - 如果是异步, xfs_ioend->io_isasync 
+   > aio_complete(xfs_ioend->io_iocb, xfs_ioend->io_result, 0)
+   - 这里回唤醒kiocb??
+   - 最后释放xfs_ioend 
+
+** xfs_ioend_is_append(xfs_ioend)
+   - 检查是否是append io?
+   - xfs_ioend->io_offset + io_size > xfs_inode->xfs_icdinode->di_size ?? 
+
+** xfs_setfilesize_trans_alloc(xfs_ioend)
+   - 构造xfs_trans 
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_FSYNC_TS)
+   - 预留空间, XFS_FSNC_TS_LOG_RES??
+   > xfs_trans_reserve(xfs_trans, 0, XFS_FSYNC_TS_LOG_RES(xfs_mount), 0, 0,0)
+   - 把上面创建的xfs_trans给xfs_ioend->io_append_trans
+   
+** xfs_setfilesize(xfs_ioend) 
+   - IO完成后释放更新文件大小
+   - 锁住inode 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL) 
+   - 计算新的文件大小, 它不能超过i_size, 而且必须比di_size大才需要更新??
+   - 在a_ops->write中回更新i_size
+   > xfs_new_eof(xfs_inode, xfs_ioend->io_offset + io_size)
+   - 设置xfs_inode->xfs_icdinode->di_size 
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, XFS_ILOCK_EXCL)
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+
+** xfs_finish_ioend(xfs_ioend)
+   - 释放xfs_ioend的使用计数,如果减为0, 释放资源?
+   > atomic_dec_and_test(xfs_ioend->io_remaining) 
+   - 如果xfs_ioend->io_type == XFS_IO_UNWRITTEN? 
+   > queue_work(xfs_mount->m_unwritten_workqueue, xfs_ioend->io_work)
+   - 如果是append IO? 或者directIO 
+   > xfs_ioend_is_append(xfs_ioend)
+   > queue_work(xfs_mount->m_data_workqueue, xfs_ioend->io_work)
+   - 否则直接释放xfs_ioend 
+   > xfs_destroy_ioend(xfs_ioend)
+
+** xfs_end_io(work_struct)
+   - 参数是xfs_ioend->io_work
+   - 什么是XFS_IO_UNWRITTEN, 只分配空间,但没有写数据?
+   > xfs_iomap_write_unwritten(xfs_inode, xfs_ioend->io_offset, xfs_ioend->io_size)
+   - 如果是direct IO, 修改文件大小? 
+   > xfs_setfilesize_trans_alloc(xfs_ioend)
+   > xfs_setfilesize(xfs_ioend)
+   - 如果只是append? 
+   > xfs_setfilesize(xfs_ioend)
+   - 最后释放xfs_ioend 
+   > xfs_destroy_ioend(xfs_ioend)
+
+** xfs_finish_ioend_sync(xfs_ioend)
+   - 释放xfs_ioend->io_remaining计数 
+   - 这是同步方式, 直接调用
+   > xfs_end_io(xfs_ioend->io_work)
+
+** xfs_alloc_ioend(inode, type)
+   - 构造xfs_ioend, 只是设置io_type = type? 
+
+** xfs_bmbt_irec 
+   - extent数据
+   #+BEGIN_SRC 
+	xfs_fileoff_t	br_startoff;	/* starting file offset */
+	xfs_fsblock_t	br_startblock;	/* starting block number */
+	xfs_filblks_t	br_blockcount;	/* number of blocks */
+	xfs_exntst_t	br_state;	/* extent state */   
+   #+END_SRC
+
+** xfs_map_blocks(inode, offset, xfs_bmbt_irec, type, nonblocking)
+   - 查找offset对应的extent?
+   - 如果type == XFS_IO_UNWRITTEN, 忽略state? XFS_BMAPI_IGSTATE
+   - 先锁住inode, 使用XFS_ILOCK_SHARED 
+   > xfs_ilock_nowait(xfs_inode, XFS_ILOCK_SHARED)
+   - 如果锁不住,而且nonblocking!=0, 返回EAGAIN
+   - 否则等待这个锁 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_SHARED)
+   - 开始查找extent, 范围是(offset, -1)
+   - 最大值是super_block->s_maxbytes
+   - 转化为FSB 
+   > XFS_B_TO_FSB(xfs_mount, offset)
+   - 只会返回1个xfs_bmbt_irec
+   > xfs_bmapi_read(xfs_inode, offset_fsb, end_fsb-offset_fsb, xfs_bmbt_irec, nimaps, bmapi_flags)
+   - 释放xfs_inode的锁 
+   > xfs_iunlock(xfs_inode, XFS_ILOCK_SHARED)
+   - 如果type是XFS_IO_DELALLOC,而且没有找到xfs_bmbt_irec, 或者找到的是hole 
+   > isnullstartblock(xfs_bmbt_irec->br_startblock)
+   - 更新btree? 
+   > xfs_iomap_write_unwritten(xfs_inode, offset, count, xfs_bmbt_irec)
+
+** xfs_imap_valid(xfs_inode, xfs_bmbt_irec, offset)
+   - 验证xfs_bmbt_irec的有效性
+   - offset应该在xfs_bmbt_irec->br_startoff和br_blockcount之间
+   - 两者单位是什么?  xfs_inode->i_blkbits, 是bb还是fsb?
+
+** xfs_end_bio(bio, error)
+   - bio的回调函数
+   - 处理bio->bi_private,也就是xfs_ioend
+   - 根据bio->bi_flags的BIO_UPTODATE确定io的结果
+   - 首先处理bio 
+   > bio_put(bio)
+   > xfs_finish_ioend(xfs_ioend)
+
+** xfs_submit_ioend_bio(writeback_control, xfs_ioend, bio)
+   - 提交bio, 首先配置bio
+   - 增加xfs_ioend->io_remaining计数
+   - 设置bio->bi_end_io = xfs_end_bio 
+   > submit_bio(writeback_control->sync_mode == WB_SYNC_ALL? WRITE_SYNC:WRITE, bio)
+
+** xfs_alloc_ioend_bio(buffer_head)
+   - 构造bio, 为何使用多个iovec?
+   > bio_get_nr_vecs(buffer_head->b_bdev)
+   > bio_alloc(GFP_NOIO, nvecs)
+   - 计算bio的起始位置??
+   > buffer_head->b_blocknr * buffer_head->b_size >>9
+
+** xfs_start_buffer_writeback(buffer_head)
+   - 检查buffer_head的状态，必须是BH_Mapped, BH_Locked 
+   - 不能是BH_Delay? BH_Unwritten??
+   - 异步写? 通用的函数, 使bio回调通用的函数
+   > mark_buffer_async_write(buffer_head)
+   - 设置BH_Uptodate, 清除BH_Dirty 
+   > set_buffer_uptodate(buffer_head)
+   > clear_buffer_dirty(buffer_head)
+   - 没有衍生的操作? 比如修改计数?
+
+** xfs_start_page_writeback(page, clear_dirty, buffers)
+   - 写回page? 检查page的状态
+   - 必须有PG_locked, 而且没有PG_writeback
+   - 如果clear_dirty !=0, 修改标志 
+   > clear_page_dirty_for_io(page)
+   - 准备启动bio 
+   > set_page_writeback(page)
+   > unlock_page(page)
+   - 如果buffers ==0, 没有必要IO? 
+   > end_page_writeback(page)
+
+** bio_add_buffer(bio, buffer_head)
+   - 向bio中增加iovec
+   > bio_add_page(bio, buffer_head->b_page, buffer_head->b_size, bh_offset(buffer_head))
+
+** 
