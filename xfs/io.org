@@ -1,4 +1,3 @@
-
 * xfs_aops.c
 
 ** xfs_count_page_state(page, delalloc, unwritten)
@@ -26,7 +25,7 @@
 	unsigned int		io_isdirect : 1;/* direct I/O */
 	struct inode		*io_inode;	/* file being written to */
 	struct buffer_head	*io_buffer_head;/* buffer linked list head */
-	struct buffer_head	*io_buffer_tail;/* buffer linked list tail */
+	struct buffer_head	*io_buffer_tail;/* buffer linked list tail */ //这里使用的buffer_head->b_private链表?
 	size_t			io_size;	/* size of the extent */
 	xfs_off_t		io_offset;	/* offset in the file */
 	struct work_struct	io_work;	/* xfsdatad work queue */
@@ -180,4 +179,103 @@
    - 向bio中增加iovec
    > bio_add_page(bio, buffer_head->b_page, buffer_head->b_size, bh_offset(buffer_head))
 
-** 
+** xfs_submit_ioend(writeback_control, xfs_ioend, fail)
+   - xfs_ioend是单链表, 使用xfs_ioend->io_list
+   - 遍历每个xfs_ioend中的buffer_head
+   - 修改buffer_head的标志
+   > xfs_start_buffer_writeback(buffer_head)
+   - 再次遍历, 提交bio 
+   - 首先分配bio
+   > xfs_alloc_ioend_bio(buffer_head)
+   - 后续的buffer_head可以合并到这里
+   > bio_add_buffer(bio, buffer_head)
+   - 如果无法合并,先提交之前的io, 创建新的 
+   > xfs_submit_ioend_bio(writeback_control, xfs_ioend, bio)
+
+** xfs_cancel_ioend(xfs_ioend)
+   - 释放xfs_ioend中的buffer_head 
+   > clear_buffer_async_write(buffer_head)
+   > unlock_buffer(buffer_head)
+   - 直接释放xfs_ioend
+
+** xfs_add_to_ioend(inode, buffer_head, xfs_off_t, type, xfs_ioend, need_ioend)
+   - 把buffer_head添加到xfs_ioend管理中
+   - 首先检查buffer_head能否放到参数中
+   - need_ioend ==0, 而且type == xfs_ioend->io_type
+   - 把buffer_head放到xfs_ioend->io_buffer_tail中, 果然使用buffer_head->b_private
+   - 否则创建新的xfs_ioend 
+   > xfs_alloc_ioend(inode, type)
+   - 设置xfs_ioend->io_offset 为参数offset
+   - 并且把xfs_ioend放到参数的xfs_ioend->io_list链表中
+   - 还要增加xfs_ioend->io_size += buffer_head->b_size 
+
+** xfs_map_buffer(inode, buffer_head, xfs_bmbt_irec, xfs_off_t)
+   - 根据xfs_bmbt_irec计算buffer_head的磁盘位置
+   - xfs_off_t是文件偏移,以字节为单位, 同样转换xfs_bmbt_irec->br_startoff 
+   > XFS_FSB_TO_B(xfs_mount, xfs_bmbt_irec->br_startoff)
+   - 磁盘位置先转化为磁盘绝对位置, 以BB为单位, fsb包含agno,agbno 
+   > xfs_fsb_to_db(xfs_inode, xfs_bmbt_irec->br_startblock)
+   - 然后根据文件位置做偏移,转化为inode->i_blkbits为单位, 应该是sectorsize?
+   - 设置buffer_head->b_blocknr
+   - 设置BH_Mapped
+
+** xfs_map_at_offset(inode, buffer_head, xfs_bmbt_irec, xfs_off_t)
+   - 影射buffer_head的磁盘位置  
+   > xfs_map_buffer(inode, buffer_head, xfs_bmbt_irec, xfs_off_t)
+   - 有设置BH_Mapped? 
+   - 去掉BH_Delay, BH_Unwritten
+
+** xfs_check_page_type(page, type)
+   - 检查page是否和type一致??
+   - 如果paeg在写回PG_writeback, 返回0
+   - 如果page有buffer_head, 遍历它的buffer_head
+   > page_has_buffers(page)
+   - XFS_IO_UNWRITTEN要求BH_Unwritten
+   - XFS_IO_DELALLOC要求BH_Delay
+   - XFS_IO_OVERWRITE要求BH_Mapped
+   - 只有存在和type对应的buffer_head时才返回1
+
+** xfs_convert_page(inode, page, loff_t, xfs_bmbt_irec, xfs_ioend, writeback_control)
+   - 为page构造buffer_head, 并影射磁盘信息 
+   - 只处理delalloc/unwritten的page
+   - 先检查page状态
+   - page->index == loff_t, 文件偏移
+   - 锁住page, PG_lock, 如果有PG_writeback, 返回
+   - 检查io类型 
+   > xfs_check_page_type(page, xfs_ioend->io_type)
+   - 计算需要IO的buffer_head的个数, 每个处理的长度是inode->i_blkbits?
+   - 只有文件的最后一个page需要处理 
+   - end_offset = min((page->index + 1) <<PAGE_CACHE_SHIFT, i_size_read(inode))
+   - 检查extent信息
+   > xfs_imap_valid(inode, xfs_bmbt_irec, end_offset)
+   - buffer_head的个数是 end_offset & PAGE_CACHE_SHIFT >> inode->i_blkbits
+   - 遍历它的buffer_head
+   - 如果page/buffer_head都不是有效的,PG_uptodate/BH_Uptodate, 不处理?
+   - 只处理3种buffer_head, BH_Unwritten/BH_Delay/BH_Mapped
+   > xfs_imap_valid(inode, xfs_bmbt_irec, offset)
+   - 对于BH_Unwritten, 使用io_type是XFS_IO_UNWRITTEN
+   - 对于BH_Delay, 使用io_type是XFS_IO_DELALLOC
+   - 其他使用XFS_IO_OVERWRITE
+   - 影射buffer_head的磁盘位置 
+   > xfs_map_at_offset(inode, buffer_head, xfs_bmbt_irec, offset)
+   - 提交bio
+   > xfs_add_to_ioend(inode, buffer_head, offset, type, xfs_ioend, done)
+   - 最后可以更新page的PG_uptodate
+   - 释放page的锁, 修改状态
+   > xfs_start_page_writeback(page, !page_dirty, count)
+
+** xfs_cluster_write(inode, pgoff_t tindex, xfs_bmbt_irec, writeback_control, pgoff_t tlast)
+   - 处理(tindex,tlast)之间的page, 属于同一个extent?
+   - 循环处理, 先在address_space中查找 
+   > pagevec_lookup(page, inode->address_space, tindex, len)
+   - 然后提交所有的page 
+   > xfs_convert_page(inode, page, tindex, xfs_bmbt_irec, xfs_ioend, writeback_control)
+   - 这样也积累了一个队列的xfs_ioend 
+
+** xfs_vm_invalidatepage(page, offset, length)
+   - 释放address_space中的page 
+   > block_invalidatepage(page, offset, length)
+
+** xfs_aops_discard_page(page)
+   - 
+
