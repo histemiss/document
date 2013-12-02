@@ -431,4 +431,129 @@
 
 * xfs_iomap.c
 
-** xfs_iomap_eof_align_last_fsb(xfs_mount, xfs_inode, xfs_extlen_t, xfs_fileoff_t)
+** xfs_iomap_eof_align_last_fsb(xfs_mount, xfs_inode, xfs_extlen_t extsize, xfs_fileoff_t last_fsb)
+   - 处理文件的eof? last_fsb
+   - 首先使用xfs_mount->swidth或xfs_mount->d_dalign对齐
+   - 如果eof超过align 
+   > XFS_ISIZE(xfs_inode)
+   - 然后对齐extsize?? 
+   - 修改什么? 
+   > xfs_bmap_eof(xfs_inode, new_last_fsb, XFS_DATA_FORK, eof)
+  
+** xfs_alert_fsblock_zero(xfs_inode, xfs_bmbmt_irec)
+   - 调式信息, 输出xfs_bmbt_irec的信息  
+
+** xfs_bmap_free_item 
+   #+BEGIN_SRC 
+	xfs_fsblock_t		xbfi_startblock;/* starting fs block number */
+	xfs_extlen_t		xbfi_blockcount;/* number of blocks in extent */
+	struct xfs_bmap_free_item *xbfi_next;	/* link to next entry */   
+   #+END_SRC
+
+** xfs_bmap_free
+   #+BEGIN_SRC 
+	xfs_bmap_free_item_t	*xbf_first;	/* list of to-be-free extents */
+	int			xbf_count;	/* count of items on list */
+	int			xbf_low;	/* alloc in low mode */   
+   #+END_SRC
+
+** xfs_iomap_write_direct(xfs_inode, xfs_off_t offset, size_t count, xfs_bmbt_irec, nmaps)
+   - 要写的数据是(offset, count), 如果超过eof, 校正eof? 
+   - 获取hint extent size 
+   > xfs_get_extsz_hint(xfs_inode)
+   - offset + count > XFS_ISIZE(xfs_inode)
+   > xfs_iomap_eof_align_last_fsb(xfs_mount, xfs_inode, extsz, last_fsb)
+   - 如果对应的xfs_bmbt_irec表示范围是hole, 限制操作范围
+   - 校正文件范围,起始位置和长度都要对extsz对齐
+   - 创建xfs_trans 
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_DIOSTRAT)
+   - 预留空间 
+   > xfs_trans_reserve(xfs_trans, resblks, XFS_WRITE_LOG_RES(xfs_mount), resrtextents, XFS_TRANS_PERM_LOG_RES, XFS_WRITE_LOG_COUNT)
+   - 锁住inode ? 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL)
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 初始化xfs_bmap_free? 
+   > xfs_bmap_init(xfs_bmap_free, firstfsb)
+   - 获取xfs_bmbt_irec?? 
+   > xfs_bmapi_write(xfs_trans, xfs_inode, offset_fsb, count_fsb, bmapi_flags, firstfsb, 0, xfs_bmbt_irec, nimaps, free_list)
+   - 结束transaction 
+   > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
+
+** xfs_iomap_eof_want_preallocate(xfs_mount, xfs_inode, xfs_off_t offset, size_t count, xfs_bmbt_irec, nimaps, prealloc)
+   - 在写操作增加eof时,检查是否能预分配空间? 设置结果给prealloc?
+   - 如果写的范围没有超过eof, 直接返回
+   - 如果offset + count <= XFS_ISIZE(xfs_inode)
+   - 如果prealloc有限制, xfs_mount使用XFS_MOUNT_DFLT_IOSIZE
+   - 如果文件太小, 小于xfs_mount->m_writeio_blocks, 直接返回0
+   - 读取文件的extent, 检查是否已经有空间? 
+   - 在offset+count之后的
+   > xfs_bmapi_read(xfs_inode, start_fsb, count_fsb, xfs_bmbt_irec, imaps, 0)
+   - 遍历读取的xfs_bmbt_irec, 如果xfs_bmbt_irec->br_startblock不是HOLDSTARTBLOCK/DELAYSTARTBLOCK,直接返回
+   - 如果xfs_bmbt_irec->br_startblock是DELAYSTARTBLOCK, 找到delalloc?
+   - 只有找不到xfs_bmbt_irec, 或者找到的都是HOLDSTARTBLOCK, 才能设置prealloc=1
+
+** xfs_iomap_eof_prealloc_initial_size(xfs_mount, xfs_inode, xfs_off_t offset, xfs_bmbt_irec, nimaps)
+   - 计算与分配的空间?
+   - 如果xfs_mount->m_flags有XFS_MOUNT_DFLT_IOSIZE, 使用特定的大小
+   - 如果文件太小, 不超过xfs_mount->m_dalign, 使用默认的
+   - 查找xfs_bmbt_irec 
+   > xfs_bmapi_read(xfs_inode, start_fsb, 1, xfs_bmbt_irec, imaps, XFS_BMAPI_ENTIRE)
+   - 如果xfs_bmbt_irec->br_startblock是HOLDSTARTBLOCK, 返回0? 使用默认的?
+   - 如果xfs_bmbt_irec->br_blockcount <= MAXEXTLEN/2, 返回xfs_bmbt_irec->br_blockcount * 2 ??
+   - 否则返回offset???
+
+** xfs_quota_calc_throttle(xfs_inode, type, xfs_fsblock_t, qshift)
+
+** xfs_iomap_prealloc_size(xfs_mount, xfs_inode, xfs_off_t, xfs_bmbt_irec, nimaps)
+   - 首先检查是否使用变化的prealloc size 
+   > xfs_iomap_eof_prealloc_initial_size(xfs_mount, xfs_inode, offset, xfs_bmbt_irec, nimaps)
+   - 如果返回0, 使用固定的大小
+   - 否则使用上面返回的alloc_blocks,计算适当的值
+   - 检查文件系统的剩余空间, 如果越少,越少分配 
+   - xfs_sb->sb_fdblocks, 标准是xfs_mount->m_low_space[5]
+   - 根据上面的条件,缩小alloc_blocks
+   - 同时它还不能超过文件系统剩余空间, 否则需要缩小4倍,16倍..
+   - 最后默认的,也是最小的是xfs_mount->m_writeio_blocks
+
+** xfs_iomap_write_delay(xfs_inode, xfs_off_t, size_t, xfs_bmbt_irec)
+   - 首先获取extent hint? 
+   > xfs_get_extsz_hint(xfs_inode)
+   - 校正eof ? 
+   > xfs_iomap_eof_want_preallocate(xfs_mount, xfs_inode, offset, count, xfs_bmbt_irec, XFS_WRITE_IMAPS, prealloc)
+   - 如果需要预分配? 检查与分配的空间?? 
+   > xfs_iomap_prealloc_size(xfs_mount, xfs_inode, offset, xfs_bmbt_irec, XFS_WRITE_IMAPS)
+   - 然后构造extent? 
+   > xfs_bmapi_delay(xfs_inode, offset_fsb, last_fsb-offset_fsb, xfs_bmbt_irec, nimaps, XFS_BMAPI_ENTIRE)
+   - 最后设置xfs_inode标志? 
+   > xfs_inode_set_eofblocks_tag(xfs_inode)
+
+** xfs_iomap_write_allocate(xfs_inode, xfs_off_t, size_t, xfs_bmbt_irec)
+   - 把delayed的extent,转化为已经使用的extent?
+   - 首先准备xfs_trans 
+   > xfs_trans_alloc(xfs_mount, XFS_TRNS_STRAT_WRITE)
+   - 预留空间?? 
+   > xfs_trans_reserve(xfs_trans, nres, XFS_WRITE_LOG_RES(xfs_mount), 0, XFS_TRANS_PERM_LOG_RES, XFS_WRITE_LOG_COUNT)
+   - 为何要锁住xfs_inode, 才能设置trans? 
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 初始化xfs_bmap_free? 
+   > xfs_bmap_init(xfs_bmap_free, first_block)
+   - 计算last_block?? 
+   > xfs_bmap_last_offset(NULL, xfs_inode, last_block, XFS_DATA_FORK)
+   - 修改extent数据?
+   > xfs_bmapi_write(xfs_trans, xfs_inode, map_start_fsb, count_fsb, XFS_BMAPI_STACK_SWITCH, first_block, 1, xfs_bmbt_irec, nimaps, xfs_bmap_free)
+   - 结束transaction
+   > xfs_bmap_finish(xfs_trans, xfs_bmap_free, committed)
+   - 提交transaction 
+   > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
+   - 需要循环处理, 直到(offset, count)范围内的extent都处理掉
+
+** xfs_iomap_write_unwritten(xfs_inode, xfs_off_t offset, size_t count)
+   - 和上面很想,循环处理(offset, count)内的xfs_bmbt_irec
+   > _xfs_trans_alloc(xfs_mount, XFS_TRANS_STRAT_WRITE, KM_NOFS)
+   > xfs_trans_reserve(xfs_trans, resblks, XFS_WRITE_LOG_RES(xfs_mount), 0, XFS_TRANS_PERM_LOG_RES, XFS_WRITE_LOG_COUNT)
+   > xfs_bmapi_init(xfs_bmap_free, firstfsb)
+   > xfs_bmapi_write(xfs_trans, xfs_inode, offset_fsb, count_fsb, XFS_BMAPI_CONVERT, firstfsb, ..)
+   - 如果改变文件大小 
+   > xfs_new_eof(xfs_inode, i_size)
+   - 需要使用trans改变xfs_dinode 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
