@@ -99,7 +99,7 @@
    - 构造xfs_ioend, 只是设置io_type = type? 
 
 ** xfs_bmbt_irec 
-   - extent数据
+   - extent数据, 单位都是  inode->i_blkbits
    #+BEGIN_SRC 
 	xfs_fileoff_t	br_startoff;	/* starting file offset */
 	xfs_fsblock_t	br_startblock;	/* starting block number */
@@ -277,5 +277,158 @@
    > block_invalidatepage(page, offset, length)
 
 ** xfs_aops_discard_page(page)
-   - 
+   - 检查page是否有delalloc的buffer_head
+   > xfs_check_page_type(page, XFS_IO_DELALLOC)
+   - 遍历page的buffer_header, 只处理BH_Delay的
+   - 为何合理处理整个page的偏移??
+   > XFS_B_TO_FSB(xfs_mount, offset)
+   > xfs_bmap_punch_delalloc_range(xfs_inode, start_fsb, 1)
+   - 释放pagecache 
+   > xfs_vm_invalidatepage(page, 0, PAGE_CACHE_SIZE)
 
+** xfs_vm_writepage(page, writeback_control)
+   - 这是address_space的回调函数, 把page写回磁盘
+   - 对于BH_Delay, 需要分配空间, 然后发送bio
+   - 对于BH_Unwritten, 需要做什么?? 
+   - 其他的只需要发送bio
+   - 检查current->flags的PF_FSTRANS, 不能在transaction中操作??
+   - 如果处理文件最有一个page,需要清空文件大小之外的数据 i_size
+   - 遍历所有的buffer_head
+   - 检查BH_Uptodate, 如果所有的buffer_head都有,才设置PG_uptodate
+   - 如果没有BH_Mapped,但有BH_Uptodate? 放到后面处理?
+   - 检查buffer_head的状态, 确定对应的io_type
+   - 如果和前一个io_type一样,不需要重新获取xfs_bmbt_irec, 否则需要 
+   > xfs_map_blocks(inode, offset, xfs_bmbt_irec, type, noblocking) 
+   - 验证offset是否在xfs_bmbt_irec里面
+   > xfs_imap_valid(inode, xfs_bmbt_irec, offset)
+   - 如果xfs_bmbt_irec可用, 计算buffer_head的磁盘位置  
+   > xfs_map_at_offset(inode, buffer_head, xfs_bmbt_irec, offset)
+   - 把它给xfs_ioend 
+   > xfs_add_to_ioend(inode, buffer_head, offset, type, xfs_ioend, new_ioend)
+   - 设置page状态 
+   > xfs_start_page_writeback(page, 1, count)
+   - 然后提交page后面的数据??
+   > xfs_cluster_write(inode, page->index+1, xfs_bmbt_irec, xfs_ioend, writeback_control, end_index)
+   - 构造log, 为修改文件大小准备? 
+   - xfs_ioend->io_type != XFS_IO_UNWRITTEN, 而且是append 
+   > xfs_ioend_is_append(xfs_ioend)
+   > xfs_setfilesize_trans_alloc(xfs_ioend)
+   - 提交xfs_ioend 
+   > xfs_submit_ioend(writeback_control, xfs_ioend, err)
+
+** xfs_vm_writepages(address_space, writeback_control)
+   - 去掉xfs_inode->i_flags的XFS_ITRUNCATED?? 
+   > xfs_iflags_clear(xfs_inode, XFS_ITRUNCATED) 
+   - 使用vfs接口处理 
+   > generic_writepages(address_space, writeback_control)
+
+** xfs_vm_releasepage(page, gfp_t)
+   - 检查page是否可以释放? 
+   > xfs_count_page_state(page, delalloc, unwritten)
+   - 如果是delaye/unwritten, 不可以释放? 
+   - 然后检查buffer_head 
+   > try_to_free_buffers(page)
+
+** __xfs_get_blocks(inode, sector_t offset, buffer_head, craete, direct)
+   - 分配block?
+   - 如果create==0, direct==1, 而且offset超过i_size, 返回0??
+   - 锁住inode
+   - 如果create ==1, 而且direct==0, 这时普通buffered的IO?
+   - 使用XFS_ILOCK_EXCL 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL)
+   - 否则,根据extent状态而定  
+   > xfs_ilock_map_shared(xfs_inode)
+   - 把所有的文件位置/大小转化为字节?
+   - 参数sector_t 单位是inode->i_blkbits, buffer_head->b_size单位是字节
+   - 然后转化为fsb, 单位是xfs_sb->sb_blocklog
+   > XFS_B_TO_FSB(xfs_mount, offset)
+   - fsb的位置和大小是2回事, 位置包含agno,agbno, 大小直接是以sb_blocklog为单位的数量
+   - 获取xfs_bmbt_irec 
+   > xfs_bmapi_read(inode, offset_fsb, end_fsb-offset_fsb, xfs_bmbt_irec, nimaps, XFS_BMAPI_ENTIRE)
+   - 如果没有找到xfs_bmbt_irec, 而且create==1, 需要创建extent ?
+   - xfs_bmbt_irec->br_startblock是HOLESTARTBLOCK|DELAYSTARTBLOCK
+   - 如果是direct, 或者hint? 
+   > xfs_get_extsz_hint(xfs_inode)
+   - 然后iomap怎么了??
+   > xfs_iomap_write_direct(xfs_inode, offset, size, xfs_bmbt_irec, nimaps)
+   - 否则是delay分配? 
+   > xfs_iomap_write_delay(xfs_inode, offset, size, xfs_bmbt_irec)
+   - 如果create==0, 而且没有找到xfs_bmbt_irec?? 直接退出??
+   - 然后准备新的xfs_bmbt_irec?
+   - 如果xfs_bmbt_irec的磁盘位置不是hole/delay, 映射buffer_head? 
+   > xfs_map_buffer(inode, buffer_head, xfs_bmbt_irec, offset)
+   - 如果xfs_bmbt_irec->br_state是XFS_EXT_UNWRITTEN, 设置buffer_head 
+   > set_buffer_unwritten(buffer_head)
+   - 查找block_dev 
+   > xfs_find_bdev_for_inode(inode)
+   - 如果create ==1, 而且block是之前分配的, 设置BH_New
+   - 为何没有BH_Mapped, BH_Uptodate就是新的??
+   - offset超过文件大小就是新的?
+   - xfs_bmbt_irec是hole,或者state==unwritten, 也是新的
+   > set_buffer_new(buffer_head)
+   - 如果xfs_bmbt_irec是DELAYSTARTBLOCK? 设置buffer_head 
+   > set_buffer_uptodate(buffer_head)
+   > set_buffer_mapped(buffer_head)
+   > set_buffer_delay(buffer_head)
+   - 最后要更新buffer_head->b_size ? 不能超过xfs_bmbt_irec
+
+** xfs_get_blocks(inode, sector_t iblock, buffer_head, create)
+   - buffered的io 
+   > __xfs_get_blocks(inode, iblock, buffer_head, create, 0)
+
+** xfs_get_blocks_direct(inode, sector_t iblock, buffer_head, create)
+   > __xfs_get_blocks(inode, iblock, buffer_head, create, 1)
+
+** xfs_end_io_direct_write(kiocb, loff_t offset, size, private)
+   - 更新inode->i_size, 怎么在这里更新?
+   > i_size_write(xfs_ioend->io_inode, offset + size)
+   - 如果private !=0, 而且size>0, 设置xfs_ioend->io_type = XFS_IO_UNWRITTEN
+   > xfs_finish_ioend_sync(xfs_ioend)
+
+** xfs_vm_direct_IO(rw, kiocb, iovec, offset, nr_segs)
+   - 如果rw是WRITE, 准备xfs_ioend 
+   > xfs_alloc_ioend(inode, XFS_IO_DIRECT)
+   - 如果写的范围超过文件大小, 设置xfs_ioend->io_isdirect =1 
+   > __blockdev_direct_IO(rw, kiocb, inode, block_device, iovec, offset, nr_segs, xfs_get_blocks_direct, xfs_end_io_direct_write, NULL, 0)
+   - 对于READ? 
+   > __block_direct_IO(rw, kiocb, inode, block_device, iovec, offset, nr_segs, xfs_get_blocks_direct, NULL, NULL, 0)
+
+** xfs_vm_kill_delalloc_range(inode, start, end)
+   - 释放delalloc的磁盘空间?
+   - 锁住inode 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL)
+   > xfs_bmap_punch_delalloc_range(xfs_inode, start_fsb, end_fsb-offset_fsb)
+
+** xfs_vm_write_failed(inode, page, pos, len)
+   - write的错误处理函数?
+   - 遍历page的buffer_header
+   > xfs_vm_kill_delalloc_range(inode, block_offset, block_offset + buffer_head->b_size)
+
+** xfs_vm_write_begin(file, address_space, pos, len, flags, page, fsdata)
+   - 获取page  
+   > grab_cache_page_write_begin(address_space, index, flags)
+   - 准备block? 
+   > __block_write_begin(page, pos, len, xfs_get_blocks)
+
+** xfs_vm_write_end(file, address_space, loff_t pos, len, copied, page, fsdata)
+   - 还是使用vfs的接口函数 
+   > generic_write_end(file, address_space， pos, len, copied, page, fsdata)
+
+** xfs_vm_bmap(address_space, sector_t block)
+   - 锁住xfs_inode, XFS_IOLOCK_SHARED
+   > xfs_ilock(xfs_inode, XFS_IOLOCK_SHARED)
+   - flush pagecache? 
+   > filemap_write_and_wait(address_space)
+   - 然后映射?? 
+   > generic_block_bmap(address_space, block, xfs_get_blocks)
+
+** xfs_vm_readpage(file, page)
+   > mpage_readpage(page, xfs_get_blocks)
+
+** xfs_vm_readpages(file, address_space, list_head, nr_pages)
+   - 都使用vfs接口
+   > mpage_readpages(address_space, list_head, nr_pages, xfs_get_blocks)
+
+* xfs_iomap.c
+
+** xfs_iomap_eof_align_last_fsb(xfs_mount, xfs_inode, xfs_extlen_t, xfs_fileoff_t)
