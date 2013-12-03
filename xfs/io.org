@@ -557,3 +557,19 @@
    > xfs_new_eof(xfs_inode, i_size)
    - 需要使用trans改变xfs_dinode 
    > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+
+* xfs_bmap.c 
+  - bmap tree
+
+** xfs_bmap_compute_maxlevels(xfs_mount, whichfork)
+   - 计算btree高度的最大值, 首先计算可能的叶子节点的最大值
+   - 对于data fork, 记录项最多是MAXEXTNUM, signed int
+   - 对于attr fork, 记录项最多MAXAEXTNUM, signed short
+   - 叶子节点或内部节点的最小分支是xfs_mount->m_bmap_dmnr[2]
+   - 然后计算btree是最小分支时的高度
+   - 最后一个节点必须比跟节点小
+   - maxrootrecs = xfs_bmdr_maxrecs(xfs_mount, sz, 0)
+   - (sz-sizeof(xfs_bmdr_block_t) / (sizeof(xfs_bmdr_key_t) + sizeof(xfs_bmdr_ptr_t))
+   - sz表示data fork或attr fork的最小空间
+   > XFS_BMDR_SPACE_CALC(MINDBPTRS) / MINADBPTRS
+   - 为何不直接使用这2个宏??
