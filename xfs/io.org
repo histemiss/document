@@ -561,6 +561,42 @@
 * xfs_bmap.c 
   - bmap tree
 
+** xfs_bmdr_block 
+   - 这是数据节点使用的,后面是(key,value)点对
+   - 这个在xfs_dinode的fork中
+   #+BEGIN_SRC 
+	__be16		bb_level;	/* 0 is a leaf */
+	__be16		bb_numrecs;	/* current # of data records */   
+   #+END_SRC
+
+** xfs_btree_block 
+   - 每个btree节点使用的block使用的数据结构
+   #+BEGIN_SRC 
+	__be32		bb_magic;	/* magic number for block type */
+	__be16		bb_level;	/* 0 is a leaf */
+	__be16		bb_numrecs;	/* current # of data records */
+
+	__be64		bb_leftsib;
+	__be64		bb_rightsib;
+
+	__be64		bb_blkno;
+	__be64		bb_lsn;
+	uuid_t		bb_uuid;
+	__be64		bb_owner;
+	__le32		bb_crc;
+	__be32		bb_pad; /* padding for alignment */
+   
+   #+END_SRC
+
+** xfs_bmbt_key 
+   - btree中节点使用的key, 分支指针使用磁盘块指针 
+   - xfs_bmbt_ptr_t, xfs_bmdr_ptr_t
+
+   #+BEGIN_SRC 
+	__be64		br_startoff;	/* starting file offset */   
+   #+END_SRC
+
+
 ** xfs_bmap_compute_maxlevels(xfs_mount, whichfork)
    - 计算btree高度的最大值, 首先计算可能的叶子节点的最大值
    - 对于data fork, 记录项最多是MAXEXTNUM, signed int
@@ -573,3 +609,63 @@
    - sz表示data fork或attr fork的最小空间
    > XFS_BMDR_SPACE_CALC(MINDBPTRS) / MINADBPTRS
    - 为何不直接使用这2个宏??
+
+** xfs_fsb_to_db(xfs_inode, xfs_fsblock_t)
+   - 把fsb指针转化为磁盘绝对地址
+   > XFS_FSB_TO_DADDR(xfs_mount, fsb)
+   - 它先分解成agno, agbno, 然后对ag的起始地址做偏移
+   > XFS_AGB_TO_ADDR(XFS_FSB_TO_AGNO(xfs_mount, fsbno), XFS_FSB_TO_AGBNO(xfs_mount, fsbno)
+   - fsb指针单位是fsb, xfs_mount->m_blkbb_log
+
+** xfs_bmbt_lookup_eq(xfs_btree_cur, xfs_fileoff_t off, xfs_fsblock_t bno, xfs_filblks_t len, stat)
+   - btree查找可以精确到记录? 还是到叶子节点?
+   - 设置xfs_btree_cur->xfs_bmbt_irec的startoff/startblock/blockcount
+   - 为何要都设置? 查找是否存在对应的xfs_bmbt_irec? 
+   > xfs_btree_lookup(xfs_btree_cur, XFS_LOOKUP_EQ, stat)
+  
+** xfs_bmbmt_lookup_ge(xfs_btree_cur, xfs_fileoff_t, xfs_fsblock_t, xfs_filblks_t, stat)
+   - 设置xfs_btree_cur, 查找btree 
+   > xfs_btree_lookup(xfs_btree_cur, XFS_LOOKUP_GE, stat)
+
+** xfs_bmap_needs_btree(xfs_inode, whichfork)
+   - 当前是extent数组,才能转化成btree
+   - 检查xfs_icdinode->di_format/di_aformat, XFS_IFORK_FORMAT(xfs_inode, whichfork) == XFS_DINODE_FMT_EXTENTS
+   - 而且extent数量超过限制 
+   > XFS_IFORK_NEXTENTS(xfs_inode, whichfork)
+   > XFS_IFORK_MAXEXT(xfs_inode, whichfork)
+
+** xfs_bmap_wants_extents(xfs_inode, whichfork)
+   - 当前使用btree存储数据,转为extent
+   - 当前xfs_icdinode->di_format/di_aformat使用XFS_DINODE_FMT_BTREE
+   > XFS_IFORK_FORMAT(xfs_inode, whichfork)
+   - 而且extent低于限制 
+   > XFS_IFORK_MAXEXT(xfs_inode, whichfork)
+
+** xfs_bmbt_update(xfs_btree_cur, xfs_fileoff_t, xfs_fsblock_t, xfs_filblks_t, xfs_exntst_t)
+   - 使用xfs_btree_cur转移数据
+   > xfs_bmbt_disk_set_allf(xfs_bmbt_cur->xfs_bmbt_irec, off, bno, len, state)
+   - 写给btree 
+   > xfs_btree_update(xfs_btree_cur, xfs_btree_rec)
+   - xfs_bmbt_irec中数据单位应该都是fsb
+
+** xfs_bmap_worst_indlen(xfs_inode, xfs_filblks_t len)
+   - len是什么长度?
+   - 计算最坏情况下btree节点使用的block的个数?
+   - len / xfs_mount->m_bmap_dmxr[0] ?? 
+
+** xfs_default_attroffset(xfs_inode)
+   - 计算xfs_dinode中attr fock的默认开始位置
+   - 如果xfs_sb->sb_inodesize == 256, 只会留下2个节点的btree根结点使用的空间
+   > XFS_LITINO(xfs_mount, xfs_icdinode->di_version) - XFS_BMDR_SPACE_CALC(MINABTPTRS)
+   - 否则偏移为包含MINABTPTRS*6个记录的根结点的空间,给data fork使用
+   > XFS_BMDR_SPACE_CALC( 6 * MINABTPTRS)
+
+** xfs_bmap_forkoff_reset(xfs_mount, xfs_inode, whichfork)
+   - 如果参数whichfork是XFS_ATTR_FORK
+   - 而且data fork使用XFS_DINODE_FMT_EXTENTS/XFS_DINODE_FMT_LOCAL
+   - 重新计算attr fork的空间 dfl_forkoff
+   > xfs_default_attroffset(xfs_inode) 
+   - 只有偏移扩大时才设置
+   - xfs_inode->icdinode->di_forkoff = dfl_forkoff / 8 
+
+** xfs_bmap_count_leaves(xfs_ifork, xfs_extnum_t, numrecs, count)
