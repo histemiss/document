@@ -668,4 +668,81 @@
    - 只有偏移扩大时才设置
    - xfs_inode->icdinode->di_forkoff = dfl_forkoff / 8 
 
-** xfs_bmap_count_leaves(xfs_ifork, xfs_extnum_t, numrecs, count)
+** xfs_bmap_count_leaves(xfs_ifork, xfs_extnum_t idx, numrecs, count)
+   - 统计xfs_ifork中(idx, numrecs)范围内的xfs_bmbt_rec_host, 影射的磁盘总量
+   - 获取这些xfs_bmbt_rec_host 
+   > xfs_iext_get_ext(xfs_ifork, idx)
+   - 只抽取blockcount
+   > xfs_bmbt_get_blockcount(xfs_bmbt_rec_host)
+   - 这些xfs_bmbt_rec_host管理分配的磁盘空间??
+
+** xfs_bmap_disk_count_leaves(xfs_mount, xfs_btree_block, numrecs, count)
+   - xfs_btree_block指向一个叶子节点
+   - 取出这个叶子节点的(numrecs, count)范围内的xfs_bmbt_rec
+   > XFS_BMBT_REC_ADDR(xfs_mount, xfs_btree_block, idx)
+   - 叶子节点xfs_btree_block后面就是xfs_btree_block数组
+   - 累加blockcount 
+   > xfs_bmbt_disk_get_blockcount(xfs_btree_block)
+
+** xfs_bmap_count_tree(xfs_mount, xfs_trans, xfs_ifork, xfs_fsblock_t blockno, levelin, count)
+   - 这个函数用来统计xfs_ifork占用的磁盘空间,不仅包括btree
+   - 还有数据叶子节点影射的空间
+   - bno指向的block是btree的节点
+   > xfs_btree_read_bufl(xfs_mount, xfs_trans, bno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
+   - 从xfs_buf中获取xfs_btree_block 
+   > XFS_BUF_TO_BLOCK(xfs_trans)
+   - level表示父节点的高度
+   - 如果level >1, 这是内部节点
+   - 使用xfs_btree_block->bb_u->l->bb_rightsib遍历这一层的所有节点
+   > xfs_btree_read_bufl(xfs_mount, xfs_trans, nextbno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
+   - 这里不会使用xfs_buf, 立刻释放
+   > xfs_trans_brelse(xfs_trans, xfs_buf)
+   - 这种遍历只是统计内部节点的个数
+   - 然后处理下一层,获得第一个ptr的值, bno
+   > XFS_BMBT_PTR_ADDR(xfs_mount, block, 1, xfs_mount->m_bmap_dmxr[1])
+   - key和ptr是严格分开的,最大的分支数已经确定
+   - 统计下一层节点个数和叶子节点影射的磁盘数量
+   - xfs_bmap_count_tree(xfs_mount, xfs_trans, xfs_ifork, bno, level, count)
+   - 如果level ==1, 当前节点是叶子节点
+   - 还是根据xfs_btree_block->bb_u->l->bb_rightsib遍历最下层的节点
+   - 针对每个节点分支, 统计影射的磁盘的总量 
+   > xfs_bmap_disk_count_leaves(xfs_mount, xfs_btree_block, numrecs, count)
+   - 使用count传递总数,这里还得添加叶子节点的1
+   - 然后读取下一个兄弟节点 
+   > xfs_btree_read_bufl(xfs_mount, xfs_trans, bno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
+   > XFS_BUF_TO_BLOCK(xfs_buf)
+
+** xfs_bmap_sanity_check(xfs_mount, xfs_buf)
+   - xfs_buf里面是xfs_btree_block
+   - 检查magic, level
+   - numrecs !=0, 也不超过最大分支xfs_mount->m_bmap_dmxr[level!=0]
+
+** xfs_bmap_get_bp(xfs_btree_cur, xfs_fsblock_t bno)
+   - 查找xfs_btree_cur中和bno对应的xfs_buf?
+   - 首先查找xfs_btree_cur->bc_bufs, 它应该是是从跟到叶子节点的路径
+   - 然后遍历xfs_btree_cur->bc_tmp->t_items
+   - 查找里面的xsf_buf_log_item 
+   > XFS_BUF_ADDR(xfs_buf)
+
+** xfs_check_block(xfs_btree_block, xfs_mount, root, sz)
+   - xfs_btree_block是btree的内部节点
+   - 检查key是否是有序的
+   - 检查ptr是否有重复的
+   - 如果不满足,说明文件系统崩溃.. 
+   - xfs_btree_block可能是根节点,在fork数据中
+   > XFS_BMBT_KEY_ADDR(xfs_mount, xfs_btree_block, i)
+   > XFS_BMAP_BROOT_PTR_ADDR(xfs_mount, xfs_btree_block, i, sz)
+   > XFS_BMAP_PTR_ADDR(xfs_mount, xfs_btree_block, i, dmxr)
+   - (key,value)的点对数 
+   > xfs_btree_get_numrecs(xfs_btree_block)
+
+** xfs_bmap_check_leaf_extents(xfs_btree_cur, xfs_inode, whichfork)
+   - 检查xfs_btree_cur中btree节点的数据有效性
+   - xfs_ifork使用XFS_DINODE_FMT_BTREE, attr fork操作都是用这些?
+   - 获取xfs_ifork, xfs_btree_block
+   - 这里xfs_btree_block的数据结构是带大端的
+   - 检查level, 和根结点
+   > xfs_check_block(xfs_btree_block, xfs_mount, 1, xfs_ifork->if_broot_bytes)xo
+   - 然后遍历所有的level
+   - 
+   > xfs_bmap_get_bp(xfs_btree_cur, XFS_FSB_TO_DADDR(xfs_mount, bno)
