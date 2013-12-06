@@ -768,4 +768,54 @@
 ** xfs_bmap_trace_extlist(xfs_inode, xfs_extnum_t, whichfork, caller_ip)
    - bmap trace insert entry??
 
-** xfs_bmap_validate_ret(xfs_fileoff_t, xfs_filblks_t, flags, xfs_bmbt_irec, nmap, ret_nmap)
+** xfs_bmap_validate_ret(xfs_fileoff_t bno, xfs_filblks_t len, flags, xfs_bmbt_irec, nmap, ret_nmap)
+   - 检查xfs_bmbt_irec数组, 哪里获取的?
+   - xfs_bmbt_irec->br_blockcount >0, 它表示范围
+   - 如果flags有XFS_BMAPI_ENTIRE,(br_startoff,br_blockcount)必须在(bno,len)范围内
+   - 否则两个范围必须交叉
+   - 而且相邻2个xfs_bmbt_irec不能交叉
+   - br_startblock不能是DELAYSTARTBLOCK和HOLESTARTBLOCK
+
+** xfs_bmap_add_free(xfs_fsblock_t bno, xfs_filblks_t len, xfs_bmap_free_t flist, xfs_mount)
+   - 构造xfs_bmap_free_item, 记录(bno, len)
+   - 把它放到参数xfs_bmap_free->xbf_first的链表中
+   - 里面节点按照xfs_bmap_free_item->xbfi_startblock排序
+
+** xfs_bmap_del_free(xfs_bmap_free, xfs_bmap_free_item prev, xfs_bmap_free_item)
+   - free是xfs_bmap_free->xbf_first链表上的节点, 删除free
+   - 减小xfs_bmap_free->xbf_count 
+
+** xfs_bmap_finish(xfs_trans, xfs_bmap_free, committed)
+   - 释放xfs_bmap_free中的所有extent?
+   - xfs_trans->t_flags必须有XFS_TRANS_PERM_LOG_RES
+   - 构造xfs_efi_log_item, 用来free extent
+   > xfs_trans_get_efi(xfs_trans, nextents)
+   - 遍历xfs_bmap_free的xfs_bmap_free_list, 填充到xfs_extent
+   > xfs_trans_log_efi_extent(xfs_trans, xfs_efi_log_item, xfs_fsblock_t, xfs_extlen_t)
+   - 设置xfs_trans->t_flags的XFS_TRANS_DIRTY
+   - xfs_log_item->xfs_log_item_desc->lid_flags的XFS_LID_DIRTY
+   - 为何要复制xfs_trans 
+   > xfs_trans_dup(xfs_trans)
+   - 又在提交? 
+   > xfs_trans_commit(xfs_trans, 0)
+   - 什么是xlog_ticket ?? 
+   > xfs_log_ticket_put(xfs_trans->t_ticket)
+   - 预留空间
+   > xfs_trans_reserve(xfs_trans, 0, logres, 0, XFS_TRANS_PERM_LOG_RES, logcount)
+   - 为xfs_trans创建xfs_efd_log_item, extent free done
+   > xfs_trans_get_efd(xfs_trans, xfs_efi_log_item, xfs_bmap_free->xbf_count)
+   - 然后遍历xfs_bmap_free->xbf_first的xfs_bmap_free_item, 释放空间
+   > xfs_free_extent(xfs_trans, xfs_bmap_free_item->xbfi_startblock, xbfi_blockcount)
+   - 记录xfs_efd_log_item
+   > xfs_trans_log_efd_extent(xfs_trans, xfs_efd_log_item, xbfi_startblock, xbfi_blockcount)
+   - 释放xfs_bmap_free_item 
+   > xfs_bmap_del_free(xfs_bmap_free, NULL, xfs_bmap_free_item)
+   - 在xfs_bmap_free_item/xfs_extent里面都是磁盘位置
+
+** xfs_bmap_cancel(xfs_bmap_free)
+   - 直接释放xfs_bmap_free的xfs_bmap_free_item节点
+
+** xfs_bmap_btree_to_extents(xfs_trans, xfs_inode, xfs_btree_cur, logflags, whichfork)
+   - 文件的extent数据从btree改为extents, 把extents队列放到xfs_dinode中
+   - 在xfs_icdinode中,extents本来就是数组格式?
+   - 
