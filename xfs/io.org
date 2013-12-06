@@ -739,10 +739,33 @@
 ** xfs_bmap_check_leaf_extents(xfs_btree_cur, xfs_inode, whichfork)
    - 检查xfs_btree_cur中btree节点的数据有效性
    - xfs_ifork使用XFS_DINODE_FMT_BTREE, attr fork操作都是用这些?
-   - 获取xfs_ifork, xfs_btree_block
+   - 获取xfs_ifork中的跟节点xfs_btree_block, xfs_ifork->if_broot
    - 这里xfs_btree_block的数据结构是带大端的
-   - 检查level, 和根结点
+   - 检查根结点的成员, level,key,value
    > xfs_check_block(xfs_btree_block, xfs_mount, 1, xfs_ifork->if_broot_bytes)xo
-   - 然后遍历所有的level
-   - 
-   > xfs_bmap_get_bp(xfs_btree_cur, XFS_FSB_TO_DADDR(xfs_mount, bno)
+   - 然后检查btree的叶子节点的数据有效性
+   -这里没有全部遍历内部节点
+   - 首先找到第一个叶子节点,使用内部节点的第一个分支
+   - 先取出xfs_buf
+   > xfs_bmap_get_bp(xfs_btree_cur, XFS_FSB_TO_DADDR(xfs_mount, bno))
+   > xfs_btree_read_bufl(xfs_mount, NULL, bno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
+   - 获取xfs_btree_block 
+   > XFS_BUF_TO_BLOCK(xfs_buf)
+   - 检查成员的有效性 
+   > xfs_check_block(xfs_btree_block, xfs_mount, 0, 0)
+   - 获取第一个分支的value 
+   > XFS_BMBT_PTR_ADDR（xfs_mount, xfs_btree_block, 1, xfs_mount->m_bmap_dmxr[1])
+   - 如果level不是0, 需要继续查找
+   - 找到第一个叶子节点,使用xfs_btree_block->bb_u->l->bb_rightsib遍历所有的叶子节点
+   - 对于每个叶子节点,检查它成员的有效性
+   > XFS_BMBT_REC_ADDR(xfs_mount, xfs_btree_block, j)
+   - 检查xfs_bmbt_rec, 他也是大端定义的
+   - 他们指向的文件范围不能交叉
+   > xfs_bmbt_disk_get_startoff(xfs_bmbt_rec)
+   > xfs_bmbt_disk_get_blockcount(xfs_bmbt_rec)
+   - 相邻2个叶子节点也必须比较
+
+** xfs_bmap_trace_extlist(xfs_inode, xfs_extnum_t, whichfork, caller_ip)
+   - bmap trace insert entry??
+
+** xfs_bmap_validate_ret(xfs_fileoff_t, xfs_filblks_t, flags, xfs_bmbt_irec, nmap, ret_nmap)
