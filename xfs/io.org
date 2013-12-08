@@ -816,6 +816,370 @@
    - 直接释放xfs_bmap_free的xfs_bmap_free_item节点
 
 ** xfs_bmap_btree_to_extents(xfs_trans, xfs_inode, xfs_btree_cur, logflags, whichfork)
-   - 文件的extent数据从btree改为extents, 把extents队列放到xfs_dinode中
-   - 在xfs_icdinode中,extents本来就是数组格式?
+   - 把fork数据从btree改为extents, 把extents队列放到xfs_dinode中
+   - 在xfs_icdinode中,extents已经是数组格式?
+   - 检查当前的数据
+   > XFS_IFORK(xfs_inode, whichfork)
+   - 现在xfs_ifork->if_flags有XFS_IFEXTENTS?
+   - xfs_icdinode->di_format是XFS_DINODE_FMT_BTREE 
+   > XFS_IFORK_FORMAT(xfs_inode, whichfork)
+   - 获取xfs_ifork中的跟节点xfs_btree_block, xfs_ifork->if_broot
+   - xfs_btree_block->bb_level ==1
+   - xfs_btree_block->bb_numrecs ==1
+   - xfs_bmbt_maxrecs(xfs_mount, xfs_ifork->if_broot_bytes, 0) ==1
+   - 只有一个分支,一个叶子节点, 但bb_numrecs和if_broot_bytes有什么区别??
+   - 读出这个叶子节点
+   > XFS_BMAP_BROOT_PTR_ADDR(xfs_mount, xfs_broot_block, 1, xfs_ifork->if_broot_bytes)
+   > xfs_btree_read_bufl(xfs_mount, xfs_trans, cbno, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
+   - 检查获取的xfs_bmbt_block 
+   > XFS_BUF_TO_BLOCK(xfs_buf)
+   - 上面的xfs_btree_cur为何没有直接找到叶子节点?
+   > xfs_btree_check_block(xfs_btree_cur, xfs_btree_block, 0, xfs_buf)
+   - 释放叶子节点使用的block
+   > xfs_bmap_add_free(cbno, 1, xfs_btree_cur->bc_private->xfs_bmap_free, xfs_mount)
+   - 减小xfs_inode->xfs_icdinode->di_nblocks
+   - 为何无效transaction? log xfs_buf?
+   > xfs_trans_binval(xfs_trans, xfs_buf)
+   - 更新xfs_ifork的broot
+   > xfs_iroot_realloc(xfs_inode, -1, whichfork)
+   - 更正xfs_btree_cur->bc_bufs[0] ???
+   - 检查xfs_ifork->if_broot == NULL
+   - 而且xfs_ifork->if_flags没有XFS_IFBROOT
+   - 设置xfs_inode->xfs_icdinode->di_format
+   > XFS_IFORK_FMT_SET(xfs_inode, whichfork, XFS_DINODE_FMT_EXTENTS)
+   - 最后设置参数logflags = XFS_ILOG_CORE|xfs_ilog_fext(whichfork)
+   - 这里怎么没有xfs_log_item??
+
+** xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, xfs_fsblock_t firstblock, xfs_bmap_free, xfs_btree_cur, wasdel, logflags, whichfork)
+   - 把磁盘的extents格式转化为btree格式
+   - 检查当前xfs_ifork 
+   > XFS_IFORK_PTR(xfs_inode, whichfork)
+   - xfs_icdinode->di_format是XFS_DINODE_FMT_EXTENTS
+   > XFS_IFORK_FORMAT(xfs_inode, whichfork) == XFS_DINODE_FMT_EXTENTS
+   - 重新分配xfs_ifork的btree 
+   > xfs_iroot_realloc(xfs_inode, 1, whichfork)
+   - 设置xfs_ifork->if_flags的XFS_IFBROOT, 怎么不在分配时设置?
+   - 填充xfs_ifork->xfs_btree_block 
+   > xfs_btree_init_block_int(xfs_mount, xfs_btree_block, XFS_BUF_DADDR_NULL, XFS_BMAP_CRC_MAGIC, 1,1, xfs_inode->i_ino, XFS_BTREE_LONG_PTR|XFS_BTREE_CRC_BLOCKS)
+   - 准备xfs_btree_cur 
+   > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, whichfork)
+   - 设置xfs_btree_cur->pc_private->b, 什么东西?
+   - 设置di_format 
+   > XFS_IFORK_FMT_SET(xfs_inode, whichfork, XFS_DINODE_FMT_BTREE)
+   - 准备xfs_alloc_args, 准备分配block
+   - 设置xfs_alloc_args->fsbno = firstblock
+   - 如果firstblock == NULLFSBLOCK, 使用inode的位置
+   > XFS_INO_TO_FSB(xfs_mount, xfs_inode->i_ino)
+   - 当然xfs_alloc_args->type也不一样
+   > xfs_alloc_vextent(xfs_alloc_args)
+   - 分配不能失败? 因为已经reserve空间
+   - 把xfs_alloc_args->fsbno给xfs_btree_cur->bc_private->b_firstblock?
+   - 增加xfs_btree_cur->bc_private->b_allocated
+   - 增加xfs_icdinode->di_nblocks
+   - 准备一个xfs_buf, 会读上来吗??
+   > xfs_btree_get_bufl(xfs_mount, xfs_trans, xfs_alloc_args->fsbno, 0)
+   - 初始化xfs_buf, 写上头xfs_btree_block 
+   > xfs_btree_init_block_int(xfs_mount, xfs_btree_block, xfs_buf->b_bn, XFS_BMAP_CRC_MAGIC, 0, 0, xfs_inode->i_ino, XFS_BTREE_LONG_PTR|XFS_BTREE_CRC_BLOCKS)
+   - 然后把xfs_ifork中的xfs_bmbt_rec_host写到xfs_btree_block中
+   > xfs_iext_get_ext(xfs_ifork, i)
+   - 跳过nullblock, 不写hole? 
+   > isnullstartblock(xfs_bmbt_get_startblock(xfs_bmbt_rec_host))
+   - 在xfs_ifork的extent矩阵中的格式是没有大短的,但写道xfs_buf中时,转化为大端 
+   - 比较xfs_ifork中的extent数量,需要和xfs_icdinode->di_nextents相同 
+   > XFS_IFORK_NEXTENTS(xfs_inode, whichfork)
+   - 设置xfs_btree_block->bb_numrecs
+   > xfs_btree_set_numrecs(xfs_btree_block, cnt)
+   - 然后设置btree根结点
+   > XFS_BMBT_KEY_ADDR(xfs_mount, xfs_btree_block, 1)
+   - 第一个分支的key就是叶子节点第一个xfs_bmbt_rec的startoff
+   - 第一个xfs_bmbt_rec
+   > XFS_BMBT_REC_ADDR(xfs_mount, xfs_btree_block, 1)
+   > xfs_bmbt_disk_get_startoff(xfs_bmbt_rec)
+   - 设置第一个分支的value
+   > XFS_BMBT_PTR_ADDR(xfs_mount, xfs_btree_block, 1, xfs_bmbt_get_maxrecs(xfs_btree_cur, level))
+   - value就是xfs_alloc_args->fsbno
+   - 然后log叶子节点的改动
+   - 首先是xfs_btree_block
+   > xfs_btree_log_block(xfs_btree_cur, xfs_btree_block, XFS_BB_ALL_BITS)
+   - 然后是xfs_bmbt_rec 
+   > xfs_btree_log_recs(xfs_btree_cur, xfs_btree_block, 1, xfs_btree_block->bb_numrecs)
+   - 最后设置logflags
+   - XFS_ILOG_CORE|xfs_ilog_fbroot(whichfork)
+
+** xfs_bmap_local_to_extents_empty(xfs_inode, whichfork)
+   - 把磁盘格式从local改为extents??
+   - 现在xfs_icdinode->di_format是XFS_DINODE_FMT_LOCAL
+   > XFS_IFORK_FORMAT(xfs_inode, whichfork)
+   - 而且现在xfs_ifork->if_bytes ==0, extent数量是0 
+   > XFS_IFORK_NEXTENTS(xfs_inode, whichfork)
+   - 重新设置forkoff? 
+   > xfs_bmap_forkoff_reset(xfs_mount, xfs_inode, whichfork)
+   - 去掉xfs_ifork->if_flags的XFS_IFINLINE, 设置XFS_IFEXTENTS 
+   - 还有di_format的XFS_DINODE_FMT_EXTENTS 
+   > XFS_IFORK_FMT_SET(xfs_inode, whichfork, XFS_DINODE_FMT_EXTENTS)
+
+** xfs_bmap_local_to_extents(xfs_trans, xfs_inode, xfs_fsblock_t, xfs_extlen_t, logflag, whichfork, init_fn)
+   - xfs_inode不是reg文件,而且whichfork必须是XFS_DATA_FORK?
+   - 获取xfs_ifork 
+   > XFS_IFORK_PTR(xfs_inode, whichfork)
+   - 而且磁盘格式是XFS_DINODE_FMT_LOCAL 
+   > XFS_IFORK_FORMAT(xfs_inode, whichfork)
+   - 如果xfs_ifork->if_bytes是0, 现在还没有extent数据 
+   > xfs_bmap_local_to_extents_empty(xfs_inode, whichfork)
+   - 否则分配空间?
+   - 现在xfs_ifork的格式应该是XFS_IFINLINE
+   - 准备xfs_alloc_args, 分配空间 
+   - xfs_alloc_args->minlen, maxlen, prod是1
+   > xfs_alloc_vextent(xfs_alloc_args)
+   - 读取对应的block 
+   > xfs_btree_get_bufl(xfs_alloc_args->xfs_mount, xfs_trans, xfs_alloc_args->fsbno, 0)
+   - 初始化xfs_buf, 而且把fork数据给xfs_buf
+   - 不确定里面是什么，只能说是fork数据
+   > init_fn(xfs_trans, xfs_buf, xfs_inode, xfs_ifork)
+   - 然后记录log? 
+   > xfs_trans_log_buf(xfs_trans, xfs_buf, 0, xfs_ifork->if_bytes -1 )
+   - 释放xfs_ifork的内存空间, fork数据已经到extent索引的block中
+   > xfs_idata_realloc(xfs_inode, -xfs_ifork->if_bytes, whichfork)
+   - 只是重新设置forkoff
+   > xfs_bmap_local_to_extents_empty(xfs_inode, whichfork)
+   - 增加extent? 
+   - 原来xfs_ifork中是local数据，现在添加一个xfs_bmbt_rec_host索引上面创建的xfs_buf
+   > xfs_iext_add(xfs_ifork, 0, 1)
+   - 获取这个xfs_bmbt_rec_host
+   > xfs_iext_get_ext(xfs_ifork, 0)
+   - 填充对应的位置信息
+   > xfs_bmbt_set_allf(xfs_bmbt_rec_host, 0, xfs_alloc_args->fsbno, 1, XFS_EXT_NORM)
+   - 设置fork使用的extent数量为1
+   > XFS_IFORK_NEXT_SET(xfs_inode, whichfork, 1)
+   - xfs_inode->xfs_icdinode->di_nblocks = 1
+   - logflags, 添加对应的log标志 XFS_ILOG_DEXT
+   > xfs_ilog_fext(whichfork)
+
+** xfs_bmap_add_attrfork_btree(xfs_trans, xfs_inode, xfs_fsblock_t, xfs_bmap_free, flags)
+   - 设置data fork?
+   - 如果xfs_inode->xfs_ifork->if_broot_bytes <= XFS_IFORK_DSIZE(xfs_inode)
+   - 只需要设置flags的XFS_ILOG_DBROOT???
+   - 否则先去磁盘查找  
+   - 准备xfs_btree_cur 
+   > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, XFS_DATA_FORK)
+   - 设置xfs_btree_cur->bc_private->b->xfs_bmap_free, firstblock为参数xfs_fsblock_t
+   - 查找第一个叶子节点??
+   > xfs_bmbt_lookup_ge(xfs_btree_cur, 0, 0, 0, stat)
+   - 创建新的root? 
+   > xfs_btree_new_iroot(xfs_btree_cur, flags, stat)
+   - 更新参数xfs_fsblock_t为xfs_btree_cur->bc_private->b->firstblock
+
+** xfs_bmap_add_attrfork_extents(xfs_trans, xfs_inode, xfs_fsblock_t firstblock, xfs_bmap_free, flags)
+   - 处理data fork?
+   - 如果xfs_bmbt_rec_host数据占的空间没有超过限制, 直接返回
+   > xfs_inode->xfs_ifork->di_nextents * sizeof(xfs_bmbt_rec) <= XFS_IFORK_DSIZE(xfs_inode)
+   - 否则需要转化为XFS_DINODE_FMT_BTREE 
+   > xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, xfs_btree_cur, 0, flags, XFS_DATA_FORK)
+   - 如果上面有xfs_btree_cur,还要释放它??
+   - 设置xfs_btree_cur->bc_private->b->allocated = 0
+   > xfs_btree_del_cursor(xfs_btree_cur, XFS_BTREE_NOERROR)
+
+** xfs_bmap_add_attrfork_local(xfs_trans, xfs_inode, xfs_fsblock_t, xfs_bmap_free_t, flags)
+   - 如果fork数据不够多,不需要转化?  xfs_inode->xfs_ifork->if_bytes 
+   > XFS_IFORK_DSIZE(xfs_inode)
+   - 如果是dir文件,使用xfs_da_args实现 
+   > xfs_dir2_sf_to_block(xfs_da_args)
+   - 如果是link文件 
+   > xfs_bmap_local_to_extents(xfs_trans, xfs_inode, firstblock, 1, flags, XFS_DATA_FORK, xfs_symlink_local_to_remote)
+   - reg文件的extent影射信息不会使用local? 
+
+** xfs_bmap_add_attrfork(xfs_inode, size, rsvd)
+   - 增加attr数据?? 原来是non-attributed?
+   - 必须在transaction之外?
+   - xfs_inode->xfs_icdinode->di_forkoff必须是0? 没有data attr数据
+   - 构造transaction 
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_ADDAFORK)
+   - 预留空间??
+   > XFS_ADDAFORK_SPACE_RES(xfs_mount)
+   - 如果rsvd >0, 设置xfs_trans->t_flags的XFS_TRANS_RESERVE 
+   - 什么东西??
+   > xfs_trans_reserve(xfs_trans, blks, XFS_ADDAFORK_LOG_RES(xfs_mount), 0, XFS_TRANS_PERM_LOG_RES, XFS_ADDAFORK_LOG_COUNT)
+   - 设置xfs_ifork->di_aformat为XFS_DINODE_FMT_EXTENTS? 还要处理attr fork? 
+   - 锁住trans? 
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, XFS_ILOCK_EXCL)
+   - log inode? 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 重新设置xfs_icdinode->di_forkoff 
+   - 对于XFS_DINODE_FMT_DEV, 就是sizeof(xfs_dev_t)/8
+   - 对于XFS_DINODE_FMT_UUID, 就是sizeof(uuid_t) /8
+   - 对于XFS_DINODE_FMT_LOCAL/EXTENTS/BTREE 
+   > xfs_attr_shortform_bytes(xfs_inode, size)
+   - 如果计算的无效,使用默认的 
+   > xfs_default_attroffset(xfs_inode)
+   - 创建attr fork, 设置xfs_ifork->if_flags的XFS_IFEXTENTS? 为何要使用这个?
+   - 初始化xfs_bmap_free, 都从新设为0
+   - 根据xfs_icdinode->di_format, 创建data fork使用的空间
+   - 如果是XFS_DINODE_FMT_LOCAL 
+   > xfs_bmap_add_attrfork_local(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, logflags)
+   - 如果是XFS_DINODE_FMT_EXTENTS 
+   > xfs_bmap_add_attrfork_extents(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, logflags)
+   - 如果是XFS_DINODE_FMT_BTREE 
+   > xfs_bmap_add_attrfork_btree(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, logflags)
+   - 根据上面的logflags, log inode 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, logflags)
+   - 最后释放上面操作中多余的block? 
+   > xfs_bmap_finish(xfs_trans, xfs_bmap_free, committed)
+   - 提交transaction 
+   > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
+
+** xfs_bmap_read_extents(xfs_trans, xfs_inode, whichfork)
+   - 首先获取xfs_ifork, xfs_btree_block, xfs_ifork->if_broot
+   > XFS_IFORK_PTR(xfs_inode, whichfork)
+   - 首先根据节点的第一个分支,找到第一个叶子节点
+   - 根结点第一个分支
+   > XFS_BMAP_BROOT_PTR_ADDR(xfs_mount, xfs_btree_block, 1, xfs_ifork->if_broot_bytes)
+   > xfs_btree_read_bufl(xfs_mount, xfs_trans, bno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
+   - 获取xfs_btree_block, XFS_BUF_TO_BLOCK(xfs_buf)
+   - 获取第一个分支指针 
+   > XFS_BMBT_PTR_ADDR(xfs_mount, xfs_btree_block, 1, xfs_mount->m_bmap_dmxr[1])
+   - 然后遍历这些叶子节点,获取对应的xfs_bmbt_rec数据
+   - xfs_bmbt_rec数组长度是xfs_ifork->if_bytes决定
+   - 获取叶子节点xfs_btree_block 
+   > xfs_btree_get_numrecs(xfs_btree_block)
+   - 检查是否超过xfs_ifork在内存中的限制
+   - 检查xfs_buf的xfs_btree_block成员
+   > xfs_bmap_sanity_check(xfs_mount, xfs_buf, 0)
+   - 遍历叶子节点里面的xfs_bmbt_rec数组
+   - 放到xfs_ifork中, 数据类型从大端转为host
+   > xfs_iext_get_ext(xfs_ifork, i)
+   - xfs_bmbt_rec/xfs_bmbt_host/xfs_bmbt_irec是一个东西
+   - 检查xfs_bmbt_irec的xfs_exntst_t
+   > xfs_check_nostate_extents(xfs_ifork, start, num_recs)
+   - 读取兄弟叶子节点 
+   > xfs_btree_read_bufl(xfs_mount, xfs_trans, bno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
+   > xfs_trans_brelse(xfs_trans, xfs_buf)
+
+** xfs_bmap_search_multi_extents(xfs_ifork, xfs_fileoff_t, eof, xfs_extnum_t, xfs_bmbt_iret got, xfs_bmbt_irec prev)
+   - 根据xfs_fileoff_t, 查找对应的xfs_bmbt_rec
+   - xfs_extnum_t是对应的xfs_bmbt_rec的索引, 后面2个参数是结果,一个是前一个xfs_bmbt_rec, 一个是当前的
+   - 如果xfs_fileoff_t指向hole, 返回下一个, 如果超过文件大小, eof设置为1
+   - 查找xfs_ifork的ic的xfs_bmbt_rec_host矩阵
+   > xfs_iext_bno_to_ext(xfs_ifork, bno, lastx)
+   - 如果找到, 而且不是第一个, lastx>0
+   - 获取前一个xfs_bmbt_rec, 转化为xfs_bmbt_irec
+   > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, lastx-1), xfs_bmbt_irec)
+   - 如果没有超过界线 xfs_ifork->if_bytes / sizeof(xfs_bmbt_rec)
+   - 读取找到的 
+   > xfs_bmbt_get_all(xfs_bmbt_rec_host, xfs_bmbt_irec)
+   - 如果没有找到和是的, 设置eof = 1, 使用前一个xfs_bmbt_irec
+
+** xfs_bmap_search_extents(xfs_inode, xfs_fileoff_t, fork, eofp, xfs_extnum_t lastexp, xfs_bmbt_irec gotp, xfs_bmbt_irec prep)
+   - 获取xfs_ifork 
+   > XFS_IFORK_PTR(xfs_inode, whichfork)
+   - 查找xfs_bmbt_irec 
+   > xfs_bmap_search_multi_extents(xfs_ifork, bno, eof, lastxp, xfs_bmbt_irec gotp, prevp)
+   - 如果是data fork, 而且返回的xfs_bmbt_irec->br_startblock是0, 返回NULL?
+
+** xfs_bmap_first_unused(xfs_trans, xfs_inode, xfs_extlen_t, xfs_fileoff_t, whichfork)
+   - 查找(xfs_fileoff_t后面的,长度超过xfs_extlen_t的hole
+   - whichfork? 查找文件的第一个hole? 
+   - 对于reg可以理解, 对于dir怎么回事?
+   - xfs_icdinode->di_format/di_aformat必须是XFS_DINODE_FMT_BTREE/LOCAL/EXTENTS
+   - 如果是XFS_DINODE_FMT_LOCAL, 直接返回0,没有hole?
+   - 获取xfs_ifork 
+   > XFS_IFORK_PTR(xfs_inode, whichfork)
+   - 如果xfs_ifork->if_flags没有XFS_IFEXTENTS, 读取extents数据? 
+   > xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
+   - 遍历所有的xfs_bmbt_rec_host 
+   > xfs_iext_get_ext(xfs_ifork, index)
+   - 检查2个xfs_bmbt_rec_host之间的距离
+   > xfs_bmbt_get_startoff(xfs_bmbt_rec_host)
+   - off >= lowest+len 保证下面的比较不会溢出?
+   - off-max >= len, hole长度超过len
+
+** xfs_bmap_last_before(xfs_trans, xfs_inode, xfs_fileoff_t, whichfork)
    - 
+   - 先检查di_format/di_aformat, 必须是XFS_DINODE_FMT_BTREE/LOCAL/EXTENTS
+   - 如果是XFS_DINODE_FMT_LOCAL, 返回0
+   - 获取xfs_ifork, 准备xfs_bmbt_rec_host 
+   > xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
+   - 根据xfs_fileoff_t查找xfs_bmbt_rec_host 
+   > xfs_bmap_search_extents(xfs_inode, bno, whichfork, eof, xfs_extnum_t, xfs_bmbt_irec got, xfs_bmbt_irec prev)
+   - 如果eof==1, 或者extent没有覆盖xfs_fileoff_t,不能直接使用
+   - 如果xfs_bmbt_irec->br_startoff是NULLFILEOFF, 返回0??
+   - 否则使用前一个xfs_bmbt_irec的范围最大值
+   > xfs_bmbt_irec->br_startoff + br_blockcount
+
+** xfs_bmap_last_extent(xfs_trans, xfs_inode, whichfork, xfs_bmbt_irec, is_empty)
+   - 获取最后一个xfs_bmbt_irec
+   - 如果xfs_ifork->if_flags没有XFS_IFEXTENTS, 首先读取磁盘的xfs_bmbt_rec 
+   > xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
+   - 根据xfs_ifork->if_bytes计算最后一个xfs_bmbt_rec索引数
+   > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, nextents-1), xfs_bmbt_irec)
+
+** xfs_bmap_isaeof(xfs_bmalloca, whichfork)
+   - 获取最后一个xfs_bmbt_rec 
+   > xfs_bmap_last_extent(NULL, xfs_bmalloca->xfs_inode, whichfork, xfs_bmbt_irec, is_empty)
+   - 检查xfs_bmalloca->offset是否是在文件最后
+   - 这里并不是使用磁盘位置,而是文件偏移,也就是说有没有造成hole?
+   - 记录在xfs_bmalloca->aeof
+   - 这是hole extent?
+   > isnullstartblock(xfs_bmbt_irec->br_startblock)
+
+** xfs_bmap_eof(xfs_inode, xfs_fileoff_t, whichfork, eof)
+   - 判断xfs_fileoff_t是否超过文件大小
+   - 没有使用i_size? 反而使用extent信息?
+   - 获取最后一个xfs_bmbt_rec 
+   > xfs_bmap_last_extent(NULL, xfs_inode, whichfork, xfs_bmbt_irec, eof)
+   - 比较xfs_bmbt_irec->br_startoff + br_blockcount
+
+** xfs_bmap_last_offset(xfs_trans, xfs_inode, xfs_fileoff_t, whichfork)
+   - 获取文件最大偏移
+   - 如果是XFS_DINODE_FMT_LOCAL, 返回0
+   - 如果不是XFS_DINODE_FMT_BTREE/EXTENTS,返回EIO??
+   - 获取最后一个xfs_bmbt_rec 
+   > xfs_bmap_last_extent(NULL, xfs_inode, whichfork, xfs_bmbt_irec, is_empty)
+   - 返回xfs_bmbt_irec->br_startoff + br_blockcount
+
+** xfs_bmap_one_block(xfs_inode, whichfork)
+   - 检查data/attr fork是否只有一个block?
+   - 检查xfs_icdinode->di_nextents/di_anextents 
+   > XFS_IFORK_NEXTENTS(xfs_inode, whichfork)
+   - 如果不是XFS_DINODE_FMT_EXTENTS, 也不可能?? btree会有多个?
+   - 获取第一个xfs_bmbt_irec 
+   > XFS_IFORK_PTR(xfs_inode, whichfork)
+   > xfs_iext_get_ext(xfs_ifork, 0)
+   > xfs_bmbt_get_all(xfs_bmbt_rec_hsot, xfs_bmbt_irec)
+   - bt_startoff ==0, 而且br_blockcount ==1
+   - 如果是data fork, xfs_inode->i_size必须是sb_blocksize?
+
+** xfs_bmalloca 
+   #+BEGIN_SRC 
+	xfs_fsblock_t		*firstblock; /* i/o first block allocated */
+	struct xfs_bmap_free	*flist;	/* bmap freelist */
+	struct xfs_trans	*tp;	/* transaction pointer */
+	struct xfs_inode	*ip;	/* incore inode pointer */
+	struct xfs_bmbt_irec	prev;	/* extent before the new one */
+	struct xfs_bmbt_irec	got;	/* extent after, or delayed */
+
+	xfs_fileoff_t		offset;	/* offset in file filling in */
+	xfs_extlen_t		length;	/* i/o length asked/allocated */
+	xfs_fsblock_t		blkno;	/* starting block of new extent */
+
+	struct xfs_btree_cur	*cur;	/* btree cursor */
+	xfs_extnum_t		idx;	/* current extent index */
+	int			nallocs;/* number of extents alloc'd */
+	int			logflags;/* flags for transaction logging */
+
+	xfs_extlen_t		total;	/* total blocks needed for xaction */
+	xfs_extlen_t		minlen;	/* minimum allocation size (blocks) */
+	xfs_extlen_t		minleft; /* amount must be left after alloc */
+	char			eof;	/* set if allocating past last extent */
+	char			wasdel;	/* replacing a delayed allocation */
+	char			userdata;/* set if is user data */
+	char			aeof;	/* allocated space at eof */
+	char			conv;	/* overwriting unwritten extents */
+	char			stack_switch;
+	int			flags;
+	struct completion	*done;
+	struct work_struct	work;
+	int			result;   
+   #+END_SRC
+
+** xfs_bmap_add_extent_delay_real(xfs_bmalloca)
+   - 从delayed allocation转化为real allocation? 
