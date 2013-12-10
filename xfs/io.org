@@ -1183,3 +1183,166 @@
 
 ** xfs_bmap_add_extent_delay_real(xfs_bmalloca)
    - 从delayed allocation转化为real allocation? 
+   - xfs_bmalloca->got是分配的xfs_bmbt_irec, new
+   - 获取data fork, xfs_bmalloca->xfs_inode->xfs_ifork 
+   > XFS_IFORK_PTR(xfs_inode, XFS_DATA_FORK)
+   - 检查xfs_bmalloca的参数
+   - xfs_bmalloca->idx是xfs_bmbt_irec在extents数组中的索引, 而且xfs_bmbt_irec不是hole 
+   > isnullstartblock(xfs_bmbt_irec->br_startblock)
+   - 获取xfs_ifork中对应的xfs_bmbt_rec_host
+   > xfs_iext_get_ext(xfs_ifork, xfs_bmalloca->idx)
+   - 转化为xfs_bmbt_irec, prev
+   > xfs_bmbt_get_all(xfs_bmbt_rec_host, xfs_bmbt_irec)
+   - prev的范围必须覆盖new
+   - 检查new和2端exetnt的关系, 计算合并的条件state
+   - 如果new和prev的start文件偏移重复,设置BMAP_LEFT_FILLING, BMAP_RIGHT_FILLING
+   - 如果2端有extent, 也就是不在文件数据开头和末尾, 设置BMAP_LEFT_VALID, BMAP_RIGHT_VALID
+   - 如果2端的extent没有指向有效的磁盘空间, delay allocation, 设置XFS_LEFT_DELAY, XFS_RIGHT_DELAY
+   - 检查2端extent的磁盘位置是否和new连续, 设置BMAP_LEFT_CONTIG, BMAP_RIGHT_CONTIG
+   - state & BMAP_LEFT_VALID, 左边extent存在
+   - state没有BMAP_LEFT_DELAY, 左边extent不是delay allocation, 分配磁盘空间
+   - left->br_startoff + left->br_blockcount == new->br_startoff
+   - left->br_startblock + left->br_blockcount == new->br_startblock
+   - left->br_state == new->br_state, 这是什么意思???
+   - left->br_blockcount + new->br_blockcount <= MAXEXTLEN, 合并之后长度没有超过限制
+   - 检查right的extent时,还要考虑3个extent合并是否超过MAXEXTLEN
+   - 如果state == BMAP_LEFT_FILLING | BMAP_LEFT_CONTIG | BMAP_RIGHT_FILLING | BMAP_RIGHT_CONTIG, 合并3个extent
+   - 设置xfs_bmalloca->idx-1, 这个index指向left, 为何不直接修改index? 可能还是需要xfs_bmalloc->xfs_btree_cur??
+   - 设置idx对应的xfs_bmbt_rec_host的blockcount 
+   > xfs_bmbt_set_blockcount(xfs_iext_get_ext(xfs_ifork, xfs_bmalloca->idx), LEFT->br_blockcount + PREV->br_blockcount + RIGHT->br_blockcount)
+   - 删除多余的2个xfs_bmbt_rec_host 
+   > xfs_iext_remove(xfs_bmalloca->xfs_inode, xfs_bmalloca->idx+1, 2, state) 
+   - 修改xfs_inode->xfs_icdinode->di_nextents --, 删除2个,为何就减小1个??
+   - 然后删除btree中的节点??
+   - 如果xfs_bmalloca->xfs_btree_cur == NULL, 就不释放了?? 设置rval = XFS_ILOG_CORE|XFS_ILOG_DEXT
+   - 否则删除右边的extent? 设置rval = XFS_ILOG_CORE?? 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, right->br_startoff, right->br_startblock, right->br_blockcount, i)
+   > xfs_btree_delete(xfs_bmalloca->xfs_btree_cur, i)
+   > xfs_btree_decrement(xfs_bmalloca->xfs_btree_cur, 0, i)
+   - 同时更新left的xfs_bmbt_rec, 文件偏移startoff, 磁盘位置startblock, 长度blockcount, 状态state
+   > xfs_bmbt_update(xfs_bmalloca->xfs_btree_cur, left->br_startoff, left->br_startblock, left->br_blockcount + PREV->br_blockcount + right->br_blockcount, left->br_state)
+   - 如果没有xfs_btree_cur就不更新了, 而且new没有在btree中??
+   - 如果state == BMAP_LEFT_FILLING | BMAP_RIGHT_FILLING | BMAP_LEFT_CONTIG
+   - right的extent不存在? delayed? 或者state不一样? 可以直接合并prev和left
+   - 修改xfs_bmalloca->idx --
+   - xfs_bmbt_set_blockcount(xfs_iext_get_ext(xfs_ifork, xfs_bmalloca->idx), LEFT->br_blockcount + PREV->br_blockcount)
+   - 删除prev对应的xfs_bmbt_rec_host
+   - 如果xfs_bmalloca->xfs_btree_cur不存在,设置rval = XFS_ILOG_DEXT
+   - 否则修改btree节点
+   > xfs_bmbt_lookup_eq(xfs_bmalloca->xfs_btree_cur, left->br_startoff, left->br_startblock, left->br_blockcount, i)
+   - 更新startoff, startblock, blockcount
+   > xfs_bmbt_update(xfs_bmalloca->xfs_btree_cur, left->br_startoff, left->br_blockcount + prev->br_blockcount, left->br_state)
+   - 如果是BMAP_LEFT_FILLING | BMAP_RIGHT_FILLING | BMAP_RIGHT_CONTIG,
+   - 合并右边2个extent, 上面这些合并,都需要new和prev完全重合
+   - 更新prev指向的xfs_bmbt_rec_host 
+   > xfs_bmbt_set_startblock(xfs_bmbt_irec, new->br_startblock)
+   > xfs_bmbt_set_blockcount(xfs_bmbt_irec, PREV->br_blockcount + right->br_blockcount)
+   - 删除right对应的xfs_bmbt_rec_host 
+   > xfs_iext_remove(xfs_bmalloca->xfs_inode, idx+1, 1, state)
+   - 修改btree节点 
+   - 查找right对应的xfs_bmbt_rec
+   > xfs_bmbt_lookup_eq(xfs_bmalloca->xfs_btree_cur, right->br_startoff, ..)
+   > xfs_bmbt_update(xfs_bmalloca->xfs_btree_cur, br_startoff, bf_startblock, PREV->br_blockcount + right->br_blockcount, prev->br_state)
+   - 如果state == BMAP_LEFT_FILLING | BMAP_RIGHT_FILLING, 不需要合并, 只需要创建新的btree节点
+   - 修改prev对应的xfs_bmbt_rec_host 
+   > xfs_bmbt_set_startblock(xfs_bmbmt_rec_host, xfs_bmbt_irec->br_startblock)
+   - 增加xfs_inode->xfs_icdinode->id_nextents ++
+   - 查找btree节点?? 不是创建?? 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, xfs_bmbt_irec->br_startoff, xfs_bmbt_irec->br_startblock, br_blockcount, i) 
+   - 设置xfs_bmalloca->xfs_btree_cur->bc_rec->xfs_bmbt_rec_host->br_state == XFS_EXT_NORM?? 
+   >xfs_btree_insert(xfs_bmalloca->xfs_btree_cur, i)
+   - 如果state == BMAP_LEFT_FILLING | BMAP_LEFT_CONFIG, 需要分配prev对应的xfs_bmbt_rec_host?
+   - 先更新left, 包含进去新分配的空间
+   - 增加blockcount
+   > xfs_bmbt_set_blockcount(xfs_iext_get_ext(xfs_ifork, idx-1), left->br_blockcount + new->br_blockcount)
+   - 修改btree节点
+   > xfs_bmbt_lookup_eq(xfs_bmalloca->xfs_btree_cur, left->br_startoff, left->br_startblock, left->br_blockcount, i)
+   > xfs_bmbt_update(xfs_bmalloca->xfs_btree_cur, left->br_startoff, left->br_startblock, left->br_blockcount + new->br_blockcount, left->br_state)
+   - 然后更新prev指向的xfs_bmbt_rec_host
+   - 修改文件偏移startoff
+   > xfs_bmbt_set_startoff(xfs_bmbt_rec_host, prev->br_startoff + new->br_blockcount)
+   - 设置extent长度
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, prev->br_blockcount - new->br_blockcount)
+   - 设置磁盘位置?? 原来应该是什么?? 
+   - 为何计算btree使用的block数量? 还要还要和原来的磁盘开始位置比,取较小值??
+   > xfs_bmap_worst_indlen(xfs_inode, new->br_blockcount-prev->br_blockcount)
+   > startblockval(prev->br_startblock)
+   - 为了下次分配??
+   - 设置新的磁盘位置, 这个肯定是hole, 但为以后分配提供一点信息 
+   > xfs_bmbt_set_startblock(xfs_bmbt_rec_host, nullstartblock(startoff))
+   - 如果state ==BMAP_LEFT_FILLING, 左边连续,但磁盘不连续, 分裂extent? 修改prev对应的xfs_bmbt_rec_host, 然后在之前插入一个新的
+   - 先修改prev的文件偏移和extent长度
+   > xfs_bmbt_set_startoff(xfs_bmbt_rec_host, new_endoff)
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, temp)
+   - 然后创建新的xfs_bmbt_rec_host 
+   > xfs_iext_insert(xfs_inode, idx, 1, xfs_bmbt_irec, state) 
+   - 增加xfs_inode->xfs_icdinode->id_nextents ++
+   - 插入btree节点, 如果不存在为何还查找?
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, xfs_bmbt_irec->br_startoff, startblock, blockcount, i)
+   - 设置xfs_btree_cur->bc_rec->xfs_bmbt_irec->br_state = XFS_EXT_NORM
+   > xfs_btree_insert(xfs_bmalloca->xfs_btree_cur)
+   - 检查extent是否需要转为XFS_DINODE_FMT_BTREE格式 
+   > xfs_bmap_needs_btree(xfs_inode, XFS_DATA_FORK)
+   - 为何要使用firstblock? 用来分配空间??
+   > xfs_bmap_extents_to_btree(xfs_trans, xfs_bmalloca->xfs_inode, firstblock, xfs_bmap_free, xfs_btree_cur, 1, tmp_rval, XFS_DATA_FORK)
+   - 然后更新prev指向的xfs_bmbt_rec_host的磁盘地址
+   > xfs_bmap_worst_indlen(xfs_inode, temp)
+   > startblockval(prev->br_startblock)
+   - 获取对应的xfs_bmbt_rec_host, 现在快混了！！
+   > xfs_iext_get_ext(xfs_ifork, idx+1)
+   > xfs_bmbt_set_startblock(xfs_bmbt_rec_host, nullstartblock(new))
+   - 如果state是BMAP_RIGHT_FILLING|BMAP_RIGHT_CONTIG, extent需要分类,而且更新right的xfs_bmbt_rec
+   - 首先更西prev对应的xfs_bmbt_rec_ host
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, prev->br_blockcount - new->br_blockcount)
+   - 更新right对应的xfs_bmbt_rec_host
+   > xfs_bmbt_set_allf(xfs_iext_get_ext(xfs_ifork, idx+1), new->br_startoff, new->br_startblock, new->br_blockcount + right->br_blockcount, right->br_state)
+   - 然后更新btree节点 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, right->br_startoff, right->br_startblock, right->br_blockcount, i)
+   - 直接使用new的起始位置和right的count/state
+   > xfs_bmbt_update(xfs_btree_cur, new->br_startoff, startblock, blockcount, state)
+   - 这样本不用更新prev指向的xfs_bmbt_rec_host, 但还是更新了startblock
+   - 所以磁盘位置是其他地方使用的 
+   > xfs_bmap_worst_indlen(xfs_inode, temp)
+   > xfs_bmbt_set_startblock(xfs_bmbt_rec_host, nullstartblock(da_new))
+   - 如果state == BMAP_RIGHT_FILLING, 需要分割extent, 但不用合并
+   - 先更新prev指向的xfs_bmbt_rec_host
+   - xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, prev->br_blockcount - new->br_blockcount)
+   - 插入new对应的新的xfs_bmbt_rec_host 
+   > xfs_iext_insert(xfs_inode, idx+1, 1, xfs_bmbt_irec, state)
+   - 增加xfs_inode->xfs_icdinode->id_nextents ++
+   - 插入新的btree数据xfs_bmbt_rec
+   > xfs_bmap_lookup_eq(xfs_btree_cur, new->br_startoff, new->br_startblock, new->br_blockcount, i)
+   - 设置xfs_btree_cur->bc_rec->xfs_bmbt_irec->br_state = XFS_EXT_NORM 
+   > xfs_btree_insert(xfs_btree_cur, i)
+   - 然后检查是否转化di_format为XFS_DINODE_FMT_BTREE 
+   > xfs_bmap_needs_btree(xfs_inode, XFS_DATA_FORK)
+   > xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, xfs_bmalloca->firstblock, xfs_bmap_free, xfs_btree_cur, 1, tmp_rval, XFS_DATA_FORK)
+   - 然后更新prev指向的xfs_bmbt_rec_host, 更新他的磁盘位置 
+   > xfs_bmap_worst_indlen(xfs_inode, temp)
+   - 为何不使用上面的xfs_bmbt_rec_host? 还有重新计算??
+   > xfs_iext_get_ext(xfs_ifork, idx)
+   > xfs_bmbt_set_startblock(xfs_bmbt_rec_host, nullstartblock(da_new))
+   - 如果state ==0, 说明新分配的extet在prev的内部,需要把它分成3部分
+   - 2端都是delay allocation
+   - 第一个端使用原来的xfs_bmbt_rec_host, 更新长度 
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, new->br_startoff - prev->br_startoff)
+   - 先准备2个xfs_bmbt_irec, 第一个对应new, 第二个对应第三段
+   - 对于第3段, startoff是new的结束，blockcount是prev->br_blockcount+prev->br_startoff - new->br_blockcount - new->br_startoff
+   - startblock需要根据新的blockcount计算
+   > nullstartblock(xfs_bmap_worst_indlen(xfs_inode, temp2))
+   - 插入新的xfs_bmbt_rec_host 
+   > xfs_iext_insert(xfs_inode, idx+1, 2, xfs_bmbt_irec, state)
+   - 增加xfs_inode->xfs_icdinode->id_nextents ++, 原来只增加btree的记录数量
+   - 查找btree, 插入new对应的节点
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, new->br_startoff, startblock, blockcount, i)
+   > xfs_btree_insert(xfs_btree_cur, i)
+   - 检查是否转化di_format 
+   > xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, xfs_bmalloca->firstblock, xfs_bmap_free, xfs_btree_cur, 1, tmp_rval, XFS_DATA_FORK)
+   - 然后更新2变delay allocation的xfs_bmbt_rec_host的磁盘位置
+   - 需要重新计算??
+   > xfs_bmap_worst_indlen(xfs_inode, temp)
+   > xfs_bmbt_set_startblock(xfs_iext_get_ext(xfs_ifork, idx+2), nullstartblock(temp))
+   - 对于state的其他组合,都不可能
+   - 最后再检查btree的转化?? 
+   > xfs_bmap_needs_btree(xfs_inode, XFS_DATA_FORK)
+   - 这里还修改了系统参数?? XFS_SBS_FDBLOCKS??
