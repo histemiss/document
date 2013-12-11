@@ -1346,3 +1346,168 @@
    - 最后再检查btree的转化?? 
    > xfs_bmap_needs_btree(xfs_inode, XFS_DATA_FORK)
    - 这里还修改了系统参数?? XFS_SBS_FDBLOCKS??
+
+** xfs_bmap_add_extent_unwritten_real(xfs_trans, xfs_inode, xfs_extnum_t idx, xfs_bmbt_irec new, xfs_fsblock_t first, xfs_bmap_free, logflags)
+   - 这里和上面类似?
+   - 操作data fork, extent数据  
+   > XFS_IFORK_PTR(xfs_inode, XFS_DATA_FORK)
+   - idx必须在xfs_fork的xfs_bmbt_rec_host数组长度范围之内
+   - xfs_ifork->if_bytes / sizeof(xfs_bmbmt_rec_host)
+   - 获取idx对应的xfs_bmbt_rec_host
+   - 它必须覆盖参数xfs_bmbt_irec
+   > xfs_iext_get_ext(xfs_ifork, idx)
+   - 转化为xfs_bmbt_irec
+   > xfs_bmbt_get_all(xfs_bmbt_rec_host, prev)
+   - 检查extent的状态, 它必须和new对应
+   - 如果new->br_state是XFS_EXT_UNWRITTEN, prev必须是XFS_EXT_NORM?? 否则是XFS_EXT_UNWRITTEN??
+   - 检查new和prev的关系,计算state
+   - 如果prev和new的br_startoff相同设置BMAP_LEFT_FILLING
+   - 如果br_startoff + br_blockcount相同,设置BMAP_RIGHT_FILLING
+   - 检查2端的extent，先检查前面的extent
+   - 如果前面存在extent, idx > 0, 设置BMAP_LEFT_VALID
+   - 获取xfs_bmbt_irec, left
+   > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, idx-1), left)
+   - 如果letf->br_startblock是null, 设置state的BMAP_LEFT_DELAY 
+   > isnullstartblock(left->br_startblock)
+   - 如果state有BMAP_LEFT_VALID, 没有BMAP_LEFT_DELAY
+   - 文件偏移和磁盘位置, 都和new邻接
+   - 而且state相同new相同, 而且br_blockcount累加不超过MAXEXTLEN
+   - 设置state的BMAP_LEFT_CONTIG
+   - 再检查后面的extent, idx < xfs_ifork->if_bytes / sizeof(xfs_bmbt_rec_host) - 1
+   - 设置state的BMAP_RIGHT_VALID, 获取xfs_bmbt_irec right
+   - 如果它没有有效的startblock, 设置state的BMAP_RIGHT_VALID
+   - 检查它是否可以和new合并
+   - 如果state有BMAP_RIGHT_VALID, 没有BMAP_RIGHT_DELAY
+   - 文件偏移和磁盘位置和new邻接, state相同
+   - 合并之后长度没有超过限制 MAXEXTLEN
+   - 根据state处理extent..
+   - 如果是BMAP_LEFT_FILLING|XFS_LEFT_CONTIG|XFS_RIGHT_FILLING|XFS_RIGHT_CONTIG
+   - 合并3个extent, 需要减小extent的个数, 减小2个 
+   - xfs_inode->xfs_icdinode->di_nextents -=2
+   - 更新第一个extent的长度 
+   > xfs_bmbt_set_blockcount(xfs_iext_get_ext(xfs_ifork, idx), LEFT->br_blockcount+new->br_blockcount+right->br_blockcount)
+   - 删除多余的xfs_bmbt_rec_host 
+   > xfs_iext_remove(xfs_inode, idx+1, 2, state)
+   - 删除btree中的节点
+   - 现在prev,right,left都在btree中??
+   - 先找到right对应的xfs_bmbt_rec 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, right->br_startoff, right->br_startblock, RIGHT->br_blockcount, i)
+   - 删除 
+   > xfs_btree_delete(xfs_btree_cur, i)
+   - 然后向前移动xfs_btree_cur, 再删除一个记录 ???
+   > xfs_btree_decrement(xfs_btree_cur, 0, i)
+   > xfs_btree_delete(xfs_btree_cur, i)
+   - 然后更新前面xfs_bmbt_rec的长度
+   > xfs_bmbt_update(xfs_btree_cur, left->br_startoff, br_startblock, left->br_blockcount + new->br_blockcount + right->br_blockcount, left->br_state)
+   - 如果state是BMAP_LEFT_FILLING|BMAP_RIGHT_FILLING|BMAP_LEFT_CONTIG,
+   - 把前2个xfs_bmbt_rec合并, 这里需要有BMAP_RIGHT_FILLING, 否则就得分裂extent 
+   - 减小xfs_inode->xfs_icdinode->di_nextents --
+   - 更新前面xfs_bmbt_rec_host的长度 
+   > xfs_bmbt_set_blockcount(xfs_iext_get_ext(xfs_ifork, idx), left->br_blockcount + prev->br_blockcount)
+   - 删除prev对应的xfs_bmbt_rec_host 
+   > xfs_iext_remove(xfs_inode, idx+1, 1, state)
+   - 删除prev对应的xfs_bmbt_rec 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, prev->br_startoff, prev->br_startblock, prev->br_blockcount, i)
+   > xfs_btree_delete(xfs_btree_cur, i)
+   - 然后更新前面xfs_bmbt_rec对应的长度 
+   > xfs_btree_decrement(xfs_btree_cur, i)
+   > xfs_bmbt_update(xfs_btree_cur, left->br_startoff, left->br_startblock, left->br_blockcount + prev->br_blockcount)
+   - 如果是XFS_LEFT_FILLING|XFS_RIGHT_FILLING|XFS_RIGHT_CONTIG
+   - 把后面2个xfs_bmbt_rec_host合并 
+   - 减小xfs_inode->xfs_icdinode->di_nextents --
+   - 更新prev指向的xfs_bmbt_rec_host的长度 
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, prev->br_blockcount + right->br_blockcount)
+   > xfs_bmbt_set_state(xfs_bmbt_rec_host, new->br_state)
+   - 删除后面的xfs_bmbt_rec_host
+   > xfs_iext_remove(xfs_inode, idx+1, 1, state)
+   - 操作brtee, 删除right对应的xfs_bmbt_rec_host
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, right->br_startoff, right->br_startblock, right->br_blockcount, i)
+   > xfs_bmbt_delete(xfs_btree_cur, i)
+   - 更新前面的xfs_bmbt_rec
+   > xfs_btree_decrement(xfs_btree_cur, 0, i)
+   > xfs_bmbt_update(xfs_btree_cur, new->br_startoff, new->br_startblock, new->br_blockcount + right->br_blockcount, new->br_state)
+   - 如果state是BMAP_LEFT_FILLING | BMAP_RIGHT_FILLING
+   - 不能合并,但可以转化prev对应的xfs_bmbt_rec
+   - 更新xfs_bmbt_rec_host的state 
+   > xfs_bmbt_set_state(xfs_bmbt_rec_host, new->br_state)
+   - 修改xfs_bmbt_rec 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, new->br_startoff, new->br_startblock, new->br_blockcount, i)
+   > xfs_bmbt_update(xfs_btree_cur, new->br_startoff, ..., new->br_state)
+   - 如果state是BMAP_LEFT_FILLING|BMAP_LEFT_CONTIG
+   - 需要把prev分成2部分, 前面的和left合并
+   - 修改left对应的xfs_bmbt_rec_host的长度 
+   > xfs_bmbt_set_blockcount(xfs_iext_get_ext(xfs_ifork, idx-1), left->br_blockcount + new->br_blockcount)
+   - 修改prev的开始位置, 文件偏移
+   > xfs_bmbt_set_startoff(xfs_bmbt_rec_host, prev->br_startoff + new->br_blockcount)
+   - prev的磁盘位置有效??? 
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, prev->br_blockcount - new->br_blockcount)
+   - 然后更新btree的xfs_bmbt_rec 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, prev->br_startoff, prev->br_startblock, prev->br_blockcount, i)
+   - 更新开始位置
+   > xfs_bmbt_update(xfs_btree_cur, prev->br_startoff + new->br_blockcount, prev->br_blockcount + new->br_blockcount, prev->br_blockcount - new->br_blockcount, prev->br_state)
+   - 修改前一个xfs_bmbt_rec的长度 
+   > xfs_bmbt_decrement(xfs_btree_cur, 0, i)
+   > xfs_bmbt_update(xfs_btree_cur, left->br_startoff, left->br_startblock, left->br_blockcount + new->br_blockcount, left->br_state)
+   - 如果state是BMAP_LEFT_FILLING, 只需要把prev分成2部分, 没有合并
+   - 增加xfs_inode->xfs_icdinode->di_nextents ++
+   - 先修改prev对应的xfs_bmbt_rec_host 
+   > xfs_bmbt_set_startoff(xfs_bmbt_rec_host, new_end)
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, new->br_blockcount)
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, prev->br_blockcount + new->br_blockcount)
+   - 在前面插入新的new对应的xfs_bmbt_rec_host
+   > xfs_iext_insert(xfs_inode, idx, 1, new, state)
+   - 然后修改btree的xfs_bmbt_rec
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, prev->br_startoff, prev->br_startblock, prev->br_blockcount, i)
+   - 做上面对应的更新 
+   > xfs_bmbt_update(xfs_btree_cur, prev->br_startoff + new->br_blockcount, prev->br_startblock + new->br_blockcount, PREV->br_blockcount - new->br_blockcount, prev->br_state)
+   - 然后把new给xfs_btree->br_rec->xfs_bmbt_irec, 插入新的xfs_bmbt_rec
+   > xfs_btree_insert(xfs_btree_cur, i)
+   - 如果state是BMAP_RIGHT_FILLING|BMAP_RIGHT_CONTIG
+   - 同样把prev分成2部分,后一部分和rgiht合并
+   - 更新prev指向的xfs_bmbt_rec_host的长度 
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, prev->br_blockcount - new->br_blockcount)
+   - 更新right对应的xfs_bmbt_rec_host的开始位置
+   > xfs_bmbt_set_allf(xfs_iext_get_ext(xfs_ifork, idx), new->br_startoff, new->br_startblock, new->br_blockcount + right->br_blockcount, new->br_state)
+   - 更新btree的xfs_bmbt_rec 
+   - 首先更新prev对应的xfs_bmbt_rec
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, prev->br_startoff, prev->br_startblock, prev->br_blockcount, i)
+   > xfs_bmbt_update(xfs_btree_cur, prev->br_startoff, prev->br_blockstart, prev->br_blockcount - new->br_blockcount, prev->br_state)
+   - 然后更新right 
+   > xfs_btree_increment(xfs_btree_cur, 0, i)
+   > xfs_bmbt_update(xfs_btree_cur, new->br_startoff, new->br_startblock, new->br_blockcount + right->br_blockcount, new->br_state)
+   - 如果state是BMAP_RIGHT_FILLING, 只会把prev分成2部分,而不会合并
+   - 增加xfs_inode->xfs_icdinode->di_nextents ++
+   - 修改prve对应的blockcount
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, prev->br_blockcount - new->br_blockcount)
+   - 然后使用new创建对应的xfs_bmbt_rec_host 
+   > xfs_iext_insert(xfs_inode, idx, 1, new, state)
+   - 然后修改btree的xfs_bmbt_rec
+   - 首先是prev的blockcount 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, prev->br_startoff, prev->br_startblock, prev->br_blockcount, i)
+   > xfs_bmbt_update(xfs_btree_cur, prev->br_startoff, prev->br_blockcount, prev->br_blockcount - new->br_blockcount, prev->br_state)xo
+   - 然后插入新的节点, 为何就成了先查找??而不是insert? 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, new->br_startoff, new->br_startblock, new->br_blockcount, i)
+   - 修改xfs_btree_cur->bc_rec->xfs_bmbt_irec->br_state = XFS_EXT_NORM 
+   > xfs_btree_insert(xfs_btree_cur, i)
+   - 如果state是0, prev需要分成3部分, 增加xfs_inode->xfs_icdinode->di_nextents += 2
+   - 更新第一部分的长度 
+   > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, new->br_startoff - prev->br_startoff)
+   - 然后构造2个xfs_bmbt_irec, 第一个可使用new, 第二个对应第三部分 
+   > xfs_iext_insert(xfs_inode, idx, 2, r, state)
+   - 然后修改btree的xfs_bmbt_rec
+   - 先更新第三部分的长度 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, prev->br_startoff, prev->br_startblock, prev->br_blockcount, i)
+   > xfs_bmbt_update(xfs_btree_cur, r[1].br_startoff, ..)
+   - 然后使用prev添加第一部分, 给xfs_btree_cur->bc_rec->xfs_bmbt_irec
+   - 因为这是xfs_bmbt_cur可以直接插入??
+   > xfs_btree_insert(xfs_btree_cur, i)
+   - 然后修改xfs_btree_cur, 指向第二部分 
+   > xfs_bmbt_lookup_eq(xfs_btree_cur, new->br_startoff, ...)
+   > xfs_btree_insert(xfs_btree_cur, i)
+   - 对于其他的state, 都是错误的状态
+   - 最后检查di_format是否需要变为XFS_DINODE_FMT_BTREE 
+   > xfs_bmap_need_btree(xfs_inode, XFS_DATA_FORK)
+   > xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, first, xfs_bmap_free, xfs_btree_cur, 0, logflags, XFS_DATA_FORK)
+  
+** xfs_bmap_add_extent_hole_delay(xfs_inode, xfs_extnum_t, xfs_bmbt_irec)
+   - 
