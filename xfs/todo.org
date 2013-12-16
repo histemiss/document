@@ -228,8 +228,10 @@
    > XFS_BUF_TO_BLOCK(xfs_buf)
 
 ** xfs_btree_get_bufl(xfs_mount, xfs_trans, xfs_fsblock_t, lock)
-   - 创建xfs_fsblock_t对应的xfs_buf, 转化磁盘地址
+   - 创建xfs_fsblock_t对应的xfs_buf
+   - 先转化磁盘地址
    > XFS_FSB_TO_DADDR(xfs_mount, xfs_fsblock_t)
+   - 这里有读操作?
    > xfs_trans_get_buf(xfs_trans, xfs_mount->xfs_buftarg, d, xfs_mount->m_bsize, lock)
 
 ** xfs_btree_get_bufs(xfs_mount, xfs_trans, xfs_agnumber_t agno, xfs_agblock_t agbno, lock)
@@ -262,4 +264,169 @@
    - 只需要检查开头和结尾 
 
 ** xfs_btree_read_bufl(xfs_mount, xfs_trans, xfs_fsblock_t fsbno, lock, xfs_buf, refval, xfs_buf_ops)
-   - 
+   - 读取btree节点,磁盘地址是xfs_fsblock_t, 先转化为绝对地址  
+   > XFS_FSB_TO_DADDR(xfs_mount, xfs_fsblock_t)
+   - 读取xfs_buf 
+   > xfs_trans_read_buf(xfs_mount, xfs_trans, xfs_mount->xfs_buftarg, d, xfs_mount->m_bsize, lock, xfs_buf, xfs_buf_ops)
+   - 这里节点大小是xfs_mount->m_bsize
+
+** xfs_btree_read_bufl(xfs_mount, xfs_fsblock_t fsbno, xfs_extlen_tcount, xfs_buf_ops)
+   - 预读磁盘数据,转化磁盘地址 
+   > XFS_FSB_TO_DADDR(xfs_mount,xfs_fsblock_t)
+   > xfs_buf_readahead(xfs_mount->xfs_buftarg, d, xfs_mount->m_bsize *count, xfs_buf_ops)
+
+** xfs_btree_reada_bufs(xfs_mount, xfs_agnumber_t agno, xfs_agblock_t agbno, xfs_extlen_t count, xfs_buf_ops ops)
+   - 读取磁盘数据,地址由(agno,agbno)决定 
+   > XFS_AGB_TO_DADDR(xfs_mount,agno,agbno)
+   > xfs_buf_readahead(xfs_mount->xfs_buftarg,d, xfs_mount->m_bsize * count, xfs_buf_ops)
+
+** xfs_btree_readahead_lblock(xfs_btree_cur, lr,xfs_btree_block)
+   - 读取xfs_btree_block的兄弟节点 
+   - 从xfs_btree_block->bb_u->l->bb_leftsib/bb_rightsib获取指针
+   - 如果lr有XFS_BTCUR_LEFTRA, 读取左边的节点
+   > xfs_btree_reada_bufl(xfs_btree_cur->xfs_mount, left, 1, xfs_btree_cur->bc_ops->buf_ops)
+   - lr的XFS_BTCUR_RIGHTRA对应右边节点 
+
+** xfs_btree_readahead_sblock(xfs_btree_cur, lr, xfs_btree_block)
+   - 上面的xfs_btree_block使用指针是fsb,这里是agbno
+   - 使用xfs_btree_cur->bc_private->a->agno计算磁盘地址 
+   > xfs_btree_reada_bufs(xfs_btree_cur->xfs_mount, xfs_btree_cur->bc_private->a->agno, left, 1, xfs_btree_cur->xfs_btree_ops->xfs_buf_ops)
+
+** xfs_btree_readahead(xfs_btree_cur, level, lr)
+   - 如果level指向根节点,而且根节点在xfs_ifork中, 直接返回
+   - xfs_btree_cur->bc_flags有XFS_BTREE_ROOT_IN_INODE, level == xfs_btree_cur->bc_nlevels - 1
+   - 如果xfs_btree_cur->bc_ra[level]中已经有lr的标志,直接返回, 表示readahead已经完成
+   - 否则设置xfs_btree_cur->bc_ra[level] 
+   - 获取对应的xfs_btree_block 
+   > XFS_BUF_TO_BLOCK(xfs_btree_cur->bc_bufs[level]
+   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_LONG_PTR, 使用xfs_fsblock_t预读
+   > xfs_btree_readahead_lblock(xfs_btree_cur, lr, xfs_block_btree)
+   > xfs_btree_readahead_sblock(xfs_btree_cur, lr, xfs_block_btree)
+
+** xfs_btree_setbuf(xfs_btree_cur, level, xfs_buf)
+   - 把xfs_buf给xfs_btree_cur->bc_bufs[level], 释放原来的
+   > xfs_trans_brelse(xfs_btree_cur->xfs_trans, xfs_btree_cur->bc_bufs[level])
+   - 重新计算xfs_btree_cur->bc_ra[level]
+   - 如果xfs_buf中的xfs_btree_block的兄弟节点指针是NULLDFSBNO, 设置相关的XFS_BTCUR_RIGHTRA, XFS_BTCUR_LEFTRA, 以后不需要readahead 
+
+** xfs_btree_ptr_is_null(xfs_btree_cur cur, xfs_btree_ptr ptr)
+   - xfs_btree_ptr是分支指针
+   - 比较xfs_btree_ptr->l/s和NULLDFSBNO/NULLAGBLOCK
+
+** xfs_btree_set_ptr_null(xfs_btree_cur cur, xfs_btree_ptr ptr)
+   - 设置为空指针, xfs_btree_ptr使用大端的数据类型, 需要转化
+
+** xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, lr)
+   - 获取xfs_btree_block的兄弟节点, lr决定right/left
+   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_LONG_PTR, 使用fsb 
+   - 如果lr有XFS_BB_RIGHTSIB,设置xfs_btree_ptr为xfs_btree_block->bb_u->l->bb_rightsib
+   - 否则使用bb_leftsib
+
+** xfs_btree_set_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, lr)
+   - 设置兄弟节点指针
+
+** xfs_btree_init_block_init(xfs_mount, xfs_btree_block, xfs_daddr_t, magic, level, numrec, owner, flags)
+   - 初始化xfs_btree_block, 它的数据类型是大端的
+   - 先设置magic, level, numrecs
+   - 下面根据XFS_BTREE_LONG_PTR而定
+   - 兄弟节点设为NULL, 
+   - 如果flags有XFS_BTREE_CRC_BLOCK, 设置bno, uuid, owner
+
+** xfs_btree_init_block(xfs_mount, xfs_buf, magic, level, numrecs, owner, flags)
+   - 初始化xfs_btree_block, 首先获取对应的xfs_btree_block
+   > xfs_btree_init_block_int(xfs_mount, XFS_BUF_TO_BLOCK(xfs_buf), xfs_buf->b_bn, magic, level, numrecs, owner, flags)
+
+** xfs_btree_init_block_cur(xfs_btree_cur, xfs_buf, level, numrecs)
+   - 初始化xfs_buf中的xfs_btree_block
+   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_LONG_PTRS, owner就是ino?? 这个btree就是xfs_ifork的?? 
+   - 否则设为xfs_btree_cur->bc_private->a->agno? btree中使用的指针限于ag内部?
+   > xfs_btree_init_block_init(xfs_btree_cur->xfs_mount, XFS_BUF_TO_BLOCK(xfs_buf), xfs_buf->b_bn, xfs_btree_magic(xfs_btree_cur), level, numrecs, owner, xfs_btree_cur->bc_flags)
+
+** xfs_btree_is_lastrec(xfs_btree_cur, xfs_btree_block, level)
+   - 检查xfs_btree_block是否为btree的最后一个叶子节点??
+   - 如果level >0, 返回0. 最后一个节点应该是叶子节点
+   - 如果xfs_btree_cur->bc_flags也没有XFS_BTREE_LASTREC_UPDATE?? 返回0?
+   - 获取xfs_btree_block的右兄弟 
+   > xfs_btree_et_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_RIGHTSIB)
+   - 检查指针是否为null 
+   > xfs_btree_ptr_is_null(xfs_btree_cur, xfs_btree_ptr)
+
+** xfs_btree_buf_to_ptr(xfs_btree_cur, xfs_buf, xfs_btree_ptr)
+   - 把xfs_buf的地址给xfs_btree_ptr
+   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_LONG_PTR, 需要xfs_fsblock_t格式
+   > XFS_DADDR_TO_FSB(xfs_btree_cur->xfs_mount, XFS_BUF_ADDR(xfs_buf))
+   - 否则使用agbno 
+   > xfs_daddr_to_agbno(xfs_mount, XFS_BUF_ADDR(xfs_buf))
+
+** xfs_btree_ptr_to_daddr(xfs_btree_ptr, xfs_btree_ptr ptr)
+   - 把xfs_btree_ptr的指针转化为xfs_daddr_t格式 
+   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_LONG_PTRS, 使用xfs_fsblock_t 
+   > XFS_FSB_TO_DADDR(xfs_btree_block->xfs_mount, be64_to_cpu(xfs_btree_ptr->l))
+   - 否则使用agno/agbno
+
+** xfs_btree_set_refs(xfs_btree_cur, xfs_buf)
+   - 根据xfs_btree_cur->bc_btnum, 设置xfs_buf->b_lru_ref中的标志
+   > xfs_buf_set_ref(xfs_buf, lru_ref)
+   - 对于不同的btree, 设置不同的标志, XFS_ALLOC_BTREE_REF/XFS_INO_BTREE_REF/XFS_BMAP_BTREE_REF
+
+** xfs_btree_get_buf_block(xfs_btree_cur, xfs_btree_ptr, flags, xfs_btree_block block, xfs_buf)
+   - 获取xfs_btree_ptr指向的xfs_buf, 以及对应的xfs_btree_block 
+   > xfs_btree_ptr_to_daddr(xfs_btree_cur, xfs_btree_ptr)
+   > xfs_trans_get_buf(xfs_btree_cur->xfs_trans, xfs_mount->xfs_buftarg, d, xfs_mount->m_bsize, flags)
+   - 设置xfs_buf->xfs_buf_ops = xfs_btree_cur->xfs_btree_ops->xfs_buf_ops
+   > XFS_BUF_TO_BLOCK(xfs_buf)
+
+** xfs_btree_read_buf_block(xfs_btree_cur, xfs_btree_ptr, level, flags, xfs_btree_block, xfs_buf)
+   - 读取xfs_btree_ptr对应的xfs_buf, xfs_btree_block 
+   > xfs_btree_ptr_to_daddr(xfs_btree_cur, xfs_btree_ptr)
+   > xfs_trans_read_buf(xfs_mount, xfs_btree_cur->xfs_trans, xfs_mount->xfs_buftarg, d, xfs_mount->m_bsize, flags, xfs_buf, xfs_btree_cur->xfs_btree_ops->xfs_buf_ops)
+   - 为何这里设置refs?
+   > xfs_btree_set_refs(xfs_btree_cur, xfs_buf)
+   > XFS_BUF_TO_BLOCK(xfs_buf)
+
+** xfs_btree_copy_keys(xfs_btree_cur, xfs_btree_key dst, xfs_btree_key src, numkeys)
+   - 复制xfs_btree_key数组, 数组单元长度是xfs_btree_cur->xfs_btree_ops->key_len
+
+** xfs_btree_copy_recs(xfs_btree_cur, xfs_btree_rec dst, xfs_btree_rec src, numrecs)
+   - 复制xfs_btree_rec数组, 直接使用memcpy
+   - 数组单位长度是xfs_btree_cur->xfs_btree_ops->rec_len
+
+** xfs_btree_copy_ptrs(xfs_btree_cur, xfs_btree_ptr dst, src, numptrs)
+   - 复制xfs_btree_ptr数组, 单位是指针长度
+   > xfs_btree_ptr_len(xfs_btree_cur)
+
+** xfs_btree_shift_keys(xfs_btree_cur, xfs_btree_key, dir, numkeys)
+   - dir表示向前还是向后移动
+
+** xfs_btree_shift_recs(xfs_btree_cur, xfs_btree_rec, dir, numrecs)
+
+** xfs_btree_shift_ptrs(xfs_btree_cur, xfs_btree_ptr, dir, numptrs)
+
+** xfs_btree_log_keys(xfs_btree_cur, xfs_buf, first, last)
+   - log xfs_buf中的修改?
+   - 如果xfs_buf不是NULL, 记录(first, last)范围内的xfs_btree_key 
+   > xfs_trans_buf_set_type(xfs_btree_cur->xfs_trans, xfs_buf, XFS_BLFT_BTREE_BUF)
+   > xfs_trans_log_buf(xfs_btree_cur->xfs_trans, xfs_buf, xfs_btree_key_offset(xfs_btree_cur, first), xfs_btree_key_offset(xfs_btree_cur, last+1) -1 )
+   - 如果xfs_buf, 要log根节点,而且在xfs_ifork中
+   - log把整个根节点
+   > xfs_trans_log_inode(xfs_btree_cur->xfs_trans, xfs_btree_cur->bc_private->b->xfs_inode, xfs_ilog_fbroot(whichfork))
+
+** xfs_btree_log_recs(xfs_btree_cur, xfs_buf, first, last)
+   - xfs_buf是叶子节点,不可能是根节点 
+   - 只是log (first, last)范围内的xfs_btree_rec数组 
+
+** xfs_btree_log_ptrs(xfs_btree_cur, xfs_buf, first, last)
+   - 和上面处理xfs_btree_key一样
+
+** xfs_btree_log_block(xfs_btree_cur, xfs_buf, fields)
+   - log xfs_btree_block, 根据field计算范围
+   - 这里有XFS_BB_MAGIC/LEVEL/NUMRECS/LEFTSIB/RIGHTSIB/BLKNO
+   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_CRC_BLOCKS, 而且fields是XFS_BB_ALL_BITS, 需要包括XFS_BB_ALL_BITS_CRC, 只有在全部log时,crc的log才有意义
+   - 计算xfs_buf中的数据范围
+   > xfs_btree_offset(fields, loffset/soffset, nbits, first, last)
+   > xfs_trans_buf_set_type(xfs_btree_cur->xfs_trans, xfs_buf, XFS_BLFL_BTREE_BUF)
+   > xfs_trans_log_buf(xfs_trans, xfs_buf, first, last)
+   - 如果xfs_buf == NULL, 要log xfs_ifork中的数据 
+   > xfs_trans_log_inode(xfs_btree_cur->xfs_trans, xfs_btree_cur->bc_private->b->xfs_inode, xfs_ilog_fbroot(whichfork))
+
+** xfs_btree_increment(xfs_btree_cur, level, state)
