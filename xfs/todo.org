@@ -1,0 +1,265 @@
+* xfs_btree.c 
+
+** xfs_btree_cur 
+   #+BEGIN_SRC 
+	struct xfs_trans	*bc_tp;	/* transaction we're in, if any */
+	struct xfs_mount	*bc_mp;	/* file system mount struct */
+	const struct xfs_btree_ops *bc_ops;
+	uint			bc_flags; /* btree features - below */
+	union {
+		xfs_alloc_rec_incore_t	a;
+		xfs_bmbt_irec_t		b;
+		xfs_inobt_rec_incore_t	i;
+	}		bc_rec;		/* current insert/search record value */
+	struct xfs_buf	*bc_bufs[XFS_BTREE_MAXLEVELS];	/* buf ptr per level */
+	int		bc_ptrs[XFS_BTREE_MAXLEVELS];	/* key/record # */
+	__uint8_t	bc_ra[XFS_BTREE_MAXLEVELS];	/* readahead bits */
+#define	XFS_BTCUR_LEFTRA	1	/* left sibling has been read-ahead */
+#define	XFS_BTCUR_RIGHTRA	2	/* right sibling has been read-ahead */
+	__uint8_t	bc_nlevels;	/* number of levels in the tree */
+	__uint8_t	bc_blocklog;	/* log2(blocksize) of btree blocks */
+	xfs_btnum_t	bc_btnum;	/* identifies which btree type */
+	union {
+		struct {			/* needed for BNO, CNT, INO */
+			struct xfs_buf	*agbp;	/* agf/agi buffer pointer */
+			xfs_agnumber_t	agno;	/* ag number */
+		} a;
+		struct {			/* needed for BMAP */
+			struct xfs_inode *ip;	/* pointer to our inode */
+			struct xfs_bmap_free *flist;	/* list to free after */
+			xfs_fsblock_t	firstblock;	/* 1st blk allocated */
+			int		allocated;	/* count of alloced */
+			short		forksize;	/* fork's inode space */
+			char		whichfork;	/* data or attr fork */
+			char		flags;		/* flags */
+#define	XFS_BTCUR_BPRV_WASDEL	1			/* was delayed */
+		} b;
+	}		bc_private;	/* per-btree type data */   
+   #+END_SRC
+
+** xfs_btree_block 
+   - 这里的数据类型是大端的，所以应该是磁盘中的数据格式,使用时先转化
+   #+BEGIN_SRC 
+	__be32		bb_magic;	/* magic number for block type */
+	__be16		bb_level;	/* 0 is a leaf */
+	__be16		bb_numrecs;	/* current # of data records */
+	union {
+		struct {
+			__be32		bb_leftsib;
+			__be32		bb_rightsib;
+
+			__be64		bb_blkno;
+			__be64		bb_lsn;
+			uuid_t		bb_uuid;
+			__be32		bb_owner;
+			__le32		bb_crc;
+		} s;			/* short form pointers */
+		struct	{
+			__be64		bb_leftsib;
+			__be64		bb_rightsib;
+
+			__be64		bb_blkno;
+			__be64		bb_lsn;
+			uuid_t		bb_uuid;
+			__be64		bb_owner;
+			__le32		bb_crc;
+			__be32		bb_pad; /* padding for alignment */
+		} l;			/* long form pointers */
+	} bb_u;				/* rest */   
+   #+END_SRC
+
+** xfs_magics
+   - 各种magic
+   #+BEGIN_SRC 
+#define	XFS_ABTB_MAGIC		0x41425442	/* 'ABTB' for bno tree */
+#define	XFS_ABTB_CRC_MAGIC	0x41423342	/* 'AB3B' */
+#define	XFS_ABTC_MAGIC		0x41425443	/* 'ABTC' for cnt tree */
+#define	XFS_ABTC_CRC_MAGIC	0x41423343	/* 'AB3C' */     
+#define XFS_BMAP_MAGIC		0x424d4150	/* 'BMAP' */  //extentmap btree节点的头
+#define XFS_BMAP_CRC_MAGIC	0x424d4133	/* 'BMA3' */
+#define	XFS_IBT_MAGIC		0x49414254	/* 'IABT' */  //inode map btree节点的头
+#define	XFS_IBT_CRC_MAGIC	0x49414233	/* 'IAB3' */
+   #+END_SRC
+
+** xfs_btnum_t 
+   #+BEGIN_SRC 
+	XFS_BTNUM_BNOi,   //对应XFS_ABTB_MAGIC
+	XFS_BTNUM_CNTi,   //对应XFS_ABTC_MAGIC
+	XFS_BTNUM_BMAPi,  //对应XFS_BMAP_MAGIC
+	XFS_BTNUM_INOi,   //对应XFS_IBT_MAGIC
+	XFS_BTNUM_MAX   
+   #+END_SRC
+
+
+** xfs_btree_check_lblock(xfs_btree_cur cur, xfs_btree_block block, level, xfs_buf)
+   - 比较xfs_btree_block->bb_u->l->bb_uuid 和 xfs_sb->sb_uuid
+   - 比较xfs_btree_block->bb_u->l->bb_blkno 和 xfs_buf->b_bn, 磁盘位置??
+   - 比较magic, 根据xfs_btree_cur->bc_btnum计算使用的magic 
+   > xfs_btree_magic(xfs_btree_cur)
+   - 检查xfs_btree_block->level 和参数level
+   - 检查xfs_btree_block->bb_numrecs, 不能超过上线
+   > xfs_btree_cur->bc_ops->get_maxrecs(xfs_btree_cur, level)
+
+** xfs_btree_check_sblock(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
+   - 这个和上面有什么区别??
+
+** xfs_btree_check_block(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
+   - xfs_btree_cur->bc_flags的XFS_BTREE_LONG_PTRS表示什么?? 磁盘的指针?? 
+   - 影响xfs_btree_block->bb_u->s的rightsib/leftsib
+   > xfs_btree_check_lblock(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
+   > xfs_btree_check_sblock(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
+
+** xfs_btree_check_lptr(xfs_btree_cur, xfs_dfsbno_t bno, level)
+   - 如果level>0, bno直线子节点??
+   - 检查磁盘位置,包括agno, agbno 
+
+** xfs_btree_check_sptr(xfs_btree_cur, xfs_agblock_t bno, level)
+   - bno是ag内部偏移 
+   > bno > xfs_btree_cur->xfs_mount->xfs_sb->sb_agblocks
+
+** xfs_btree_check_ptr(xfs_btree_cur, xfs_btree_ptr, index, level)
+   - xfs_btree_ptr是btree内部节点的value数组?? 指向子分支 
+   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_LONG_PTR
+   - 检查对应的磁盘指针是否有意义
+   > xfs_btree_check_ptr(xfs_btree_cur, xfs_btree_ptr->l[index], level)
+
+** xfs_btree_lblock_calc_crc(xfs_buf)
+   - 如果xfs版本表示不使用crc,直接退出 
+   > xfs_sb_version_hascrc(xfs_buf->xfs_buftarg->xfs_mount->xfs_sb)
+   - 如果buf有xfs_log_item? 更新xfs_btree_block 
+   - xfs_btree_block->bb_u->l->ll_lsn = xfs_buf_log_item->xfs_log_item->li_lsn 
+   - 计算crc, 只计算头部
+   > xfs_update_cksum(xfs_buf->b_addr, BBTOB(xfs_buf->b_length), XFS_BTREE_LBLOCK_CRC_OFF)
+
+** xfs_btree_lblock_verify_crc(xfs_buf)
+   - 首先判断xfs版本,支持crc 
+   > xfs_sb_version_hascrc(xfs_buf->xfs_buftarg->xfs_mount->xfs_sb)
+   > xfs_verify_cksum(xfs_buf->b_addr, BBTOB(xfs_buf->b_length), XFS_BTREE_LBLOCK_CRC_OFF)
+
+** xfs_btree_sblock_calc_crc(xfs_buf)
+   - 上面的指针是64位,这里是32位 
+
+** xfs_btree_sblock_verify_crc(xfs_buf)
+   - 上面的指针是64位,这里是32位 
+
+** xfs_btree_del_cursor(xfs_btree_cur, error)
+   - 释放xfs_btree_cur遍历时使用的xfs_buf 
+   > xfs_trans_brelse(xfs_btree_cur->xfs_trans, xfs_btree_cur->bc_bufs[i])
+   - 如果btree是XFS_BTNUM_BMAP, 映射extent? xfs_btree_cur->bc_private->b->allocated === 0
+   - 最后释放自己
+
+** xfs_btree_dup_cursor(xfs_btree_cur, cur, xfs_btree_cur ncur)
+   - 复制一个xfs_btree_cur, 需要增加哪些资源?? 
+   > xfs_btree_cur->bc_ops-dup_cursor(xfs_btree_cur)
+   - 复制xfs_btree_cur中的数据 xfs_btree_cur->bc_rec
+   - 这些不是指针,而是btree中的具体记录, xfs_bmbt_irec/xfs_alloc_rec_incore等都已经把磁盘格式转化为内存格式
+   - 遍历xfs_btree_cur使用的节点指针 xfs_btree_cur->bc_nlevels 
+   - 重新读取数据??
+   > xfs_trans_read_buf(xfs_mount, xfs_trans, xfs_mount->xfs_buftarg, XFS_BUF_ADDR(xfs_buf), xfs_mount->m_bsize, 0, xfs_buf, xfs_btree_cur->bc_ops->buf_ops)
+
+** xfs_btree_block_len(xfs_btree_cur)
+   - 计算btree节点的xfs_btree_block头的大小??
+   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_LONG_PTR, 而且是crc, XFS_BTREE_CRC_BLOCKS, 返回XFS_BTREE_LBLOCK_CRC_LEN
+   - 如果没有crc, 使用XFS_BTREE_LBLOCK_LEN
+   - 如果没有XFS_BTREE_LONG_PTR, 但有XFS_BTREE_CRC_BLOCKS, 使用XFS_BTREE_SBLOCK_CRC_LEN
+   - 否则使用XFS_BTREE_SBLOCK_LEN
+
+** xfs_btree_ptr_len(xfs_btree_cur)
+   - 分支指针的大小, sizeof(__be64), 或者sizeof(__be32)
+
+** xfs_btree_rec_offset(xfs_btree_cur, n)
+   - 计算叶子节点第n个记录的位置?? 
+   - xfs_btree_block_len(xfs_btree_cur) + (n-1) * xfs_btree_cur->bc_ops->rec_len
+
+** xfs_btree_key_offset(xfs_btree_cur, n)
+   - 计算内部节点第n个key的位置 
+   > xfs_btree_block_len(xfs_btree_cur) + (n-1) * xfs_btree_cur->bc_ops->key_len
+
+** xfs_btree_ptr_offset(xfs_btree_cur, n, level)
+   - 内部节点value的位置, 包括3部分偏移
+   - xfs_btree_block头的偏移
+   > xfs_btree_block_len(xfs_btree_cur) 
+   - key的偏移
+   - xfs_btree_cur->bc_ops->get_maxrecs(xfs_btree_cur, level) * xfs_btree_cur->bc_ops->key_len 
+   - 然后是value的偏移 
+   - (n-1) * xfs_btree_ptr_len(xfs_btree_cur)
+
+** xfs_btree_rec 
+   #+BEGIN_SRC 
+	xfs_bmbt_rec_t		bmbt;
+	xfs_bmdr_rec_t		bmbr;	/* bmbt root block */
+	xfs_alloc_rec_t		alloc;
+	xfs_inobt_rec_t		inobt;   
+   #+END_SRC
+
+** xfs_btree_rec_addr(xfs_btree_cur, n, xfs_btree_block)
+   - 访问xfs_btree_block中的第n个节点 
+   > xfs_btree_rec_offset(xfs_btree_cur, n)
+   - xfs_btree_block应该指向内存中一个xfs_buf的数据, 返回的xfs_btree_rec,数据类新是磁盘格式的
+
+** xfs_btree_key
+   #+BEGIN_SRC 
+	xfs_bmbt_key_t		bmbt;
+	xfs_bmdr_key_t		bmbr;	/* bmbt root block */
+	xfs_alloc_key_t		alloc;
+	xfs_inobt_key_t		inobt;   
+   #+END_SRC
+
+** xfs_btree_key_addr(xfs_btree_cur, n, xfs_btree_block)
+   - 和上面一样
+
+** xfs_btree_ptr_addr(xfs_btree_cur, n, xfs_btree_block)
+   - 这里需要xfs_btree_block指向节点的level 
+   > xfs_btree_get_level(xfs_btree_block)
+   > xfs_btree_ptr_offset(xfs_btree_cur, n, level)
+
+** xfs_btree_get_iroot(xfs_btree_cur)
+   - 获取btree的根节点, 还是xfs_btree_block指针, 数据类型的磁盘使用的
+   - 首先找到对应的xfs_ifork 
+   > XFS_IFORK_PTR(xfs_btree_cur->bc_private->b->xfs_inode, xfs_btree_cur->bc_private->b->whichfork)
+   - 然后返回xfs_ifork->if_broot
+
+** xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
+   - 获取xfs_btree_cur中level对应的节点的xfs_buf和xfs_btree_block
+   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_ROOT_IN_INODE, 而且level == xfs_btree_cur->bc_nlevels-1, 表示跟节点在xfs_ifork中??
+   - 对于block/inode等待,就使用ag的专门的block 
+   > xfs_btree_get_iroot(xfs_btree_cur)
+   - 否则直接使用xfs_btree_cur->bc_bufs[level]
+   > XFS_BUF_TO_BLOCK(xfs_buf)
+
+** xfs_btree_get_bufl(xfs_mount, xfs_trans, xfs_fsblock_t, lock)
+   - 创建xfs_fsblock_t对应的xfs_buf, 转化磁盘地址
+   > XFS_FSB_TO_DADDR(xfs_mount, xfs_fsblock_t)
+   > xfs_trans_get_buf(xfs_trans, xfs_mount->xfs_buftarg, d, xfs_mount->m_bsize, lock)
+
+** xfs_btree_get_bufs(xfs_mount, xfs_trans, xfs_agnumber_t agno, xfs_agblock_t agbno, lock)
+   - 磁盘地址是(agno, agbno)
+   > XFS_AGB_TO_DADDR(xfs_mount, agno, agbno)
+   > xfs_trans_get_buf(xfs_trans, xfs_mount->xfs_buftarg, d, xfs_mount->m_bsize, lock)
+
+** xfs_btree_islastblock(xfs_btree_cur, level)
+   - 首先获取xfs_btree_cur对应level的节点 
+   > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
+   - 检查它的有效性 
+   > xfs_btree_check_block(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
+   - 检查他的rightsib, 是否为空, 表示他是level层的最后一个节点
+   - 如果使用64为磁盘指针,比较NULLDFSBNO, 32位使用NULLAGBLOCK (-1)
+
+** xfs_btree_firstrec(xfs_btree_cur, level)
+   - 获取level对应的xfs_btree_block 
+   > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
+   > xfs_btree_check_block(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
+   - 如果他没有子节点?? xfs_btree_block->bb_numrecs ==0, 返回0
+   - 否则设置xfs_btree_cur->bc_ptrs[level] ==1
+   - 这里xfs_btree_ptr->bc_bufs[level]已经取出来, 只是修改bc_ptrs[level], 它决定下一层分支
+
+** xfs_btree_lastrec(xfs_btree_cur, level)
+   - 和上面相反,这里设置xfs_btree_cur->bc_ptrs[level] = xfs_btree_block->bb_numrecs
+   - 这个指针是从1开始的.. 
+
+** xfs_btree_offset(fields, offset, nbits, first, last)
+   - fields对应offset的内存, 检查(0,nbits)中置位的范围, 给(first,last)
+   - 只需要检查开头和结尾 
+
+** xfs_btree_read_bufl(xfs_mount, xfs_trans, xfs_fsblock_t fsbno, lock, xfs_buf, refval, xfs_buf_ops)
+   - 
