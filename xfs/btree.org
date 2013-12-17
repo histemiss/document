@@ -579,4 +579,112 @@
    > xfs_btree_updkey(xfs_btree_cur, xfs_btree_key, 1)
 
 ** xfs_btree_lshift(xfs_btree_cur, level, state)
-   - 
+   - 如果更新根结点,而且根结点在xfs_ifork中,不允许修改??
+   - 找到level层的节点 xfs_buf/xfs_btree_block
+   > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
+   - 获取左边的叶子节点 
+   > xfs_btree_get_sibling(xfs_btree, xfs_btree_block, xfs_btree_ptr, XFS_BB_LEFTSIB)
+   - 如果不存在,直接返回 
+   > xfs_btree_ptr_is_null(xfs_btree_cur, xfs_btree_ptr)
+   - 移动的子分支是第一个分支, 如果当前路径在使用这个分支,不再移动
+   - 因为太复杂???
+   - xfs_btree_cur->bc_ptrs[level] <= 1
+   - 获取左边的叶子节点xfs_buf, xfs_btree_block 
+   > xfs_btree_read_buf_block(xfs_btree_cur, xfs_btree_ptr, level, 0, xfs_btree_block, xfs_buf)
+   - 检查左边的节点是否满了?? 
+   > xfs_btree_cur->xfs_btree_ops->get_maxrecs(xfs_btree_cur, level)
+   > xfs_btree_get_numrecs(xfs_btree_block)
+   - 要从当前的节点,向左边的兄弟节点中移动一个子分支
+   - 如果不是叶子节点, level > 0
+   - 先找到xfs_btree_key/xfs_btree_ptr的位置
+   > xfs_btree_key_addr(xfs_btree_cur, lrecs, left)
+   > xfs_btree_key_addr(xfs_btree_cur, 1, right)
+   > xfs_btree_ptr_addr(xfs_btree_cur, lrecs, left)
+   > xfs_btree_ptr_addr(xfs_btree_cur, 1, left)
+   - 复制xfs_btree_key/xfs_btree_ptr 
+   > xfs_btree_copy_keys(xfs_btree_cur, xfs_btree_key, xfs_btree_key, 1)
+   > xfs_btree_copy_ptrs(xfs_btree_cur, xfs_btree_ptrs, xfs_btree_ptrs, 1) 
+   - 然后log左边的节点??
+   > xfs_btree_log_keys(xfs_btree_cur, left, lrecs, lrecs)
+   > xfs_btree_log_ptrs(xfs_btree_cur, left, lrecs, lrecs)
+   - 如果是叶子节点, level ==0
+   - 找到xfs_btree_rec位置 
+   > xfs_btree_rec_addr(xfs_btree_cur, lrecs, left)
+   > xfs_btree_rec_addr(xfs_btree_cur, 1, right)
+   > xfs_btree_copy_recs(xfs_btree_cur, l, r, 1)
+   - 然后log左边的节点
+   > xfs_btree_log_recs(xfs_btree_cur, xfs_buf, lrecs, lrecs)
+   - 最后设置2个xfs_btree_block->numrecs
+   > xfs_btree_set_numrecs(left, lrecs)
+   > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_NUMRECS)
+   - 然后是右边节点 
+   > xfs_btree_set_numrecs(right, rrecs)
+   > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_NUMRECS)
+   - 然后删除右边节点的第一个分支
+   - 如果不是叶子节点, level >0 
+   - 从第2个key/ptr开始移动,向左移动
+   > xfs_btree_shift_keys(xfs_btree_cur, xfs_btree_key_addr(xfs_btree_cur, 2, right), -1, rrecs)
+   > xfs_btree_shift_ptrs(xfs_btree_cur, xfs_btree_ptr_addr(xfs_btree_cur, 2, right), -1, rrecs)
+   - 然后log右边的节点, 把整个key/ptr都log下来
+   - 为何不和上面一块, 把整个节点都log下来??
+   > xfs_btree_log_keys(xfs_btree_cur, xfs_buf, 1, rrecs)
+   > xfs_btree_log_ptrs(xfs_btree_cur, xfs_buf, 1, rrecs)
+   - 如果是叶子节点, level=0
+   > xfs_btree_shift_recs(xfs_btree_cur, xfs_btree_rec_addr(xfs_btree_cur, 2, right), -1, rrecs)
+   > xfs_btree_log_recs(xfs_btree_cur, xfs_buf, 1, rrecs)
+   - 然后更新right节点的父节点的xfs_btree_key 
+   > xfs_btree_cur->xfs_btree_ops->init_key_from_rec(xfs_btree_key, xfs_btree_rec_addr(xfs_btree_cur, 1, right))
+   > xfs_btree_updkey(xfs_btree_cur, xfs_btree_key, level+1)
+   - 同样修改路径的指针, 只需要修改当前移动的level的子分支 
+   - xfs_btree_cur->bc_ptrs[level] --
+
+** xfs_btree_rshift(xfs_btree_cur, level, state)
+   - 首先判断根结点, 如果在xfs_ifork中不做修改?? 
+   - 但是对于其他的btree就能修改?? 也只有一个根结点??
+   - 获取2个节点, xfs_buf/xfs_btree_block 
+   - left就是xfs_btree_cur中level指向的
+   > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
+   - 然后获取右边兄弟指针
+   > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_RIGHTSIB)
+   - 如果不存在,直接返回 
+   > xfs_btree_ptr_is_null(xfs_btree_cur, xfs_btree_ptr)
+   - 检查需要移动的子节点,也就是最后一个子分支,是否在路径中正常使用  xfs_btree_block->bc_ptrs[level]
+   > xfs_btree_get_numrecs(xfs_btree_block)
+   - 如果是，不再移动,太复杂!!
+   - 否则获取对应的xfs_buf/xfs_btree_block 
+   - 下面的参数level没有使用!!
+   > xfs_btree_read_buf_block(xfs_btree_cur, xfs_btree_ptr, level, 0, xfs_buf, xfs_btree_block)
+   - 检查right是否满了 
+   > xfs_btree_cur->xfs_btree_ops->get_maxrecs(xfs_btree_cur, level)
+   - 如果不是叶子节点, level >0
+   - 移动对应的xfs_btree_key/xfs_btree_ptr
+   - 找到对应的位置 
+   > xfs_btree_key_addr(..)
+   > xfs_btree_ptr_addr(..)
+   - 需要先从right节点中空出来位置 
+   > xfs_btree_shift_keys(xfs_btree_cur, xfs_buf, 1, rrecs)
+   > xfs_btree_shift_ptrs(xfs_btree_cur, xfs_buf, 1, rrecs)
+   > xfs_btree_copy_keys(..)
+   > xfs_btree_copy_ptrs(..)
+   - 然后log右边的节点
+   > xfs_btree_log_keys(..)
+   > xfs_btree_log_ptrs(..)
+   - 如果是叶子节点, level==0 
+   - 找到对应的位置 
+   > xfs_btree_rec_addr(..)
+   - right节点准备 
+   > xfs_btree_shift_recs(..)
+   > xfs_btree_copy_recs(..)
+   > xfs_btree_log_recs(..)
+   - 最有左边节点,只需要修改xfs_btree_block->numrecs 
+   > xfs_btree_set_numrecs(left, --lrecs)
+   > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_NUMRECS)
+   - 使用临时的xfs_btree_cur? 修改右边节点的父节点的xfs_btree_key?
+   > xfs_btree_dup_cursor(xfs_btree_cur, xfs_btree_cur)
+   - 原来的xfs_btree_cur指针不需要任何移动
+   - 如果这里移动了,需要完全复原,还得需要一个临时变量保存
+   - 所以不如直接使用一个临时的xfs_btree_cur
+   - 首先移动指针?? 
+   > xfs_btee_increment(xfs_btree_cur, level, i)
+   > xfs_btree_updkey(xfs_btree_cur, xfs_btree_key, level+1)
+   
