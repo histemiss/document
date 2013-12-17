@@ -688,3 +688,81 @@
    > xfs_btee_increment(xfs_btree_cur, level, i)
    > xfs_btree_updkey(xfs_btree_cur, xfs_btree_key, level+1)
    
+** xfs_btree_split(xfs_btree_cur, level, xfs_btree_ptr ptr, xfs_btree_key key, xfs_btree_cur, state)
+   - 把xfs_btree_cur中level对应的节点分裂开??  
+   - 获取xfs_buf/xfs_btree_block 
+   > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
+   > xfs_btree_check_block(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
+   - 获取节点磁盘位置,为何还是用xfs_btree_ptr
+   > xfs_btree_buf_to_ptr(xfs_btree_cur, xfs_buf, xfs_btre_ptr)
+   - 分配新的节点,使用上面的地址做提示信息?? 
+   > xfs_btree_cur->xfs_btree_ops->alloc_block(xfs_btree_cur, xfs_btree_ptr, xfs_btree_ptr rptr, 1, stat)
+   - 获取对应的xfs_btree_block 
+   > xfs_btree_get_buf_block(xfs_btree_cur, xfs_btree_ptr, 0, xfs_btree_block, xfs_buf)
+   - 初始化新的xfs_btree_block, 放到原来的xfs_btree_block的后面 
+   > xfs_btree_init_block_cur(xfs_btree_cur, xfs_buf, xfs_btree_get_level(xfs_btree_block), 0)
+   - 移动xfs_btree_key/xfs_btree_ptr, 或者xfs_btree_rec
+   > xfs_btree_get_numrecs(xfs_btree_block)
+   - 如果level >0 
+   - 复制一半的xfs_btree_key/xfs_btree_ptr 
+   > xfs_btree_key_addr(xfs_btree_cur, src_idx, xfs_btree_block)
+   > xfs_btree_ptr_addr(..)
+   > xfs_btree_copy_keys(..)
+   > xfs_btree_copy_ptrs(..)
+   - log右边的节点 
+   > xfs_btree_log_keys(..)
+   > xfs_btree_log_ptrs(..)
+   - 这里还有记录第一个xfs_btree_key, 作为新节点的xfs_btree_key
+   - 如果level ==0, 复制xfs_btree_rec数组 
+   > xfs_btree_rec_addr(xfs_btree_cur, src_idx, xfs_btree_block)
+   > xfs_btree_rec_addr(xfs_btree_cur, 1, xfs_btree_block)
+   > xfs_btree_copy_recs(xfs_btree_cur, ..)
+   > xfs_btree_log_recs(xfs_btree_cur, ..)
+   - 使用回调函数构造新节点的xfs_btree_key 
+   > xfs_btree_cur->xfs_btree_ops->init_key_from_rec(xfs_btree_key, xfs_btree_cur_addr(xfs_btree_rec, 1, xfs_btree_block))
+   - 设置兄弟节点
+   > xfs_btree_get_sibling(xfs_btee_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_RIGHTSIB)
+   - 设置原来节点的右兄弟节点为新的
+   > xfs_btree_set_sibling(xfs_btree_cur, ...)
+   - 设置新的节点的兄弟节点
+   - 设置2个节点的numrecs, 并且log 
+   > xfs_btree_set_numrecs(xfs_btree_block, lrecs)
+   - 对于新的节点,整个xfs_btree_block都log
+   > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_ALL_BITS)
+   - 对于原来的节点,只有右兄弟节点和numrecs 
+   > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_NUMRECS | XFS_BB_RIGHTSIB)
+   - 还有节点原来的右兄弟节点,需要设置它的做兄弟节点,指向新的节点 
+   > xfs_btree_read_buf_block(xfs_btree_cur, xfs_btree_ptr, level, 0, xfs_btree_block, xfs_buf)
+   > xfs_btree_set_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_LEFTSIB)
+   > xfs_btree_log_block(xfs_btree_cur, xfs_btree_ptr, XFS_BB_LEFTSIB)
+   - 如果xfs_btree_cur中的路径使用的分支被复制到新的xfs_btree_block,修改对应的xfs_btree_cur->bc_bufs/bc_ptrs 
+   > xfs_btree_setbuf(xfs_btree_cur, level, xfs_buf)
+   - 如果level不是指向根, 就创建一个新的xfs_btree_cur?
+   - 这里通过参数返回xfs_btree_key / xfs_btree_cur
+
+** xfs_btree_new_iroot(xfs_btree_cur, logflags, stat)
+   - btree的根结点必须在xfs_ifork中? 
+   - xfs_btree_cur->bc_flags有XFS_BTREE_ROOT_IN_INODE
+   - 添加一个新节点代替原有的根结点, 分支全部复制到新的节点 
+   - 新节点作为原来根结点的分支, 相当于btree高度增加一层
+   - 获取现在xfs_btree_cur指向的根结点 
+   > xfs_btree_get_iroot(xfs_btree_cur)
+   - 获取第一个分支指针?? 
+   > xfs_btree_ptr_addr(xfs_btree_cur, 1, xfs_btree_block)
+   - 创建新的节点 
+   > xfs_btree_cur->xfs_btree_ops->alloc_block(xfs_btree_cur, xfs_btree_ptr, new_ptr, 1, stat)
+   - 这里是get, 不是read??
+   > xfs_btree_get_buf_block(xfs_btree_cur, new_ptr, 0, xfs_btree_block, xfs_buf)
+   - 把原来的根结点复制到新的根结点上, memcpy
+   - 但要重新设置xfs_btree_block->bb_u->l->bb_bklno = xfs_buf->b_bn
+   - 设置xfs_btree_block->bb_level = 1, numrecs 
+   - 增加xfs_btree_cur->bc_nlevels ?? 
+   - 复制xfs_btree_key/xfs_btree_ptr 
+   - 把原来根结点的数据给新节点
+   - 然后把新节点的xfs_btree_ptr给原来根结点, 不是修改xfs_btree_key,和原来一样
+   - 重新设置xfs_ifork中的根结点的长度
+   > xfs_iroot_realloc(xfs_btree_cur->bc_private->b->xfs_inode, 1-xfs_btree_get_numrecs(xfs_btree_cur), xfs_btree_cur->bc_private->b->whichfork)
+   - 新创建的节点怎么添加到新的根节点中??
+   - 最后log新的节点
+   - XFS_BB_ALL_BITS, xfs_btree_key, xfs_btree_ptr数组
+     
