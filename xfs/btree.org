@@ -82,9 +82,9 @@
 #define	XFS_ABTB_CRC_MAGIC	0x41423342	/* 'AB3B' */
 #define	XFS_ABTC_MAGIC		0x41425443	/* 'ABTC' for cnt tree */
 #define	XFS_ABTC_CRC_MAGIC	0x41423343	/* 'AB3C' */     
-#define XFS_BMAP_MAGIC		0x424d4150	/* 'BMAP' */  //extentmap btree节点的头
+#define XFS_BMAP_MAGIC		0x424d4150	/* 'BMAP' */  //extentmap btree结点的头
 #define XFS_BMAP_CRC_MAGIC	0x424d4133	/* 'BMA3' */
-#define	XFS_IBT_MAGIC		0x49414254	/* 'IABT' */  //inode map btree节点的头
+#define	XFS_IBT_MAGIC		0x49414254	/* 'IABT' */  //inode map btree结点的头
 #define	XFS_IBT_CRC_MAGIC	0x49414233	/* 'IAB3' */
    #+END_SRC
 
@@ -117,7 +117,7 @@
    > xfs_btree_check_sblock(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
 
 ** xfs_btree_check_lptr(xfs_btree_cur, xfs_dfsbno_t bno, level)
-   - 如果level>0, bno直线子节点??
+   - 如果level>0, bno直线子结点??
    - 检查磁盘位置,包括agno, agbno 
 
 ** xfs_btree_check_sptr(xfs_btree_cur, xfs_agblock_t bno, level)
@@ -125,7 +125,7 @@
    > bno > xfs_btree_cur->xfs_mount->xfs_sb->sb_agblocks
 
 ** xfs_btree_check_ptr(xfs_btree_cur, xfs_btree_ptr, index, level)
-   - xfs_btree_ptr是btree内部节点的value数组?? 指向子分支 
+   - xfs_btree_ptr是btree内部结点的value数组?? 指向子分支 
    - 如果xfs_btree_cur->bc_flags有XFS_BTREE_LONG_PTR
    - 检查对应的磁盘指针是否有意义
    > xfs_btree_check_ptr(xfs_btree_cur, xfs_btree_ptr->l[index], level)
@@ -160,12 +160,12 @@
    > xfs_btree_cur->bc_ops-dup_cursor(xfs_btree_cur)
    - 复制xfs_btree_cur中的数据 xfs_btree_cur->bc_rec
    - 这些不是指针,而是btree中的具体记录, xfs_bmbt_irec/xfs_alloc_rec_incore等都已经把磁盘格式转化为内存格式
-   - 遍历xfs_btree_cur使用的节点指针 xfs_btree_cur->bc_nlevels 
+   - 遍历xfs_btree_cur使用的结点指针 xfs_btree_cur->bc_nlevels 
    - 重新读取数据??
    > xfs_trans_read_buf(xfs_mount, xfs_trans, xfs_mount->xfs_buftarg, XFS_BUF_ADDR(xfs_buf), xfs_mount->m_bsize, 0, xfs_buf, xfs_btree_cur->bc_ops->buf_ops)
 
 ** xfs_btree_block_len(xfs_btree_cur)
-   - 计算btree节点的xfs_btree_block头的大小??
+   - 计算btree结点的xfs_btree_block头的大小??
    - 如果xfs_btree_cur->bc_flags有XFS_BTREE_LONG_PTR, 而且是crc, XFS_BTREE_CRC_BLOCKS, 返回XFS_BTREE_LBLOCK_CRC_LEN
    - 如果没有crc, 使用XFS_BTREE_LBLOCK_LEN
    - 如果没有XFS_BTREE_LONG_PTR, 但有XFS_BTREE_CRC_BLOCKS, 使用XFS_BTREE_SBLOCK_CRC_LEN
@@ -175,15 +175,15 @@
    - 分支指针的大小, sizeof(__be64), 或者sizeof(__be32)
 
 ** xfs_btree_rec_offset(xfs_btree_cur, n)
-   - 计算叶子节点第n个记录的位置?? 
+   - 计算叶子结点第n个记录的位置?? 
    - xfs_btree_block_len(xfs_btree_cur) + (n-1) * xfs_btree_cur->bc_ops->rec_len
 
 ** xfs_btree_key_offset(xfs_btree_cur, n)
-   - 计算内部节点第n个key的位置 
+   - 计算内部结点第n个key的位置 
    > xfs_btree_block_len(xfs_btree_cur) + (n-1) * xfs_btree_cur->bc_ops->key_len
 
 ** xfs_btree_ptr_offset(xfs_btree_cur, n, level)
-   - 内部节点value的位置, 包括3部分偏移
+   - 内部结点value的位置, 包括3部分偏移
    - xfs_btree_block头的偏移
    > xfs_btree_block_len(xfs_btree_cur) 
    - key的偏移
@@ -200,7 +200,7 @@
    #+END_SRC
 
 ** xfs_btree_rec_addr(xfs_btree_cur, n, xfs_btree_block)
-   - 访问xfs_btree_block中的第n个节点 
+   - 访问xfs_btree_block中的第n个结点 
    > xfs_btree_rec_offset(xfs_btree_cur, n)
    - xfs_btree_block应该指向内存中一个xfs_buf的数据, 返回的xfs_btree_rec,数据类新是磁盘格式的
 
@@ -216,19 +216,19 @@
    - 和上面一样
 
 ** xfs_btree_ptr_addr(xfs_btree_cur, n, xfs_btree_block)
-   - 这里需要xfs_btree_block指向节点的level 
+   - 这里需要xfs_btree_block指向结点的level 
    > xfs_btree_get_level(xfs_btree_block)
    > xfs_btree_ptr_offset(xfs_btree_cur, n, level)
 
 ** xfs_btree_get_iroot(xfs_btree_cur)
-   - 获取btree的根节点, 还是xfs_btree_block指针, 数据类型的磁盘使用的
+   - 获取btree的根结点, 还是xfs_btree_block指针, 数据类型的磁盘使用的
    - 首先找到对应的xfs_ifork 
    > XFS_IFORK_PTR(xfs_btree_cur->bc_private->b->xfs_inode, xfs_btree_cur->bc_private->b->whichfork)
    - 然后返回xfs_ifork->if_broot
 
 ** xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
-   - 获取xfs_btree_cur中level对应的节点的xfs_buf和xfs_btree_block
-   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_ROOT_IN_INODE, 而且level == xfs_btree_cur->bc_nlevels-1, 表示跟节点在xfs_ifork中??
+   - 获取xfs_btree_cur中level对应的结点的xfs_buf和xfs_btree_block
+   - 如果xfs_btree_cur->bc_flags有XFS_BTREE_ROOT_IN_INODE, 而且level == xfs_btree_cur->bc_nlevels-1, 表示跟结点在xfs_ifork中??
    - 对于block/inode等待,就使用ag的专门的block 
    > xfs_btree_get_iroot(xfs_btree_cur)
    - 否则直接使用xfs_btree_cur->bc_bufs[level]
@@ -247,18 +247,18 @@
    > xfs_trans_get_buf(xfs_trans, xfs_mount->xfs_buftarg, d, xfs_mount->m_bsize, lock)
 
 ** xfs_btree_islastblock(xfs_btree_cur, level)
-   - 首先获取xfs_btree_cur对应level的节点 
+   - 首先获取xfs_btree_cur对应level的结点 
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
    - 检查它的有效性 
    > xfs_btree_check_block(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
-   - 检查他的rightsib, 是否为空, 表示他是level层的最后一个节点
+   - 检查他的rightsib, 是否为空, 表示他是level层的最后一个结点
    - 如果使用64为磁盘指针,比较NULLDFSBNO, 32位使用NULLAGBLOCK (-1)
 
 ** xfs_btree_firstrec(xfs_btree_cur, level)
    - 获取level对应的xfs_btree_block 
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
    > xfs_btree_check_block(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
-   - 如果他没有子节点?? xfs_btree_block->bb_numrecs ==0, 返回0
+   - 如果他没有子结点?? xfs_btree_block->bb_numrecs ==0, 返回0
    - 否则设置xfs_btree_cur->bc_ptrs[level] ==1
    - 这里xfs_btree_ptr->bc_bufs[level]已经取出来, 只是修改bc_ptrs[level], 它决定下一层分支
 
@@ -271,11 +271,11 @@
    - 只需要检查开头和结尾 
 
 ** xfs_btree_read_bufl(xfs_mount, xfs_trans, xfs_fsblock_t fsbno, lock, xfs_buf, refval, xfs_buf_ops)
-   - 读取btree节点,磁盘地址是xfs_fsblock_t, 先转化为绝对地址  
+   - 读取btree结点,磁盘地址是xfs_fsblock_t, 先转化为绝对地址  
    > XFS_FSB_TO_DADDR(xfs_mount, xfs_fsblock_t)
    - 读取xfs_buf 
    > xfs_trans_read_buf(xfs_mount, xfs_trans, xfs_mount->xfs_buftarg, d, xfs_mount->m_bsize, lock, xfs_buf, xfs_buf_ops)
-   - 这里节点大小是xfs_mount->m_bsize
+   - 这里结点大小是xfs_mount->m_bsize
 
 ** xfs_btree_read_bufl(xfs_mount, xfs_fsblock_t fsbno, xfs_extlen_tcount, xfs_buf_ops)
    - 预读磁盘数据,转化磁盘地址 
@@ -288,11 +288,11 @@
    > xfs_buf_readahead(xfs_mount->xfs_buftarg,d, xfs_mount->m_bsize * count, xfs_buf_ops)
 
 ** xfs_btree_readahead_lblock(xfs_btree_cur, lr,xfs_btree_block)
-   - 读取xfs_btree_block的兄弟节点 
+   - 读取xfs_btree_block的兄弟结点 
    - 从xfs_btree_block->bb_u->l->bb_leftsib/bb_rightsib获取指针
-   - 如果lr有XFS_BTCUR_LEFTRA, 读取左边的节点
+   - 如果lr有XFS_BTCUR_LEFTRA, 读取左边的结点
    > xfs_btree_reada_bufl(xfs_btree_cur->xfs_mount, left, 1, xfs_btree_cur->bc_ops->buf_ops)
-   - lr的XFS_BTCUR_RIGHTRA对应右边节点 
+   - lr的XFS_BTCUR_RIGHTRA对应右边结点 
 
 ** xfs_btree_readahead_sblock(xfs_btree_cur, lr, xfs_btree_block)
    - 上面的xfs_btree_block使用指针是fsb,这里是agbno
@@ -300,7 +300,7 @@
    > xfs_btree_reada_bufs(xfs_btree_cur->xfs_mount, xfs_btree_cur->bc_private->a->agno, left, 1, xfs_btree_cur->xfs_btree_ops->xfs_buf_ops)
 
 ** xfs_btree_readahead(xfs_btree_cur, level, lr)
-   - 如果level指向根节点,而且根节点在xfs_ifork中, 直接返回
+   - 如果level指向根结点,而且根结点在xfs_ifork中, 直接返回
    - xfs_btree_cur->bc_flags有XFS_BTREE_ROOT_IN_INODE, level == xfs_btree_cur->bc_nlevels - 1
    - 如果xfs_btree_cur->bc_ra[level]中已经有lr的标志,直接返回, 表示readahead已经完成
    - 否则设置xfs_btree_cur->bc_ra[level] 
@@ -314,7 +314,7 @@
    - 把xfs_buf给xfs_btree_cur->bc_bufs[level], 释放原来的
    > xfs_trans_brelse(xfs_btree_cur->xfs_trans, xfs_btree_cur->bc_bufs[level])
    - 重新计算xfs_btree_cur->bc_ra[level]
-   - 如果xfs_buf中的xfs_btree_block的兄弟节点指针是NULLDFSBNO, 设置相关的XFS_BTCUR_RIGHTRA, XFS_BTCUR_LEFTRA, 以后不需要readahead 
+   - 如果xfs_buf中的xfs_btree_block的兄弟结点指针是NULLDFSBNO, 设置相关的XFS_BTCUR_RIGHTRA, XFS_BTCUR_LEFTRA, 以后不需要readahead 
 
 ** xfs_btree_ptr_is_null(xfs_btree_cur cur, xfs_btree_ptr ptr)
    - xfs_btree_ptr是分支指针
@@ -324,19 +324,19 @@
    - 设置为空指针, xfs_btree_ptr使用大端的数据类型, 需要转化
 
 ** xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, lr)
-   - 获取xfs_btree_block的兄弟节点, lr决定right/left
+   - 获取xfs_btree_block的兄弟结点, lr决定right/left
    - 如果xfs_btree_cur->bc_flags有XFS_BTREE_LONG_PTR, 使用fsb 
    - 如果lr有XFS_BB_RIGHTSIB,设置xfs_btree_ptr为xfs_btree_block->bb_u->l->bb_rightsib
    - 否则使用bb_leftsib
 
 ** xfs_btree_set_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, lr)
-   - 设置兄弟节点指针
+   - 设置兄弟结点指针
 
 ** xfs_btree_init_block_init(xfs_mount, xfs_btree_block, xfs_daddr_t, magic, level, numrec, owner, flags)
    - 初始化xfs_btree_block, 它的数据类型是大端的
    - 先设置magic, level, numrecs
    - 下面根据XFS_BTREE_LONG_PTR而定
-   - 兄弟节点设为NULL, 
+   - 兄弟结点设为NULL, 
    - 如果flags有XFS_BTREE_CRC_BLOCK, 设置bno, uuid, owner
 
 ** xfs_btree_init_block(xfs_mount, xfs_buf, magic, level, numrecs, owner, flags)
@@ -350,8 +350,8 @@
    > xfs_btree_init_block_init(xfs_btree_cur->xfs_mount, XFS_BUF_TO_BLOCK(xfs_buf), xfs_buf->b_bn, xfs_btree_magic(xfs_btree_cur), level, numrecs, owner, xfs_btree_cur->bc_flags)
 
 ** xfs_btree_is_lastrec(xfs_btree_cur, xfs_btree_block, level)
-   - 检查xfs_btree_block是否为btree的最后一个叶子节点??
-   - 如果level >0, 返回0. 最后一个节点应该是叶子节点
+   - 检查xfs_btree_block是否为btree的最后一个叶子结点??
+   - 如果level >0, 返回0. 最后一个结点应该是叶子结点
    - 如果xfs_btree_cur->bc_flags也没有XFS_BTREE_LASTREC_UPDATE?? 返回0?
    - 获取xfs_btree_block的右兄弟 
    > xfs_btree_et_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_RIGHTSIB)
@@ -414,12 +414,12 @@
    - 如果xfs_buf不是NULL, 记录(first, last)范围内的xfs_btree_key 
    > xfs_trans_buf_set_type(xfs_btree_cur->xfs_trans, xfs_buf, XFS_BLFT_BTREE_BUF)
    > xfs_trans_log_buf(xfs_btree_cur->xfs_trans, xfs_buf, xfs_btree_key_offset(xfs_btree_cur, first), xfs_btree_key_offset(xfs_btree_cur, last+1) -1 )
-   - 如果xfs_buf, 要log根节点,而且在xfs_ifork中
-   - log把整个根节点
+   - 如果xfs_buf, 要log根结点,而且在xfs_ifork中
+   - log把整个根结点
    > xfs_trans_log_inode(xfs_btree_cur->xfs_trans, xfs_btree_cur->bc_private->b->xfs_inode, xfs_ilog_fbroot(whichfork))
 
 ** xfs_btree_log_recs(xfs_btree_cur, xfs_buf, first, last)
-   - xfs_buf是叶子节点,不可能是根节点 
+   - xfs_buf是叶子结点,不可能是根结点 
    - 只是log (first, last)范围内的xfs_btree_rec数组 
 
 ** xfs_btree_log_ptrs(xfs_btree_cur, xfs_buf, first, last)
@@ -437,30 +437,30 @@
    > xfs_trans_log_inode(xfs_btree_cur->xfs_trans, xfs_btree_cur->bc_private->b->xfs_inode, xfs_ilog_fbroot(whichfork))
 
 ** xfs_btree_increment(xfs_btree_cur, level, state)
-   - 修改level层的指针, 指向下一个节点 
-   - 预读level节点的右边兄弟节点, 可能会用到, 但不一定
+   - 修改level层的指针, 指向下一个结点 
+   - 预读level结点的右边兄弟结点, 可能会用到, 但不一定
    > xfs_btree_readahead(xfs_btree_cur, level, XFS_BTCUR_RIGHTRA)
    - 获取level对应的xfs_btree_block 
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
    > xfs_btree_check_block(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
    - 如果当前分支指针不是指向最后一个, 直接修改xfs_btree_cur->bc_ptrs[level], 然后可以结束
    - xfs_btree_get_numrecs(xfs_btree_block)
-   - 如果当前是最后一个分支,需要使用对应的兄弟节点
-   - 获取兄弟节点的磁盘位置
+   - 如果当前是最后一个分支,需要使用对应的兄弟结点
+   - 获取兄弟结点的磁盘位置
    > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, ptr, XFS_BB_RIGHTSIB)
    - 如果指针为空,直接退出
    > xfs_btree_ptr_is_null(xfs_btree_cur, xfs_btree_ptr)
-   - 这里不用回朔就能判断level层是否有下一个节点
+   - 这里不用回朔就能判断level层是否有下一个结点
    - 但要修改xfs_btree_cur->bc_ptrs/bc_bufs, 还是得回朔
-   - 向根结点方向回朔,找到不是最有一个分支的节点 
+   - 向根结点方向回朔,找到不是最有一个分支的结点 
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
    - 移动指针xfs_btree_cur->bc_ptrs[level], 指向下一个分支
    - 如果超过xfs_btree_block的分支数, 继续回朔
    > xfs_btree_get_numrecs(xfs_btree_block)
-   - 如果需要继续,预读右边的兄弟节点 
+   - 如果需要继续,预读右边的兄弟结点 
    > xfs_btree_readahead(xfs_btree_cur, level, XFS_BTCUR_RIGHTRA)
    - 然后向level遍历,获取对应的xfs_buf指针,同时修改分支指针为1
-   - 获取子节点磁盘位置
+   - 获取子结点磁盘位置
    > xfs_btree_ptr_add(xfs_btree_cur, xfs_btree_cur->bc_ptrs[level], xfs_btree_block)
    - 读取对应的xfs_buf
    > xfs_btree_read_buf_block(xfs_btree_cur, xfs_btree_ptr, level, 0, xfs_btree_block, xfs_buf)
@@ -469,29 +469,29 @@
    - 设置xfs_btree_cur->bc_ptrs[level] ==1
 
 ** xfs_btree_decrement(xfs_btree_cur, level, stata)
-   - 首先读取对应的左兄弟节点 
+   - 首先读取对应的左兄弟结点 
    > xfs_btree_readahead(xfs_btree_cur, leve, XFS_BTCUR_LEFTRA)
    - 首先修改分支指针 xfs_btree_cur->bc_ptrs[level] --
-   - 如果修改后>0, 说明不用切换节点,直接退出
-   - 否则需要切换多个节点, 检查是否有左边的兄弟节点 
+   - 如果修改后>0, 说明不用切换结点,直接退出
+   - 否则需要切换多个结点, 检查是否有左边的兄弟结点 
    > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_LEFTSIB)
    > xfs_btree_ptr_is_null(xfs_btree_cur, xfs_btree_ptr)
-   - 否则向上回朔, 找到有左边分支的父节点 
+   - 否则向上回朔, 找到有左边分支的父结点 
    - 只要减小 --xfs_btree_cur->bc_ptrs[level]
    - 而且减小后>0, 也就是有效的, 可以回朔
    > xfs_btree_readahead(xfs_btree_cur, level, XFS_BTCUR_LEFTRA)
    - 然后向level遍历, 更新xfs_btree_cur->bc_ptrs/bc_bufs
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
-   - 获取对应的子节点地址, 读取对应的xfs_buf
+   - 获取对应的子结点地址, 读取对应的xfs_buf
    > xfs_btree_ptr_addr(xfs_btree_cur, xfs_btree_cur->bc_ptrs[level], xfs_btree_block)
    > xfs_btree_read_buf_block(xfs_btree_cur, xfs_btree_ptr, level, 0, xfs_btree_block, xfs_buf)
    - 设置xfs_btree_cur->bc_bufs
    > xfs_btree_setbuf(xfs_btree_cur, level, xfs_buf)
-   - 设置子分支的索引,指向最后一个节点 
+   - 设置子分支的索引,指向最后一个结点 
    > xfs_btree_get_numrecs(xfs_btree_block)
 
 ** xfs_btree_lookup_get_block(xfs_btree_cur, level, xfs_btree_ptr, xfs_btree_block blkp)
-   - 获取xfs_btree_cur中level对应的节点?? 
+   - 获取xfs_btree_cur中level对应的结点?? 
    - 如果level是最高层,而且btree在xfs_ifork中 
    - xfs_btree_cur->bc_flags有XFS_BTREE_ROOT_IN_INODE
    - level == xfs_btree_cur->bc_nlevels -1 
@@ -509,7 +509,7 @@
 
 ** xfs_lookup_get_search_key(xfs_btree_cur, level, keyno, xfs_btree_block, xfs_btree_key)
    - 计算当前查找的xfs_btree_key? 也就是keyno对应的分支的key?
-   - 对于叶子节点,根据第keyno对应的xfs_btree_rec构造一个?? 
+   - 对于叶子结点,根据第keyno对应的xfs_btree_rec构造一个?? 
    > xfs_btree_cur->xfs_btree_ops->init_key_from_rec(xfs_btree_key, xfs_btree_rec_addr(xfs_btree_cur, keyno, xfs_btree_block))
    - 否则返回xfs_btree_block中keyno对应的xfs_btree_key 
    > xfs_btree_key_addr(xfs_btree_cur, keyno, xfs_btree_block)
@@ -523,77 +523,77 @@
    - 查找的是什么, xfs_btree_cur->bc_rec?
    - 初始化xfs_btree_ptr? 
    > xfs_btree_cur->xfs_btree_ops->init_ptr_from_cur(xfs_btree_cur, xfs_btree_ptr)
-   - 开始向叶子节点遍历
-   - 对于一个节点,使用2分查找 
-   - 先获取节点的分支数 
+   - 开始向叶子结点遍历
+   - 对于一个结点,使用2分查找 
+   - 先获取结点的分支数 
    > xfs_btree_get_numrecs(xfs_btree_block) 
-   - 如果节点分支数为0, 它必须是叶子节点,没有任何记录
+   - 如果结点分支数为0, 它必须是叶子结点,没有任何记录
    - 查找对应的xfs_btree_key 
    > xfs_lookup_get_search_key(xfs_btree_key, level, keyno, xfs_btree_block, key)
    - 然后比较什么?? 
    > xfs_btree_cur->xfs_btree_ops->key_diff(xfs_btree_cur, xfs_btree_key)
-   - 查找介绍后根据level设置子节点指针 
+   - 查找介绍后根据level设置子结点指针 
    > xfs_btree_ptr_addr(xfs_btree_cur, keyno, xfs_btree_block)
    > xfs_btree_check_ptr(xfs_btree_cur, xfs_btree_ptr, 0, level)
    - 设置xfs_btree_cur->bc_ptrs[level] = keyno
    - 如果参数dir不是XFS_LOOKUP_LE?? 而且diff < 0,需要向前移动指针 
    - 直接增加keyno, 也就是分支指针, 如果查找XFS_LOOKUP_EQ, 反正找不到,所以keyno没有意义也可以接受
    > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_RIGHTSIB)
-   - 如果dir是XFS_LOOKUP_GE, 既然找不到,也需要指向有意义的节点 
-   - 如果keyno超过分指数,需要指向下一个节点
+   - 如果dir是XFS_LOOKUP_GE, 既然找不到,也需要指向有意义的结点 
+   - 如果keyno超过分指数,需要指向下一个结点
    > xfs_btree_increment(xfs_btree_cur, 0, i)
    - 最后根据keyno设置查找结果
 
 ** xfs_btree_updkey(xfs_btree_cur, xfs_btree_key, leven)
-   - 更新xfs_btree_key路径上的节点的xfs_btree_key? 
+   - 更新xfs_btree_key路径上的结点的xfs_btree_key? 
    - 设置为参数xfs_btree_key
    - 从level=1向上, 直到xfs_btree_cur->bc_nlevels 
-   - 但是只有子分支是第一个子节点时,才继续回朔
-   - 找到level对应的xfs_buf, 也就是父节点
+   - 但是只有子分支是第一个子结点时,才继续回朔
+   - 找到level对应的xfs_buf, 也就是父结点
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
-   - 节点中针对下层的分支指针是xfs_btree_cur->bc_ptrs[level] 
+   - 结点中针对下层的分支指针是xfs_btree_cur->bc_ptrs[level] 
    - 就直接修改这个子分支的xfs_btree_key 
    > xfs_btree_key_addr(xfs_btree_cur, xfs_btree_ptr, xfs_btree_block)
    - 从参数复制数据
    > xfs_btree_copy_keys(xfs_btree_cur, xfs_btree_key, xfs_btree_key, 1)
    > xfs_btree_log_keys(xfs_btree_cur, xfs_buf, xfs_btree_ptr, xfs_btree_ptr)
-   - 这里更新节点的xfs_btree_key, 只能在父节点里更新
+   - 这里更新结点的xfs_btree_key, 只能在父结点里更新
 
 ** xfs_btree_update(xfs_btree_cur, xfs_btree_cur)
    - 更新xfs_btree_cur查找的结果
-   - 获取叶子节点  
+   - 获取叶子结点  
    > xfs_btree_get_block(xfs_btree_cur, 0, xfs_buf)
    - 根据xfs_btree_cur->bc_ptrs[0], 找到对应的xfs_btree_rec 
    > xfs_btree_rec_addr(xfs_btree_cur, ptr, xfs_btree_block)
    - 复制参数 
    > xfs_btree_copy_recs(xfs_btree_cur, xfs_btree_rec, xfs_btree_cur, 1)
    > xfs_btree_log_recs(xfs_btree_cur, xfs_buf, ptr, ptr)
-   - 如果这个节点是最后一个, 需要更新什么?? 
+   - 如果这个结点是最后一个, 需要更新什么?? 
    > xfs_btree_cur->xfs_btree_ops->update_lastrec(xfs_btree_cur, xfs_btree_block, xfs_btree_rec, ptr, LASTREC_UPDATE)
-   - 如果上面分支指针是1, 这个叶子节点的key需要更新 
+   - 如果上面分支指针是1, 这个叶子结点的key需要更新 
    - 首先构造一个xfs_btree_key
    > xfs_btree_cur->xfs_btree_ops->init_key_from_rec(xfs_btree_key, xfs_btree_rec)
-   - 更新到父节点中
+   - 更新到父结点中
    > xfs_btree_updkey(xfs_btree_cur, xfs_btree_key, 1)
 
 ** xfs_btree_lshift(xfs_btree_cur, level, state)
    - 如果更新根结点,而且根结点在xfs_ifork中,不允许修改??
-   - 找到level层的节点 xfs_buf/xfs_btree_block
+   - 找到level层的结点 xfs_buf/xfs_btree_block
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
-   - 获取左边的叶子节点 
+   - 获取左边的叶子结点 
    > xfs_btree_get_sibling(xfs_btree, xfs_btree_block, xfs_btree_ptr, XFS_BB_LEFTSIB)
    - 如果不存在,直接返回 
    > xfs_btree_ptr_is_null(xfs_btree_cur, xfs_btree_ptr)
    - 移动的子分支是第一个分支, 如果当前路径在使用这个分支,不再移动
    - 因为太复杂???
    - xfs_btree_cur->bc_ptrs[level] <= 1
-   - 获取左边的叶子节点xfs_buf, xfs_btree_block 
+   - 获取左边的叶子结点xfs_buf, xfs_btree_block 
    > xfs_btree_read_buf_block(xfs_btree_cur, xfs_btree_ptr, level, 0, xfs_btree_block, xfs_buf)
-   - 检查左边的节点是否满了?? 
+   - 检查左边的结点是否满了?? 
    > xfs_btree_cur->xfs_btree_ops->get_maxrecs(xfs_btree_cur, level)
    > xfs_btree_get_numrecs(xfs_btree_block)
-   - 要从当前的节点,向左边的兄弟节点中移动一个子分支
-   - 如果不是叶子节点, level > 0
+   - 要从当前的结点,向左边的兄弟结点中移动一个子分支
+   - 如果不是叶子结点, level > 0
    - 先找到xfs_btree_key/xfs_btree_ptr的位置
    > xfs_btree_key_addr(xfs_btree_cur, lrecs, left)
    > xfs_btree_key_addr(xfs_btree_cur, 1, right)
@@ -602,35 +602,35 @@
    - 复制xfs_btree_key/xfs_btree_ptr 
    > xfs_btree_copy_keys(xfs_btree_cur, xfs_btree_key, xfs_btree_key, 1)
    > xfs_btree_copy_ptrs(xfs_btree_cur, xfs_btree_ptrs, xfs_btree_ptrs, 1) 
-   - 然后log左边的节点??
+   - 然后log左边的结点??
    > xfs_btree_log_keys(xfs_btree_cur, left, lrecs, lrecs)
    > xfs_btree_log_ptrs(xfs_btree_cur, left, lrecs, lrecs)
-   - 如果是叶子节点, level ==0
+   - 如果是叶子结点, level ==0
    - 找到xfs_btree_rec位置 
    > xfs_btree_rec_addr(xfs_btree_cur, lrecs, left)
    > xfs_btree_rec_addr(xfs_btree_cur, 1, right)
    > xfs_btree_copy_recs(xfs_btree_cur, l, r, 1)
-   - 然后log左边的节点
+   - 然后log左边的结点
    > xfs_btree_log_recs(xfs_btree_cur, xfs_buf, lrecs, lrecs)
    - 最后设置2个xfs_btree_block->numrecs
    > xfs_btree_set_numrecs(left, lrecs)
    > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_NUMRECS)
-   - 然后是右边节点 
+   - 然后是右边结点 
    > xfs_btree_set_numrecs(right, rrecs)
    > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_NUMRECS)
-   - 然后删除右边节点的第一个分支
-   - 如果不是叶子节点, level >0 
+   - 然后删除右边结点的第一个分支
+   - 如果不是叶子结点, level >0 
    - 从第2个key/ptr开始移动,向左移动
    > xfs_btree_shift_keys(xfs_btree_cur, xfs_btree_key_addr(xfs_btree_cur, 2, right), -1, rrecs)
    > xfs_btree_shift_ptrs(xfs_btree_cur, xfs_btree_ptr_addr(xfs_btree_cur, 2, right), -1, rrecs)
-   - 然后log右边的节点, 把整个key/ptr都log下来
-   - 为何不和上面一块, 把整个节点都log下来??
+   - 然后log右边的结点, 把整个key/ptr都log下来
+   - 为何不和上面一块, 把整个结点都log下来??
    > xfs_btree_log_keys(xfs_btree_cur, xfs_buf, 1, rrecs)
    > xfs_btree_log_ptrs(xfs_btree_cur, xfs_buf, 1, rrecs)
-   - 如果是叶子节点, level=0
+   - 如果是叶子结点, level=0
    > xfs_btree_shift_recs(xfs_btree_cur, xfs_btree_rec_addr(xfs_btree_cur, 2, right), -1, rrecs)
    > xfs_btree_log_recs(xfs_btree_cur, xfs_buf, 1, rrecs)
-   - 然后更新right节点的父节点的xfs_btree_key 
+   - 然后更新right结点的父结点的xfs_btree_key 
    > xfs_btree_cur->xfs_btree_ops->init_key_from_rec(xfs_btree_key, xfs_btree_rec_addr(xfs_btree_cur, 1, right))
    > xfs_btree_updkey(xfs_btree_cur, xfs_btree_key, level+1)
    - 同样修改路径的指针, 只需要修改当前移动的level的子分支 
@@ -639,14 +639,14 @@
 ** xfs_btree_rshift(xfs_btree_cur, level, state)
    - 首先判断根结点, 如果在xfs_ifork中不做修改?? 
    - 但是对于其他的btree就能修改?? 也只有一个根结点??
-   - 获取2个节点, xfs_buf/xfs_btree_block 
+   - 获取2个结点, xfs_buf/xfs_btree_block 
    - left就是xfs_btree_cur中level指向的
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
    - 然后获取右边兄弟指针
    > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_RIGHTSIB)
    - 如果不存在,直接返回 
    > xfs_btree_ptr_is_null(xfs_btree_cur, xfs_btree_ptr)
-   - 检查需要移动的子节点,也就是最后一个子分支,是否在路径中正常使用  xfs_btree_block->bc_ptrs[level]
+   - 检查需要移动的子结点,也就是最后一个子分支,是否在路径中正常使用  xfs_btree_block->bc_ptrs[level]
    > xfs_btree_get_numrecs(xfs_btree_block)
    - 如果是，不再移动,太复杂!!
    - 否则获取对应的xfs_buf/xfs_btree_block 
@@ -654,30 +654,30 @@
    > xfs_btree_read_buf_block(xfs_btree_cur, xfs_btree_ptr, level, 0, xfs_buf, xfs_btree_block)
    - 检查right是否满了 
    > xfs_btree_cur->xfs_btree_ops->get_maxrecs(xfs_btree_cur, level)
-   - 如果不是叶子节点, level >0
+   - 如果不是叶子结点, level >0
    - 移动对应的xfs_btree_key/xfs_btree_ptr
    - 找到对应的位置 
    > xfs_btree_key_addr(..)
    > xfs_btree_ptr_addr(..)
-   - 需要先从right节点中空出来位置 
+   - 需要先从right结点中空出来位置 
    > xfs_btree_shift_keys(xfs_btree_cur, xfs_buf, 1, rrecs)
    > xfs_btree_shift_ptrs(xfs_btree_cur, xfs_buf, 1, rrecs)
    > xfs_btree_copy_keys(..)
    > xfs_btree_copy_ptrs(..)
-   - 然后log右边的节点
+   - 然后log右边的结点
    > xfs_btree_log_keys(..)
    > xfs_btree_log_ptrs(..)
-   - 如果是叶子节点, level==0 
+   - 如果是叶子结点, level==0 
    - 找到对应的位置 
    > xfs_btree_rec_addr(..)
-   - right节点准备 
+   - right结点准备 
    > xfs_btree_shift_recs(..)
    > xfs_btree_copy_recs(..)
    > xfs_btree_log_recs(..)
-   - 最有左边节点,只需要修改xfs_btree_block->numrecs 
+   - 最有左边结点,只需要修改xfs_btree_block->numrecs 
    > xfs_btree_set_numrecs(left, --lrecs)
    > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_NUMRECS)
-   - 使用临时的xfs_btree_cur? 修改右边节点的父节点的xfs_btree_key?
+   - 使用临时的xfs_btree_cur? 修改右边结点的父结点的xfs_btree_key?
    > xfs_btree_dup_cursor(xfs_btree_cur, xfs_btree_cur)
    - 原来的xfs_btree_cur指针不需要任何移动
    - 如果这里移动了,需要完全复原,还得需要一个临时变量保存
@@ -687,13 +687,13 @@
    > xfs_btree_updkey(xfs_btree_cur, xfs_btree_key, level+1)
    
 ** xfs_btree_split(xfs_btree_cur, level, xfs_btree_ptr ptr, xfs_btree_key key, xfs_btree_cur, state)
-   - 把xfs_btree_cur中level对应的节点分裂开??  
+   - 把xfs_btree_cur中level对应的结点分裂开??  
    - 获取xfs_buf/xfs_btree_block 
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
    > xfs_btree_check_block(xfs_btree_cur, xfs_btree_block, level, xfs_buf)
-   - 获取节点磁盘位置,为何还是用xfs_btree_ptr
+   - 获取结点磁盘位置,为何还是用xfs_btree_ptr
    > xfs_btree_buf_to_ptr(xfs_btree_cur, xfs_buf, xfs_btre_ptr)
-   - 分配新的节点,使用上面的地址做提示信息?? 
+   - 分配新的结点,使用上面的地址做提示信息?? 
    > xfs_btree_cur->xfs_btree_ops->alloc_block(xfs_btree_cur, xfs_btree_ptr, xfs_btree_ptr rptr, 1, stat)
    - 获取对应的xfs_btree_block 
    > xfs_btree_get_buf_block(xfs_btree_cur, xfs_btree_ptr, 0, xfs_btree_block, xfs_buf)
@@ -707,29 +707,29 @@
    > xfs_btree_ptr_addr(..)
    > xfs_btree_copy_keys(..)
    > xfs_btree_copy_ptrs(..)
-   - log右边的节点 
+   - log右边的结点 
    > xfs_btree_log_keys(..)
    > xfs_btree_log_ptrs(..)
-   - 这里还有记录第一个xfs_btree_key, 作为新节点的xfs_btree_key
+   - 这里还有记录第一个xfs_btree_key, 作为新结点的xfs_btree_key
    - 如果level ==0, 复制xfs_btree_rec数组 
    > xfs_btree_rec_addr(xfs_btree_cur, src_idx, xfs_btree_block)
    > xfs_btree_rec_addr(xfs_btree_cur, 1, xfs_btree_block)
    > xfs_btree_copy_recs(xfs_btree_cur, ..)
    > xfs_btree_log_recs(xfs_btree_cur, ..)
-   - 使用回调函数构造新节点的xfs_btree_key 
+   - 使用回调函数构造新结点的xfs_btree_key 
    > xfs_btree_cur->xfs_btree_ops->init_key_from_rec(xfs_btree_key, xfs_btree_cur_addr(xfs_btree_rec, 1, xfs_btree_block))
-   - 设置兄弟节点
+   - 设置兄弟结点
    > xfs_btree_get_sibling(xfs_btee_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_RIGHTSIB)
-   - 设置原来节点的右兄弟节点为新的
+   - 设置原来结点的右兄弟结点为新的
    > xfs_btree_set_sibling(xfs_btree_cur, ...)
-   - 设置新的节点的兄弟节点
-   - 设置2个节点的numrecs, 并且log 
+   - 设置新的结点的兄弟结点
+   - 设置2个结点的numrecs, 并且log 
    > xfs_btree_set_numrecs(xfs_btree_block, lrecs)
-   - 对于新的节点,整个xfs_btree_block都log
+   - 对于新的结点,整个xfs_btree_block都log
    > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_ALL_BITS)
-   - 对于原来的节点,只有右兄弟节点和numrecs 
+   - 对于原来的结点,只有右兄弟结点和numrecs 
    > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_NUMRECS | XFS_BB_RIGHTSIB)
-   - 还有节点原来的右兄弟节点,需要设置它的做兄弟节点,指向新的节点 
+   - 还有结点原来的右兄弟结点,需要设置它的做兄弟结点,指向新的结点 
    > xfs_btree_read_buf_block(xfs_btree_cur, xfs_btree_ptr, level, 0, xfs_btree_block, xfs_buf)
    > xfs_btree_set_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_LEFTSIB)
    > xfs_btree_log_block(xfs_btree_cur, xfs_btree_ptr, XFS_BB_LEFTSIB)
@@ -741,13 +741,13 @@
 ** xfs_btree_new_iroot(xfs_btree_cur, logflags, stat)
    - btree的根结点必须在xfs_ifork中? 
    - xfs_btree_cur->bc_flags有XFS_BTREE_ROOT_IN_INODE
-   - 添加一个新节点代替原有的根结点, 分支全部复制到新的节点 
-   - 新节点作为原来根结点的分支, 相当于btree高度增加一层
+   - 添加一个新结点代替原有的根结点, 分支全部复制到新的结点 
+   - 新结点作为原来根结点的分支, 相当于btree高度增加一层
    - 获取现在xfs_btree_cur指向的根结点 
    > xfs_btree_get_iroot(xfs_btree_cur)
    - 获取第一个分支指针?? 
    > xfs_btree_ptr_addr(xfs_btree_cur, 1, xfs_btree_block)
-   - 创建新的节点 
+   - 创建新的结点 
    > xfs_btree_cur->xfs_btree_ops->alloc_block(xfs_btree_cur, xfs_btree_ptr, new_ptr, 1, stat)
    - 这里是get, 不是read??
    > xfs_btree_get_buf_block(xfs_btree_cur, new_ptr, 0, xfs_btree_block, xfs_buf)
@@ -756,12 +756,12 @@
    - 设置xfs_btree_block->bb_level = 1, numrecs 
    - 增加xfs_btree_cur->bc_nlevels ?? 
    - 复制xfs_btree_key/xfs_btree_ptr 
-   - 把原来根结点的数据给新节点
-   - 然后把新节点的xfs_btree_ptr给原来根结点, 不是修改xfs_btree_key,和原来一样
+   - 把原来根结点的数据给新结点
+   - 然后把新结点的xfs_btree_ptr给原来根结点, 不是修改xfs_btree_key,和原来一样
    - 重新设置xfs_ifork中的根结点的长度
    > xfs_iroot_realloc(xfs_btree_cur->bc_private->b->xfs_inode, 1-xfs_btree_get_numrecs(xfs_btree_cur), xfs_btree_cur->bc_private->b->whichfork)
-   - 新创建的节点怎么添加到新的根节点中??
-   - 最后log新的节点
+   - 新创建的结点怎么添加到新的根结点中??
+   - 最后log新的结点
    - XFS_BB_ALL_BITS, xfs_btree_key, xfs_btree_ptr数组
      
 ** xfs_btree_new_root(xfs_btree_cur, stat)
@@ -772,12 +772,12 @@
    > xfs_btree_cur->xfs_btree_ops->alloc_block(xfs_btree_cur, xfs_btree_ptr rptr, xfs_btree_ptr lptr, 1, stat)
    - 获取分配的xfs_buf/xfs_btree_block 
    > xfs_btree_get_buf_block(xfs_btree_cur, xfs_btree_ptr, 0, xfs_btree_block, xfs_buf)
-   - 把这个新的xfs_btree_block设为根节点?? 
+   - 把这个新的xfs_btree_block设为根结点?? 
    > xfs_btree_cur->xfs_btree_ops->set_root(xfs_btree_cur, xfs_btree_ptr, 1)
    - 读取xfs_btree_cur中bc_nlevels-1对应的xfs_btree_block?
    - 这一层刚执行过分裂?? 或者根结点刚才分裂过??
    > xfs_btree_get_block(xfs_btree_cur, xfs_btree_cur->bc_nlevels -1 , xfs_buf)
-   - 同时获取它的兄弟节点, 可能是左兄弟,可能是右兄弟
+   - 同时获取它的兄弟结点, 可能是左兄弟,可能是右兄弟
    > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_RIGHTSIB)
    - 如果右兄弟存在, 也就是上面的xfs_btree_ptr, rptr
    > xfs_btree_ptr_is_null(xfs_btree_cur, xfs_btree_ptr)
@@ -796,41 +796,41 @@
    > xfs_btree_init_block_cur(xfs_btree_cur, xfs_buf, xfs_btree_cur->bc_nlevels, 2)
    - log这些?? 
    > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_ALL_BITS)
-   - 如果子节点(left/right)的level >0, 他们是内部节点,可以直接使用第一个xfs_btree_key  
-   - left复制到根节点的第一个xfs_btree_key, right复制到第二个
+   - 如果子结点(left/right)的level >0, 他们是内部结点,可以直接使用第一个xfs_btree_key  
+   - left复制到根结点的第一个xfs_btree_key, right复制到第二个
    > xfs_btree_copy_keys(xfs_btree_cur, xfs_btree_key_addr(xfs_btree_cur, 1, new), xfs_btree_key_addr(xfs_btree_cur, 1, right))
-   - 否则需要使用回调函数,计算叶子节点的xfs_btree_key
+   - 否则需要使用回调函数,计算叶子结点的xfs_btree_key
    > xfs_btree_cur->xfs_btree_ops->init_key_from_rec(xfs_btree_key_addr(xfs_btree_cur, 2, 1, xfs_buf), xfs_btree_cur_addr(xfs_btree_cur, 1, xfs_buf))
    - 然后log2个xfs_btree_key 
    > xfs_btree_log_keys(xfs_btree_cur, xfs_buf, 1, 2)
    - 然后填充xfs_btree_ptr, lptr, rptr 
    > xfs_btree_copy_ptrs(xfs_btree_cur, xfs_btree_ptr_addr(xfs_btree_cur, 1, xfs_buf), lptr, 1)
    > xfs_btree_log_ptrs(xfs_btree_cur, xfs_buf, 1, 2)
-   - 把新的节点给xfs_buf->bc_bufs 
+   - 把新的结点给xfs_buf->bc_bufs 
    > xfs_btree_setbuf(xfs_btree_cur, xfs_btree_cur->bc_nlevels, xfs_buf)
-   - 对于xfs_btree_cur->bc_ptrs, 根据上面兄弟节点的选择
-   - 如果开始从xfs_btree_cur中取出来的节点是右兄弟,设置为2,否则设置1
+   - 对于xfs_btree_cur->bc_ptrs, 根据上面兄弟结点的选择
+   - 如果开始从xfs_btree_cur中取出来的结点是右兄弟,设置为2,否则设置1
   
 ** xfs_btree_make_block_unfull(xfs_btree_cur, level, numrecs, oindex, index, xfs_btree_ptr, xfs_btree_cur, xfs_btree_rec, stat)
-   - 分裂节点?? 
+   - 分裂结点?? 
    - 如果level指向根结点,而且根结点在xfs_ifork中, 直接在xfs_dinode修改
    > xfs_btree_cur->bc_flags有XFS_BTREE_ROOT_IN_INODE, level == xfs_btree_cur->bc_nlevels -1 
    - 检查根结点是否能扩大, 计算最大值
    > xfs_btree_cur->xfs_btree_ops->get_dmaxrecs(xfs_btree_cur, level)
    - 直接修改xfs_dinode中的大小 
    > xfs_iroot_realloc(xfs_inode, 1, xfs_btree_cur->bc_private->b->whichfork)
-   - 否则创建新的节点 
+   - 否则创建新的结点 
    > xfs_btree_new_iroot(xfs_btree_cur, logflags, stat)
    - 然后log对xfs_dinode的修改
    > xfs_trans_log_inode(xfs_trans, xfs_inode, logflags)
    - 如果不是xfs_ifork中的根结点
-   - 首先向兄弟节点中移动??
+   - 首先向兄弟结点中移动??
    > xfs_btree_rshift(xfs_btree_cur, level, stat)
    > xfs_btree_lshift(xfs_btree_cur, level, stat)
    - 上面不一定能移动,会受到xfs_btree_cur的影响
    - 如果可以移动,直接返回
    - 设置oindex = index = xfs_btree->bc_ptrs[level]?
-   - 否则需要分裂节点 
+   - 否则需要分裂结点 
    > xfs_btree_split(xfs_btree_cur, level, xfs_btree_ptr, xfs_btree_key, xfs_btree_cur, stat)
    - 这个返回3个参数, 新的xfs_btree_ptr/xfs_btree_key/xfs_btree_cur?? 已经合并到原来的btree中?? 
    - 这里需要备份index = xfs_btree_cur->bc_ptrs[level]
@@ -838,10 +838,10 @@
    > xfs_btree_cur->xfs_btree_ops->init_rec_from_key(xfs_btree_key, xfs_btree_ptr)
 
 ** xfs_btree_insrec(xfs_btree_cur, level, xfs_btree_ptr, xfs_btree_rec, xfs_btree_cur, stat)
-   - 向level中对应的节点插入新的xfs_btree_rec
-   - 如果分裂,需要返回新的值,给btree的上层节点使用??
+   - 向level中对应的结点插入新的xfs_btree_rec
+   - 如果分裂,需要返回新的值,给btree的上层结点使用??
    - 如果是根结点,而且根在专有的block中
-   - 怎么可能是根结点?? 根结点怎么成了叶子节点??
+   - 怎么可能是根结点?? 根结点怎么成了叶子结点??
    - xfs_btree_cur->bc_flags没有XFS_BTREE_ROOT_IN_INODE, 而且level >= xfs_btree_cur->bc_nlevels 
    - 直接创建新的root, 它的原来的root已经分裂?? 
    > xfs_btree_new_root(xfs_btree_cur, stat)
@@ -858,10 +858,10 @@
    - 如果满了,分裂或移动分支 
    > xfs_btree_make_block_unfull(xfs_btree_cur, level, numrecs, optr, ptr, xfs_btree_ptr nptr, xfs_btree_cur, xfs_btree_rec nrec, stat)
    - 上面为何计算新的xfs_btree_rec? 分裂后产生新的xfs_btree_ptr/xfs_btree_key还算正常??
-   - 重新获取xfs_btree_cur中level对应的节点, 上面可能回修改btree 
+   - 重新获取xfs_btree_cur中level对应的结点, 上面可能回修改btree 
    > xfs_btree_get_block(xfs_btree_cur, levle, xfs_buf)
    > xfs_btree_get_numrecs(xfs_btree_block)
-   - 如果level > 0, 插入的节点是内部节点?? 
+   - 如果level > 0, 插入的结点是内部结点?? 
    - 找到ptr对应的xfs_btree_key/xfs_btree_ptr的位置
    - 然后移动xfs_btree_key/xfs_btree_ptr,为插入准备 
    > xfs_btree_shift_keys(xfs_btree_cur, xfs_btree_key, 1 numrecs-ptr+1)
@@ -874,9 +874,9 @@
    > xfs_btree_shift_recs(xfs_btree_cur, xfs_btree_rec, 1, numrecs - ptr + 1)
    > xfs_btree_copy_recs(xfs_btree_cur, xfs_btree_rec, recp, 1)
    - 然后log这些修改, 增加xfs_btree_block->numrecs
-   - 如果插入的位置是第一个分支/记录, 需要更新父节点的key 
+   - 如果插入的位置是第一个分支/记录, 需要更新父结点的key 
    > xfs_btree_updkey(xfs_btree_key, level+1)
-   - 如果是最后一个节点?? 同样更新什么?? 
+   - 如果是最后一个结点?? 同样更新什么?? 
    > xfs_btree_is_lastrec(xfs_btree_cur, xfs_btree_block, level)
    > xfs_btree_cur->xfs_btree_ops->update_lastrec(xfs_btree_cur, xfs_btrree_block, xfs_btree_rec, xfs_btree_ptr, LASTREC_UPDATE)
    - 然后返回这里使用的参数, 从分裂中返回的参数,这里全部返回
@@ -888,7 +888,7 @@
    - 从xfs_btree_cur中取出来对应的xfs_btree_rec
    - 它的数据结构是大端的 
    > xfs_btree_cur->xfs_btree_ops->init_rec_from_cur(xfs_btree_cur, xfs_btree_rec)
-   - 循环处理,从叶子节点开始插入 
+   - 循环处理,从叶子结点开始插入 
    > xfs_btree_insrec(xfs_btree_cur, level, xfs_btree_ptr, xfs_btree_rec, xfs_btree_cur, i) 
    - 如果上面返回的xfs_btree_cur和传入的不一样,说明有分裂?? 
    - 更新原始的xfs_btree_cur 
@@ -899,14 +899,14 @@
    - 估计全部的参数都在分裂的地方使用
 
 ** xfs_btree_kill_iroot(xfs_btree_cur)
-   - 使用一个内部节点代替xfs_ifork中的根结点
+   - 使用一个内部结点代替xfs_ifork中的根结点
    - 降低btree的高度
    - xfs_btree_cur->bc_flags必须有XFS_BTREE_ROOT_IN_INODE, 而且高度必须>1
-   - 如果是level==2, 不继续操作, 不会用叶子节点代替根结点
+   - 如果是level==2, 不继续操作, 不会用叶子结点代替根结点
    - 获取xfs_btree_block, 它的分支必须为1
    > xfs_btree_get_iroot(xfs_btree_cur)
    > xfs_btree_get_numrecs(xfs_btree_block)
-   - 获取这个唯一的子节点 
+   - 获取这个唯一的子结点 
    > xfs_btree_get_block(xfs_btree_block, level-1, xfs_buf)
    > xfs_btree_get_numrecs(xfs_btree_block)
    - 检查是否超过根结点的限制
@@ -916,7 +916,7 @@
    > xfs_iroot_realloc(xfs_btree_cur->bc_private->b->xfs_inode, index, whichfork)
    - 开始更新根结点, 设置numrecs, level减1
    - 复制xfs_btree_key / xfs_btree_ptr
-   - 把原来的子节点释放 
+   - 把原来的子结点释放 
    > xfs_btree_cur->xfs_btree_ops->free_block(xfs_btree_cur, xfs_buf)
    - 然后更新xfs_btree_cur, bc_nlevels -1
    - 然后log修改的xfs_dinode 
@@ -928,29 +928,29 @@
    - 释放参数xfs_buf?? 它是原来的根结点? 
    > xfs_btree_cur->xfs_btree_ops->free_block(xfs_btree_cur, xfs_buf)
    - 降低xfs_btree_cur->bc_nlevels --, 设置level指向的bc_bufs/bc_ra为NULL
-   - 新的节点怎么弄?? 
+   - 新的结点怎么弄?? 
 
 ** xfs_btree_dec_cursor(xfs_btree_cur, level, stat)
-   - 如果level > 0, 操作内存节点?? 
+   - 如果level > 0, 操作内存结点?? 
    > xfs_btree_decrement(xfs_btree_cur, level, i)
-   - 对于叶子节点,不操作??
+   - 对于叶子结点,不操作??
 
 ** xfs_btree_delrec(xfs_btree_cur, level, stat)
    - 又是一个庞大的函数!!!
-   - 删除xfs_btree_cur中level对应的节点的bc_ptrs对应的分支??
+   - 删除xfs_btree_cur中level对应的结点的bc_ptrs对应的分支??
    - 获取对应的xfs_btree_block / xfs_buf  
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
    > xfs_btree_get_numrecs(xfs_btree_block)
    - 获取对应的分支索引ptr = xfs_btree_cur->bc_ptrs[level]
    - 如果ptr超过numrecs, 返回错误
-   - 如果level > 0, 操作内部节点, 直接移动xfs_btree_key/xfs_btree_ptr 
+   - 如果level > 0, 操作内部结点, 直接移动xfs_btree_key/xfs_btree_ptr 
    > xfs_btree_shift_keys(xfs_btree_cur, xfs_btree_key, -1, num_recs-ptr)
    > xfs_btree_shfit_ptrs(..)
    > xfs_btree_log_keys(..)
    > xfs_btree_log_ptrs(..)
    - 如果ptr ==1, 需要准备一个xfs_btree_key, 给后面的操作使用??
    > xfs_btree_key_addr(xfs_btree_cur, 1, xfs_btree_block)
-   - 如果是叶子节点, 同样移动后面的xfs_btree_rec, 覆盖调要删除的 
+   - 如果是叶子结点, 同样移动后面的xfs_btree_rec, 覆盖调要删除的 
    > xfs_btree_shift_recs(..)
    > xfs_btree_log_recs(..) 
    - 如果ptr ==1, 同样准备一个xfs_btree_key 
@@ -975,20 +975,20 @@
    > xfs_btree_kill_root(xfs_btree_cur, xfs_buf, level, xfs_btree_ptr)
    - 原来的根结点直接删除了,而且新的根结点在xfs_btree_cur->bc_bufs[level]中, 但还是英国把它的指针放到磁盘的某个位置上?? 哪里实现这些操作??
    - 如果是根结点,操作完成,直接退出
-   - 否则继续， 如果上面删除的是第一个节点,首先更新父节点的key  
+   - 否则继续， 如果上面删除的是第一个结点,首先更新父结点的key  
    > xfs_btree_updkey(xfs_btree_cur, xfs_btree_key, level+1)
    - 如果当前分支数numrecs大于最小分支数, 直接退出,不需要合并之类的 
    > xfs_btree_cur->xfs_btree_ops->get_minrecs(xfs_btree_cur, level)
    - 但得移动分支. .
    > xfs_btree_dec_cursor(xfs_btree_cur, level, stat)
    - 否则检查是否需要合并
-   - 获取2边的兄弟节点, rptr / lptr
+   - 获取2边的兄弟结点, rptr / lptr
    > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, rptr, XFS_BTREE_RIGHTSIB)
    - 如果根结点在xfs_ifork中, 而且2边都是空, 而且是在倒数第2层?? level == xfs_btree_cur->bc_levels - 2 
    - 说明最上面2层都只有1个分支?? 考虑降低高度 
    > xfs_btree_kill_iroot(xfs_btree_cur)
    > xfs_btree_dec_cursor(xfs_btree_cur, level, stat)
-   - 否则不能2边的分支都是空,父节点不能只有一个分支, 因为它不是根节点
+   - 否则不能2边的分支都是空,父结点不能只有一个分支, 因为它不是根结点
    - 复制一个xfs_btree_cur 
    > xfs_btree_dup_cursor(xfs_btree_cur, tcur)
    - 如果右兄弟不是空  
@@ -1003,11 +1003,11 @@
    > xfs_btree_lastrec(xfs_btree_cur, level)
    - 获取对应的xfs_buf / xfs_btree_block
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf) 
-   - 根据左兄弟指针,获取当前的节点的指针?? 
+   - 根据左兄弟指针,获取当前的结点的指针?? 
    > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block right, xfs_btree_ptr cptr, XFS_BB_LEFTSIB)
    - 如果右兄弟能够的分支足够多 
    > xfs_btree_get_numrecs(xfs_btree_block) -1 >= xfs_btree_cur->xfs_btree_ops->get_minrecs(xfs_btree_cur, level)
-   - 然后直接移动一个节点, 直接退出
+   - 然后直接移动一个结点, 直接退出
    > xfs_btree_lshift(xfs_btree_cur, level) 
    - 然后释放xfs_btree_cur
    > xfs_btree_del_cursor(xfs_btree_cur, XFS_BTREE_NOERROR)
@@ -1024,39 +1024,39 @@
    > xfs_btree_firstrec(xfs_btree_cur, level)
    - 根据cur/level获取对应的xfs_btree_block / xfs_buf 
    > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
-   - 获取这个左兄弟的右兄弟?? 不就是当前操作的节点? 
+   - 获取这个左兄弟的右兄弟?? 不就是当前操作的结点? 
    > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, cptr, XFS_BB_RIGHTSIB)
    - 检查分支的数量是否满足 
    > xfs_btree_get_numrecs(xfs_btree_block) -1 >= xfs_btree_cur->xfs_btree_ops->get_minrecs(xfs_btree_cur, level)
-   - 如果满足,直接向右移动一个节点,然后退出 
+   - 如果满足,直接向右移动一个结点,然后退出 
    > xfs_btree_rshift(xfs_btree_cur, level, i)
    - 同时删除备份的xfs_btree_cur 
    > xfs_btree_del_cursor(xfs_btree_cur) 
-   - 如果不能移动来解决问题,记录当前节点的分支数量 lrecs
-   - 无法通过借分支来解决,只能合并2个节点
-   - 如果左兄弟存在, 而且lrecs + 当前节点没有超过最大值 
+   - 如果不能移动来解决问题,记录当前结点的分支数量 lrecs
+   - 无法通过借分支来解决,只能合并2个结点
+   - 如果左兄弟存在, 而且lrecs + 当前结点没有超过最大值 
    > xfs_btree_get_numrecs(xfs_btree_block)
    > xfs_btree_cur->xfs_btree_ops->get_maxrecs(xfs_btree_cur, level)
-   - 这里需要把左兄弟节点读出来?? 之前没有读出来? 
+   - 这里需要把左兄弟结点读出来?? 之前没有读出来? 
    > xfs_btree_read_buf_block(xfs_btree_cur, xfs_btree_ptr lptr, level, 0, xfs_btree_block, xfs_buf)
-   - 否则检查rrecs 和当前节点的分支数之和没有超过限制, 使用当前节点和右兄弟 
-   - 如果level > 0, 要合并的是内部节点
-   - 需要把right的xfs_btree_key / xfs_btree_ptr移动到left节点 
+   - 否则检查rrecs 和当前结点的分支数之和没有超过限制, 使用当前结点和右兄弟 
+   - 如果level > 0, 要合并的是内部结点
+   - 需要把right的xfs_btree_key / xfs_btree_ptr移动到left结点 
    > xfs_btree_key_addr(xfs_btree_cur, lrecs + 1, left)
    > xfs_btree_key_addr(xfs_btree_cur, 1, right)
    > xfs_btree_ptr_addr(..)
    > xfs_btree_copy_keys(..)
    > xfs_btree_copy_ptrs(..)
-   - log左边节点的修改, 右边节点不管,因为要删除 
+   - log左边结点的修改, 右边结点不管,因为要删除 
    > xfs_btree_log_keys(..)
    > xfs_btree_log_ptrs(..)
    - 如果level ==0, 需要移动xfs_btree_rec 
    > xfs_btree_rec_addr(..)
    > xfs_btree_copy_recs(..)
    > xfs_btree_log_recs(..)
-   - 最后设置左边的节点的xfs_btree_block 
+   - 最后设置左边的结点的xfs_btree_block 
    > xfs_btree_set_numrecs(left, lrecs + rrecs)
-   - 修改对应的右兄弟节点
+   - 修改对应的右兄弟结点
    > xfs_btree_get_sibling(xfs_btree_cur, right, cptr, XFS_BB_RIGHTSIB)
    > xfs_btree_set_sibling(xfs_btree_cur, left, cptr, XFS_BB_RIGHTSIB)
    - 还有右兄弟的右兄弟的左兄弟 
@@ -1065,22 +1065,22 @@
    > xfs_btree_set_sibling(xfs_btree_cur, rblock, xfs_btree_ptr, XFS_BB_LEFTSIB)
    - 还要log这些修改 
    > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_LEFTSIB)
-   - 把右边的兄弟节点释放  
+   - 把右边的兄弟结点释放  
    > xfs_btree_cur->xfs_btree_ops->free_block(xfs_btree_cur, xfs_buf)
-   - 如果原来的节点释放,也就是合并到左兄弟上面
+   - 如果原来的结点释放,也就是合并到左兄弟上面
    - 需要修改xfs_btree_cur->bc_bufs/bc_ptrs
-   - 如果原来的节点没有释放,它合并了右兄弟
+   - 如果原来的结点没有释放,它合并了右兄弟
    > xfs_btree_increment(xfs_btree_cur, level+1, i)
-   - 这里的意思是右兄弟删除,所以指针level+1应该指向删除的节点
-   - 就像上面合并到右兄弟一样,level+1层指向的还是当前节点
-   - 当前节点虽然删除,但它在父节点中对应的xfs_btree_key / xfs_btree_ptr还留着
+   - 这里的意思是右兄弟删除,所以指针level+1应该指向删除的结点
+   - 就像上面合并到右兄弟一样,level+1层指向的还是当前结点
+   - 当前结点虽然删除,但它在父结点中对应的xfs_btree_key / xfs_btree_ptr还留着
    - 需要继续调用这个函数,删除xfs_btree_cur level+1指向的记录
    - 这里需要向上删除,设置参数stat = 2
    - 而上面已经解决分支数量, 设置参数stat = 1
    - 还有不需要解决分支问题的,应该设置stat = 0
 
 ** xfs_btree_delete(xfs_btree_cur, stat)
-   - 循环处理，直到不需要删除父节点记录  
+   - 循环处理，直到不需要删除父结点记录  
    - i != 2
    > xfs_btree_delrec(xfs_btree_cur, level, i)
    - 检查xfs_btree_cur->bc_ptrs中的指针
@@ -1090,16 +1090,45 @@
    
 ** xfs_btree_get_rec(xfs_btree_cur, xfs_btree_rec, stat)
    - 获取叶子中的xfs_btree_rec的指针
-   - 只检查叶子节点的分支索引 xfs_btree_cur->bc_ptrs[0]
+   - 只检查叶子结点的分支索引 xfs_btree_cur->bc_ptrs[0]
    > xfs_btree_get_block(xfs_btree_cur, 0, xfs_buf)
    > xfs_btree_get_numrecs(xfs_btree_block)
    - 读取xfs_btree_block后面的数据
    > xfs_btree_cur_addr(xfs_btree_cur, ptr, xfs_btree_block)
+
+** xfs_btree_block_change_owner(xfs_btree_cur, level, new_owner, buffer_list)
+   - 把xfs_btree_cur中level对应的结点的owner改为new_owner? 它应该是xfs_ino_t
+   - 首先预读兄弟结点 
+   > xfs_btree_readahead(xfs_btree_cur, level, XFS_BTCUR_RIGHTRA)
+   - 获取level对应的xfs_btree_block / xfs_buf 
+   > xfs_btree_get_block(xfs_btree_cur, level, xfs_buf)
+   - 设置xfs_btree_block->bb_u->l->bb_owner = new_owner
+   - 上面可能获取不到xfs_buf, 因为他在xfs_ifork中?? 那还需要修改owner??
+   - 如果xfs_buf不是NULL, log这些修改  
+   - ordered??
+   > xfs_trans_ordered_buf(xfs_trans, xfs_buf)
+   > xfs_btree_log_block(xfs_btree_cur, xfs_buf, XFS_BB_OWNER)
+   - 然后准备右兄弟结点 
+   > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_RIGHTSIB)
+   > xfs_btree_lookup_get_block(xfs_btree_cur, level, xfs_btree_ptr, xfs_btree_block)
+   - 这里取出来没有使用
+
+** xfs_btree_change_owner(xfs_btree_cur, new_owner, buffer_list)
+   - 创建一个xfs_btree_ptr??
+   > xfs_btree_cur->xfs_btree_ops->init_ptr_from_cur(xfs_btree_cur, xfs_btree_ptr)
+   - 遍历所有的结点?? 使用兄弟结点,不需要回朔
+   - 遍历每一层,获取第一个分支
+   > xfs_btree_lookup_get_block(xfs_btree_cur, level, xfs_btree_ptr, xfs_btree_block)
+   - 获取第一个分支的磁盘位置 
+   > xfs_btree_ptr_addr(xfs_btree_cur, 1, xfs_btree_block)
+   - 然后遍历这一层的所有结点
+   > xfs_btree_block_change_owner(xfs_btree_cur, level, new_owenr, buffer_list)
+
 * xfs_bmap_btree.c
   - 操作文件extent影射 
     
 ** xfs_bmdr_block
-   - bmap节点的头?? 为何不是xfs_btree_block?
+   - bmap结点的头?? 为何不是xfs_btree_block?
    #+BEGIN_SRC 
 	__be16		bb_level;	/* 0 is a leaf */
 	__be16		bb_numrecs;	/* current # of data records */   
@@ -1234,9 +1263,101 @@
    - 否则使用xfs_mount->m_bmap_dmnr[ level !=0 ]
 
 ** xfs_bmbt_get_maxrecs(xfs_btree_cur, level)
-   - 如果是根结点, 根结点也可以是叶子节点?? 
+   - 如果是根结点, 根结点也可以是叶子结点?? 
    > xfs_bmbt_maxrecs(xfs_mount, xfs_ifork->if_broot_bytes, level ==0) 
    > xfs_mount->m_bmap_dmxr[level != 0] 
 
-
+** xfs_bmbt_get_dmaxrecs(xfs_btree_cur, level)
+   - 获取磁盘中一个结点支持的最多记录个数??
+   - 如果不是跟结点, 使用xfs_map->m_bmap_dmxr[level !=0], 和上面一样
+   - 否则不一样?? 
+   > xfs_bmdr_maxrecs(xfs_mount, xfs_bmbt_cur->bc_private->b->forksize, level != 0)
      
+** xfs_bmbt_init_key_from_rec(xfs_btree_key, xfs_btree_rec) 
+   - xfs_btreekey是xfs_bmbt_key, 使用文件偏移
+   - 但这里的数据类型是大端的  __be64
+   - 返回xfs_btree_rec的bt_startoff
+
+** xfs_bmbt_inti_rec_from_key(xfs_btree_key, xfs_btree_rec) 
+   - 根据xfs_btree_key初始化xfs_btree_rec, 也就是xfs_bmbt_rec
+   - 只设置文件偏移 startoff 
+
+** xfs_bmbt_init_rec_from_cur(xfs_btree_cur, xfs_btree_rec)
+   - 使用xfs_btree_cur->bc_rec->b, 也就是xfs_bmbt_irec
+   > xfs_bmbt_disk_set_all(xfs_bmbt_rec->xfs_bmbt_rec, xfs_btree_cur->bc_rec->xfs_bmbt_irec)
+
+** xfs_bmbt_init_ptr_from_cur(xfs_bmbt_cur, xfs_btree_ptr)
+   - 设置为0?? 不是NULL
+
+** xfs_bmbt_key_diff(xfs_btree_cur, xfs_btree_key)
+   - 比较xfs_btree_key和要查找的记录的关系
+   - xfs_btree_key是文件偏移,而且数据结构是大端的, 先转化为普通的数据类型
+   - 然后和xfs_btree_cur->bc_rec->b->br_startoff比较 
+
+** xfs_bmbt_verify(xfs_buf)
+   - xfs_buf里面是xfs_btree_block, 检查它的格式??
+   - magic, crc, uuid, blkno, owner不能是0
+   - level不能超过xfs_mount->m_bm_maxlevels[]
+   - numrecs不能超过 xfs_mount->m_bmap_dmxr[]
+   - 而且兄弟指针不能为NULLDFSBNO, 或者为0, 或者和当前的结点在一个ag中
+
+** xfs_bmbt_read_verify(xfs_buf)
+   - 先计算crc
+   > xfs_btree_lblock_verify_crc(xfs_buf)
+   - 然后检查xfs_btree_block
+   > xfs_bmbt_verify(xfs_buf)
+
+** xfs_bmbt_write_verify(xfs_buf)
+   - 写之前的验证
+   - 检查xfs_btree_block
+   > xfs_bmbt_verify(xfs_buf)
+   - 然后计算crc, 谁用呢? 
+   > xfs_btree_lblock_calc_crc(xfs_buf)
+   
+** xfs_buf_ops xfs_bmbt_buf_ops 
+   - 包装上面的2个verify函数, 给xfs_btree_ops使用
+
+** xfs_bmbt_keys_inorder(xfs_btree_cur, xfs_btree_key k1, k2)
+   - 返回 k1 < k2, 需要先转化为本地的数据类型
+
+** xfs_bmbt_recs_inorder(xfs_bmbt_cur, xfs_btree_rec r1, r2)
+   - 比较范围是否有序
+   - r1->br_startoff + r1->br_blockcount <= r2->br_startoff
+
+** xfs_btree_ops xfs_bmbt_ops
+   - 构造回调函数指针 
+
+** xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, whichfork)
+   - 构造新的xfs_btree_cur
+   - 设置参数xfs_mount, xfs_trans
+   - bc_nlevels需要跟结点,在xfs_ifork中保存 
+   > xfs_ifork->if_broot->bb_level + 1
+   - bc_blocklog是什么?? xfs_sb->sb_blocklog
+   - bc_flags设置为XFS_BTREE_LONG_PTR | XFS_BTREE_ROOT_IN_INODE
+   - 然后是xfs_btree_cur->bc_private->b
+   - forksize是对应的xfs_ifork在xfs_dinode中的空间大小 
+   > XFS_IFORK_SIZE(xfs_inode, whichfork)
+   - xfs_inode, whichfork
+   - 其他的都设为0, 哪里分配的xfs_bmap_free?? 
+
+** xfs_bmbt_maxrecs(xfs_mount, blocklen, leaf)
+   - 对于磁盘中结点长度为blocklen, 计算支持的做多记录数?? 
+   - 减去头部XFS_BMBT_BLOCK_LEN(xfs_mount), 磁盘中xfs_bmdr_block不是没有crc等??
+   - 对于叶子结点,返回blocklen /= sizeof(xfs_bmbt_rec)
+   - 对于内部结点,返回blocklen /= (sizeof(xfs_bmbt_key + xfs_bmbt_ptr))
+   - 这里没有使用xfs_btree_key / xfs_btree_ptr, 应该是更精确了.. 
+
+** xfs_bmdr_maxrecs(xfs_mount, blocklen, leaf)
+   - 对于普通的非跟结点,还是使用xfs_btree_block
+   - 对于在xfs_dinode的跟结点,使用xfs_bmdr_block, 不需要xfs_btree_block重复的成员
+   - blocklen -= sizeof(xfs_bmdr_block)
+   - 对于叶子结点, blocklen /= sizeof(xfs_bmdr_rec)
+   - 对于内部结点, blocklen /= (sizeof(xfs_bmdr_key) + sizeof(xfs_bmdr_ptr))
+
+** xfs_bmdr_change_owner(xfs_trans, xfs_inode, whichfork, xfs_ino_t new_owner, list_head buffer_list)
+   - 修改xfs_ifork的xfs_inode?这个可以移动?? 
+   - 创建一个xfs_btree_cur 
+   > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, whichfork)
+   - 遍历所有的结点, 修改对应的owner成员
+   > xfs_btree_change_owner(xfs_btree_cur, new_owner, buffer_list)
+   - 删除xfs_btree_cur
