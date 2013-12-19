@@ -4,7 +4,6 @@
 
 * xfs_buf.c
 
-* xfs_ialloc_btree.c
 * xfs_btree.c 
 
 ** xfs_btree_cur 
@@ -1361,3 +1360,127 @@
    - 遍历所有的结点, 修改对应的owner成员
    > xfs_btree_change_owner(xfs_btree_cur, new_owner, buffer_list)
    - 删除xfs_btree_cur
+* xfs_ialloc_btree.c
+
+** xfs_agi 
+   - 这个数据结构是磁盘中使用的,数据类型是大端的
+   - 下面的磁盘位置指针都是32的,只有agbno
+   #+BEGIN_SRC 
+	/*
+	 * Common allocation group header information
+	 */
+	__be32		agi_magicnum;	/* magic number == XFS_AGI_MAGIC */
+	__be32		agi_versionnum;	/* header version == XFS_AGI_VERSION */
+	__be32		agi_seqno;	/* sequence # starting from 0 */
+	__be32		agi_length;	/* size in blocks of a.g. */
+	/*
+	 * Inode information
+	 * Inodes are mapped by interpreting the inode number, so no
+	 * mapping data is needed here.
+	 */
+	__be32		agi_count;	/* count of allocated inodes */
+	__be32		agi_root;	/* root of inode btree */
+	__be32		agi_level;	/* levels in inode btree */
+	__be32		agi_freecount;	/* number of free inodes */
+
+	__be32		agi_newino;	/* new inode just allocated */
+	__be32		agi_dirino;	/* last directory inode chunk */
+	/*
+	 * Hash table of inodes which have been unlinked but are
+	 * still being referenced.
+	 */
+	__be32		agi_unlinked[XFS_AGI_UNLINKED_BUCKETS];
+
+	uuid_t		agi_uuid;	/* uuid of filesystem */
+	__be32		agi_crc;	/* crc of agi sector */
+	__be32		agi_pad32;
+	__be64		agi_lsn;	/* last write sequence */
+   
+   #+END_SRC
+
+** xfs_btree_cur
+   - 这里使用xfs_btree_cur->bc_private->a 
+   - btree是属于ag, 而不是inode
+   - 这里的xfs_buf指向xfs_agi, 里面是inode的btree的信息
+   #+BEGIN_SRC 
+			struct xfs_buf	*agbp;	/* agf/agi buffer pointer */
+			xfs_agnumber_t	agno;	/* ag number */
+   #+END_SRC
+
+** xfs_inobt_rec 
+   #+BEGIN_SRC 
+	__be32		ir_startino;	/* starting inode number */
+	__be32		ir_freecount;	/* count of free inodes (set bits) */
+	__be64		ir_free;	/* free inode mask */   
+   #+END_SRC
+
+** xfs_inobt_key 
+   #+BEGIN_SRC 
+	__be32		ir_startino;	/* starting inode number */
+   #+END_SRC
+
+** xfs_inobt_rec_incore 
+   #+BEGIN_SRC 
+	xfs_agino_t	ir_startino;	/* starting inode number */
+	__int32_t	ir_freecount;	/* count of free inodes (set bits) */
+	xfs_inofree_t	ir_free;	/* free inode mask */   
+   #+END_SRC
+
+** xfs_inobt_get_minrecs(xfs_btree_cur, level)
+   - 使用xfs_mount->m_inobt_mnr[level != 0] 
+
+** xfs_inobt_dup_cursor(xfs_btree_cur)
+   - 复制一个xfs_btree_cur, 使用参数的bc_private
+   > xfs_inobt_init_cursor(xfs_mount, xfs_trans, xfs_btree_cur->bc_private->a->xfs_buf, agno)
+
+** xfs_inobt_set_root(xfs_btree_cur, xfs_btree_ptr, inc)
+   - btree的根结点改变,高度也改变,更新到xfs_agi中
+   - 从xfs_buf中获取xfs_agi 
+   > XFS_BUF_TO_AGI(xfs_buf)
+   - 设置xfs_agi->agi_root = xfs_btree_ptr->s
+   - 增加xfs_agi->agi_level += inc
+   - log这些修改  
+   > xfs_ialloc_log_agi(xfs_btree_cur->xfs_trans, xfs_buf, XFS_AGI_ROOT | XFS_AGI_LEVEL)
+
+** xfs_inobt_alloc_block(xfs_btree_cur, xfs_btree_ptr start, new, length, stat)
+   - 创建新的结点, 分配block
+   - 参数length没有使用, 和上面bmbt的类似
+   - 准备xfs_alloc_arg, 设置xfs_trans, xfs_mount, minlen = maxlen = prod = 1
+   - 使用参数start作为提示信息, 它是agbno, 需要和xfs_btree_cur的agno构造xfs_fsblock_t地址 
+   > XFS_AGB_TO_FSB(xfs_alloc_arg->xfs_mount, xfs_btree_cur->bc_private->a->agno, start->s)
+   - 使用XFS_ALLOCTYPE_NEAR_BNO方式分配
+   > xfs_alloc_vextent(xfs_alloc_arg)
+   - 如果成功,把地址的agbno给new->s
+   > XFS_FSB_TO_AGBNO(xfs_mount, xfs_alloc_arg->fsbno)
+
+** xfs_inobt_free_block(xfs_btree_cur, xfs_buf)
+   - 释放结点的block, 获取xfs_buf的磁盘位置
+   > XFS_DADDR_TO_FSB(xfs_mount, XFS_BUF_ADDR(xfs_buf))
+   - 直接释放, 不想bmbt一样?? 
+   > xfs_free_extent(xfs_trans, fsbno, 1)
+   - 提交transaction? 
+   > xfs_trans_binval(xfs_trans, xfs_buf)
+
+** xfs_inobt_get_maxrecs(xfs_btree_cur, level)
+   - 上面是获取最小的分支数,这里是最大的
+   - 使用xfs_mount->m_inobt_mxr[level !=0]
+
+** xfs_inobt_init_key_from_rec(xfs_btree_key, xfs_btree_rec)
+   - xfs_btree_key使用里面的xfs_inobt_key, 不过是ag内部的inode的偏移 
+   - 使用xfs_btree_rec->xfs_inobt_rec->ir_startino
+   - 也即是inode簇的第一个ino 
+
+** xfs_inobt_init_rec_from_key(xfs_btree_key, xfs_btree_rec)
+   - 只设置xfs_inobt_rec->ir_startino 
+
+** xfs_inobt_init_rec_from_cur(xfs_btree_cur, xfs_btree_rec)
+   - 获取xfs_btree_cur->bc_rec->xfs_inobt_rec_incore
+   - 数据类型转化为大端模式的
+
+** xfs_inobt_init_ptr_from_cur(xfs_btree_cur, xfs_btree_ptr)
+   - 获取btree的根结点磁盘位置指针
+   - 先获取xfs_agi,使用xfs_agi->agi_root
+   > XFS_BUF_TO_AGI(xfs_btree_cur->bc_private->a->xfs_buf)
+
+** xfs_inobt_key_diff(xfs_btree_cur,x fs_btree_key)
+   - 
