@@ -1207,4 +1207,73 @@ typedef struct xfs_buf {
    > bio_put(bio)
 
 ** xfs_buf_ioapply_map(xfs_buf, map, buf_offset, count, rw)
-   - 
+   - 获取磁盘位置 xfs_buf->b_maps[map]->bm_bn 
+   - buf_offset对应的page已经页内偏移
+   - IO数据量是min(count, xfs_buf_map[map]->bm_len)
+   - 增加xfs_buf->b_io_remaining
+   - 构造bio, 这里准备的iovec长度不超过BIO_MAX_SECTORS(256pages)和xfs_buf->b_page_count
+   > xfs_alloc(GFP_NOIO, nr_pages)
+   - 设置bio的block_device, 磁盘位置bi_sector是上面xfs_buf_map的地址
+   - 回调函数是xfs_buf_bio_end_io
+   - bio->bi_private是xfs_buf 
+   - 遍历xfs_buf里面的page 
+   - 这里的offset和page_index根据上面的buf_offset计算
+   > bio_add_page(bio, xfs_buf->b_pages[page_index], nbytes, offset)
+   - 如果bio无法添加IO,先提交一个,然后创建新的bio
+   - 提交bio 
+   > submit_bio(rw, bio)
+
+** _xfs_buf_ioapply(xfs_buf)
+   - 根据xfs_buf的标志计算IO的方向
+   - 如果xfs_buf->b_flags有XBF_WRITE, 写操作
+   - 如果xfs_buf->b_flags有XBF_SYNCIO, rw是WRITE_SYNC, 否则是WRITE
+   - 如果xfs_buf->b_flags有XBF_FUA, 设置rw的REQ_FUA
+   - 如果xfs_buf->b_flags有XBF_FLUSH, 设置rw的REQ_FLUSH
+   - 验证xfs_buf的数据  
+   > xfs_buf->xfs_buf_ops->verify_write(xfs_buf)
+   - 如果xfs_buf->b_flags有XBF_READ_AHEAD, 设置rw = READA 
+   - 其他情况设置为rw = READ
+   - 最后设置rw的REQ_META, 这里只会读取metadata?? 普通数据的IO??
+   - 获取xfs_buf->b_offset / b_io_length, 提交bio 
+   - 先停止块设备 
+   > xfs_start_plug(plug)
+   - 遍历xfs_buf->b_map_count, 每次提交一个xfs_buf_map的IO
+   > xfs_buf_ioapply_map(xfs_buf, i, offset, size, rw)
+   - xfs_finish_plug(plug)
+
+** xfs_buf_iorequest(xfs_buf)
+   - xfs_buf->b_flags不能有_XBF_DELWRI_Q ??
+   - 如果xfs_buf->b_flags有XBF_WRITE, 等待pin?? 
+   > xfs_buf_wait_unpin(xfs_buf)
+   - 增加使用计数 
+   > xfs_buf_hold(xfs_buf)
+   - 设置xfs_buf->b_io_remaining = 1 
+   - 提交bio 
+   > _xfs_buf_ioapply(xfs_buf)
+   - 为何这里还要释放??
+   > _xfs_buf_ioend(xfs_buf, 1)
+   - 释放xfs_buf的使用计数
+   > xfs_buf_rele(xfs_buf)
+
+** xfs_buf_iowait(xfs_buf)
+   - 等待xfs_buf的IO完成  
+   > wait_for_completion(xfs_buf->b_iowait)
+   - 返回xfs_buf->b_error 
+
+** xfs_buf_offset(xfs_buf, offset)
+   - 获取xfs_buf中offset对应的内存地址
+   - 如果xfs_buf->b_addr有效,已经建立内存映射, 返回xfs_buf->b_addr + offset
+   - 否则返回page的直接映射地址, 首先计算page偏移 
+   - ( offset + xfs_buf->b_offset ) / PAGE_SIZE
+   - 然后计算page映射地址,做页内偏移
+
+** xfs_buf_iomove(xfs_buf, boff, bsize, data, xfs_buf_rw_t mode)
+   - 在参数data和xfs_buf之间移动数据
+   - 对于xfs_buf, 完全使用page的直接映射访问
+   - 根据boff定位xfs_buf中的内存page
+   - 检查mode, 如果是XBRW_ZERO, 设置xfs_buf对应的空间为0
+   - 如果是XBRW_READ, 从xfs_buf总复制数据
+   - 如果是XBRW_WRITE, 把data写到xfs_buf中
+
+** xfs_buftarg_wait_rele(list_head, lru_lock, arg)
+   - 等待释放??
