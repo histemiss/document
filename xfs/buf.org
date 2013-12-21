@@ -1277,3 +1277,117 @@ typedef struct xfs_buf {
 
 ** xfs_buftarg_wait_rele(list_head, lru_lock, arg)
    - 等待释放??
+   - 第一个参数list_head是xfs_buf->b_lru, 最后一个参数是链表 list_head
+   - 如果xfs_buf->b_hold > 1, 返回LRU_SKIP??
+   - 否则释放lru链表关系
+   - 设置xfs_buf->b_lru_ref = 0, 添加xfs_buf->b_state的XFS_BSTATE_DISPOSE
+   - 把xfs_buf->b_lru放到arg链表中
+   - 最后返回LRU_REMOVED
+
+** xfs_wait_buftarg(xfs_buftarg)
+   - 循环检查xfs_buftarg->bt_lru链表, 如果还有xfs_buf, 释放它?
+   - 这里循环退出条件是这个链表个数? 为何不直接用空判断?
+   > list_lru_count(xfs_buftarg->bt_lru)
+   - 遍历链表,使用xfs_buftarg_wait_rele处理它 
+   > list_lru_walk(xfs_buftarg->bt_lru, xfs_buftarg_wait_rele, list_head, LOGN_MAX)
+   - 如果上面list_head中收集了xfs_buf, 释放他们  
+   > xfs_buf_rele(xfs_buf)
+
+** xfs_buftarg_isolate(list_head, lru_lock, arg)
+   - 也是一个遍历的回调函数, 处理xfs_buf->b_lru_ref计数
+   - 锁住xfs_buf, 如果锁不住,返回LRU_SKIP 
+   > 减小xfs_buf->b_io_remaining， 如果已经是0,返回LRU_ROTATE?? 
+   - 设置xfs_buf->b_state的XFS_BSTATE_DISPOSE, 放到arg链表中  
+     
+** xfs_buftarg_shrink_scan(shrinker, shrink_control)
+   - 在xfs_buftarg->bt_lru上回收可以释放的xfs_buf 
+   > list_lru_walk_node(xfs_buftarg->bt_lru, shrinker->nid, xfs_buftarg_isolate, dispose, nr_to_scan)
+   - 释放他们
+   > xfs_buf_rele(xfs_buf)
+   - IO中的xfs_buf应该不会在lru中,应该只会回收内存
+
+** xfs_buftarg_shrink_count(shrinker, shrink_count)
+   - 计算可回收的xfs_buf的个数? 
+   > list_lru_count_node(xfs_buf->bt_lru, shrink_control->nid)
+
+** xfs_free_buftarg(xfs_mount, xfs_buftarg)
+   - 释放xfs_buftarg
+   - 注销xfs_buftarg->bt_shrinker
+   - 如果xfs_mount->m_flags有XFS_MOUNT_BARRIAR?? 
+   - 给磁盘发送flush操作
+   > xfs_blkdev_issue_flush(xfs_buftarg)
+   - 最后释放xfs_buftarg内存
+
+** xfs_setsize_buftarg_flags(xfs_buftarg, blocksize, sectorsize, verbose)
+   - 设置xfs_buftarg->bt_bsize = blocksize
+   - bt_sshift = log(sectorsize), bt_smask是sectorsize的位掩码
+   - 设置block_device->bd_block_size, 还有对应的blockfs的inode 
+   > set_blocksize(xfs_buftarg->block_device, sectorsize)
+   - 竟然可以在fs设置blockdevice
+
+** xfs_setsize_buftarg_early(xfs_buftarg, block_device)
+   - 在mount之前的操作??
+   - 使用PAGE_SIZE作为blocksize, 磁盘默认的sectorsize?
+   > xfs_setsize_buftarg_flags(xfs_buftarg, PAGE_SIZE, bdev_logical_block_size(block_device), 0)
+
+** xfs_setsize_buftarg(xfs_buftarg, blocksize, sectorsize)
+   > xfs_setsize_buftarg_flags(xfs_buftarg, blocksize, sectorsize, 1)
+
+** xfs_alloc_buftarg(xfs_mount, block_device, external, fsname)
+   - 构造xfs_buftarg, 在mount中使用
+   - 设置xfs_mount / block_device
+   - backing_dev_info使用block_device的 
+   > blk_get_backing_dev_info(block_device)
+   - 先设置默认的blocksize/sectorsize 
+   > xfs_setsize_buftarg_early(xfs_buftarg, block_device)
+   - 设置xfs_buftarg->shrink_control
+   > register_shrinker(xfs_buftarg->bt_shrinker)
+
+** xfs_buf_delwri_queue(xfs_buf, list_head)
+   - 把xfs_buf放到delayed write队列中
+   - 如果xfs_buf->b_flags有_XBF_DELWRI_Q, 它已经在队列中,返回false
+   - 设置xfs_buf->b_flags的_XBF_DELWRI_Q, 而且把xfs_buf->b_list放到参数list_head中, 增加xfs_buf->b_hold计数
+
+** xfs_buf_cmp(xfs_priv, list_head a, b)
+   - list_head是xfs_buf->b_list, 比较2个xfs_buf
+   - 根据xfs_buf->xfs_map_buf[0]->bm_bn
+
+** __xfs_buf_delwri_submit(list_head buffer_list, io_list, wait)
+   - 提交xfs_buf的写操作?
+   - 遍历buffer_list里的xfs_buf->b_list
+   - 如果wait ==0, 而且xfs_buf被别人使用? pin ?  跳过这个xfs_buf
+   > xfs_buf_ispinned(xfs_buf)
+   - 否则尝试锁住, 如果锁不住也跳过
+   - 如果wait !=0, 锁住xfs_buf, 而且等待锁操作
+   > xfs_buf_lock(xfs_buf)
+   - 检查xfs_buf->b_flags的_XBF_DELWRI_Q? 其他人可能写回?? 
+   - 释放链表, 释放这个xfs_buf 
+   > xfs_buf_relse(xfs_buf)
+   - 如果可以释放,把他们集中到io_list链表
+   - 根据磁盘位置排序
+   > list_sort(NULL, io_list, xfs_buf_map)
+   > blk_start_plug(plug)
+   - 遍历io_list里的xfs_buf, 去掉_XBF_DELWRI_Q | XBF_ASYNC
+   - 设置XBF_WRITE
+   - 根据wait设置XBF_ASYNC
+   - 如果wait ==0, 还要删除xfs_buf->b_list队列
+   - 如果wait !=0, 估计外面回等待这些IO 
+   > xfs_bdstrat_cb(xfs_buf)
+   > blk_finish_plug(plug)
+
+** xfs_buf_delwri_submit_nowait(list_head)
+   - 使用异步方式写回队列中的xfs_buf 
+   > __xfs_buf_delwri_submit(buffer_list, io_list, false)
+   - 这里的io_list没有用, wait ==0, 所以删除了链表
+
+** xfs_buf_delwri_submit(list_head)
+   - 同步写回一串的xfs_buf, 这里回把有IO的xfs_buf放到io_list中
+   > __xfs_buf_delwri_submit(buffer_list, io_list, true)
+   - 然后等待他们  
+   > xfs_buf_iowait(xfs_buf)
+   > xfs_buf_relse(xfs_buf)
+
+** xfs_buf_init(void)
+   - 构造xfs_buf使用的kmem_zone
+   - 构造workqueue, 为异步的IO服务
+   - IO回调函数可能在软中断中,不能在里面做验证或回调用户的程序, 所以在workqueue中完成
