@@ -533,6 +533,31 @@
 ** mount-option
    - 省略mount option
 
+** xfs_max_file_offset(blockshift)
+   - 计算最大的文件长度, 在64位系统中, 1^63 - 1
+
+** xfs_set_inode32(xfs_mount)
+   - xfs_mount->m_maxicount表示inode的上限?
+   - 如果m_maxicount !=0, 需要计算可分配inode的AG的数量
+   - xfs_sb->sb_dblocks * xfs_sb->sb_imax_pct表示metadata的空间 icount
+   - icount /= 100, icount / xfs_sb->sb_agblocks
+   - 计算之后获取max_metadata
+   - 遍历xfs_mount的所有xfs_perag
+   - 如果agno太大,不适合32位的ino
+   - 计算AG的最大ino
+   > XFS_AGINO_TO_INO(xfs_mount, index, agino)
+   - 如果ino > XFS_MAXINUMBER_32, 这个AG不能作为inode/meta
+   - 设置xfs_perag->pagi_inodeok = pagf_metadata = 0
+   - 否则设置page_inodeok = 1, 如果它超过上面计算的max_metadata, 设置pagf_metadata = 1
+   - 有些AG可以保存xfs_dinode, 但不能用于其他metadata?
+   - 最后设置xfs_mount->m_flags的XFS_MOUNT_32BITINODES | XFS_MOUNT_SMALL_INUMS
+
+** xfs_set_inode64(xfs_mount)
+   - 遍历所有的xfs_perag
+   - 设置xfs_perag->pagi_inodeok = 1, pagf_metadata = 0
+   - pagf_metadata =1时会拒绝文件数据的分配, 所以不设置就不会影响分配
+   - 只是32位的时候设置, 才会影响磁盘分配
+
 ** xfs_blkdev_get(xfs_mount, name, block_device)
    - 根据nema打开block_device 
    > blkdev_get_by_path(name, FMODE_READ | FMODE_WRITE | FMODE_EXCL, block_device)
@@ -766,3 +791,194 @@
    > register_filesystem(xfs_fs_type)
 * xfs_mount.c
 
+** xfs_uuid_mount(xfs_mount)
+   - 检查xfs_mount使用的uuid和使用的xfs是否重复
+   - 如果xfs_mount->m_flags有XFS_MOUNT_NOUUID, 返回0
+   - 系统中所有的uuid在xfs_uuid_table数组中
+   - 遍历数组,比较是否和xfs_mount->xfs_sb->sb_uuid重复
+   - 如果重复返回1,已经重复
+   - 否返回1,而且把它放到xfs_uuid_table中,这是动态改变长度的
+   - 全是0的uuid的地方表示空的表项
+
+** xfs_uuid_umount(xfs_mount)
+   - 删除xfs_uuid_table中xfs_mount->xfs_sb->sb_uuid使用的表象,只是重新设为全0
+
+** __xfs_free_perag(rcu_head)
+   - 参数是xfs_perag->rcu_head, 异步释放自己
+
+** xfs_free_perag(xfs_mount)
+   - 遍历xfs_mount->m_perag_tree中的所有xfs_perag, 使用radix tree
+   > radix_tree_delete(xfs_mount->m_perag_tree, agno)
+   > call_rcu(xfs_perag->rcu_head, __xfs_free_perag)
+
+** xfs_sb_validate_fsb_count(xfs_sb, nblocks)
+   - 检查nblocks表示的长度是否超过xfs限制
+   - nblocks单位是fsb, 2^xfs_sb->sb_blocklog
+   - 如果使用XFS_BIG_BLKNOS, 最大长度是ULONG_MAX个page
+
+** xfs_initialize_perag(xfs_mount, xfs_agnumber_t agcount, xfs_agnumber_t maxagi)
+   - growfs使用?
+   - 遍历(0, agcount)范围内的AG
+   - 是否已经有xfs_perag 
+   > xfs_perag_get(xfs_mount, index)
+   - 如果不存在,创建xfs_perag, 放到xfs_mount->m_perag_index
+   - 初始化index, xfs_mount, pag_buf_tree
+   > radix_tree_insert(xfs_mount->m_perag_tree, index, xfs_perag)
+   - ino包含3部分:agno, agblocks, inopb
+   - 计算是否使用32位的ino? 
+   - 如果不能使用,在xfs_perag中标注
+   - 如果xfs_mount->m_flags有XFS_MOUNT_SMALL_INUMS, 要求xfs使用32ino 
+   - 大的agno就不合适组合ino, 所以设置xfs_mount->m_flags的XFS_MOUNT_32BITINODES 
+   - 如果xfs_mount->m_flags有XFS_MOUNT_32BITINODES 
+   > xfs_set_inode32(xfs_mount)
+   - 否则设置为64位模式
+   > xfs_set_inode64(xfs_mount)
+   
+** xfs_readsb(xfs_mount, flags)
+   - 读取磁盘的xfs_dsb
+   - 先获取设备的blocksize, block_device->bd_block_size
+   > xfs_getsize_buftarg(xfs_mount->m_ddev_targp)
+   - xfs_sb的位置是XFS_SB_DADDR / 0, 使用一个block
+   > xfs_buf_read_uncached(xfs_mount->m_ddev_targp, XFS_SB_DADDR, BTOBB(sector_size), 0, xfs_sb_buf_ops)
+   - 把数据放到xfs_mount->xfs_sb, 他和xfs_dsb一样,不过数据类型使用本地的,而不是大端的
+   > xfs_sb_from_disk(xfs_mount->xfs_sb, XFS_BUF_TO_SBP(xfs_mount))
+   - 初始化icbs计数?? 
+   > xfs_icsb_reinit_counters(xfs_mount)
+   - 把上面读出来的xfs_buf给xfs_mount->m_sb_bp
+
+** xfs_update_alignment(xfs_mount)
+   - 更新xfs_mount的参数?
+   - mount optoin sunit设置xfs_mount->m_dalign, swidth设置xfs_mount->m_swidth
+   - xfs_mount->m_blockmask = xfs_sb->sb_blocksize -1, 表示fsb大小
+   - 如果xfs_mount->m_dalign !=0, 单位变为fsb, 同时设置m_swidth
+   > XFS_BB_TO_FSBT(xfs_mount, xfs_mount->m_dalign)
+   - 同时更新xfs_sb->sb_unit / sb_width
+   - 设置xfs_mount->m_update_flags的XFS_SB_UNIT/XFS_SB_WIDTH
+   - 如果xfs_mount->m_dalign ==0, 但mount option没有noalign, 而且xfs版本支持sb_unit/sb_width
+   - 使用他们设置xfs_mount->m_dalign/m_swidth
+
+** xfs_set_maxicount(xfs_mount)
+   - 设置最大支持的ino的数量. 根据xfs_sb->sb_imax_pct 
+   > xfs_sb->sb_imax_pct表示可用于inode的最多block的比例
+   - xfs_sb->sb_dblocks * xfs_sb->sb_imax_pct / 100 << xfs_sb->sb_inopblog
+
+** xfs_set_rw_sizes(xfs_mount)
+   - 设置最小的rsize/wsize? nfs使用?
+   - mount option的biosize设置xfs_mount->m_readio_log/m_writeio_log和m_flags的XFS_MOUNT_DFLT_IOSIZE
+   - 如果没有设定检查wsync, 专门针对nfs的, 使用默认的小的iosize   read/write = (32k/16k)
+   - 否则默认的是(64k/64k)
+   - 设置xfs_mount->m_readio_log / m_writeio_log / m_readio_blocks / m_writeio_blocks, 后面2个单位是fsb
+
+** xfs_set_low_space_thresholds(xfs_mount)
+   - 计算5个阈值,在preallocation中使用
+   - ( 1% -- 5% ) * xfs_sb->sb_dblocks
+
+** xfs_set_inoalignment(xfs_mount)
+   - 计算inode分配的block的align?
+   - xfs版本需要支持, xfs_sb->sb_inoalignment > xfs_mount->m_inode_cluster_size
+   - xfs_mount->m_inode_cluster_size默认是8k
+   - xfs_mount->m_dalign有效
+
+** xfs_check_sizes(xfs_mount)
+   - 检查data设备和log设备的大小
+
+** xfs_mount_reset_sbqflags(xfs_mount)
+   - 重新设置quota的标志
+
+** xfs_default_resblks(xfs_mount)
+   - 预留5%的空间, xfs_sb->sb_dblocks * 5%
+
+** xfs_mountfs(xfs_mount)
+   - 磁盘中的xfs_dsb已经读取出来, 根据它设置xfs_mount
+   - 并计算一些参数数据
+   > xfs_sb_mount_common(xfs_mount, xfs_mount->xfs_sb)
+   - 根据xfs的版本,计算对应的特性
+   > xfs_update_alignment(xfs_mount)
+   - 计算btree的属性 
+   > xfs_alloc_compute_maxlevels(xfs_mount)
+   > xfs_bmap_compute_maxlevels(xfs_mount, XFS_DATA_FORK)
+   > xfs_bmap_compute_maxlevels(xfs_mount, XFS_ATTR_FORK)
+   > xfs_ialloc_compute_maxlevels(xfs_mount)
+   - 计算系统支持的最大ino 
+   > xfs_set_maxicount(xfs_mount)
+   - 注册uuid 
+   > xfs_uuid_mount(xfs_mount)
+   - 设置iosize  
+   > xfs_set_rw_sizes(xfs_mount)
+   - 设置low space阈值  
+   > xfs_set_low_space_thresholds(xfs_mount)
+   - 设置xfs_mount->m_inode_cluster_size 
+   > xfs_set_inoalignment(xfs_mount)
+   - 检查磁盘大小
+   > xfs_check_sizes(xfs_mount)
+   > xfs_rtmount_init(xfs_mount)
+   - 根据uuid计算xfs_mount->m_fixedfsid
+   - 初始化目录相关的 
+   > xfs_dir_mount(xfs_mount)
+   - 设置attribute manager?? 
+   - xfs_mount->m_attr_magicpct为37%的blocksize
+   - 初始化transaction
+   > xfs_trans_init(xfs_mount)
+   - 初始化AG的xfs_perag 
+   > xfs_initialize_perag(xfs_mount, xfs_sb->sb_agcount, xfs_mount->m_maxagi)
+   - mount操作也需要log? 
+   > xfs_log_mount(xfs_mount, xfs_mount->m_logdev_targp, XFS_FSB_TO_DADDR(xfs_mount, xfs_sb->sb_logstart), XFS_FSB_TO_BB(xfs_mount, xfs_sb->sb_logblocks))
+   - 如果xfs支持lazy sbcount? 而且之前的umount不正确?
+   > xfs_sb_version_haslazysbcount(xfs_mount->xfs_sb)
+   - 通过log recover得知之前umuont是否正确
+   > XFS_LAST_UNMOUNT_WAS_CLEAN(xfs_mount)
+   - 读取AG的agi/agf,修正文件系统的同计数?
+   > xfs_initialize_perag_data(xfs_mount, xfs_sb->sb_agcount)
+   - 构造根目录的inode, 给xfs_mount->m_rootip
+   > xfs_iget(xfs_mount, NULL, xfs_sb->sb_rootino, 0, XFS_ILOCK_EXCL, xfs_inode)
+   - rtmount? 
+   > xfs_rtmount_inodes(xfs_mount)
+   - 如果需要更新xfs_dsb? xfs_mount->m_update_flags !=0, 而且文件系统可写
+   - log对xfs_dsb的修改
+   > xfs_mount_log_sb(xfs_mount, xfs_mount->m_update_flags)
+   - quota
+   - mount完成, 也要log 
+   > xfs_log_mount_finish(xfs_mount)
+   - 预留空间, 给特殊的transaction使用
+   > xfs_default_resblks(xfs_mount)
+   > xfs_reserve_blocks(xfs_mount, resblks, NULL)
+
+** xfs_unmountfs(xfs_mount)
+   - 取消eofblock的工作? 
+   > cancel_delayed_work_sync(xfs_mount->m_eofblocks_work)
+   - 刷新log数据  
+   > xfs_log_force(xfs_mount, XFS_LOG_SYNC)
+   > xfs_ail_push_all_sync(xfs_mount->xfs_ail)
+   - 回收inode 
+   > xfs_reclaim_inodes(xfs_mount, SYNC_WAIT)
+   - 释放预留的空间? 
+   > xfs_reserve_blocks(xfs_mount, 0, NULL)
+   - 把文件系统的同计数写回磁盘
+   > xfs_log_sbcount(xfs_mount)
+   - 关闭log 
+   > xfs_log_unmount(xfs_mount)
+   > xfs_uuid_unmount(xfs_mount)
+
+** xfs_fs_writable(xfs_mount)
+   - 检查文件系统是否可写
+   - xfs_mount->super_block->s_writers->frozen >0, 不可写
+   - 文件系统关闭中,不可写
+   > XFS_FORCED_SHUTDOWN(xfs_mount)
+   - xfs_mount->m_flags有XFS_MOUNT_RDONLY, 不可写
+
+** xfs_log_sbcount(xfs_mount)
+   - 同步计数 
+   > xfs_icsb_sync_counters(xfs_mount, 0)
+   - 如果xfs不支持lazy sbcount, 在每次修改之后,都会刷会磁盘
+   - 所以不需要log这些 
+   > xfs_sb_version_haslazysbcount(xfs_sb)
+   - 否则创建xfs_trans, log上面的操作  
+   > _xfs_trans_alloc(xfs_mount, XFS_TRANS_SB_COUNT, KM_SLEEP)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_sb, 0, 0)
+   > xfs_mod_sb(xfs_trans, XFS_SB_IFREE | XFS_SB_ICOUNT | XFS_SB_FDBLOCKS)
+   - 设置xfs_trans的sync标志
+   > xfs_trans_set_sync(xfs_trans)
+   > xfs_trans_commit(xfs_trans, 0)
+
+** xfs_mod_incore_sb_unlocked(xfs_mount, xfs_sb_field_t, delta, rsvd)
+   - 
