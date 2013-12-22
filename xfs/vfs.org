@@ -1,10 +1,6 @@
 * xfs_ioctl.c
 * xfs_fsops.c
 
-* xfs_mount.c
-
-* xfs_super.c
-
 * xfs_file.c
 ** inode-lock
    - IOLOCK对应inode->i_mutex
@@ -317,4 +313,456 @@
 * xfs_iops.c
 
 ** xfs_initxattrs(inode, xattr, fs_info)
-   - 
+   - 设置文件xattr,遍历xattr数组 
+   > xfs_attr_set(xfs_inode, xattr->name, xattr->value, xattr->value_len, ATTR_SECURE)
+
+** xfs_init_security(inode, dir, qstr)
+   - selinux的接口?  在创建inode时同时创建acl?
+   > security_inode_init_security(inode, dir, qstr, xfs_init_attrs, NULL)
+
+** xfs_name 
+   - 应该是文件夹中存储的数据
+   #+BEGIN_SRC 
+	const unsigned char	*name;
+	int			len;
+	int			type;   
+   #+END_SRC
+
+** xfs_dentry_to_name(xfs_name, dentry)
+   - 根据dentry->d_name设置xfs_name
+   - 还包含文件属性
+
+** xfs_cleanup_inode(inode dir, inode inode, dentry)
+   - 删除dentry对应的文件, 它就是inode指向的文件? 
+   > xfs_dentry_to_name(xfs_name, dentry, 0)
+   - 使用xfs_inode.c中的接口, 操作btree
+   > xfs_remove(xfs_inode dir, xfs_name, xfs_inode inode)
+
+** xfs_vm_mknod(inode dir, dentry, mode, rdev)
+   - 准备dir的default ACL
+   > xfs_get_acl(dir, ACL_TYPE_DEFAULT)
+   - 准备xfs_name, 创建对应的文件 
+   > xfs_dentry_to_name(xfs_name, dentry, mode)
+   > xfs_create(xfs_inode dir, xfs_name, mode, rdev, xfs_inode)
+   - 创建获取新的inode, 设置ACL  
+   > xfs_inherit_acl(inode, default_acl)
+   - 关联dentry 
+   > d_instantiate(dentry, inode)
+
+** xfs_vn_create(inode dir, dentry, mode, flags)
+   > xfs_vm_mknod(dir, dentry, mode, 0)
+
+** xfs_vm_lookup(inode dir, dentry, flags)
+   - 查找文件, 先根据dentry->d_name获取对应的ino，然后读取xfs_dinode, 创建inode 
+   > xfs_dentry_to_name(xfs_name, dentry, 0)
+   > xfs_lookup(xfs_inode dir, xfs_name, xfs_inode, NULL)
+
+** xfs_vm_ci_lookup(inode, dentry, flags)
+   - 大小写无关查找?
+   > xfs_lookup(xfs_inode dir, xfs_name, xfs_inode, ci_name)
+
+** xfs_vm_link(dentry old_dentry, inode dir, dentry)
+   - 创建link文件dir/dentry, 指向old_dentry
+   > xfs_dentry_to_name(xfs_name, dentry, old_dentry->inode->i_mode)
+   > xfs_link(xfs_inode dir, xfs_inode inode, xfs_name)
+   - 然后关联新的dentry和老的inode 
+   > d_instantiate(dentry, old_dentry->inode)
+
+** xfs_vm_unlink(inode, dentry)
+   - 直接删除link文件
+   > xfs_remove(xfs_inode dir, xfs_name, dentry->inode)
+   - 原来的dentry变为negative, 但是还在hash表中, 可以找到 
+
+** xfs_vm_symlink(dir, dentry, symname)
+   - 创建文件dir/dentry, 指向的内容是symname
+   - 计算mode S_IFLNK, 这里使用uamsk计算
+   - 获取dentry的文件名  
+   > xfs_dentry_to_name(xfs_name, dentry, mode)
+   > xfs_symlink(xfs_inode dir, xfs_name, symname, mode, xfs_inode)
+   - 创建selinux的xattr 
+   > xfs_init_security(inode, dir, dentry->d_name)
+   > d_instantiate(dentry, inode)
+
+** xfs_vm_rename(inode, dentry, inode, dentry)
+   - 不需要准备什么 
+   > xfs_rename(xfs_inode old_dir, xfs_name old_name, xfs_inode old_inode, xfs_inode new_dir, xfs_name new_name, xfs_inode new_inode)
+   - 为何这里不需要关联新的inode和dentry
+   - 如果目录一样,是否可以直接修改文件名?
+
+** xfs_vm_follow_link(dentry, nameidata)
+   - 获取symlink的内容, 给nameidata->saved_names[]
+   > xfs_readlink(xfs_inode, link)
+
+** xfs_vm_put_link(dentry, nameidata, p)
+   - 释放p指向的内容,它就是上面读取的symlink内容
+
+** xfs_vm_getattr(vfsmount, dentry, kstat)
+   - stat操作? 获取dentry->inode的信息
+   - 设置size/dev_t/mode/nlink/uid/gid/ino/time
+   - stat->blocks是数据的磁盘空间, 以及delay write的空间
+   - xfs_icdinode->di_nblocks + xfs_inode->i_delayed_blks
+
+** xfs_setattr_mode(xfs_trans, xfs_inode, iattr)
+   - 设置xfs_inode的文件属性mode 
+   - 先设置xfs_inode->xfs_icdinode, 然后是inode->i_mode
+
+** xfs_setattr_nosize(xfs_inode, iattr, flags)
+   - 忽略iattr->i_size
+   - 创建xfs_trans, 预留空间? 
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_SETATTR_NOT_SIZE)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_ichange, 0, 0)
+   - 使用xfs_inode的XFS_ILOCK_EXCL锁住
+   - 如果修改ATTR_UID|ATTR_GID, 检查quota
+   - 把inode放到xfs_trans中
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 处理ATTR_UID|ATTR_GUID, 当前uid必须有效. 哪里检查哪些? 修改xfs_inode->xfs_icdinode, inode
+   - 处理ATTR_MODE
+   > xfs_setattr_mode(xfs_trans, xfs_inode, iattr)
+   - 处理time, 同时修改inode, xfs_inode->xfs_icdinode
+   - 提交对xfs_inode->xfs_icdinode的修改  
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 如果mount使用sync, 设置transaction属性
+   > xfs_trans_set_sync(xfs_trans)
+   > xfs_trans_commit(xfs_trans, 0)
+
+** xfs_setattr_size(xfs_inode, iattr)
+   - iattr->ia_valid中不能有uid/gid/atime/mtime??
+   - 检查iattr的文件大小
+   > inode_change_ok(inode, iattr)
+   - 如果newsize/oldsize为0, 不需要修改size
+   - 去掉iattr->ia_valid的ATTR_SIZE, 操作其他iattr 
+   > xfs_setattr_nonsize(xfs_inode, iattr, 0)
+   - 如果newsize > oldsize, 对应空间写0 
+   > xfs_zero_eof(xfs_inode, newsize, oldsize)
+   - 如果oldsize和xfs_inode->xfs_icdinode->di_size不一样, 还有IO中的数据?
+   - 上面把(oldsize,newsize)清0, 其他地方回写这里??
+   > filemap_write_and_wait_range(address_space, xfs_icdinode->di_size, newsize)
+   - 等待dio 
+   > inode_dio_wait(inode)
+   - 处理eof锁在的page, 为何还有获取block?
+   > block_truncate_page(address_space, newsize, xfs_get_blocks)
+   - 最后修改文件大小 
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_SETATTR_SIZE)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_itruncate, 0, 0)
+   - 修改inode, 释放多余的pagecache
+   > truncate_setsize(inode, newsize)
+   - log整个inode
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 添加iattr的ATTR_CTIME|ATTR_MTIME, 设置ctime=mtime为当前时间
+   - 设置xfs_inode->xfs_icdinode->di_size = newsize, 提交log 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 如果newsize < oldsize
+   - 删除多余的xfs_bmbt_rec 
+   > xfs_itruncate_extents(xfs_trans, xfs_inode, XFS_DATA_FORK, newsize)
+   - 设置xfs_inode的XFS_ITRUNCATED标志，在文件关闭时写回磁盘? 
+   - 数据写回去,但metadata也进口写回去?
+   > xfs_iflags_set(xfs_inode, XFS_ITRUNCATED)
+   > xfs_inode_clear_eofblicks_tag(xfs_inode)
+   - 然后处理ATTR_MODE, ATTR_CTIME, ATTR_MTIME 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 提交transaction 
+   > xfs_trans_set_sync(xfs_trans)
+   > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
+
+** xfs_vm_setattr(dentry, iattr)
+   - 根据iattr->ia_valid的ATTR_SIZE, 使用不同方法 
+   > xfs_setattr_size(xfs_inode, iattr)
+   > xfs_setattr_nonsize(xfs_inode, iattr)
+
+** xfs_vm_update_time(inode, timespec, flags)
+   - 修改mtime/ctime
+   - 构造xfs_trans 
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_FSYNC_TS)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_fsyncts, 0, 0)
+   - 锁住xfs_inode, 使用XFS_ILOCK_EXCL
+   - 根据flags, 设置xfs_inode->xfs_icdinode / inode的 ctime, mtime, atime
+   - 提交log  
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, XFS_ILOCk_EXCL)
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_TIMESTAMP)
+   > xfs_trans_commit(xfs_trans, 0)
+   - 这里没有释放锁?? 
+
+** xfs_fiemap_format(arg, getbmapx, full)
+   - 获取文件数据的磁盘位置信息
+   - 计算fiemap_flags?
+   - 如果getbmapx->bmv_oflags包含BMV_OF_PREALLOC, 使用FIEMAP_EXTENT_UNWRITTEN
+   - 预分配的磁盘, 还没有写数据， 应该也没有数据,或者完全清0?
+   - 如果包含BMV_OF_DELALLOC, 使用FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_UNKNOWN
+   - 应该时还没有分配磁盘信息?? 有没有??
+   - 如果包含BMV_OF_LAST, 使用FIEMAP_EXTENT_LAST
+   > fiemap_fill_next_extent(fiemap_extent_info, logical, physical, length, fiemap_flags)
+   - 为何还限制磁盘位置??
+
+** fiemap_extent_info 
+   #+BEGIN_SRC 
+	unsigned int fi_flags;		/* Flags as passed from user */
+	unsigned int fi_extents_mapped;	/* Number of mapped extents */
+	unsigned int fi_extents_max;	/* Size of fiemap_extent array */
+	struct fiemap_extent __user *fi_extents_start; /* Start of
+							fiemap_extent array */   
+   #+END_SRC
+
+** xfs_vn_fiemap(inode, fiemap_extent_info, start, length)
+   - 检查fiemap_extent_info的信息??
+   > fiemap_check_flags(fiemap_extent_info, XFS_FIEMAP_FLAGS) 
+   - 组装getbmapx, 设置getbmapx->bmv_iflags的BMV_IF_PREALLOC | BMV_IF_NO_HOLES
+   - 如果fiemap_extent_info->fi_flags包含FIEMAP_FLAG_XATTR, 设置BMV_IF_ATTRFORK
+   - 如果fi_flags没有FIEMAP_FLAG_SYNC, 还设置BMV_IF_DELALLOC
+   > xfs_getbmap(xfs_inode, getbmapx, xfs_fiemap_format, fiemap_extent_info)
+
+** xfs_diflag_to_iflags(inode, xfs_inode)
+   - 根据xfs_inode->xfs_icdinode->di_flags计算inode->i_flags
+   - XFS_DIFLAG_IMMUTABLE, 对应S_IMMUTABLE
+   - XFS_DIFLAG_APPEND 对应S_APPEND
+   - XFS_DIFLAG_SYNC 对应S_SYNC
+   - XFS_DIFLAG_NOATIME对应S_NOATIME
+
+** xfs_setup_inode(xfs_inode)
+   - 初始化inode, xfs_inode已经创建, 只需要复制一些信息
+   - i_ino, i_mode, i_link, uid, gid, dev, genera, size, time
+   - 设置i_state = I_NEW
+   - 把inode放到super_block中
+   > inode_sb_list_add(inode)
+   - 最终要的时组装回调函数接口
+   - 最后去掉XFS_INEW标志?? 
+   > xfs_iflags_clear(xfs_inode, XFS_INEW)
+   - 并且去掉inode->i_state的I_NEW 
+   > unlock_new_inode(inode)
+   
+* xfs_super.c
+** mount-option
+   - 省略mount option
+
+** xfs_blkdev_get(xfs_mount, name, block_device)
+   - 根据nema打开block_device 
+   > blkdev_get_by_path(name, FMODE_READ | FMODE_WRITE | FMODE_EXCL, block_device)
+
+** xfs_blkdev_put(block_device)
+   - 关闭设置文件, 为何还需要mode参数??
+   > blkdev_put(block_device, FMODE_READ | FMODE_WRITE | FMODE_EXCL)
+
+** xfs_blkdev_issue_flush(xfs_buftarg)
+   - 放松flush请求,对应mount的barrier 
+   > blkdev_issue_flush(xfs_buftarg->block_device, GFP_NOFS, NULL)
+
+** xfs_close_devices(xfs_mount)
+   - 关闭log使用的设备, 设备和xfs_buftarg对应
+   > xfs_free_buftarg(xfs_mount, xfs_mount->m_logdev_targp)
+   > xfs_blkdev_put(block_device)
+   - 然后关闭data的设备 
+   > xfs_free_buftarg(xfs_mount, xfs_mount->m_ddev_targp)
+
+** xfs_open_devices(xfs_mount)
+   - data的设备已经打开? 只需要打开log设备?
+   > xfs_blkdev_get(xfs_mount, xfs_mount->m_logname, block_device)
+   - 创建data使用的xfs_buftarg 
+   > xfs_alloc_buftarg(xfs_mount, xfs_mount->xfs_super->s_bdev, 0, xfs_mount->m_fsname)
+   - 创建log使用的xfs_buftarg, 里面最重要的估计就是bdi
+   > xfs_alloc_buftarg(xfs_mount, logdev, 1, xfs_mount->m_fsname)
+
+** xfs_setup_devices(xfs_mount)
+   - 设置blocksize/sectorsize
+   - sectorsize给block_device, 但应该不会影响到bio
+   > xfs_setsize_buftarg(xfs_mount->m_ddev_targp, xfs_mount->xfs_sb->sb_blocksize, xfs_sb->sb_sectsize)
+   - 然后设置log的device 
+   > xfs_setsize_buftarg(xfs_mount->m_logdev_targp, xfs_sb->sb_blocksize, xfs_sb->sb_logsectsize)
+
+** xfs_init_mount_workqueues(xfs_mount)
+   - 创建一系列workqueue
+   - xfs_mount->m_dta_workqueue是什么? xfs-data
+   - xfs_mount->m_unwritten_workqueue  xfs-conv?
+   - xfs_mount->m_cil_workqueue  xfs-cil
+   - xfs_mount->m_reclaim_workqueue, xfs-reclaim
+   - xfs_moung->m_log_workqueue  xfs-log
+   - xfs_mount->m_eofblocks_workqueue   xfs-eofblocks
+
+** xfs_flush_inodes(xfs_mount)
+   - 把所有的dirty data写回磁盘?
+   > sync_inodes_sb(super_block, jiffies)
+   - 提交wb_writeback_work, 启动pdflush的workqueue执行
+   - 当前任务只会锁住super_block, 不会锁住inode
+   - 对于inode的metadata,使用super_operations->write_inode,但xfs没有实现..
+
+** xfs_fs_alloc_inode(super_block)
+   - 创建inode? 不可能调用到这里?
+
+** xfs_fs_destroy_inode(inode)
+   - inode_operations->destroy_inode接口? 在销毁inode的最后一步使用
+   - xfs_inode没有XFS_IRECLAIMABLE | XFS_IRECLAIM标志?
+   - 而且要这只这些标志? 
+   > xfs_inode_set_reclaim_tag(xfs_inode)
+   - 使用background的回收任务回收不用的xfs_inode? 可能这个inode的IO还没有完成?? 可能metadata还有IO？
+
+** xfs_fs_inode_init_once(xfs_inode)
+   - slab的回调函数, 只是初始化inode
+   > inode_init_once(inode)
+
+** xfs_fs_evict_inode(inode)
+   - inode_operations->evice_inode接口, 删除之前的一步
+   - 释放pagecache中的所有page, 等待写IO中的page
+   > truncate_inode_pages(address_space, 0)
+   - 检查inode的状态, 设置idone->i_state的I_FREEING|I_CLEAR
+   > clear_inode(inode)
+   - 最后清除xfs_inode的信息, 信息量很大.
+   > xfs_inactive(xfs_inode)
+
+** xfs_fs_drop_inode(inode)
+   - 检查inode是否必要缓存起来
+   - 通用的判断条件
+   > generic_drop_inode(inode)
+   - 如果xfs_inode->i_flags有XFS_IDONTCACHE, 直接释放
+
+** xfs_free_fsname(xfs_mount)
+   - 释放xfs_mount->m_fsname, m_logname
+
+** xfs_fs_put_super(super_block)
+   - super_operations->put_super接口 
+   - 关闭文件系统?
+   > xfs_unmount(xfs_mount)
+   - 释放什么? 
+   > xfs_freesb(xfs_mount)
+   - 释放计数  
+   > xfs_icsb_destroy_counter(xfs_mount)
+   - 关闭workqueue 
+   > xfs_destroy_mount_workqueue(xfs_mount)
+   - 关闭设备 
+   > xfs_close_devices(xfs_mount)
+   - 释放自己 
+   > xfs_free_fsname(xfs_mount)
+   
+** xfs_fs_sync_fs(super_block, wait)
+   - super_operations->sync_fs接口
+   - 如果wait ==0, 直接返回??
+   - 否则提交log 
+   > xfs_log_force(xfs_mount, XFS_LOG_SYNC)
+
+** xfs_fs_statfs(dentry, kstatfs)
+   - 获取文件系统的信息
+   - type = XFS_SB_MAGIC 'XFSB'
+   - fsid是什么? 
+   > huge_encode_dev(xfs_mount->m_ddev_targp->bt_dev) 
+   - sync什么计数 ? 
+   > xfs_icsb_sync_counters(xfs_mount, XFS_ICSB_LAZY_COUNT)
+   - bsize = xfs_sb->sb_blocksize
+   - f_blocks = xfs_sb->sb_dblocks - xfs_sb->sb_logblocks?
+   - f_bfree = f_bavail = xfs_sb->sb_fdblocks - XFS_ALLOC_SET_ASIDE(xfs_mount)
+   - 上面去掉的是ag的头部?  4个block?
+   - f_files = xfs_sb->sb_icount + f_bfree << sb_inopblog, 这的确是最多的, 把空闲空间全部分配为xfs_dinode
+   - f_ffree是什么 
+
+** xfs_save_resvblks(xfs_mount)
+   - 设置xfs_mount->m_resblks_save = xfs_mount->m_resblks ?? 
+   - 这个实现在xfs_fsops.c中
+   > xfs_reserve_blocks(xfs_mount, resblks, NULL)
+
+** xfs_restore_resvblks(xfs_mount)
+   - 还是预留空间???  先计算需要预留的空间??
+   > xfs_reserve_blocks(xfs_mount, resblks, NULL)
+
+** xfs_quiesce_attr(xfs_mount)
+   - 把metadata的写回操作, 而不是写回log, 在freeze中使用 
+   - 完成之后log全部删除, sync操作却是把log写回
+   - 停止log操作?
+   - 等待transaction完成?? xfs_mount->m_active_trans > 0
+   - 先刷回log数据? 释放pin状态的数据
+   > xfs_log_force(xfs_mount, XFS_LOG_SYNC)
+   - 回收inode 
+   > xfs_reclaim_inodes(xfs_mount, 0)
+   > xfs_reclaim_inodes(xfs_mount, SYNC_WAIT)
+   - 关闭log 
+   > xfs_log_sbcount(xfs_mount)
+   > xfs_log_quiesce(xfs_mount)
+
+** xfs_fs_remount(super_block, flags, options)
+   - 解析remount的参数, 接受的参数包括, barrier, inode64?
+   - 如果是ro => rw, 去掉xfs_mount->m_flags的XFS_MOUNT_RDONLY
+   > xfs_mount_log_sb(xfs_mount, xfs_mount->m_update_flgs)
+   - 启动预留和log??
+   > xfs_restore_resvblks(xfs_mount)
+   > xfs_log_work_queue(xfs_mount)
+   - 如果rw => ro, 写回所有的数据, 设置xfs_mount->m_flags的XFS_MOUNT_RDONLY 
+   > xfs_save_resvblks(xfs_mount)
+   > xfs_quiesce_attr(xfs_mount)
+
+** xfs_fs_freeze(super_block)
+   - 锁住文件系统之前的操作  
+   > xfs_save_resvblks(xfs_mount)
+   > xfs_quiesce_attr(xfs_moutn)
+   - 写一个空的transaction? 
+   > xfs_fs_log_dummy(xfs_mount)
+
+** xfs_fs_unfreeze(super_block)
+   - 恢复预留计数? 
+   > xfs_restore_resvblks(xfs_mount)
+   - 恢复log操作  
+   > xfs_log_work_queue(xfs_mount)
+
+** xfs_fs_show_options(seq_file, dentry)
+   > xfs_showargs(dentry->super_block, m)
+
+** xfs_finish_flags(xfs_mount)
+   - 根据mount option, 计算xfs_mount的成员, m_flags 
+
+** xfs_fs_fill_super(super_block, data, silent)
+   - 构造xfs_mount给super_block->s_fs_info
+   - data是mount option
+   > xfs_parseargs(xfs_mount, data)
+   - 打开设备  
+   > xfs_open_devices(xfs_mount)
+   - 创建workqueue 
+   > xfs_init_mount_workqueues(xfs_mount)
+   - 初始化系统统计参数  
+   > xfs_icsb_init_counters(xfs_mount)
+   - 读取磁盘的super_block 
+   > xfs_readsb(xfs_mount, flags)
+   > xfs_finish_flags(xfs_mount)
+   - 创建xfs_buftarg 
+   > xfs_setup_devices(xfs_mount)
+   - filestream? 
+   > xfs_filestream_mount(xfs_mount)
+   - 初始化super_block, blocksize, maxbytes, max_links
+   > set_posix_acl_flags(super_block)
+   - 执行mount?? 
+   > xfs_mountfs(xfs_mount)
+   - 获取根结点inode  
+   > igrab(xfs_mount->m_rootip)
+   - 创建对应的dentry 
+   > d_make_root(inode)
+
+** xfs_fs_mount(file_system_type, flags, dev_name, data)
+   - 使用通用接口, 创建super_block, 执行回调函数
+   > mount_bdev(fs_type, flags, dev_name, data, xfs_fs_fill_super)
+   
+** xfs_fs_nr_cached_objects(super_block, nid)
+   - 回收inode?
+   > xfs_reclaim_inodes_count(xfs_mount)
+   
+** xfs_fs_free_cached_objects(super_block, nr_to_scan, nid)
+   - 同样是回收缓存的inode
+
+** xfs_init_zones(void)
+   - 挂载xfs模块时使用
+   - 创建各种kmem_zone, ioend, xlog_ticket, xfs_bmap_item, xfs_btree_cur, xfs_da_state, xfs_ifork, xfs_trans, xfs_log_item_desc, xfs_buf_log_item, xfs_efd_log_item, xfs_efi_log_item, xfs_inode, xfs_inode_log_item, xfs_icreate_item
+
+** xfs_init_workqueues(void)
+   - xfsalloc和上面mount时的什么不一样??
+
+** init_xfs_fs()
+   - 内存管理
+   > xfs_init_zones()
+   - workqueues 
+   > xfs_init_workqueues()
+   - lock cache? 
+   > xfs_mru_cache_init()
+   - filestream 
+   > xfs_filestream_init()
+   - xfs_buf? 
+   > xfs_buf_init()
+   - procfs 
+   > xfs_init_procfs()
+   - systemctl register? 
+   > xfs_sysctl_register()
+   - 最后注册文件系统类型  
+   > register_filesystem(xfs_fs_type)
+* xfs_mount.c
+
