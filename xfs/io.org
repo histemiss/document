@@ -2054,4 +2054,4 @@
    > xfs_bmbt_irec->br_startblock  != DELAYSTARTBLOCK
    - 那还释放什么?? 
    > xfs_bunmapi(NULL, xfs_inode, start_fsb, 1, 0, 1, firstblock, xfs_bmap_free, done)
-* xfs_bmap_uitl.c
+* xfs_bmap_util.c
