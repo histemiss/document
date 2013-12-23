@@ -1,6 +1,4 @@
 * xfs_ioctl.c
-* xfs_fsops.c
-
 * xfs_file.c
 ** inode-lock
    - IOLOCK对应inode->i_mutex
@@ -790,7 +788,6 @@
    - 最后注册文件系统类型  
    > register_filesystem(xfs_fs_type)
 * xfs_mount.c
-
 ** xfs_uuid_mount(xfs_mount)
    - 检查xfs_mount使用的uuid和使用的xfs是否重复
    - 如果xfs_mount->m_flags有XFS_MOUNT_NOUUID, 返回0
@@ -981,4 +978,436 @@
    > xfs_trans_commit(xfs_trans, 0)
 
 ** xfs_mod_incore_sb_unlocked(xfs_mount, xfs_sb_field_t, delta, rsvd)
-   - 
+   - 修改xfs_mount->xfs_sb的计数成员, 这里没有修改磁盘中的数据xfs_dsb
+   - 修改的成员是xfs_sb_field_t
+   - 对于XFS_SBS_ICOUNT, XFS_SBS_IFREE, XFS_SBS_FREXTENTS, XFS_SBS_DBLOCKS, XFS_SBS_AGCOUNT, XFS_SBS_IMAX_PCT, XFS_SBS_RBMBLOCKS, XFS_SBS_RBLOCKS, XFS_SBS_REXTENTS, XFS_SBS_REXTSLOG, 都是直接修改对应的成员变量
+   - 对于XFS_SBS_FDBLOCKS, 修改xfs_sb->sb_fdblocks
+   - 先计算已经使用的reserve的空间?? res_used =  xfs_mount->m_resblks - xfs_mount->m_resblks_avail
+   - 如果delta > 0, 是释放reserve空间?
+   - 如果res_used > delta, 直接增加xfs_mount->m_resblks_avail
+   - 否则说明释放比已经使用的多? 设置xfs_mount->m_resblks_avail = xfs_mount->m_resblks, 把多余的给xfs_sb->sb_fdblocks
+   - 如果delta < 0, 需要分配reserve空间, 先从xfs_sb->sb_fdblocks中分配
+   - 如果它不够, 而且参数rsvd !=0, 从xfs_mount->m_resblks_avail分配
+   - xfs_sb->sb_fdblocks不能少于阈值 
+   > XFS_ALLOC_SET_ASIDE(xfs_mount)
+
+** xfs_mod_incore_sb(xfs_mount, xfs_sb_field_t, delta, rsvd)
+   - 锁住xfs_mount->m_sb_lock 
+   > xfs_mod_incore_sb_unlocked(xfs_mount, xfs_sb_field_t, delta, rsvd)
+
+** xfs_mod_sb 
+   #+BEGIN_SRC 
+	xfs_sb_field_t	msb_field;	/* Field to modify, see below */
+	int64_t		msb_delta;	/* Change to make to specified field */   
+   #+END_SRC
+
+** xfs_mod_incore_sb_batch(xfs_mount, xfs_mod_sb, uint nmsb, rsvd)
+   - 修改xfs_sb的多个成员
+   - 遍历xfs_mod_sb数组
+   > xfs_mod_incore_sb_unlocked(xfs_mount, xfs_mod_sb->msb_field, xfs_mod_sb->msb_delta)
+
+** xfs_getsb(xfs_mount, flags)
+   - 操作xfs_dsb所在的block, 也就是xfs_mount->m_sb_bp 
+   > xfs_buf_trylock(xfs_buf)
+   - 增加xfs_buf的使用计数??
+
+** xfs_freesb(xfs_mount)
+   - 释放xfs_mount->m_sb_bp 
+   > xfs_buf_relse(xfs_buf)
+
+** xfs_mount_log_sb(xfs_mount, fields)
+   - 修改对xfs_sb的修改
+   - fields必须包含固定的成员? XFS_SB_UNIT | XFS_SB_WIDTH | XFS_SB_UUID | XFS_SB_FEATURES2 | XFS_SB_VERSIONNUM ??
+   - 构造xfs_trans
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_SB_UNIT)
+   - 怎么预留空间?
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_sb, 0, 0)
+   - 修改xfs_mount->xfs_sb
+   > xfs_mod_sb(xfs_trans, fields)
+   > xfs_trans_commit(xfs_trans, 0)
+
+** xfs_dev_is_read_only(xfs_mount, message)
+   - 检查data设备和log设备是否可以只读?
+   > xfs_readonly_buftarg(xfs_mount->m_ddev_targp)
+
+** xfs_icsb_cnts
+   #+BEGIN_SRC 
+	uint64_t	icsb_fdblocks;
+	uint64_t	icsb_ifree;
+	uint64_t	icsb_icount;
+	unsigned long	icsb_flags;   
+   #+END_SRC
+
+** xfs_icsb_cpu_notify(notifier_block, action, hcpu)
+   - 使用per-cpu的计数,加快一些操作频繁的计数修改. 而不是直接修改xfs_sb的计数
+   - 这时cpu时间的回调函数, 处理per-cpu计数
+   - 对于CPU_UP_PREPARE / CPU_UP_PREPARE_FROZEN, 清空自己的xfs_icsb_cnts_t计数
+   - 对于CPU_ONLINE / CPU_ONLINE_FROZEN, 分配3个计数
+   - XFS_SBS_ICOUNT , XFS_SBS_IFREE, XFS_SBS_FDBLOCKS, 对应xfs_icsb_cnts成员和xfs_sb中的成员
+   > xfs_icsb_balance_counter(xfs_mount, XFS_SBS_ICOUNT, 0)
+   - 对于CPU_DEAD / CPU_DEAD_FROZEN, 关闭hcpu对应的计数 
+   > xfs_icsb_disable_counter(xfs_mount, XFS_SBS_ICOUNT)
+   > xfs_icsb_balance_counter_locked(xfs_mount, XFS_SBS_ICOUNT, 0)
+
+** xfs_icsb_init_counters(xfs_mount)
+   - 创建per-cpu变量xfs_mount->m_sb_cnts
+   - xfs_mount->m_icsb_counters表示cpu的计数是否启用? 默认为-1, 所以的都关闭
+   - 注册cpu通知 
+   > register_hotcpu_notifier(xfs_mount->m_icsb_notifier)
+
+** xfs_icsb_reinit_counters(xfs_mount)
+   - 重新初始化所有的计数?? 
+   - 设置xfs_mount->m_icsb_counters = -1 
+   > xfs_icsb_balance_counter(xfs_mount, XFS_SBS_ICOUNT, 0)
+
+** xfs_icsb_destroy_counters(xfs_mount)
+   - 注销cpu通知事件,释放per-cup变量
+   > unregister_hotcpu_notifier(xfs_mount->m_icsb_notifier)
+   > free_percpu(xfs_mount->m_sb_cnts)
+
+** xfs_icsb_lock_cntr(xfs_icsb_cnts)
+   - 等待xfs_icsb_cnts->icsb_flags的XFS_ICSB_FLAG_LOCK标志
+   > ndelay(100)
+
+** xfs_icsb_unlock_cntr(xfs_icsb_cnts)
+   - 去掉xfs_icsb_cnts->icsb_flags的XFS_ICSB_FLAG_LOCK标志
+
+** xfs_icsb_lock_all_counters(xfs_mount)
+   - 锁住所有的xfs_icsb_cnts->icsb_flags, 可能会等待这些锁  
+   - 遍历每个cpu的变量 
+   > xfs_icsb_lock_cntr(xfs_icsb_cnts)
+
+** xfs_icsb_unlock_all_counters(xfs_mount)
+   - 释放fs_icsb_cnts的锁  
+   > xfs_icsb_unlock_cntr(xfs_icsb_cnts)
+   - 这里的锁等待也是忙等，释放锁也没有唤醒 
+
+** xfs_icsb_count(xfs_mount, xfs_icsb_cnts, flags)
+   - 初始化xfs_icsb_cnts?
+   - 如果flags没有XFS_ICSB_LAZY_COUNT? 需要锁住xfs_icsb_cnts 
+   > xfs_icsb_lock_all_counters(xfs_mount)
+   - 遍历所有的xfs_mount->m_sb_cnts, 累加3个成员变量
+   - 结果给参数xfs_icsb_cnts
+
+** xfs_icsb_counter_disabled(xfs_mount, xfs_sb_field_t)
+   - 检查xfs_sb_field_t对应的计数是否可用? 
+   - xfs_mount->m_icsb_counters的对应标志表示着一个成员使用使用per-cpu计数 
+
+** xfs_icsb_disable_counter(xfs_mount, xfs_sb_field_t)
+   - 禁止使用xfs_sb_field_t对应的per-cpu计数 
+   - 如果已经关闭直接返回
+   > xfs_icsb_counter_disabled(xfs_mount, xfs_sb_field_t)
+   - 先去掉xfs_mount->m_icsb_counters中对应标志 
+   - 然后获取对应的计数
+   > xfs_icsb_count(xfs_mount, xfs_icsb_cnts, XFS_ICSB_LAZY_COUNT)
+   - 根据xfs_sb_field_t, 设置上xfs_mount->xfs_sb
+
+** xfs_icsb_enable_counter(xfs_mount, xfs_sb_field_t, count, resid)
+   - 开始使用xfs_sb_field_t的per-cpu计数
+   - 遍历xfs_mount->m_sb_cnts的xfs_icsb_cnts_t
+   - 根据xfs_sb_field_t, 设置xfs_icsb_cnts的成员,第一个cpu设置为count + resid, 其他设置为count
+   - 最后去掉xfs_mount->m_icsb_counters的标志
+
+** xfs_icsb_sync_counters_locked(xfs_mount, flags)
+   - 累加xfs_mount->m_sb_cnts的计数
+   > xfs_icsb_count(xfs_mount, xfs_icsb_cnts, flags)
+   - 如果xfs_mount->m_icsb_counters表示使用它, 设置xfs_mount->xfs_sb
+
+** xfs_icsb_sync_counters(xfs_mount, flags)
+   - 使用xfs_mount->m_sb_lock保护. 获取所有计数, 放到xfs_sb中
+   > xfs_icsb_sync_counters_locked(xfs_mount, flags)
+
+** xfs_icsb_balance_counter_locked(xfs_mount, xfs_sb_field_t, min_per_cpu)
+   - 首先关闭对应的标志, 而且统计所有的变量
+   > xfs_icsb_disable_counter(xfs_mount, xfs_sb_field_t)
+   - 处理xfs_sb_field_t对应的成员
+   - 然后平均xfs_sb中的值. 如果总的值不超过阈值,或平均之后不超过min_per_cpu
+   - 不再使用per-cpu计数
+   - 对于icount/ifree, 阈值是XFS_ICSB_INO_CNTR_REENABLE(64)
+   - 对于fdblocks, 表示可用磁盘空间, 512 + 特殊reserve的空间
+   > XFS_ICSB_FDBLK_CNTR_REENABLE(xfs_mount)
+   - 如果可以使用per-cpu计数  
+   > xfs_icsb_enable_counter(xfs_mount, xfs_sb_field_t, count, resid)
+   - 上面平均操作时,可能不会整除,所以余数给第一个pcu
+
+** xfs_icsb_balance_counter(xfs_mount)
+   - 使用xfs_mount->m_sb_lock保护
+   > xfs_icsb_balance_counter_locked(xfs_mount, xfs_sb_field_t, min_per_cpu)
+
+** xfs_icsb_modify_counters(xfs_mount, xfs_sb_field_t, delta, rsvd)
+   - 修改xfs_sb的计数成员
+   - 首先检查是否有per-cpu计数 
+   > xfs_icsb_counter_disabled(xfs_mount, xfs_sb_field_t)
+   - 如果有修改per-cpu的变量
+   - 如果per-cpu分配失败,需要重新计算per-cpu的值 
+   > xfs_icsb_balance_counter(xfs_mount, xfs_sb_field_t, delta)
+   - 否则使用xfs_mount->xfs_sb
+   > xfs_mod_incore_sb_unlocked(xfs_mount, xfs_sb_field_t, delta, rsvd)
+* xfs_fsops.c
+
+** xfs_fsop_geon 
+   #+BEGIN_SRC 
+	__u32		blocksize;	/* filesystem (data) block size */
+	__u32		rtextsize;	/* realtime extent size		*/
+	__u32		agblocks;	/* fsblocks in an AG		*/
+	__u32		agcount;	/* number of allocation groups	*/
+	__u32		logblocks;	/* fsblocks in the log		*/
+	__u32		sectsize;	/* (data) sector size, bytes	*/
+	__u32		inodesize;	/* inode size in bytes		*/
+	__u32		imaxpct;	/* max allowed inode space(%)	*/
+	__u64		datablocks;	/* fsblocks in data subvolume	*/
+	__u64		rtblocks;	/* fsblocks in realtime subvol	*/
+	__u64		rtextents;	/* rt extents in realtime subvol*/
+	__u64		logstart;	/* starting fsblock of the log	*/
+	unsigned char	uuid[16];	/* unique id of the filesystem	*/
+	__u32		sunit;		/* stripe unit, fsblocks	*/
+	__u32		swidth;		/* stripe width, fsblocks	*/
+	__s32		version;	/* structure version		*/
+	__u32		flags;		/* superblock version flags	*/
+	__u32		logsectsize;	/* log sector size, bytes	*/
+	__u32		rtsectsize;	/* realtime sector size, bytes	*/
+	__u32		dirblocksize;	/* directory block size, bytes	*/
+	__u32		logsunit;	/* log stripe unit, bytes */   
+   #+END_SRC
+
+** xfs_growfs_data 
+   #+BEGIN_SRC 
+	__u64		newblocks;	/* new data subvol size, fsblocks */
+	__u32		imaxpct;	/* new inode space percentage limit */   
+   #+END_SRC
+
+** xfs_agf
+   #+BEGIN_SRC 
+	/*
+	 * Common allocation group header information
+	 */
+	__be32		agf_magicnum;	/* magic number == XFS_AGF_MAGIC */
+	__be32		agf_versionnum;	/* header version == XFS_AGF_VERSION */
+	__be32		agf_seqno;	/* sequence # starting from 0 */
+	__be32		agf_length;	/* size in blocks of a.g. */
+	/*
+	 * Freespace information
+	 */
+	__be32		agf_roots[XFS_BTNUM_AGF];	/* root blocks */
+	__be32		agf_spare0;	/* spare field */
+	__be32		agf_levels[XFS_BTNUM_AGF];	/* btree levels */
+	__be32		agf_spare1;	/* spare field */
+
+	__be32		agf_flfirst;	/* first freelist block's index */
+	__be32		agf_fllast;	/* last freelist block's index */
+	__be32		agf_flcount;	/* count of blocks in freelist */
+	__be32		agf_freeblks;	/* total free blocks */
+
+	__be32		agf_longest;	/* longest free space */
+	__be32		agf_btreeblks;	/* # of blocks held in AGF btrees */
+	uuid_t		agf_uuid;	/* uuid of filesystem */
+
+	/*
+	 * reserve some contiguous space for future logged fields before we add
+	 * the unlogged fields. This makes the range logging via flags and
+	 * structure offsets much simpler.
+	 */
+	__be64		agf_spare64[16];
+
+	/* unlogged fields, written during buffer writeback. */
+	__be64		agf_lsn;	/* last write sequence */
+	__be32		agf_crc;	/* crc of agf sector */
+	__be32		agf_spare2;
+
+	/* structure must be padded to 64 bit alignment */   
+   #+END_SRC
+
+** xfs_agfl 
+   #+BEGIN_SRC 
+	__be32		agfl_magicnum;
+	__be32		agfl_seqno;
+	uuid_t		agfl_uuid;
+	__be64		agfl_lsn;
+	__be32		agfl_crc;
+	__be32		agfl_bno[];	/* actually XFS_AGFL_SIZE(mp) */   
+   #+END_SRC
+
+** xfs_fsop_counts 
+   #+BEGIN_SRC 
+	__u64	freedata;	/* free data section blocks */
+	__u64	freertx;	/* free rt extents */
+	__u64	freeino;	/* free inodes */
+	__u64	allocino;	/* total allocated inodes */   
+   #+END_SRC
+
+** xfs_fs_geometry(xfs_mount, xfs_fsop_geom_t, new_version)
+   - 从xfs_sb中获取xfs_fsop_geom中的变量
+   - xfs_fsop_geon->flags需要根据xfs的版本计算
+   - xfs_sb->sb_versionnum
+
+** xfs_growfs_get_hdr_buf(xfs_mount, xfs_daddr blkno, size_t numblks, flags, xfs_buf_ops)
+   - 准备一个xfs_buf, 长度是numblks
+   > xfs_buf_get_uncached(xfs_mount->m_ddev_targp, numblks, flags)
+   - 设置磁盘位置 blkno
+
+** xfs_growfs_data_private(xfs_mount, xfs_growfs_data)
+   - xfs_growfs_data->newblocks表示新增的空间, 必须超过xfs_sb->sb_dblocks
+   - 获取newblocks对应的xfs_buf? 
+   > xfs_buf_read_uncached(xfs_mount->m_ddev_targp, XFS_FSB_TO_BB(xfs_mount, nb) - XFS_FSS_TO_BB(xfs_mount, 1), XFS_FSS_TO_BB(xfs_mount, 1), 0, NULL)
+   - 通过IO, 检查是否能访问扩展的磁盘位置 
+   > xfs_buf_relse(xfs_buf)
+   - 创建新的AG的xfs_buftarg
+   > xfs_initialize_perag(xfs_mount, new_agcount, agimax)
+   - 创建xfs_trans, 设置xfs_trans->t_flags的XFS_TRANS_RESERVE
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_GROWFS)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_growdata, XFS_GROWFS_SPACE_RES(xfs_mount), 0)
+   - 遍历新的AG, 创建对应的agf/agfl/agi/根结点 
+   - 初始化AGF block agf的实现在xfs_alloc.c中, 管理磁盘的空间
+   - 获取agf对应的xfs_buf, 他使用一个sector, FSS表示sector size?
+   > xfs_growfs_get_hdr_buf(xfs_mount, XFS_AG_DADDR(xfs_mount, agno, XFS_AGF_DADDR(xfs_mount), XFS_FSS_TO_BB(xfs_mount, 1), 0, xfs_agf_buf_ops))
+   > XFS_BUF_TO_AGF(xfs_buf)
+   - 设置magic, version, seqno = agno, agf_length
+   - agf_roots是XFS_BNO_BLOCK(xfs_mount) 和 XFS_CNT_BLOCK(xfs_mount), agf_levels都是1
+   - 对于AG, 第0个sector是SB? 第1是AGF, 第2个是AGI, 第3个是AGFL
+   - 后面的以fsb为单位, 后面2个AGF的2个树根, 再后面是AGI的树根
+   - AG已经使用的空间是上面这些 
+   > XFS_PREALLOC_BLOCKS(xfs_mount)
+   - 设置agf_freeblks = agf_longest = agf_length - 已经使用的空间
+   - 设置agf_fifirst = 0,flcount = 0, agf_fllast是AGFL中指针的长度
+   - 初始化后就是 ( sb_sectorsize - sizeof(xfs_agfl) ) / sizeof(xfs_agblock_t)
+   > XFS_AGFL_SIZE(xfs_mount)
+   - 设置uuid, 然后写回磁盘
+   > xfs_bwrite(xfs_buf)
+   > xfs_buf_relse(xfs_buf)
+   - 初始化AGFL block, agfl管理也在xfs_alloc.c中实现
+   > xfs_growfs_get_hdr_buf(xfs_mount, XFS_AG_DADDR(xfs_mount, agno, XFS_AGFL_DADDR(xfs_mount)), XFS_FSS_TO_BB(xfs_mount, 1), 0, xfs_agfl_buf_ops)
+   - 把xfs_buf的磁盘清0
+   - 设置xfs_agfl的magicnum, seqno, uuid
+   - 所有的指针都初始化为NULLAGBLOCK / -1
+   > xfs_bwrite(xfs_buf)
+   > xfs_buf_relse(xfs_buf)
+   - 初始化agi block, 管理AG中的xfs_dinode使用的空间
+   > xfs_growfs_get_hdr_buf(xfs_mount, XFS_AG_DADDR(xfs_mount, agno, XFS_AGI_DADDR(xfs_mount)), XFS_FSS_TO_BB(xfs_mount, 1), 0, xfs_agi_buf_ops)
+   - 设置成员agi_magicnum, agi_versionnum, agi_seqno, length就是AG的大小
+   - agi_count = 0, 这时还没有
+   - agi_root = XFS_IBT_BLOCK(xfs_mount), 在agi的根结点后面
+   - agi_level = 1, 只有一个空的叶子节点
+   - agi_freecount =0, agi_newino = agi_dirino = NULLAGINO
+   - 设置unlinked的hash表头节点, 都指向NULLAGINO / -1
+   - 写回磁盘 
+   > xfs_bwrite(xfs_buf)
+   - 初始化BNO根结点, 现在应该只有一个extent 
+   - 这里读取的xfs_buf长度是blocksize, 而不是sectorsize
+   > xfs_growfs_get_hdr_buf(xfs_mount, XFS_AGB_TO_DADDR(xfs_mount, agno, XFS_BNO_BLOCK(xfs_mount)), BTOBB(xfs_sb->sb_blocksize), 0, xfs_allocbt_buf_ops)
+   - 初始化xfs_btree_block 
+   > xfs_btree_init_block(xfs_mount, xfs_buf, XFS_ABTB_CRC_MAGIC, 0, 1, agno, XFS_BTREE_CUR_BLOCKS)
+   - btree里面的记录是xfs_alloc_rec, 初始化第一个
+   > XFS_ALLOC_REC_ADDR(xfs_mount, XFS_BUF_TO_BLOCK(xfs_buf), 1)
+   - ar_startblock = XFS_PREALLOC_BLOCKS(xfs_mount)
+   - ar_blockcount = agsize - ar_startblock
+   > xfs_bwrite(xfs_buf)
+   > xfs_buf_relse(xfs_buf)
+   - 初始化CNT根结点, 里面也只有一个extent
+   > xfs_growfs_get_hdr_buf(xfs_mount, XFS_AGB_TO_DADDR(xfs_mount, agno, XFS_CNT_BLOCK(xfs_mount)), BTOBB(xfs_sb->sb_blocksize), 0, xfs_allocbt_buf_ops)
+   - 初始化xfs_btree_block
+   > xfs_btree_init_block(xfs_mount, xfs_buf, XFS_ABTC_CRC_MAGIC, 0, 1, agno, XFS_BTREE_CRC_BLOCKS)
+   - 创建唯一的一个xfs_alloc_rec，和上面一样, 然后写回磁盘
+   - 初始化AGI/INO使用的根结点
+   > xfs_growfs_get_hdr_buf(xfs_mount, XFS_AGB_TO_DADDR(xfs_mount, agno, XFS_IBT_BLOCK(xfs_mount)), BTOBB(xfs_sb->sb_blocksize), 0, xfs_inobt_buf_ops)
+   - btree是空的,只需要设置xfs_btree_block 
+   > xfs_btree_init_block(xfs_mount, xfs_buf, XFS_IBT_CRC_MAGIC, 0, 0, agno, XFS_BTREE_CRC_BLOCKS)
+   > xfs_bwrite(xfs_buf)
+   > xfs_buf_relse(xfs_buf)
+   - 遍历过程中,使用新创建的AG的大小消耗新增的空间 newsize
+   - 如果最后newsize > 0, 说明grow之前,最后一个AG的空间不满, 这里需要补齐 
+   - 修改xfs_agi->agi_length
+   > xfs_ialloc_read_agi(xfs_mount, xfs_trans, agno, xfs_buf)
+   > xfs_ialloc_log_agi(xfs_trans, xfs_buf, XFS_AGI_LENGTH)
+   - 改变xfs_agf->agf_length 
+   > xfs_alloc_read_agf(xfs_mount, xfs_trans, agno, 0, xfs_buf)
+   > xfs_alloc_log_agf(xfs_trans, xfs_buf, XFS_AGF_LENGTH)
+   - 最后释放新增加的空间
+   > xfs_free_extent(xfs_trans, XFS_AGB_TO_FSB(xfs_mount, agno, xfs_agf->agf_length - newsize), newsize)
+   - 更新xfs_sb的统计数 
+   - AG的个数
+   > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_AGCOUNT, newagcount - oldagcount)
+   - 磁盘空间 
+   > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_DBLOCKS, newblock - xfs_sb->sb_dblocks)
+   - 空闲空间  
+   > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_FDBLOCKS, nfree)
+   - 分配比率也变了? 
+   > xfs_trans_mod_sb(xfs_trans, XFS_TRANS_SB_IMAXPCT, dpct)
+   - 提交log 
+   > xfs_trans_commit(xfs_trans, 0)
+   - 更新xfs_mount的成员参数, m_maxagi, m_maxicount 
+   > xfs_set_low_space_thresholds(xfs_mount)
+   - 最后更新每个AG的xfs_dsb 
+   - 对于老的AG, 需要读取xfs_buf
+   > xfs_trans_read_buf(xfs_mount, NULL, xfs_mount->m_ddev_targp, XFS_AGB_TO_DADDR(xfs_mount, agno, XFS_SB_BLOCK(xfs_mount)), XFS_FSS_TO_BB(xfs_mount, 1), 0, xfs_buf, xfs_sb_buf_ops)
+   - 对于新的AG, 没必要读磁盘
+   > xfs_trans_get_buf(NULL, xfs_mount->m_ddev_targp, XFS_AGB_TO_DADDR(xfs_mount, agno, XFS_SB_BLOCK(xfs_mount)), XFS_FSS_TO_BB(xfs_mount, 1), 0)
+   - 而且清0
+   > xfs_buf_zero(xfs_buf, 0, BBTOB(xfs_buf->b_length))
+   - 把xfs_sb写给xfs_dsb 
+   > xfs_sb_to_disk(XFS_BUF_TO_SBP(xfs_buf), xfs_mount->xfs_sb, XFS_SB_ALL_BITS)
+   > xfs_bwrite(xfs_buf)
+   > xfs_buf_relse(xfs_buf)
+
+** xfs_growfs_log_private(xfs_mount, xfs_growfs_log_t)
+   - 增长log使用的磁盘空间?  没有实现吧!!!
+
+** xfs_growfs_data(xfs_mount, xfs_growfs_data)
+   - 锁住xfs_mount->m_growlock
+   > xfs_growfs_data_private(xfs_mount, xfs_growfs_data)
+
+** xfs_growfs_log(xfs_mount, xfs_growfs_log_t)
+   - ???
+
+** xfs_fs_counts(xfs_mount, xfs_fsop_counts)
+   - 首先同步xfs_sb的统计数  
+   > xfs_icsb_sync_counters(xfs_mount, XFS_ICSB_LAZY_COUNT)
+   - 把xfs_sb的成员给xfs_fsop_counts, freedata/freeino/allocino
+
+** xfs_fsop_resblks 
+   #+BEGIN_SRC 
+	__u64  resblks;
+	__u64  resblks_avail;   
+   #+END_SRC
+
+** xfs_reserve_blocks(xfs_mount, inval, xfs_fsop_resblks)
+   - 通过ioctl的XFS_IOC_SET_RESBLKS和XFS_IOC_GET_RESBLKS实现
+   - 如果inval是0, 返回xfs_mount的信息, m_resblks / m_resblks_avail
+   - 否则reserve空间
+   - 首先同步per-cpu和xfs_sb的计数 
+   > xfs_icsb_sync_counters_locked(xfs_mount, 0)
+   - 如果xfs_mount->m_resblks > request? 表示已经reserve足够的空间
+   - 如果xfs_mount->m_resblks_avail > request, 把他多余的给xfs_sb
+   - 设置xfs_mount->m_resblks / m_resblks_avail = request ??
+   - 否则xfs_mount->m_resblks不够,需要从xfs_sb中分配
+   - 如果xfs_sb->sb_fdblocks足够,可以分配, 填充xfs_mount->m_resblks / m_resblks_avail
+   - 否则不再reserve空间
+   - 最后更新xfs_sb的XFS_SBS_FDBLOCKS统计数 
+   > xfs_icsb_modify_counters(xfs_mount, XFS_SBS_FDBLOCKS, fdblocks_delta, 0)
+
+** xfs_fs_log_dummy(xfs_mount)
+   - 提交一个空的log  
+   > _xfs_trans_alloc(xfs_mount, XFS_TRANS_DUMMY1, KM_SLEEP)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_sb, 0, 0)
+   > xfs_mod_sb(xfs_trans, XFS_SB_UUID)
+   > xfs_trans_set_sync(xfs_trans)
+   > xfs_trans_commit(xfs_trans, 0)
+
+** xfs_fs_goingdown(xfs_mount, inflags)
+   - 处理ioctl命令
+   - 如果是XFS_FSOP_GOING_FLAGS_DEFAULT, freeze操作  
+   > freeze_bdev(super_block->s_bdev)
+   - umount??
+   > xfs_force_shutdown(xfs_mount, SHUTDOWN_FORCE_UMOUNT)
+   > thaw_bdev(super_block->block_device, super_block)
+   - 如果是XFS_FSOP_GOING_FLAGS_LOGFLUSH, 同样关闭? 
+   > xfs_force_shutdown(xfs_mount, SHUTDOWN_FORCE_UMOUNT)
+   - 如果是XFS_FSOP_GOING_FLAGS_NOLOGFLUSH
+   > xfs_force_shutdown(xfs_mount, SHUTDOWN_FORCE_UMOUNT | SHUTDOWN_LOG_IO_ERROR)
+
+** xfs_do_force_shutdown(xfs_mount, flags, name, num)
+   - 没有umount操作,仅仅是关闭文件系统,保持数据的一致性?
+   - 如果文件系统已经关闭, 而且flags没有SHUTDOWN_LOG_IO_ERROR, 直接退出?
+   > XFS_FORCED_SHUTDOWN(xfs_mount)
+   - 不再写任何log??
+   > xfs_log_force_umount(xfs_mount, logerror)
+   - 其他就是打印调试信息
