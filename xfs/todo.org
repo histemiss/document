@@ -189,11 +189,16 @@
    > formatter(arg, getbmapx, full)
 
 ** xfs_bmap_punch_delalloc_range(xfs_inode, xfs_fileoff_t start_fsb, xfs_fileoff_t length)
-   - 遍历(start_fsb, length)范围内的xfs_bmbt_rec_host 
+   - 遍历(start_fsb, length)范围内的xfs_bmbt_irec
    > xfs_bmapi_read(xfs_inode, start_fsb, 1, xfs_bmbt_irec, nmaps, XFS_BMAPI_ENTIRE)
    - 如果不是delay allocation ?? 直接跳过??
    > xfs_bmbt_irec->br_startblock  != DELAYSTARTBLOCK
-   - 那还释放什么?? 
+   - br_blockcount !=0, 肯定不能是0?
+   - 准备空的xfs_bmap_free
+   - 如果找到delay alloc的xfs_bmbt_irec, 说明start_fsb对应的文件偏移怎么样?
+   - 释放底层的xfs_bmbt_irec
    > xfs_bunmapi(NULL, xfs_inode, start_fsb, 1, 0, 1, firstblock, xfs_bmap_free, done)
+   - 然后增加start_fsb ++, 继续查找, 这样效率也太慢了
 
+** 
 
