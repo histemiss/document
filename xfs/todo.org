@@ -134,11 +134,11 @@
 
 ** xfs_getbmapx_fix_eof_hole(xfs_inode, getbmapx, preallocated, end, startblock)
    - 如果eof位置的xfs_bmbt_rec表示Hole,组装对应的getbmapx
-   - 如果startblock == HOLESTARTBLOCK, 设置getbmapx->bmv_block = -1
+   - 如果startblock == HOLESTRATBLOCK, 设置getbmapx->bmv_block = -1
    - 长度是从getbmapx->bmv_block 到 eof, fixlen -= getbmapx->bmv_offset
    > XFS_FSB_TO_BB(xfs_mount, XFS_B_TO_FSB(xfs_mount, XFS_ISIZE(xfs_inode))
    - 如果preallocated !=0, 而且bmv_offset + bmv_length == end? 设置getbmapx->bmv_length = fixlen??  怎么决定getbmapx?
-   - 如果startblock是DELAYSTARTBLOCK, 设置bmv_block = -2
+   - 如果startblock是DELAYSTRATBLOCK, 设置bmv_block = -2
    - 否则startblock是有效的磁盘位置, 单位转化为fsb
    > xfs_fsb_to_db(xfs_inode, startblock)
    - 处理extent的开始文件偏移, getbmapx->bmv_offset, 单位转化为fsb
@@ -176,7 +176,7 @@
    > xfs_bmapi_read(xfs_inode, XFS_BB_TO_FSB(xfs_mount, getbmapx->bmv_offset), XFS_BB_TO_FSB(xfs_mount, getbmapx->bmv_length), xfs_bmbt_irec, nmap, bmapi_flags)
    - 遍历xfs_bmbt_irec, 把信息给getbmapx数组
    - 如果br_state是XFS_EXT_UNWRITTEN, 设置bmv_oflags的BMV_OF_PREALLOC
-   - 如果br_startblock是DELAYSTARTBLOCK, 设置bmv_oflags的BMV_OF_DELALLOC
+   - 如果br_startblock是DELAYSTRATBLOCK, 设置bmv_oflags的BMV_OF_DELALLOC
    - br_startoff转化成bmv_offset, 单位变为BB
    - br_blockcount转化为bmv_length, 单位变为BB
    - 主要是设置getbmapx->bmv_block
@@ -184,7 +184,7 @@
    - 如果是Hole,设置bmv_block == -1, 如果是delay?? bmv_block = -2
    - 对于delay write, 通过bmv_oflags展示. 有磁盘信息,但磁盘中是无效的, 这时preallocation? 
    - 对于hole通过bmv_block, 没有磁盘位置, 也没有数据
-   - 对于delay alloc?? DELAYSTARTBLOCK，通过bmv_start / bmv_oflags, 有数据,但没磁盘位置
+   - 对于delay alloc?? DELAYSTRATBLOCK，通过bmv_start / bmv_oflags, 有数据,但没磁盘位置
    - 最后使用回调函数放到args中 
    > formatter(arg, getbmapx, full)
 
@@ -192,7 +192,7 @@
    - 遍历(start_fsb, length)范围内的xfs_bmbt_irec
    > xfs_bmapi_read(xfs_inode, start_fsb, 1, xfs_bmbt_irec, nmaps, XFS_BMAPI_ENTIRE)
    - 如果不是delay allocation ?? 直接跳过??
-   > xfs_bmbt_irec->br_startblock  != DELAYSTARTBLOCK
+   > xfs_bmbt_irec->br_startblock  != DELAYSTRATBLOCK
    - br_blockcount !=0, 肯定不能是0?
    - 准备空的xfs_bmap_free
    - 如果找到delay alloc的xfs_bmbt_irec, 说明start_fsb对应的文件偏移怎么样?
@@ -200,5 +200,118 @@
    > xfs_bunmapi(NULL, xfs_inode, start_fsb, 1, 0, 1, firstblock, xfs_bmap_free, done)
    - 然后增加start_fsb ++, 继续查找, 这样效率也太慢了
 
-** 
+** xfs_can_free_eofblocks(xfs_inode, force)
+   - 检查是否删除eof后面的磁盘空间? prealocation/append?
+   - 如果xfs_inode->i_size ==0, 而且xfs_inode->i_delayed_blks ==0, 而且inode的address_space->nrpages==0. 磁盘中文件为0, 而且没有pagecache, 返回0
+   - 如果xfs_inode->xfs_ifork->if_flags没有XFS_IFEXTENTS,还没有缓存xfs_bmbt_rec, 肯定没有IO或者preallocation. 之前的不会考虑
+   - xfs_inode->xfs_ifork->if_flags的XFS_DIFLAG_PREALLOC和XFS_DIFLAG_APPEND表示有空间
+   - 如果force ==0或者xfs_inode->i_delayed_blks==0, 返回true,表示可以释放多余磁盘
+   - 否则返回false, 没有必要或没有空间可释放
+
+** xfs_free_eofblocks(xfs_mount, xfs_inode, need_iolock)
+   - 在inode释放时调用 inode_operations->evict 间接使用
+   - 获取xfs_inode大小, end_fsb 普通文件就是 inode->i_size 
+   > XFS_B_TO_FSB(xfs_mount, XFS_ISIZE(xfs_inode))
+   - 查找end_fsb使用的xfs_bmbt_irec 
+   > xfs_bmapi_read(xfs_inode, end_fsb, map_len, xfs_bmbt_irec, 1, 0)
+   - 如果没有问题,而且xfs_bmbt_irec不是hole, 使用delayed alloc, xfs_inode->i_delayed_blks >0
+   - 需要释放eof后面的磁盘空间
+   - 构造xfs_trans, 这是inactive事件?
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_INACTIVE)
+   - 锁住文件
+   > xfs_ilock_nowait(xfs_inode, XFS_IOLOCK_EXCL)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_itruncate, 0, 0)
+   - 把xfs_inode放到xfs_trans中
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 不需要更新xfs_dinode->di_size?? 文件数据已经写回去? 怎么会有NULL file?
+   > xfs_itruncate_extents(xfs_trans, xfs_inode, XFS_DATA_FORK, XFS_ISIZE(xfs_inode))
+   - 提交xfs_trans 
+   > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
+   > xfs_inode_clear_eofblocks_tag(xfs_inode)
+   - 怎么会有超过eof的xfs_bmbt_rec_host?? 哪里分配的? 或者修改了size?
+
+** xfs_alloc_file_space(xfs_inode, xfs_off_t offset, len, alloc_type)
+   - 为文件的(offset,len)范围分配空间? preallocation?
+   - alloc_type表示分配的目的, 必须XFS_BMAPI_PREALLOC,XFS_BMAPI_CONVERT
+   - 如果文件extent需要地址对齐, 获取xfs_inode->xfs_icdinode->di_extsize
+   > xfs_get_extsz_hint(xfs_inode)
+   - 对开始偏移和结束偏移都对齐
+   - 首先预留磁盘空间, 计算预留数量还需要考虑btree的更新使用的磁盘空间
+   - 不应该2个btree?
+   > XFS_DIOSTRAT_SPACE_RES(xfs_mount, resblks)
+   - 创建xfs_trans, XFS_TRANS_DIOSTRAT?? 战略??
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_DIOSTRAT)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_write, resblks, resrtextents)
+   - 锁住xfs_inode, 并添加到xfs_trans中 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL)
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 创建xfs_bmbt_rec_host? 准备一个xfs_bmap_free?? 
+   > xfs_bmap_init(xfs_bmap_free, firstfsb)
+   - 分配磁盘空间,或改变preallocation的空间
+   > xfs_bmapi_write(xfs_trans, xfs_inode, startoffset_fsb, allocatsize_fsb, alloc_type, firstfsb, 0, xfs_bmbt_irec, nmaps, xfs_bmap_free)
+   - 为何会释放内存??
+   > xfs_bmap_finish(xfs_trans, xfs_bmap_free, committed)
+   - 提交xfs_trans 
+   > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
+   - 根据分配的空间,向前移动startoffset_fsb, 直到分配足够的空间
+
+** xfs_zero_remaining_bytes(xfs_inode, startoff, endoff)
+   - 处理没有地址对齐的空间?
+   - 如果startoff超过eof, 直接返回
+   > XFS_ISIZE(xfs_inode)
+   - 如果endoff > eof, 设置为eof
+   - 准备一个xfs_buf,大小是blocksize 
+   > xfs_buf_get_uncached(xfs_buftarg, BTOBB(xfs_sb->sb_blocksize), 0)
+   - 遍历(startoff, endoff)之间的xfs_bmbt_irec 
+   > xfs_bmapi_read(xfs_inode, offset_fsb, 1, xfs_bmbt_irec, nmaps, 0)
+   - xfs_bmbt_irec->br_startoff必须和offset_fsb相同, 如何保证?
+   - 如果xfs_bmbt_irec是hole, br_startblock == HOLDSTRATBLOCK, 不处理
+   - xfs_bmbt_irec不能是delalloc?  DELAYSTRATBLOCK
+   - 如果br_state是XFS_EXT_UNWRITTEN, 直接返回,不处理
+   - 准备xfs_buf, 去掉XBF_DONE,XBF_WRITE, 设置XBF_READ
+   - 设置地址为xfs_bmbt_irec->br_startblock, 读取数据 
+   > xfsbdstrat(xfs_mount, xfs_buf)
+   > xfs_buf_iowait(xfs_buf)
+   - 然后设置(startoff, endoff)在这个block内的数据设置为0. 这里的xfs_buf只有一个block
+   - 然后把xfs_buf写回去, 去掉XBF_DONE,XBF_READ, 设置XBF_WRITE 
+   > xfsbdstrat(xfs_mount, xfs_buf)
+   > xfs_buf_iowait(xfs_buf)
+   - 然后操作下一个block
+
+** xfs_free_file_space(xfs_inode, xfs_off_t offset, len)
+   - 释放(offset,len)范围内的磁盘空间?
+   - 首先等待dio完成  
+   > inode_dio_wait(inode)
+   - 等待数据写回磁盘 
+   > fiemap_write_and_wait_range(inode->address_space, offset, -1)
+   - 如果offset,len没有block地址对齐,需要把不需要释放的磁盘写为0
+   - 如果(offset,len)在一个block上面,直接清空对应的数据, 而且不需要其他操作
+   > xfs_zero_remaining_bytes(xfs_inode, offset, len-1)
+   - 如果跨越多个block, 需要把2头的数据清空 
+   > xfs_zero_remaining_bytes(xfs_inode, XFS_FSB_TO_B(xfs_mount, endoffset_fsb) - 1)
+   - 然后释放中间的对齐的block
+   - 构造xfs_trans
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_DIOSTRAT)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_write, resblks, 0)
+   - log inode? 
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   > xfs_bmap_init(xfs_bmap_free, firstfsb)
+   - 修改btree/xfs_ifork信息
+   > xfs_bunmapi(xfs_trans, xfs_inode, startoffset_fsb, ...)
+   - 然后释放磁盘空间 
+   > xfs_bmap_finish(xfs_trans, xfs_bmap_free, committed)
+   > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
+
+** xfs_zero_file_space(xfs_inode, end, len)
+   - 遍历(end,len)文件范围, 首先删除pagecache 
+   > xfs_alloc_file_space(xfs_inode, start_boundary, end_boundary - start_boundary - 1)
+   - 然后分配磁盘空间,创建xfs_bmbt_rec, 修改状态为XFS_FMT_UNWRITTEN
+   - 如果地址不是对齐的, 把其他block中的部分数据清0
+   - 下面使用address_operations实现
+   > xfs_iozero(xfs_inode, offset, start_boundary - offset)
+
+** xfs_swap_extents_check_format(xfs_inode ip, xfs_inode tmpip)
+   - swap extents??
+
+** xfs_swap_extents(xfs_inode ip, tip, xfs_swapext)
 
