@@ -219,15 +219,28 @@ bh_state_bits block状态, 非常丰富:
  > buffer_new(buffer_head) 只处理BH_new, 而且需要在(from,to)范围内..
  > clear_buffer_new(buffer_head) / mark_buffer_dirty(buffer_head) ... 好像是把page的一部分置为0，而且修改其中的buffer的状态..
 
-37. __block_write_begin(page, pos, len, get_block)  这个函数的意思是在写数据的时候,如果写不满一页,需要读回一部分，然后写回去..
- > create_empty_buffers(page, blocksize, 0) 先创建buffer_head
- > 如果buffer_head在(from,to)范围内,不需要操作，只要设置BH_Uptodate
- > 否则,需要把page读上来..  > get_block(inode, block, buffer_head, 1)
- > unmap_underlying_metadata(block_device, blocknr) 这是什么意思?
- > 如果page是PG_uptodate, 则读上来的不用变? 
- > 否则需要把page置为0
- > 如果发现buffer_head不是最新的,BH_Uptodate, 需要把它读回来  ll_rw_block(READ, 1, &buffer_head)
- > wait_on_buffer(buffer_head) 这是什么意思?
+37. __block_write_begin(page, pos, len, get_block)  
+  - 这个函数的意思是在写数据的时候,如果写不满一页,需要读回一部分，然后写回去..
+  - 先创建buffer_head, 大小是inode->i_blkbits, 使用super_block->i_blocksize_bits
+  > create_empty_buffers(page, blocksize, 0) 
+  - 如果buffer_head在(from,to)范围内,不需要操作 
+  - 只需要对应PG_uptodate设置BH_Uptodate
+  - 否则,需要把数据数据读回来? 至少把没有地址对齐的设置为0??
+  - 去掉BH_New标志, 表示刚创建磁盘映射??
+  - 如果没有BH_Mapped, 还没有磁盘地址信息
+  - 使用文件系统的回调函数,获取映射信息, 最后一个参数create =1??
+  > get_block(inode, block, buffer_head, 1)
+  - 释放在block inode中的buffer_head, 原来的可能是作为metadata使用
+  > unmap_underlying_metadata(block_device, blocknr)
+  - 如果page是PG_uptodate, 去掉BH_New标志, 设置BH_Uptodate, BH_Dirty
+  - 如果没有PG_uptodate, 把即将要写的空间清0, buffer_head处理完成
+  > zero_user_segments(page, to, block_end, block_start, from)
+  - 获取buffer映射信息,如果有PG_uptodate, 设置buffer_head的BH_Uptodate, 不需要继续
+  - 如果发现buffer_head不是最新的,BH_Uptodate,而且没有BH_Delay|BH_Unwritten
+  - 需要把它读回来  
+  > ll_rw_block(READ, 1, &buffer_head)
+  - 最后等待IO, BH_Lock
+  > wait_on_buffer(buffer_head)
 
 38. __block_commit_write(inode, page, from, to) 写过成把数据搬到了page,设置相应的buffer_head标志
  > buffer_uptodate(buffer_head)
