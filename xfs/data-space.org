@@ -648,4 +648,78 @@
 
 ** xfs_free_extent(xfs_trans, xfs_buf, xfs_agnumber, xfs_agblock, xfs_extlen, isfl)
    - 释放extent.
-* xfs_extent_busy.c 
+* xfs_extent_busy.c
+** xfs_extent_busy 
+   - block/extent已经释放,但对应的释放动作log还没有提交
+   - 所以不能分配出去使用
+   - xfs_perag->pagb_tree管理
+   #+BEGIN_SRC 
+	struct rb_node	rb_node;	/* ag by-bno indexed search tree */
+	struct list_head list;		/* transaction busy extent list */
+	xfs_agnumber_t	agno;
+	xfs_agblock_t	bno;
+	xfs_extlen_t	length;
+	unsigned int	flags;
+#define XFS_EXTENT_BUSY_DISCARDED	0x01	/* undergoing a discard op. */
+#define XFS_EXTENT_BUSY_SKIP_DISCARD	0x02	/* do not discard */
+   #+END_SRC
+
+** xfs_extent_busy_insert(xfs_trans, xfs_agnumber_t agno, xfs_agblock_t bno, xfs_extlen_t len, flags)
+   - 创建xfs_extent_busy, 管理这些参数
+   - 获取xfs_perag 
+   > xfs_perag_get(xfs_trans->xfs_mount, xfs_extent_busy->agno)
+   - 查找rbtree, 如果有覆盖的,直接报错!
+   > rb_link_node(xfs_extent_busy->rb_node, parent, ..)
+   > rb_insert_color(xfs_extent_busy->rb_node, ..)
+   - 把xfs_extent_busy->list放到xfs_trans->t_busy链表中
+
+** xfs_extent_busy_search(xfs_mount, xfs_agnumber_t, xfs_agblock_t, xfs_extlen_t)
+   - 在xfs_perag->pagb_tree中查找对应的xfs_extent_busy, 只有(bno,len)都一致时才返回1
+
+** xfs_extent_busy_update_extent(xfs_mount, xfs_perag, xfs_extent_busy, xfs_agblock_t, xfs_extlen_t, userdata)
+   - 检查参数xfs_extent_busy是否可以重用? 一般只有metadata可以使用其他类型的磁盘?? 
+   - metadata的block用于btree, 来自agfl
+   - 如果xfs_extent_busy->flags包含XFS_EXTENT_BUSY_DISCARD, 返回false, 等待1s让这个extent完成
+   - extent不支持分裂,因为需要修改transaction/cil的格式 但是可以修改其中的起始位置和长度?
+   - 如果userdata ==1, 表示文件数据,不允许重用任何数据,提交transaction
+   - 如果extent覆盖(fbno,fend), 需要提交log, 释放对应的空间
+   - 如果(fbno,fend)覆盖extent, 可以使用它 
+   - 直接删除rbnode, 但没有释放这个xfs_extent_busy
+   - 设置xfs_extent_busy->length = 0,在transaction完成时释放?
+   - 如果如果(fbno,fend)覆盖extent的前一半,修改extent->bno = fend
+   - 如果后一般, 设置extent->length = fbno - extent->bno
+   - 如果需要提交transaction 
+   > xfs_log_force(xfs_mount, XFS_LOG_SYNC)
+
+** xfs_extent_busy_reuse(xfs_mount, xfs_agnumber_t, xfs_agblock_t fbno, xfs_extlen_t flen, userdata)
+   - 使用（fbno,flen)查找xfs_extent_busy
+   - 如果找到覆盖的, 检查是否能重用 
+   > xfs_extent_busy_update_extent(xfs_mount, xfs_perag, xfs_extent_busy, fbno, flen, userdata)
+   - 如果上面返回false, 需要重新查找
+   - 但其中只覆盖一部分的,怎么就不继续查找??
+
+** xfs_extent_busy_trim(xfs_alloc_arg, xfs_agblock_t bno, xfs_extlen_t len, xfs_agblock_t rbno, xfs_extlen_t rlen)
+   - 在(bno,len)中间查找没有被xfs_extent_busy覆盖的一段范围, 而且长度超过xfs_alloc_arg->minlen
+   - 如果是metadata使用,而且xfs_extent_busy->flags没有XFS_EXTENT_BUSY_DISCARD, 检查是否可以重用? 
+   > xfs_extent_busy_update_extent(xfs_mount, xfs_perag, xfs_extent_busy, fbno, flen, false)
+   - 如果可以继续查找
+   - 如果是userdata, 或者上面是discard, 不能重用,检查覆盖情况 
+   - 如果xfs_extent_busy完全覆盖(bno, len), 直接返回
+   - 如果xfs_extent_busy覆盖(bno,len)的前部分, 修改bno
+   - 如果覆盖后部分, 修改len
+   - 否则需要把(bno,len)分裂,从2头选择一个, 需要一定策略
+   - 如果前面的超过xfs_alloc_arg->maxlen, 使用前面的
+   - 如果后面的超过maxlen *4, 使用后面的
+   - 如果前面的超过minlen, 使用前面的
+   - 其他情况直接失败
+   - 这次判断成功也得继续, 所以上面的条件不一定是最合适的
+   
+** xfs_extent_busy_clear_one(xfs_mount, xfs_perag, xfs_extent_busy)
+   - 如果xfs_extent_busy->length >0, 释放rb_node 
+   - 释放xfs_extent_busy
+
+** xfs_extent_busy_clear(xfs_mount, list_head, do_discard)
+   - 遍历这些xfs_extent_busy
+   - 如果do_discard ==1, 而且xfs_extent_busy->flags没有XFS_EXTENT_BUSY_DISCARD, 设置这个标志
+   - 哪里处理他们?
+   - 否则直接删除xfs_extent_busy

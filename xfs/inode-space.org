@@ -1,3 +1,168 @@
+* xfs_ialloc_btree.c
+
+** xfs_agi 
+   - 这个数据结构是磁盘中使用的,数据类型是大端的
+   - 下面的磁盘位置指针都是32的,只有agbno
+   #+BEGIN_SRC 
+	/*
+	 * Common allocation group header information
+	 */
+	__be32		agi_magicnum;	/* magic number == XFS_AGI_MAGIC */
+	__be32		agi_versionnum;	/* header version == XFS_AGI_VERSION */
+	__be32		agi_seqno;	/* sequence # starting from 0 */
+	__be32		agi_length;	/* size in blocks of a.g. */
+	/*
+	 * Inode information
+	 * Inodes are mapped by interpreting the inode number, so no
+	 * mapping data is needed here.
+	 */
+	__be32		agi_count;	/* count of allocated inodes */
+	__be32		agi_root;	/* root of inode btree */
+	__be32		agi_level;	/* levels in inode btree */
+	__be32		agi_freecount;	/* number of free inodes */
+
+	__be32		agi_newino;	/* new inode just allocated */
+	__be32		agi_dirino;	/* last directory inode chunk */
+	/*
+	 * Hash table of inodes which have been unlinked but are
+	 * still being referenced.
+	 */
+	__be32		agi_unlinked[XFS_AGI_UNLINKED_BUCKETS];
+
+	uuid_t		agi_uuid;	/* uuid of filesystem */
+	__be32		agi_crc;	/* crc of agi sector */
+	__be32		agi_pad32;
+	__be64		agi_lsn;	/* last write sequence */
+   
+   #+END_SRC
+
+** xfs_btree_cur
+   - 这里使用xfs_btree_cur->bc_private->a 
+   - btree是属于ag, 而不是inode
+   - 这里的xfs_buf指向xfs_agi, 里面是inode的btree的信息
+   #+BEGIN_SRC 
+			struct xfs_buf	*agbp;	/* agf/agi buffer pointer */
+			xfs_agnumber_t	agno;	/* ag number */
+   #+END_SRC
+
+** xfs_inobt_rec 
+   #+BEGIN_SRC 
+	__be32		ir_startino;	/* starting inode number */
+	__be32		ir_freecount;	/* count of free inodes (set bits) */
+	__be64		ir_free;	/* free inode mask */   
+   #+END_SRC
+
+** xfs_inobt_key 
+   #+BEGIN_SRC 
+	__be32		ir_startino;	/* starting inode number */
+   #+END_SRC
+
+** xfs_inobt_rec_incore 
+   #+BEGIN_SRC 
+	xfs_agino_t	ir_startino;	/* starting inode number */
+	__int32_t	ir_freecount;	/* count of free inodes (set bits) */
+	xfs_inofree_t	ir_free;	/* free inode mask */   
+   #+END_SRC
+
+** xfs_inobt_get_minrecs(xfs_btree_cur, level)
+   - 使用xfs_mount->m_inobt_mnr[level != 0] 
+
+** xfs_inobt_dup_cursor(xfs_btree_cur)
+   - 复制一个xfs_btree_cur, 使用参数的bc_private
+   > xfs_inobt_init_cursor(xfs_mount, xfs_trans, xfs_btree_cur->bc_private->a->xfs_buf, agno)
+
+** xfs_inobt_set_root(xfs_btree_cur, xfs_btree_ptr, inc)
+   - btree的根结点改变,高度也改变,更新到xfs_agi中
+   - 从xfs_buf中获取xfs_agi 
+   > XFS_BUF_TO_AGI(xfs_buf)
+   - 设置xfs_agi->agi_root = xfs_btree_ptr->s
+   - 增加xfs_agi->agi_level += inc
+   - log这些修改  
+   > xfs_ialloc_log_agi(xfs_btree_cur->xfs_trans, xfs_buf, XFS_AGI_ROOT | XFS_AGI_LEVEL)
+
+** xfs_inobt_alloc_block(xfs_btree_cur, xfs_btree_ptr start, new, length, stat)
+   - 创建新的结点, 分配block
+   - 参数length没有使用, 和上面bmbt的类似
+   - 准备xfs_alloc_arg, 设置xfs_trans, xfs_mount, minlen = maxlen = prod = 1
+   - 使用参数start作为提示信息, 它是agbno, 需要和xfs_btree_cur的agno构造xfs_fsblock_t地址 
+   > XFS_AGB_TO_FSB(xfs_alloc_arg->xfs_mount, xfs_btree_cur->bc_private->a->agno, start->s)
+   - 使用XFS_ALLOCTYPE_NEAR_BNO方式分配
+   > xfs_alloc_vextent(xfs_alloc_arg)
+   - 如果成功,把地址的agbno给new->s
+   > XFS_FSB_TO_AGBNO(xfs_mount, xfs_alloc_arg->fsbno)
+
+** xfs_inobt_free_block(xfs_btree_cur, xfs_buf)
+   - 释放结点的block, 获取xfs_buf的磁盘位置
+   > XFS_DADDR_TO_FSB(xfs_mount, XFS_BUF_ADDR(xfs_buf))
+   - 直接释放, 不想bmbt一样?? 
+   > xfs_free_extent(xfs_trans, fsbno, 1)
+   - 提交transaction? 
+   > xfs_trans_binval(xfs_trans, xfs_buf)
+
+** xfs_inobt_get_maxrecs(xfs_btree_cur, level)
+   - 上面是获取最小的分支数,这里是最大的
+   - 使用xfs_mount->m_inobt_mxr[level !=0]
+
+** xfs_inobt_init_key_from_rec(xfs_btree_key, xfs_btree_rec)
+   - xfs_btree_key使用里面的xfs_inobt_key, 不过是ag内部的inode的偏移 
+   - 使用xfs_btree_rec->xfs_inobt_rec->ir_startino
+   - 也即是inode簇的第一个ino 
+
+** xfs_inobt_init_rec_from_key(xfs_btree_key, xfs_btree_rec)
+   - 只设置xfs_inobt_rec->ir_startino 
+
+** xfs_inobt_init_rec_from_cur(xfs_btree_cur, xfs_btree_rec)
+   - 获取xfs_btree_cur->bc_rec->xfs_inobt_rec_incore
+   - 数据类型转化为大端模式的
+
+** xfs_inobt_init_ptr_from_cur(xfs_btree_cur, xfs_btree_ptr)
+   - 获取btree的根结点磁盘位置指针
+   - 先获取xfs_agi,使用xfs_agi->agi_root
+   > XFS_BUF_TO_AGI(xfs_btree_cur->bc_private->a->xfs_buf)
+
+** xfs_inobt_key_diff(xfs_btree_cur,xfs_btree_key)
+   - 比较xfs_btree_key->xfs_inobt_key和xfs_btree_cur->bc_rec->xfs_inobt_rec_incore
+   - 比较startino 
+
+** xfs_inobt_verify(xfs_buf)
+   - 检查xfs_btree_block, magic, uuid, blkno
+   - owner和xfs_buf->xfs_perag->pag_agno
+   - level < xfs_mount->m_in_maxlevels
+   - numrecs <= xfs_mount->m_inobt_mxr[level]
+   - 检查兄弟节点指针, 使用agbno
+
+** xfs_inobt_read_verify(xfs_buf)
+   - 检查crc校验
+   > xfs_btree_sblock_verify_crc(xfs_buf)
+   > xfs_inobt_verify(xfs_buf)
+
+** xfs_inobt_write_verify(xfs_buf)
+   > xfs_inobt_verify(xfs_buf)
+   - 计算crc校验值 
+   > xfs_btree_sblock_calc_crc(xfs_buf)
+
+** xfs_buf_ops xfs_inobt_buf_ops
+   - 给xfs_buf的IO使用
+
+** xfs_btree_ops xfs_inobt_ops 
+   - 下面构造xfs_btree_cur时使用 
+
+** xfs_inobt_init_cursor(xfs_mount, xfs_trans, xfs_buf agbp, xfs_agnumber_t agno)
+   - 构造xfs_btree_cur
+   - 设置xfs_mount, xfs_trans
+   - 获取xfs_agi, 设置树的高度bc_nlevels = xfs_agi->agi_level
+   - 设置bc_blocklog = xfs_sb->sb_blocklog ?? 块大小?
+   - 设置xfs_btree_cur->bc_private的agi的xfs_buf, agno
+
+** xfs_inobt_maxrecs(xfs_mount, blocklen, leaf)
+   - 在mount中使用,计算分支的最大值
+   - 上面xfs_btree_ops也有,但使用固定的值
+   - 估计那些值是使用这个函数计算的
+   - blocklen减去头部大小 XFS_INOBT_BLOCK_LEN(xfs_mount)
+   - 根据xfs的版本,支持crc就是56, 如果不支持就是16
+   - 如果是内部节点, blocklen /= ( sizeof(xfs_inobt_key) + sizeof(xfs_inode_ptr))
+   - 如果是叶子节点, blocklen /= sizeof(xfs_inobt_rec)
+
 * xfs_ialloc.c
 
 ** xfs_alloc_arg
@@ -734,5 +899,156 @@
    > radix_tree_tag_clear(xfs_mount->m_perag_tree, XFS_INO_TO_AGNO(xfs_mount, xfs_inode->i_ino), XFS_ICI_EOFBLOCKS_TAG)
    - 这里只是修改标志, 不想上面reclaim那么复杂!!
 
-
 * xfs_icreate_item.c
+
+** xfs_icreate_log 
+   - 创建inode使用的log数据
+   - 这里的数据类型是大端的,磁盘中使用的
+   #+BEGIN_SRC 
+	__uint16_t	icl_type;	/* type of log format structure */
+	__uint16_t	icl_size;	/* size of log format structure */
+	__be32		icl_ag;		/* ag being allocated in */
+	__be32		icl_agbno;	/* start block of inode range */
+	__be32		icl_count;	/* number of inodes to initialise */
+	__be32		icl_isize;	/* size of inodes */
+	__be32		icl_length;	/* length of extent to initialise */
+	__be32		icl_gen;	/* inode generation number to use */   
+   #+END_SRC
+
+** xfs_icreate_item 
+   #+BEGIN_SRC 
+ 	struct xfs_log_item	ic_item;
+	struct xfs_icreate_log	ic_format;
+   #+END_SRC
+
+** ICR_ITEM(xfs_log_item)
+   - ICR = inode create ? 参数xfs_log_item是xfs_icreate_log内嵌成员 
+
+** xfs_icreate_item_size(xfs_log_item, nvecs, nbytes)
+   - log需要的iovec数组长度, 只需要多1个?  nvecs += 1
+   - 长度增加sizeof(xfs_icreate_log)
+   
+** xfs_icreate_item_format(xfs_log_item, xfs_log_iovec)
+   - 把xfs_icreate_item的log数据放到xfs_log_iovec中
+   - (i_addr,i_len)就是xfs_log_item->xfs_icreate_log内存块
+   - xfs_log_iovec->i_type设置为XLOG_REG_TYPE_ICREATE
+
+** xfs_icreate_item_pin(xfs_log_item)
+   - 不影响任何东西?!
+
+** xfs_icreate_item_unpin(xfs_log_item, remove)
+   - 也没什么影响 
+
+** xfs_icreate_item_unlock(xfs_log_item)
+   - 如果xfs_icreate_item->xfs_log_item->li_flags有XFS_LI_ABORTED, 可以直接释放
+
+** xfs_icreate_item_committed(xfs_log_item, xfs_lsn_t)
+   - xfs_icreate_log提交之后可以直接释放?! 这里就是直接释放内存
+
+** xfs_icreate_item_push(xfs_log_item, list_head)
+   - xfs_icreate_log不会提交到AIL?
+   - 返回XFS_ITEM_SUCCESS
+
+** xfs_icreate_item_committed(xfs_log_item, xfs_lsn_t)
+   - 什么都不做
+
+** xfs_item_ops xfs_icreate_item_ops
+
+** xfs_icreate_log(xfs_trans, xfs_agnumber_t, xfs_agblock_t, count, inode_size, length, generation)
+   - 构造xfs_icreate_item, 先初始化xfs_log_item 
+   > xfs_log_item_init(xfs_trans->xfs_mount, xfs_icreate_item->xfs_log_item, XFS_LI_ICREATE, xfs_icreate_item_ops)
+   - 填充xfs_icreate_item->xfs_icreate_log_item
+   - 记录分配的inode的block位置(agno, agbno)
+   - 放到xfs_trans中  
+   > xfs_trans_add_item(xfs_trans, xfs_icreate_item->xfs_log_item)
+   - 设置xfs_trans->t_flags的XFS_TRANS_DIRTY, xfs_icreate_item->xfs_log_item->lid_flags的XFS_LID_DIRTY
+
+* xfs_inode_buf.c
+** xfs_inobp_check(xfs_mount, xfs_buf)
+   - xfs_buf中是xfs_dinode数组, 数组长度是xfs_mount->m_inode_cluster_size >> xfs_sb->sb_inodelog
+   - 遍历xfs_buf中的xfs_dinode 
+   > xfs_buf_offset(xfs_buf, i*xfs_mount->xfs_sb->sb_inodesize)
+   - 如果xfs_dinode->di_next_unlinked是0报错. 不是0应该是什么?
+
+** xfs_inode_buf_verify(xfs_buf, readahead)
+   - 检查xfs_buf中的xfs_dinode的内容
+   - 如果readahead ==1, 表示log recovery中操作,虽然有错误,也不会报错,可能只是分配了空间,但没有写入xfs_dinode
+   - 这里计算xfs_buf的xfs_dinode的方法和上面不一样, xfs_buf的大小是一个fsb
+   - 首先转化xfs_buf的大小为fsb单位,然后获取每个fsb的inode的数量
+   > XFS_BB_TO_FSB(xfs_mount, xfs_buf->b_length) * xfs_mount->xfs_sb->sb_inopblock
+   - 遍历xfs_buf的xfs_dinode
+   > xfs_buf_offset(xfs_buf, i<<xfs_mount->xfs_sb->sb_inodelog)
+   - 通过magic/version, 确认xfs_dinode是正确的
+   - xfs_dinode->di_magic是XFS_DINODE_MAGIC  'IN'
+   - xfs_dinode->di_version是[1,3]
+   - 否则处理错误
+   - 如果是readahead, 去掉xfs_buf->b_flags的XBF_DONE 
+   - 否则设置ioerror, EFSCORRUPTED
+   - 然后检查unlink链表??
+   > xfs_inobp_check(xfs_mount, xfs_buf)
+     
+** xfs_inode_buf_read_verify(xfs_buf)
+   > xfs_inode_buf_verify(xfs_buf, false)
+
+** xfs_inode_buf_readahead_verify(xfs_buf)
+   > xfs_inode_buf_verify(xfs_buf, true)
+
+** xfs_inode_buf_write_verify(xfs_buf)
+   > xfs_inode_buf_verify(xfs_buf)
+
+** xfs_buf_ops xfs_inode_buf_ops
+   - 构造xfs_buf的回调函数
+
+** xfs_imap_to_bp(xfs_mount, xfs_trans, xfs_imap, xfs_dinode dipp, xfs_buf bpp, buf_flags, iget_flags)
+   - 把一个inode读到内存中, 获取对应的xfs_dinode/xfs_buf指针
+   - 设置buf_flags的XBF_UNMAPPED, 不需要给page建立影射, 后面找xfs_dinode时再建立
+   - 使用transaction包装的函数读xfs_buf
+   > xfs_trans_read_buf(xfs_mount, xfs_trans, xfs_mount->m_ddev_targp, xfs_imap->im_blkno, xfs_imap->im_len, buf_flags, xfs_buf, xfs_inode_buf_ops)
+   - 上面verify的错误在这里上传
+   - xfs_dinode的指针在xfs_buf上 
+   > xfs_buf_offset(xfs_buf, xfs_imap->im_boffset)
+
+** xfs_dinode_from_disk(xfs_idcinode, xfs_dinode)
+   - xfs_idcinode是xfs_dinode内存中的表示形式,使用大端数据类型
+   - 把xfs_dinode数据给xfs_icdinode
+   - xfs_icdinode在xfs_inode中
+
+** xfs_dinode_to_disk(xfs_dinode, xfs_idcinode)
+   - 上面的逆操作
+
+** xfs_dinode_verify(xfs_mount, xfs_inode, xfs_dinode)
+   - 验证xfs_dinode数据
+   - xfs_dinode->di_magic是cpu_to_be16(XFS_DINODE_MAGIC)
+   - xfs_dinode->di_version >= 3, 这个域是char, 不需要大小端
+   - 如果支持crc验证,计算checksum
+   > xfs_sb_version_hasrcr(xfs_mount->xfs_sb)
+   > xfs_verify_cksum(xfs_dinode, xfs_sb->sb_inodesize, offsetof(xfs_dinode, di_crc))
+   - 比较xfs_dinode->di_ino = xfs_inode->i_ino
+   - uuid比较, xfs_dinode->di_uuid
+
+** xfs_dinode_calc_crc(xfs_mount, xfs_dinode)
+   - 计算的对象是xfs_dinode->di_crc前面的数据, 结果给xfs_dinode->di_crc
+   > xfs_start_cksum(xfs_dinode, xfs_mount->xfs_sb->sb_inodesize, offsetof(xfs_dinode, di_crc))
+
+** xfs_iread(xfs_mount, xfs_trans, xfs_inode, iget_flags)
+   - 把xfs_dinode读到磁盘中
+   - 计算xfs_imap信息, inode的磁盘位置
+   > xfs_imap(xfs_mount, xfs_trans, xfs_inode->i_ino, xfs_inode->i_imap, iget_flags)
+   - 如果iget_flags包含XFS_IGET_CREATE, xfs版本有crc,而且xfs_mount->m_flags没有XFS_MOUNT_IKEEP
+   - 表示inode是刚创建的??? 初始化xfs_inode->xfs_icdinode
+   - 设置di_magic, di_gen = prandom_u32()
+   - 查找读取对应的block, 获取xfs_dinode指针
+   > xfs_imap_to_bp(xfs_mount, xfs_trans, xfs_inode->xfs_imap, xfs_dinode, xfs_buf, 0, iget_flags)
+   - 验证xfs_dinode数据
+   > xfs_dinode_verify(xfs_mount, xfs_inode, xfs_dinode)
+   - 如果xfs_inode->di_mode !=0, 表示它已经存在
+   > xfs_dinode_from_disk(xfs_inode->xfs_icdinode, xfs_dinode)
+   - 获取xfs_ifork信息
+   > xfs_iformat(xfs_inode, xfs_dinode)
+   - 否则它是刚创建的,只初始化一部分xfs_icdinode?
+   - 设置magic, version, gen, flushiter?
+   - 设置xfs_buf的XFS_INO_REF, 让他在内存中缓存一段时间
+   > xfs_buf_set_ref(xfs_buf, XFS_INO_REF)
+   - xfs_buf读操作使用xfs_trans, 释放对应的资源, 这里没修改xfs_dinode??
+   > xfs_trans_brelse(xfs_trans, xfs_buf)
+

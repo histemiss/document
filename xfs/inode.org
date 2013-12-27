@@ -441,44 +441,6 @@ typedef enum xfs_dinode_fmt {
    - 检查xfs_bmbt_irec->br_state
    - 解析时, br_state只有2种情况, 一种是XFS_EXT_NOR, 另一种是XFS_EXT_UNWRITTEN
 
-** xfs_inobp_check(xfs_mount, xfs_buf)
-   - xfs_buf中的inode的next不是0, 那应该是什么???
-   - xfs_buf是一个保存inode的extent? 大小是xfs_mount->m_inode_cluster_size?
-   - 计算一个cluster中inode的大小?  一个cluster是一个extent? 多大?? 
-   - xfs_mount->m_inode_cluster_size >> xfs_mount->xfs_sb->sb_inodelog
-   - 遍历xfs_buf中的xfs_dinode 
-   > xfs_buf_offset(xfs_buf, i*xfs_mount->xfs_sb->sb_inodesize)
-   - 如果xfs_dinode->di_next_unlinked是0,报错
-
-** xfs_inode_buf_verify(xfs_buf)
-   - 检查xfs_buf中的xfs_dinode的内容
-   - 这里计算xfs_buf的xfs_dinode的方法和上面不一样
-   - 首先转化xfs_buf的大小为fsb单位,然后获取每个fsb的inode的数量
-   > XFS_BB_TO_FSB(xfs_mount, xfs_buf->b_length) * xfs_mount->xfs_sb->sb_inopblock
-   - 遍历xfs_buf的xfs_dinode
-   > xfs_buf_offset(xfs_buf, i<<xfs_mount->xfs_sb->sb_inodelog)
-   - xfs_dinode->di_magic是XFS_DINODE_MAGIC  'IN'
-   - xfs_dinode->di_version是[1,3]
-   - 检查所有xfs_dinode的xfs_ifork? 已经在内存中??
-   > xfs_inobp_check(xfs_mount, xfs_buf)
-     
-** xfs_inode_buf_read_verify(xfs_buf)
-   > xfs_inode_buf_verify(xfs_buf)
-
-** xfs_inode_buf_write_verify(xfs_buf)
-   > xfs_inode_buf_verify(xfs_buf)
-
-** xfs_buf_ops xfs_inode_buf_ops
-   - 原来这里还是为了xfs_buf服务
-
-** xfs_imap_to_bp(xfs_mount, xfs_trans, xfs_imap, xfs_dinode dipp, xfs_buf bpp, buf_flags, iget_flags)
-   - 把一个inode读到内存中, 获取对应的xfs_dinode/xfs_buf指针
-   - 设置buf_flags的XBF_UNMAPPED??
-   - 使用transaction包装的函数读xfs_buf
-   > xfs_trans_read_buf(xfs_mount, xfs_trans, xfs_mount->m_ddev_targp, xfs_imap->im_blkno, xfs_imap->im_len, buf_flags, xfs_buf, xfs_inode_buf_ops)
-   - xfs_dinode的指针在xfs_buf上 
-   > xfs_buf_offset(xfs_buf, xfs_imap->im_boffset)
-
 ** xfs_attr_shortform
    #+BEGIN_SRC 
 	struct xfs_attr_sf_hdr {	/* constant-structure header block */
@@ -560,15 +522,6 @@ typedef enum xfs_dinode_fmt {
    - 设置xfs_ifork->if_flags的XFS_IFBROOT
    - 上面只把btree的root节点复制到内存中, 而且XFS_IFEXTENTS,也只是把xfs_bmbt_rec复制到内存
 
-** xfs_dinode_from_disk(xfs_idcinode, xfs_dinode)
-   - xfs_idcinode是xfs_dinode内存中的表示形式, 两者只有数据类型不一样
-   - xfs_dinode的数据类型全是大端的
-   - 把xfs_dinode数据给xfs_icdinode
-   - xfs_icdinode在xfs_inode中
-
-** xfs_dinode_to_disk(xfs_dinode, xfs_idcinode)
-   - 上面的逆操作
-
 ** _xfs_dic2xflags(di_flags)
    - xfs_icdinode和xfs_dinode->di_flag还是完全相同的, 
    - 它是XFS_DIFLAG_*, 转化为XFS_XFLAG_*
@@ -581,16 +534,6 @@ typedef enum xfs_dinode_fmt {
 ** xfs_dic2flags(xfs_dinode)
    > _xfs_dic2xflags(be16_to_cpu(xfs_dinode->di_flags)) | XFS_XFLAG_HASATTR
 
-** xfs_dinode_verify(xfs_mount, xfs_inode, xfs_dinode)
-   - 验证xfs_dinode数据
-   - xfs_dinode->di_magic是cpu_to_be16(XFS_DINODE_MAGIC)
-   - xfs_dinode->di_version >= 3, 这个域是char, 不需要大小端
-   - 如果支持crc验证,计算checksum
-   > xfs_sb_version_hasrcr(xfs_mount->xfs_sb)
-   > xfs_verify_cksum(xfs_dinode, xfs_sb->sb_inodesize, offsetof(xfs_dinode, di_crc))
-   - 比较xfs_dinode->di_ino = xfs_inode->i_ino
-   - uuid比较, xfs_dinode->di_uuid
-
 ** xfs_dinode_calc_crc(xfs_mount, xfs_dinode)
    - 计算的对象是xfs_dinode->di_crc前面的数据, 结果给xfs_dinode->di_crc
    > xfs_start_cksum(xfs_dinode, xfs_mount->xfs_sb->sb_inodesize, offsetof(xfs_dinode, di_crc))
@@ -601,26 +544,6 @@ typedef enum xfs_dinode_fmt {
 #define XFS_IGET_UNTRUSTED	0x2
 #define XFS_IGET_DONTCACHE	0x4   
    #+END_SRC
-
-** xfs_iread(xfs_mount, xfs_trans, xfs_inode, iget_flags)
-   - 计算xfs_imap信息, inode的磁盘位置
-   > xfs_imap(xfs_mount, xfs_trans, xfs_inode->i_ino, xfs_inode->i_imap, iget_flags)
-   - 如果iget_flags包含XFS_IGET_CREATE, 这里要创建inode?
-   - 初始化xfs_inode->xfs_icdinode
-   - 设置di_magic, di_gen = prandom_u32()
-   - 查找包含xfs_dinode的xfs_buf
-   > xfs_imap_to_bp(xfs_mount, xfs_trans, xfs_inode->xfs_imap, xfs_dinode, xfs_buf, 0, iget_flags)
-   - 验证xfs_dinode数据
-   > xfs_dinode_verify(xfs_mount, xfs_inode, xfs_dinode)
-   - 如果xfs_inode->di_mode !=0, 表示它已经存在
-   > xfs_dinode_from_disk(xfs_inode->xfs_icdinode, xfs_dinode)
-   > xfs_iformat(xfs_inode, xfs_dinode)
-   - 否则它是空的?? 先初始化xfs_icdinode
-   - 设置magic, version, gen, flushiter?
-   - 设置xfs_buf的XFS_INO_REF, 让他在内存中缓存一段时间 
-   > xfs_buf_set_ref(xfs_buf, XFS_INO_REF)
-   - xfs_buf读操作使用xfs_trans, 释放对应的资源?? 
-   > xfs_trans_brelse(xfs_trans, xfs_buf)
 
 ** xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
    - 读取btree_format的inode的data fork

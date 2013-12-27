@@ -1,0 +1,529 @@
+* xfs_file.c
+** inode-lock
+   - IOLOCK对应inode->i_mutex
+   #+BEGIN_SRC 
+    #define	XFS_IOLOCK_EXCL		(1<<0)
+    #define	XFS_IOLOCK_SHARED	(1<<1)
+    #define	XFS_ILOCK_EXCL		(1<<2)
+    #define	XFS_ILOCK_SHARED	(1<<3)
+   #+END_SRC
+
+** xfs_rw_ilock(xfs_inode, type)
+   - 如果type 包含XFS_IOLOCK_EXCL, 先锁住inode->i_mutex 
+   > mutex_lock(xfs_inode->inode->i_mutex)
+   - 然后锁xfs_inode
+   > xfs_ilock(xfs_inode, type)
+
+** xfs_rw_iunlock(xfs_inode, type)
+   - 上面的逆操作 
+   > xfs_iunlock(xfs_inode, type)
+   > mutex_unlock(xfs_inode->inode->i_mutex)
+
+** xfs_rw_ilock_demote(xfs_inode, type)
+   - 降级锁,相当于解锁
+   > xfs_ilock_demote(xfs_inode, type)
+   - 如果type包含XFS_IOLOCK_EXCL, 直接释放inode->i_mutex
+   > mutex_unlock(xfs_inode->inode->i_mutex)
+
+** xfs_iozone(xfs_inode, loff_t pos, count)
+   - 设置文件范围(pos, count)为0, 为hole分配磁盘空间?
+   - 使用address_space_operation的接口实现??
+   - 以page为单位操作
+   - 获取pagecache 
+   > pagecahce_write_begin(NULL, address_space, pos, bytes, AOP_FLAG_UNINTERRUPTIBLE, page, void)
+   - 清空page 
+   > zero_user(page, offset, bytes)
+   - 然后更新inode/address_space
+   > pagecache_write_end(NULL, address_space, pos, bytes, bytes, page, void)
+   
+** xfs_dir_fsync(file, start, end, datasync)
+   - flush dir文件? 只需要提交特定的log 
+   - 锁住xfs_inode 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_SHARED)
+   - 检查xfs_inode是否在log中?? 
+   > xfs_ipincount(xfs_inode)
+   - 如果不在,直接返回
+   - 提交对应的log 
+   > _xfs_log_force_lsn(xfs_mount, xfs_inode->xfs_inode_log_item->ili_last_lsn)
+
+** xfs_file_fsync(file, start, end, datasync)
+   - 先提交数据 
+   > filemap_write_and_wait_range(inode->address_space, start, end)
+   - 去掉xfs_inode的XFS_ITRUNCATED标志 
+   > xfs_iflags_clear(xfs_inode, XFS_ITRUNCATED)
+   - 如果mount使用barrier, 需要发送flush操作
+   - 如果data和log使用相同的block_device, 这里就不flush
+   > xfs_blkdev_issue_flush(xfs_mount->m_ddev_targp)
+   - 锁住xfs_inode 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_SHARED)
+   - 刷新元数据和dir文件一样,通过log实现 
+   - 前提是xfs_inode在log中, 而且datasync ==0, 或者xfs_log_item->ili_fields没有XFS_ILOG_TIMESTAMP??
+   - 获取对应的lsn 
+   > xfs_ipincount(xfs_inode)
+   > _xfs_log_force_lsn(xfs_mount, xfs_log_item->ili_last_lsn, XFS_LOG_SYNC, log_flushed)
+   - log不用flush??  如果data和log使用相同的block_device, 这里需要发送flush操作 
+   > xfs_blkdev_issue_flush(xfs_mount->m_ddev_targp)
+
+** xfs_file_aio_read(kiocb, iovec, nr_segs, pos)
+   - file_operation->aio_read的实现
+   - 检查iovec是否有问题
+   - 计算ioflags
+   - 检查file->f_flags的O_DIRECT, 对应IO_ISDIRECT
+   - 检查file->f_mode的FMODE_NOCMTIME, 对应IO_INVIS
+   > generic_segment_check(iovec, nr_segs, size, VERIFY_WRITE)
+   - 如果是O_DIRECT,而且pos/size必须是sectorsize对齐? 
+   - 锁住文件, 这里没有使用inode->i_mutex, 读操作不会锁?
+   > xfs_rw_ilock(xfs_inode, XFS_IOLOCK_SHARED
+   - 如果是O_DIRECT, 而且address_space中还有page, 先把他们写回
+   - inode->address_space->nrpages > 0
+   - 写操作需要使用互斥锁, 而且锁住inode 
+   > xfs_rw_iunlock(xfs_inode, XFS_IOLOCK_SHARED)
+   > xfs_rw_ilock(xfs_inode, XFS_IOLOCK_EXCL)
+   > filemap_write_and_wait_range(inode->address_space, pos, -1)
+   - 然后删除所有的page
+   > truncate_pages_range(inode, pos, -1)
+   - 然后释放互斥锁. 其他写操作肯定被block
+   > generic_file_aio_read(kiocb, iovec, nr_segs, pos)
+   - 最后解锁文件
+   > xfs_rw_iunlock(xfs_inode, XFS_IOLOCK_SHARED)
+
+** xfs_file_splice_read(file, ppos, pipe_inode_info pipe, count, flags)
+   - 这里不能是O_DIRECT? 检查file->f_mode的FMODE_NOCMTIME
+   - 锁住xfs_inode 
+   > xfs_rw_ilock(xfs_inode, XFS_IOLOCK_SHARED)
+   > generic_file_splice_read(file, pos, pipe_inode_info, count, ioflags)
+   - 释放xfs_inode的锁 
+   > xfs_rw_iunlock(xfs_inode, XFS_IOLOCK_SHARED)
+   - splice IO, 直接获取源文件的pagecache的page, 给目标pipe操作
+
+** xfs_file_splice_write(pipe_inode_info, file, loff_t pos, count, flags)
+   - 果然写操作会使用inode->i_mutex
+   - 仅仅锁住xfs_inode 
+   > xfs_ilock(xfs_inode, XFS_IOLOCK_EXCL)
+   > generic_file_splice_write(pipe, file, pos, count, flags)
+   > xfs_iunlock(xfs_inode, XFS_IOLOCK_EXCL)
+   - 对于写,直接把pipe的数据复制给目标文件的pagecache
+
+** xfs_zero_last_block(xfs_inode, offset, isize)
+   - 如果eof不在block边界, 最后一个block有一部分在eof之后,写入0
+   - 锁住xfs_inode 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL)
+   - 读取对应的xfs_bmbt_irec, 磁盘影射信息
+   > xfs_bmapi_read(xfs_inode, last_fsb, 1, xfs_bmbt_irec, n, 0)
+   - 释放xfs_inode的锁
+   > xfs_iunlock(xfs_inode, XFS_ILOCK_EXCL)
+   - 如果eof在hole上面, xfs_bmbt_irec->br_startblock == HOLESTARTBLOCK, 不需要操作
+   - 清0的范围是(isize, length), isize+length不超过block界线
+   - 而且isize + length 不能过offset? 
+   > xfs_iozero(xfs_inode, isize, zero_length)
+   - 但这里修改了inode->isize??
+
+** xfs_zero_eof(xfs_inode, offset, isize)
+   - 文件eof从isize改为offset
+   - 文件已经被锁住XFS_IOLOCK_EXCL 
+   > xfs_islocked(xfs_inode, XFS_IOLOCK_EXCL)
+   - 首先把isize所在的block的范围内外的清空 
+   > xfs_zero_last_block(xfs_inode, offset, isize)
+   - 转化isize和offset, 变为xfs_fsblock_t 
+   - 如果他们属于同一个xfs_fsblock_t, 直接退出
+   - 遍历范围内的block 
+   - 读取对应的xfs_bmbt_irec
+   - 使用xfs_inode的XFS_ILOCK_EXCL锁住, 但上面已经锁住?
+   > xfs_bmapi_read(xfs_inode, start_zero_fsb, zero_count_fsb, xfs_bmbt_irec, nmaps, 0)
+   - 如果是XFS_EXT_UNWRITTEN, 或者hole, 跳过这个extent
+   - 写入0数据 
+   > xfs_iozone(xfs_inode, zero_off, zero_len)
+
+** xfs_file_aio_write_checks(file, pos, count, iolock)
+   - 写操作之前的检查? 
+   > generic_write_check(file, pos, count, S_ISBLK(xfs_inode->i_mode))
+   - 如果pos超过eof, 需要写文件? 
+   > i_size_read(inode)
+   - 如果iolock是XFS_IOLOCK_SHARED, 切换为XFS_IOLOCK_EXCL
+   - 对于文件范围外的写入0
+   > xfs_zero_eof(xfs_inode, pos, i_size_read(inode))
+   - 更新文件cmtime 
+   > file_update_time(file)
+   - 去掉文件suid 
+   > file_remove_suid(file)
+
+** xfs_file_dio_aio_write(kiocb, iovec, nr_segs, pos, count)
+   - 处理dio, pos/count必须是sectorsize对齐, xfs_buftarg->bt_smask
+   - 如果pos/count对于xfs_mount->m_blockmask不是对齐的, 需要写0?
+   - 如果不是对齐的,需要使用XFS_IOLOCK_EXCL锁,否则是XFS_IOLOCK_SHARED?? 差别很大,关系到inode->i_mutex
+   - 锁住xfs_inode 
+   > xfs_rw_ilock(xfs_inode, iolock)
+   - 如果还有pagecache, 切换为XFS_IOLOCK_EXCL
+   - 先处理pos超过eof的情况
+   > xfs_file_aio_write_checks(file, pos, count, iolock)
+   - 如果有pagecache, 写回数据并删除page
+   > filemap_write_and_wait_range(inode->i_mapping, pos, -1)
+   > truncate_pages_range(inode, pos, -1)
+   - 如果是不对齐的, 等待其他的dio, 当然如果没有,就不等待
+   > inode_dio_wait(inode)
+   - 否则切换为XFS_IOLOCK_EXCL
+   > generic_file_direct_write(kiocb, iovec, nr_segs, pos, ..)
+
+** xfs_file_buffered_aio_write(kiocb, iovec, nr_segs, pos, count)
+   - 使用XFS_IOLOCK_EXCL锁住xfs_inode 
+   - 检查write参数
+   > xfs_file_aio_write_checks(file, pos, count, XFS_IOLOCK_EXCL)
+   - 设置current->backing_dev_info = inode->address_space->backing_dev_info
+   - 使用通用的接口函数
+   > generic_file_buffered_write(kiocb, iovec, nr_segs, pos, kiocb->ki_pos, count, 0)
+
+** xfs_file_aio_write(kiocb, iovec, nr_segs, pos)
+   - file_operation->aio_write的实现
+   - 检查iovec 
+   > generic_segment_chesks(iovec, nr_segs, count, VERIFY_READ)
+   - 根据file->f_flags的O_DIRECT, 分别调用不同的实现 
+   > xfs_file_dio_aio_write(kiocb, iovec, nr_segs, pos, count)
+   > xfs_file_buffered_aio_write(kiocb, iovec, nr_segs, pos, count)
+   - 然后flush数据  
+   > generic_write_sync(file, pos, ret)
+
+** xfs_file_fallocate(file, mode, offset, len)
+   - 如果文件类型不是reg, 直接返回
+   - mode只能包含FALLOC_FL_KEEP_SIZE和FALLOC_FL_PUNCH_HOLE, 不支持其他操作. 其他还有什么?
+   - 使用XFS_IOLOCK_EXCL锁住xfs_inode
+   > xfs_ilock(xfs_inode, XFS_IOLOCK_EXCL)
+   - 如果mode包含FALLOC_FL_PUNCH_HOLE, 释放磁盘空间? 
+   > xfs_free_file_space(xfs_inode, offset, len)
+   - 否则分配磁盘空间
+   - 如果mode没有FALLOC_FL_KEEP_SIZE, 而且offset + len超过文件大小, 检查新的eof是否有效 
+   - 后面回修改eof?
+   > inode_newsize_ok(inode, new_size)
+   - 分配磁盘空间  
+   > xfs_alloc_file_space(xfs_inode, offset, len, XFS_BMAPI_PREALLOC)
+   - 构造xfs_trans 
+   > xfs_trans_alloc(xfs_inode->xfs_mount, XFS_TRANS_WRITEID) 
+   - 预留空间? xfs_mount->m_resv针对没有操作都有专门的计数?
+   > xfs_trans_reserve(xfs_trans, M_RES(xfs_mount)->tr_writeid, 0, 0)
+   - 锁住xfs_inode 
+   > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL)
+   > xfs_trans_ijoine(xfs_trans, xfs_inode, XFS_ILOCK_EXCL)
+   - 去掉文件suid, xfs_inode->xfs_icdinode->di_mode的S_ISUID
+   - 如果mode不是FALLOC_FL_PUNCH_HOLE, 表示要分配空间
+   - 设置xfs_inode->xfs_icdinode->di_flags的XFS_DIFLAG_PREALLOC 
+   - 更新xfs_icdinode里面的时间
+   > xfs_trans_ichgtime(xfs_trans, xfs_inode, XFS_ICGTIME_MOD | XFS_ICHGTIME_CHG)
+   - log这些修改 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 如果file->f_flags有O_DSYNC, 提交xfs_trans? 
+   > xfs_trans_set_sync(xfs_trans)
+   - commit是什么?
+   > xfs_trans_commit(xfs_trans, 0)
+   - 如果上面更新eof, 使用iattr更新  
+   > xfs_setattr_size(xfs_inode, iattr)
+
+** xfs_file_open(inode, file)
+   - 打开文件, 只是检查file->f_flags的O_LARGEFILE
+   - 如果文件系统在关闭, 返回-EIO
+
+** xfs_dir_open(inode, file)
+   - 打开目录文件?
+   > xfs_file_open(inode, file)
+   - 预读extent里的数据 
+   > xfs_dir3_data_readahead(NULL, xfs_inode, 0, -1)
+
+** xfs_file_release(inode, file)
+   - 操作xfs_inode
+   > xfs_release(xfs_inode)
+
+** xfs_file_readdir(file, dir_context)
+   > xfs_readdir(xfs_inode, dir_context, bufsize)
+
+** xfs_file_mmap(file, vm_area_struct)
+   - 设置vm_area_struct->vm_ops, 在下面实现
+   - 更新atime
+   > file_accessed(file)
+
+** xfs_vm_page_mkwrite(vm_area_struct, vm_fault)
+   - 这里和writebegin类似, 准备page/buffer_head
+   > block_page_mkwrite(vm_area_struct, vm_fault, xfs_get_blocks)
+   - 虽然还没有写,但设置PG_dirty标志
+
+** xfs_lookup_buffer_offset(page, offset, type)
+   - 遍历page的buffer_header, 检查是否有type对应的buffer_head
+   > page_buffers(page)
+   - DATA_OFF对应BH_Unwritten和BH_Uptodate 
+   > buffer_unwritten(buffer_head)
+   > buffer_uptodate(buffer_head)
+   - HOLE_OFF对应其他的buffer_head
+   - 找到在参数offset返回文件偏移
+
+** xfs_find_get_desired_pgoff(inode, xfs_bmbt_irec, type, offset)
+   - 从offset向后查找,找到对应type的block
+   - 但不超过xfs_bmbt_irec覆盖的范围, br_startoff + br_blockcount
+   - 以page为单位遍历 
+   > pagevec_lookup(pagevec, address_space, index, want)
+   - 只是查找radix tree, 并不会发起IO操作, 那就对应hole?
+   - 如果type是DATA_OFF, 停止查找,应该不会找到
+   - 否则是HOLE_OFF, 说明找到
+   - 或者找到page,但第一个page对应的文件偏移超过offset,也可以说找到了
+   - 遍历page, 如果page没有buffer_head, 跳过 
+   > page_read_buffers(page)
+   - 查找page里面的buffer_head 
+   > xfs_lookup_buffer_offset(page, offset, type)
+   - 如果找到,返回对应的文件偏移
+   - 如果没找到,记录最后的扫描位置, 如果下一个不连续,怎么没有检查?
+   - 只是检查page超过范围, 而last_offset没有超过范围的情况?
+
+** xfs_seek_data(file, loff_t start)
+   - 计算需要使用什么锁? 需要互斥锁读xfs_bmbt_rec信息
+   > xfs_ilock_map_shared(xfs_inode)
+   - 如果start超过eof, 直接退出  
+   > i_size_read(inode)
+   - 检查的文件范围是(start, isize)
+   - 遍历范围内的xfs_bmbt_rec
+   > xfs_bmapi_read(xfs_inode, fsbno, count, xfs_bmbt_rec, nmap, XFS_BMAPI_ENTIRE)
+   - 如果没找到,返回-ENXIO??
+   - 如果br_startblock == DELAYSTARTBLOCK 或者state是XFS_EXT_NORM, 而且磁盘位置有效, 找到数据extent
+   - 如果br_state是XFS_EXT_UNWRITTEN, 找到unrwitten extent? 查找数据  
+   - 数据在pagecache中, 查找page/buffer_head
+   > xfs_find_get_desired_pgoff(inode, xfs_bmbt_irec, DATA_OFF, offset)
+   - 否则继续查找
+   - 如果找到,设置file->f_pos 
+   > vfs_setpos(file, offset, super_block->s_maxbytes)
+
+** xfs_seek_hole(file, loff_t start)
+   - 锁住文件  
+   > xfs_ilock_map_shared(xfs_inode)
+   - 如果start超过eof, 直接返回
+   > i_size_read(inode)
+   - 遍历范围内的xfs_bmbt_rec 
+   > xfs_bmapi_read(xfs_inode, fsbno, count, xfs_bmbt_irec, nmaps, XFS_BMAPI_ENTIRE)
+   - 如果xfs_bmbt_rec指向hole, br_startblock == HOLESTARTBLOCK, 找到hole
+   - 如果br_state是XFS_EXT_UNWRITTEN, 查找page/buffer_head 
+   > xfs_find_get_desired_pgoff(inode, xfs_bmbt_irec, HOLE_OFF, offset)
+   - 设置找到的结果  
+   > vfs_setpos(file, offset, super_block->s_maxbytes)
+
+** xfs_file_llseek(file, loff_t, origin)
+   - 如果origin是SEEK_END,SEEK_CUR,SEEK_SET
+   - 直接修改f_pos
+   > generic_file_llseek(file, offset, origin)
+   - 对于SEEK_DATA 
+   > xfs_seek_data(file, offset)
+   - 对于SEEK_HOLE 
+   > xfs_seek_hole(file, offset)
+* xfs_iops.c
+
+** xfs_initxattrs(inode, xattr, fs_info)
+   - 设置文件xattr,遍历xattr数组 
+   > xfs_attr_set(xfs_inode, xattr->name, xattr->value, xattr->value_len, ATTR_SECURE)
+
+** xfs_init_security(inode, dir, qstr)
+   - selinux的接口?  在创建inode时同时创建acl?
+   > security_inode_init_security(inode, dir, qstr, xfs_init_attrs, NULL)
+
+** xfs_name 
+   - 应该是文件夹中存储的数据
+   #+BEGIN_SRC 
+	const unsigned char	*name;
+	int			len;
+	int			type;   
+   #+END_SRC
+
+** xfs_dentry_to_name(xfs_name, dentry)
+   - 根据dentry->d_name设置xfs_name
+   - 还包含文件属性
+
+** xfs_cleanup_inode(inode dir, inode inode, dentry)
+   - 删除dentry对应的文件, 它就是inode指向的文件? 
+   > xfs_dentry_to_name(xfs_name, dentry, 0)
+   - 使用xfs_inode.c中的接口, 操作btree
+   > xfs_remove(xfs_inode dir, xfs_name, xfs_inode inode)
+
+** xfs_vm_mknod(inode dir, dentry, mode, rdev)
+   - 准备dir的default ACL
+   > xfs_get_acl(dir, ACL_TYPE_DEFAULT)
+   - 准备xfs_name, 创建对应的文件 
+   > xfs_dentry_to_name(xfs_name, dentry, mode)
+   > xfs_create(xfs_inode dir, xfs_name, mode, rdev, xfs_inode)
+   - 创建获取新的inode, 设置ACL  
+   > xfs_inherit_acl(inode, default_acl)
+   - 关联dentry 
+   > d_instantiate(dentry, inode)
+
+** xfs_vn_create(inode dir, dentry, mode, flags)
+   > xfs_vm_mknod(dir, dentry, mode, 0)
+
+** xfs_vm_lookup(inode dir, dentry, flags)
+   - 查找文件, 先根据dentry->d_name获取对应的ino，然后读取xfs_dinode, 创建inode 
+   > xfs_dentry_to_name(xfs_name, dentry, 0)
+   > xfs_lookup(xfs_inode dir, xfs_name, xfs_inode, NULL)
+
+** xfs_vm_ci_lookup(inode, dentry, flags)
+   - 大小写无关查找?
+   > xfs_lookup(xfs_inode dir, xfs_name, xfs_inode, ci_name)
+
+** xfs_vm_link(dentry old_dentry, inode dir, dentry)
+   - 创建link文件dir/dentry, 指向old_dentry
+   > xfs_dentry_to_name(xfs_name, dentry, old_dentry->inode->i_mode)
+   > xfs_link(xfs_inode dir, xfs_inode inode, xfs_name)
+   - 然后关联新的dentry和老的inode 
+   > d_instantiate(dentry, old_dentry->inode)
+
+** xfs_vm_unlink(inode, dentry)
+   - 直接删除link文件
+   > xfs_remove(xfs_inode dir, xfs_name, dentry->inode)
+   - 原来的dentry变为negative, 但是还在hash表中, 可以找到 
+
+** xfs_vm_symlink(dir, dentry, symname)
+   - 创建文件dir/dentry, 指向的内容是symname
+   - 计算mode S_IFLNK, 这里使用uamsk计算
+   - 获取dentry的文件名  
+   > xfs_dentry_to_name(xfs_name, dentry, mode)
+   > xfs_symlink(xfs_inode dir, xfs_name, symname, mode, xfs_inode)
+   - 创建selinux的xattr 
+   > xfs_init_security(inode, dir, dentry->d_name)
+   > d_instantiate(dentry, inode)
+
+** xfs_vm_rename(inode, dentry, inode, dentry)
+   - 不需要准备什么 
+   > xfs_rename(xfs_inode old_dir, xfs_name old_name, xfs_inode old_inode, xfs_inode new_dir, xfs_name new_name, xfs_inode new_inode)
+   - 为何这里不需要关联新的inode和dentry
+   - 如果目录一样,是否可以直接修改文件名?
+
+** xfs_vm_follow_link(dentry, nameidata)
+   - 获取symlink的内容, 给nameidata->saved_names[]
+   > xfs_readlink(xfs_inode, link)
+
+** xfs_vm_put_link(dentry, nameidata, p)
+   - 释放p指向的内容,它就是上面读取的symlink内容
+
+** xfs_vm_getattr(vfsmount, dentry, kstat)
+   - stat操作? 获取dentry->inode的信息
+   - 设置size/dev_t/mode/nlink/uid/gid/ino/time
+   - stat->blocks是数据的磁盘空间, 以及delay write的空间
+   - xfs_icdinode->di_nblocks + xfs_inode->i_delayed_blks
+
+** xfs_setattr_mode(xfs_trans, xfs_inode, iattr)
+   - 设置xfs_inode的文件属性mode 
+   - 先设置xfs_inode->xfs_icdinode, 然后是inode->i_mode
+
+** xfs_setattr_nosize(xfs_inode, iattr, flags)
+   - 忽略iattr->i_size
+   - 创建xfs_trans, 预留空间? 
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_SETATTR_NOT_SIZE)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_ichange, 0, 0)
+   - 使用xfs_inode的XFS_ILOCK_EXCL锁住
+   - 如果修改ATTR_UID|ATTR_GID, 检查quota
+   - 把inode放到xfs_trans中
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 处理ATTR_UID|ATTR_GUID, 当前uid必须有效. 哪里检查哪些? 修改xfs_inode->xfs_icdinode, inode
+   - 处理ATTR_MODE
+   > xfs_setattr_mode(xfs_trans, xfs_inode, iattr)
+   - 处理time, 同时修改inode, xfs_inode->xfs_icdinode
+   - 提交对xfs_inode->xfs_icdinode的修改  
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 如果mount使用sync, 设置transaction属性
+   > xfs_trans_set_sync(xfs_trans)
+   > xfs_trans_commit(xfs_trans, 0)
+
+** xfs_setattr_size(xfs_inode, iattr)
+   - iattr->ia_valid中不能有uid/gid/atime/mtime??
+   - 检查iattr的文件大小
+   > inode_change_ok(inode, iattr)
+   - 如果newsize/oldsize为0, 不需要修改size
+   - 去掉iattr->ia_valid的ATTR_SIZE, 操作其他iattr 
+   > xfs_setattr_nonsize(xfs_inode, iattr, 0)
+   - 如果newsize > oldsize, 对应空间写0 
+   > xfs_zero_eof(xfs_inode, newsize, oldsize)
+   - 如果oldsize和xfs_inode->xfs_icdinode->di_size不一样, 还有IO中的数据?
+   - 上面把(oldsize,newsize)清0, 其他地方回写这里??
+   > filemap_write_and_wait_range(address_space, xfs_icdinode->di_size, newsize)
+   - 等待dio 
+   > inode_dio_wait(inode)
+   - 处理eof锁在的page, 为何还有获取block?
+   > block_truncate_page(address_space, newsize, xfs_get_blocks)
+   - 最后修改文件大小 
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_SETATTR_SIZE)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_itruncate, 0, 0)
+   - 修改inode, 释放多余的pagecache
+   > truncate_setsize(inode, newsize)
+   - log整个inode
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 添加iattr的ATTR_CTIME|ATTR_MTIME, 设置ctime=mtime为当前时间
+   - 设置xfs_inode->xfs_icdinode->di_size = newsize, 提交log 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 如果newsize < oldsize
+   - 删除多余的xfs_bmbt_rec 
+   > xfs_itruncate_extents(xfs_trans, xfs_inode, XFS_DATA_FORK, newsize)
+   - 设置xfs_inode的XFS_ITRUNCATED标志，在文件关闭时写回磁盘? 
+   - 数据写回去,但metadata也进口写回去?
+   > xfs_iflags_set(xfs_inode, XFS_ITRUNCATED)
+   > xfs_inode_clear_eofblicks_tag(xfs_inode)
+   - 然后处理ATTR_MODE, ATTR_CTIME, ATTR_MTIME 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 提交transaction 
+   > xfs_trans_set_sync(xfs_trans)
+   > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
+
+** xfs_vm_setattr(dentry, iattr)
+   - 根据iattr->ia_valid的ATTR_SIZE, 使用不同方法 
+   > xfs_setattr_size(xfs_inode, iattr)
+   > xfs_setattr_nonsize(xfs_inode, iattr)
+
+** xfs_vm_update_time(inode, timespec, flags)
+   - 修改mtime/ctime
+   - 构造xfs_trans 
+   > xfs_trans_alloc(xfs_mount, XFS_TRANS_FSYNC_TS)
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_fsyncts, 0, 0)
+   - 锁住xfs_inode, 使用XFS_ILOCK_EXCL
+   - 根据flags, 设置xfs_inode->xfs_icdinode / inode的 ctime, mtime, atime
+   - 提交log  
+   > xfs_trans_ijoin(xfs_trans, xfs_inode, XFS_ILOCk_EXCL)
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_TIMESTAMP)
+   > xfs_trans_commit(xfs_trans, 0)
+   - 这里没有释放锁?? 
+
+** xfs_fiemap_format(arg, getbmapx, full)
+   - 获取文件数据的磁盘位置信息
+   - 计算fiemap_flags?
+   - 如果getbmapx->bmv_oflags包含BMV_OF_PREALLOC, 使用FIEMAP_EXTENT_UNWRITTEN
+   - 预分配的磁盘, 还没有写数据， 应该也没有数据,或者完全清0?
+   - 如果包含BMV_OF_DELALLOC, 使用FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_UNKNOWN
+   - 应该时还没有分配磁盘信息?? 有没有??
+   - 如果包含BMV_OF_LAST, 使用FIEMAP_EXTENT_LAST
+   > fiemap_fill_next_extent(fiemap_extent_info, logical, physical, length, fiemap_flags)
+   - 为何还限制磁盘位置??
+
+** fiemap_extent_info 
+   #+BEGIN_SRC 
+	unsigned int fi_flags;		/* Flags as passed from user */
+	unsigned int fi_extents_mapped;	/* Number of mapped extents */
+	unsigned int fi_extents_max;	/* Size of fiemap_extent array */
+	struct fiemap_extent __user *fi_extents_start; /* Start of
+							fiemap_extent array */   
+   #+END_SRC
+
+** xfs_vn_fiemap(inode, fiemap_extent_info, start, length)
+   - 检查fiemap_extent_info的信息??
+   > fiemap_check_flags(fiemap_extent_info, XFS_FIEMAP_FLAGS) 
+   - 组装getbmapx, 设置getbmapx->bmv_iflags的BMV_IF_PREALLOC | BMV_IF_NO_HOLES
+   - 如果fiemap_extent_info->fi_flags包含FIEMAP_FLAG_XATTR, 设置BMV_IF_ATTRFORK
+   - 如果fi_flags没有FIEMAP_FLAG_SYNC, 还设置BMV_IF_DELALLOC
+   > xfs_getbmap(xfs_inode, getbmapx, xfs_fiemap_format, fiemap_extent_info)
+
+** xfs_diflag_to_iflags(inode, xfs_inode)
+   - 根据xfs_inode->xfs_icdinode->di_flags计算inode->i_flags
+   - XFS_DIFLAG_IMMUTABLE, 对应S_IMMUTABLE
+   - XFS_DIFLAG_APPEND 对应S_APPEND
+   - XFS_DIFLAG_SYNC 对应S_SYNC
+   - XFS_DIFLAG_NOATIME对应S_NOATIME
+
+** xfs_setup_inode(xfs_inode)
+   - 初始化inode, xfs_inode已经创建, 只需要复制一些信息
+   - i_ino, i_mode, i_link, uid, gid, dev, genera, size, time
+   - 设置i_state = I_NEW
+   - 把inode放到super_block中
+   > inode_sb_list_add(inode)
+   - 最终要的时组装回调函数接口
+   - 最后去掉XFS_INEW标志?? 
+   > xfs_iflags_clear(xfs_inode, XFS_INEW)
+   - 并且去掉inode->i_state的I_NEW 
+   > unlock_new_inode(inode)
+   
+* xfs_ioctl.c
