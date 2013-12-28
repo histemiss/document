@@ -1912,11 +1912,11 @@
 * xfs_bmap_util.c
 
 ** xfs_fsb_to_db(xfs_inode, xfs_fsblock_t)
-   - 把xfs_fsblock_t指针转化为磁盘绝对地址
+   - 把xfs_fsblock_t地址转化为磁盘绝对地址
    > XFS_FSB_TO_DADDR(xfs_mount, fsb)
    - 它先分解成agno, agbno, 然后对ag的起始地址做偏移
    > XFS_AGB_TO_ADDR(XFS_FSB_TO_AGNO(xfs_mount, fsbno), XFS_FSB_TO_AGBNO(xfs_mount, fsbno)
-   - xfs_fsblock_t单位是fsb, xfs_mount->m_blkbb_log
+   - xfs_fsblock_t单位是fsb, xfs_mount->m_blocklog / xfs_sb->sb_blocksize
    - 对于realtime的文件是直接移位实现
 
 ** xfs_bmap_finish(xfs_trans, xfs_bmap_free, committed)
