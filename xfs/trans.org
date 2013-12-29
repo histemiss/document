@@ -2455,7 +2455,7 @@
    #+end_src
 
 ** xfs_trans_unreserve_and_mod_sb(xfs_trans)
-   - 释放没有使用的预留的空间,而且更新xlog_in_core中的superblock?
+   - 释放没有使用的预留的空间,而且更新xfs_trans中缓存的对xfs_dsb的修改
    - xfs_trans->t_flags & XFS_TRANS_RESERVE代表什么??
    - blkdelta = xfs_trans->t_blk_res + xfs_trans->t_fdblocks_delta 表示预留的磁盘空间
    - realtime空间
