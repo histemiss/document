@@ -1454,16 +1454,36 @@
    > xlog_grant_head_wake(xlog, xlog->l_write_head, free_bytes)
 
 ** xfs_log_need_covered(xfs_mount)
-   - cover log表示文件系统没有改动? 需要写入一个dummy log item
-   - 如果xlog->xfs_cil还有xfs_log_item, 返回0
+   - xlog的定时工作先调用这个函数, 每等待一段时间就执行一次
+   - 如果xlog->xfs_cil还有xfs_log_item, 返回0, 表示没有log数据可写
    > xlog_iclogs_empty(xlog)
+   - 否则xfs_log_item处于什么状态?
+   - 计算xlog->l_covered_state
    - 如果xlog->l_covered_state是XLOG_STATE_COVER_DONE/DONE2/IDLE, 返回0
    - 如果是XLOG_STATE_COVER_NEED/NEED2
    - 如果xlog->xfs_ail不是空, 返回0
    > xfs_ail_min_lsn(xlog->l_ailp)
-   - 如果xlog_in_core不是空, 返回0
+   - 如果xlog_in_core不全是空的, 返回0
    > xlog_iclogs_empty(xlog)
    - 把XLOG_STATE_COVER_NEED改为XLOG_STATE_COVER_DONE,  NEED2改为DONE2, 返回1, 需要插入dummy log item
+
+** 总结 xlog->l_covered_state 
+   - 表示在flush xfs_cil时,是否需要借用dummy xfs_log_item
+   - xfs需要写入2个dummy xfs_log_item, 保证recover的正常??
+   - 如果xfs_cil中有xfs_log_item, 先flush有效的xfs_log_item, 不时用dummy
+   - 如果l_covered_state是XLOG_STATE_COVER_DONE/DONE2/IDLE, 也不需要
+   - 如果l_covered_state是XLOG_STATE_COVER_NEED/NEED2, xfs_ail/xfs_cil中有xfs_log_item, flush有效的log数据,不使用dummy
+   - 否则xfs是空闲的, 而且还需要写回一个dummy xfs_log_item
+   - 状态变为XLOG_STATE_COVER_DONE/DONE2
+   - 在xlog_in_core的回调函数中,根据完成的xlog_in_core, 修改状态
+   - 大部分都改为XLOG_STATE_COVER_NEED, 需要写入dummy
+   - 只有刚才写入的是dummy时, XLOG_STATE_COVER_DONE变为XLOG_STATE_COVER_NEED2, XLOG_STATE_COVER_DONE2变为XLOG_STATE_COVER_IDLE
+   
+   - 只有写入dummy后, xlog->l_covered_state才变为DONE/DONE2
+   - 对应的dummy结束后DONE表为NEED2, DONE2变为IDLE
+   - NEED变为IDLE, 需要连续2个dummy
+   - 任何状态经过非dummy,都变为NEED
+   - 只有NEED/NEED2才会使用dummy
 
 ** xlog_assign_tail_lsn_locked(xfs_mount)
    - 设置xlog->l_tail_lsn, 并返回它. 它表示log队列的尾指针
@@ -1905,47 +1925,52 @@
 ** xlog_state_clean_log(xlog)
    - 在xlog_in_core的回调中使用, 把XLOG_STATE_DIRTY变为XLOG_STATE_ACTIVE
    - xlog_in_core顺序使用好理解, 只要检查xlog->xlog_in_core的状态. 如果有任务等待xlog_in_core完成, 是否也需要等待前面的xlog_in_core完成??
-   - 遍历xlog->l_iclog指向的xlog_in_core链表.
+   - 遍历xlog_in_core链表
    - 如果xlog_in_core->ic_state == XLOG_STATE_DIRTY, 把状态变为XLOG_STATE_ACTIVE
    - 设置xlog_in_core->ic_offset = 0
+   - 在处理过程种xlog_in_core, 计算改变状态
+   - 如果只有一个dirty的xlog_in_core, 而且它只有5 xlog_op_header, 设置change=1, 否则有多个xlog_in_core, 或者xlog_in_core中有多个xlog_in_header
    - xlog_in_core->xlog_in_core2->xlog_rec_header->h_num_logops 为XLOG_COVER_OPS(5), 表示这里xlog_in_core里面只有一个dummy transaction的commit操作
-   - 如果碰到的第一个XLOG_STATE_DIRTY的xlog_in_core是dummy, change=1
-   - 否则change = 2, 表示需要一个dummy transaction的xlog_in_core
    - 重新设置xlog_in_core中的参数 xlog_rec_header->h_num_logops = 0
    - xlog_in_core->xlog_rec_header->h_lsn = 0
-   - 把xlog_in_core->xlog_in_core2->xlog_rec_header->h_cycle_data的数据清为0
-   - 碰到xlog_in_core状态不是XLOG_STATE_ACTIVE或XLOG_STATE_DIRTY, 停止遍历
-   - 根据上面change != 0,改变xlog的状态.
-   - 如果是XLOG_STATE_COVER_IDLE/NEED/NEED2,改为XLOG_STATE_COVER_NEED. 需要一个dummy?
-   - 如果是XLOG_STATE_COVER_DONE, 如果changed=1, 改为XLOG_STATE_COVER_NEED2, 否则改为XLOG_STATE_COVER_NEED. need2为不需要??
+   - 继续重值xlog_in_core->xlog_in_core2->xlog_rec_header, h_num_logops, h_cycle_data, h_lsn都设为0
+   - 如果xlog_in_core状态是XLOG_STATE_ACTIVE,直接跳过
+   - 对于其他状态,停止遍历
+   - 所以这里状态的只是处理局部的dirty的xlog_in_core
+   - 根据上面change != 0,改变xlog的状态
+   - 如果xlog->l_covered_state是XLOG_STATE_COVER_IDLE/NEED/NEED2,改为XLOG_STATE_COVER_NEED
+   - 如果是XLOG_STATE_COVER_DONE, 如果changed=1, 改为XLOG_STATE_COVER_NEED2, 否则改为XLOG_STATE_COVER_NEED
+   - NEED2是一个暂时状态,表示前面有一个空的xlog_in_core
    - 如果是XLOG_STATE_COVER_DONE2, changed=1, 改为XLOG_STATE_COVER_IDLE, 如果changed=2，改为XLOG_STATE_COVER_NEED
-   - 如果change = 2都要改为XLOG_STATE_COVER_NEED. 如果change = 1, 表示里面有一个, 这样如果2次提交都能有dummy的,就不用专门添加一个dummy的.
+   - 如果change = 2都要改为XLOG_STATE_COVER_NEED. 如果change = 1, 表示里面有一个, 这样如果2次提交dummy的,就不用专门添加一个dummy的xlog_in_core
 
 ** xlog_get_lowest_lsn(xlog)
    - 遍历xlog->l_iclog队列，这是xlog_in_core队列.
-   - 处理xlog_in_core->ic_state & ( XLOG_STATE_ACTIVE|XLOG_STATE_DIRTY ) == 0, 找到最小的xlog_in_core->xlog_in_core2->xlog_rec_header->h_lsn.
+   - 过滤工作中的xlog_in_core, 只处理已经提交的xlog_in_core
+   - xlog_in_core->ic_state & ( XLOG_STATE_ACTIVE|XLOG_STATE_DIRTY ) == 0
+   - 找到磁盘位置最小的xlog_in_core->xlog_in_core2->xlog_rec_header->h_lsn.
 
 ** xlog_state_do_callback(xlog, aborted, xlog_in_core)
    - 在xlog_in_core的xfs_buf的IO回调函数中使用
-   - 此时xlog_in_core->ic_state = XLOG_STATE_DONE_SYNC, 把它的状态改为XLOG_STATE_DO_CALLBACK. 但xlog_in_core要有序的进入这个状态.保证回调函数执行的有序.
+   - 此时xlog_in_core->ic_state = XLOG_STATE_DONE_SYNC, 把它的状态改为XLOG_STATE_DO_CALLBACK. 但xlog_in_core要有序的进入这个状态.保证回调函数执行的有序
+   - 从当前xlog_in_core下一个开始遍历, 相当于队尾到对头, 这个顺序时按照提交的先后顺序进行
    - 可能涉及到cil/ail的顺序.
-   - 遍历xlog->l_iclog队列，这是xlog_in_core队列
-   - 如果xlog_in_core->ic_state & (XLOG_STATE_ACTIVE|XLOG_STATE_DIRTY), 直接跳过.
-   - 如果xlog_in_core->ic_state & XLOG_STATE_IOERROR, 而且xlog_in_core->ic_state & XLOG_STATE_DONE_SYNC | XLOG_STATE_DO_CALLBACK = 0, XLOG_STATE_DONE_SYNC, 把它状态改为XLOG_STATE_DO_CALLBACK. 退出循环, 不处理它
-   - 如果xlog_in_core->ic_state & XLOG_STATE_IOERROR ==0, 没有错误
-   - 而且xlog_in_core->ic_state & (XLOG_STATE_DONE_SYNC|XLOG_STATE_DO_CALLBACK) == 0, 没有xlog_in_core在准备callback状态,把参数xlog_in_core->ic_state = XLOG_STATE_DO_CALLBACK, 退出内层循环. 重新遍历xlog_in_core队列. 如果xlog_in_core的完成顺序颠倒,这里就是忙等.
-   - 后面只处理XLOG_STATE_DONE_SYNC|XLOG_STATE_DO_CALLBACK
+   - 如果xlog_in_core->ic_state & (XLOG_STATE_ACTIVE|XLOG_STATE_DIRTY), 直接跳过
+   - 如果xlog_in_core->ic_state没有XLOG_STATE_IOERROR, 表示xlog_in_core没有错误
+   - 如果xlog_in_core->ic_state不是XLOG_STATE_DONE_SYNC或XLOG_STATE_DO_CALLBACK
+   - 结束遍历, 同时把当前的状态从XLOG_STATE_DONE_SYNC改为XLOG_STATE_DO_CALLBACK, 其他xlog_in_core可以处理它
+   - 否则获取一个xlog_in_core, 它的状态是XLOG_STATE_DONE_SYNC或者XLOG_STATE_DO_CALLBACK
    - 获取xlog的最小lsn
    > xlog_get_lowest_lsn(xlog)
-   - 如果xlog_in_core->xlog_op_header->h_lsn不是最小的,也不处理.
-   - 到这里就只处理lsn最小的,而且状态是XLOG_STATE_DONE_SYNC|XLOG_STATE_DO_CALLBACK状态的. 
-   - 如果有xfs_lsn_t小的xlog_in_core, 但状态是WANT_SYNC,SYNCING,CALLBACK, 这里必须等待.
-   - 把要处理的xlog_in_core->ic_state改为XLOG_STATE_CALLBACK. 
-   - 如果xlog_in_core->ic_callback != 0, xlog->l_last_sync_lsn = xlog_in_core->xlog_in_core2->xlog_rec_header->h_lsn
-   - 遍历xfs_log_callback队列,调用它的回调函数.
+   - 如果xlog_in_core->xlog_op_header->h_lsn不是最小的,也不处理, 可能前面有ioerror的xlog_in_core
+   - 到这里就只处理lsn最小的,而且状态是XLOG_STATE_DONE_SYNC|XLOG_STATE_DO_CALLBACK状态的, 改为XLOG_STATE_CALLBACK
+   - 这样保证callback的有序
+   - 如果xlog_in_core->ic_callback != 0
+   - 更新xlog->l_last_sync_lsn = xlog_in_core->xlog_in_core2->xlog_rec_header->h_lsn
+   - 遍历xfs_log_callback队列,调用它的回调函数
    > xfs_log_callback->cb_func(xfs_log_callback->cb_arg, aborted)
    - 设置xlog_in_core->ic_state = XLOG_STATE_DIRTY
-   - 然后把它的状态改为ACTIVE
+   - 然后把它的状态改为ACTIVE, 同时更新xlog->l_covered_state
    > xlog_state_clean_log(log)
    - 唤醒等待这个xlog_in_core的任务
    > wake_up_all(xlog_in_core->ic_force_wait)
