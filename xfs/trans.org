@@ -1,3 +1,9 @@
+* 统一术语
+  - FS空间:行对于log数据而言, 包括metadata和data
+  - log队列: 文件系统的log使用的磁盘空间是一段连续的磁盘块，可能和FS使用一个磁盘,可能使用独立的磁盘。空间作为一个环形队列使用，可以不断添加xfs_log_item/xlog_in_core, 如果这些xfs_log_item写回FS空间，可以释放对应的log队列的尾部数据
+
+
+
 * trans
 ** xfs_trans 
    #+begin_src 
@@ -1853,9 +1859,9 @@
    > xlog_state_release_iclog(xlog, xlog_in_core)
    - 否则通过指针返回, 设置commit_iclog = xlog_in_core
 
-** xlog_write(xlog, xfs_log_vec, xlog_ticket, xfs_lsn_t, xlog_in_core commit_iclog, flags)
+** xlog_write(xlog, xfs_log_vec, xlog_ticket, xfs_lsn_t start_lsn, xlog_in_core commit_iclog, flags)
    - 把xfs_log_vec的数据写到xlog_in_core中
-   - xfs_lsn_t是第一个xlog_in_core中的xlog_rec_header->h_lsn
+   - 参数start_lsn用来记录使用的第一个xlog_in_core->xlog_in_core2->xlog_rec_header->h_lsn
    - 首先计算需要log的空间大小
    > xlog_write_calc_vec_length(xlog_ticket, xfs_log_vec)
    - 如果xlog_ticket->t_flags有XLOG_TIC_INITED, 它预留一个xlog_op_header, 保存XLOG_START_TRANS信息
@@ -1865,15 +1871,15 @@
    - 如果xlog_ticket->t_curr_res <0, 应该是有问题, 打印调试信息
    > xlog_print_tic_res(xlog->xfs_mount, xlog_ticket)
    - 使用双重循环遍历所有的xfs_log_iovec, 
-   - 外层用来切换xlog_io_core, 里面用来遍历xfs_log_iovec
-   - 获取xlog_in_core, 里面会检查可用的xlog_in_core, 如果不可能还需要切换，而且做相应的初始化
+   - 外层用来切换xlog_io_core, 里面用来遍历xfs_log_iovec, 数据转移是以xlog_log_iovec为单位, 当然一个xlog_log_iovec可能太大,占用多个xlog_in_core
+   - 获取xlog_in_core, 里面会检查当前的xlog_in_core, 如果需要切换，等待或者初始化
    - log_offset表示xlog_in_core的内部偏移,开始写数据的位置, contwr表示使用多个xlog_in_core
-   > xlog_state_get_iclog_space(xlog, len, xlog_io_cone, xlog_ticket, contwr, log_offset)
+   > xlog_state_get_iclog_space(xlog, len, xlog_io_core, xlog_ticket, contwr, log_offset)
    - 把第一个xlog_in_core->xlog_in_core2->xlog_rec_header->l_lsn给参数start_lsn, 它表示这个xlog_in_core在log磁盘的位置
-   - 开始向xlog_in_core中转移数据, 获取下一个xfs_log_iovec
+   - 开始向xlog_in_core中转移数据, 获取xfs_log_iovec
    - 如果xfs_log_vec->lv_buf_len是XFS_LOG_VEC_ORDERED, 跳过不处理
    - 获取xlog_op_header, 也就是xlog_in_core中的指针, ptr = xlog_in_core->ic_datap + log_offset
-   - 写入XLOG_START_TRANS使用的xlog_op_header, xlog_ticket->t_flags的XLOG_TIC_INITED决定是否写入
+   - 如果xlog_ticket->t_flags有XLOG_TIC_INITED, 写入XLOG_START_TRANS使用的xlog_op_header
    > xlog_write_start_rec(ptr, xlog_ticket)
    - 移动指针ptr, 增加log_offset, 表示xlog_in_core的数据量, 减小len, 表示剩余的数据量. 每次写了数据的都需要这些移动
    > xlog_write_adv_cnt(xlog_op_header, len, log_offset, start_rec_copy)
@@ -1904,7 +1910,7 @@
    - 如果partial_copy !=0, 退出内层循环,重新获取一个xlog_in_core
    - 否则切换xfs_log_vec / xfs_log_iovec
    - 如果上面record_cnt ==0, 也需要重新查找xlog_in_core
-   - 最后还需要更新xlog_in_core的计数
+   - 最后循环结束后还需要更新xlog_in_core的计数
    > xlog_state_finish_copy(xlog, xlog_in_core, record_cnt, data_cnt)
    - 释放xlog_in_core,可能会推进xlog_in_core状态,写回磁盘
    > xlog_state_release_iclog(xlog, xlog_in_core)
@@ -1918,7 +1924,6 @@
    - 一种时切换xfs_log_iovec时,发现xlog_in_core空间太少, 同时切换
 
    - 在查找xlog_in_core时增加使用计数, 在切换或移动完成时释放计数, 同时推进它的状态
-
    - 在查找xlog_in_core时,如果发现一个xlog_in_core不够用,提前切换, 而且后面使用时需要更新它的ic_offset, 其他任务使用下一个
    - 否则提前更新ic_offset, 其他任务可以同时使用
 
@@ -1952,21 +1957,21 @@
 
 ** xlog_state_do_callback(xlog, aborted, xlog_in_core)
    - 在xlog_in_core的xfs_buf的IO回调函数中使用
-   - 此时xlog_in_core->ic_state = XLOG_STATE_DONE_SYNC, 把它的状态改为XLOG_STATE_DO_CALLBACK. 但xlog_in_core要有序的进入这个状态.保证回调函数执行的有序
-   - 从当前xlog_in_core下一个开始遍历, 相当于队尾到对头, 这个顺序时按照提交的先后顺序进行
-   - 可能涉及到cil/ail的顺序.
-   - 如果xlog_in_core->ic_state & (XLOG_STATE_ACTIVE|XLOG_STATE_DIRTY), 直接跳过
+   - 遍历xlog_in_core->ic_state， 处理队列尾部处于XLOG_STATE_DONE_SYNC|XLOG_STATE_DO_CALLBACK的, 把它的状态改为XLOG_STATE_DO_CALLBACK, 调用它的回调函数
+   - 从当前xlog_in_core下一个开始遍历, 相当于队尾
+   - 如果碰到xlog_in_core->ic_state & (XLOG_STATE_ACTIVE|XLOG_STATE_DIRTY), 直接跳过
    - 如果xlog_in_core->ic_state没有XLOG_STATE_IOERROR, 表示xlog_in_core没有错误
+   - 如果有错误不管它状态,直接处理
    - 如果xlog_in_core->ic_state不是XLOG_STATE_DONE_SYNC或XLOG_STATE_DO_CALLBACK
-   - 结束遍历, 同时把当前的状态从XLOG_STATE_DONE_SYNC改为XLOG_STATE_DO_CALLBACK, 其他xlog_in_core可以处理它
+   - 结束遍历, 后面即使有XLOG_STATE_DONE_SYNC|XLOG_STATE_DO_CALLBACK的xlog_in_core, 也等待这个xlog_in_core的状态变为XLOG_STATE_DONE_SYNC|XLOG_STATE_DO_CALLBACK之后处理
+   - 同时把当前xlog_in_core的状态从XLOG_STATE_DONE_SYNC改为XLOG_STATE_DO_CALLBACK, 其他xlog_in_core的回调可以处理它
    - 否则获取一个xlog_in_core, 它的状态是XLOG_STATE_DONE_SYNC或者XLOG_STATE_DO_CALLBACK
-   - 获取xlog的最小lsn
+   - 检查他的xfs_lsn_t, 先获取xlog的最小lsn
    > xlog_get_lowest_lsn(xlog)
-   - 如果xlog_in_core->xlog_op_header->h_lsn不是最小的,也不处理, 可能前面有ioerror的xlog_in_core
+   - 如果xlog_in_core->xlog_op_header->h_lsn不是最小的,也不处理
+   - xlog_in_core应该按照h_lsn排序?? 现在已经按顺序访问, 为何还有这种情况??
    - 到这里就只处理lsn最小的,而且状态是XLOG_STATE_DONE_SYNC|XLOG_STATE_DO_CALLBACK状态的, 改为XLOG_STATE_CALLBACK
-   - 这样保证callback的有序
-   - 如果xlog_in_core->ic_callback != 0
-   - 更新xlog->l_last_sync_lsn = xlog_in_core->xlog_in_core2->xlog_rec_header->h_lsn
+   - 如果xlog_in_core->ic_callback != 0, 更新xlog->l_last_sync_lsn = xlog_in_core->xlog_in_core2->xlog_rec_header->h_lsn
    - 遍历xfs_log_callback队列,调用它的回调函数
    > xfs_log_callback->cb_func(xfs_log_callback->cb_arg, aborted)
    - 设置xlog_in_core->ic_state = XLOG_STATE_DIRTY
@@ -1995,29 +2000,31 @@
    - 获取可用的xlog_in_core,写xfs_log_vec时调用
    - len表示将要写的xfs_log_vec占用的数据量
    - xlog_in_core必须有序使用
-   - 检查xlog->xlog_in_core, 如果xlog_in_core->ic_state不是XLOG_STATE_ACTIVE, 它可能在flush中,等待完成
+   - 检查xlog->xlog_in_core, 如果xlog_in_core->ic_state不是XLOG_STATE_ACTIVE
+   - 在callback处理后, xlog_in_core变为XLOG_STATE_DIRTY,然后变为XLOG_STATE_ACTIVE, 唤醒xlog->l_flush_wait队列
    > xlog_wait(xlog->l_flush_wait, xlog->l_icloglock)
-   - 获取xlog_in_core->xlog_in_core2->xlog_rec_header
    - 增加xlog_rec_header->ic_refcnt, 别的任务不会把它写入磁盘, 当前任务操作完成后,才会释放计数
+   - 获取xlog_in_core->xlog_in_core2->xlog_rec_header,可能做一些初始化
    - 获取它的空闲空间偏移, xlog_rec_header->ic_offset, 就是xfs_log_vec写入的位置
    - 如果xlog_in_core->ic_offset = 0, 初始化这个xlog_in_core
    - 减小xlog_ticket reserve的log空间, 因为这些xlog_in_core2数组也会写到log空间
    - xlog_ticket->t_curr_res -= xlog->l_iclog_hsize
-   - 把这些数据信息放到xlog_ticket->t_res_arr数组中
+   - 把xlog_in_core2数组的内存指针放到xlog_ticket->t_res_arr数组中
    > xlog_tic_add_region(xlog_ticket, xlog->l_iclog_hsize, XLOG_REG_TYPE_LRHEADER)
    - 设置xlog_rec_header->h_cycle = xlog->l_curr_cycle
    - 设置xlog_rec_header->h_lsn = xlog_assign_lsn(xlog->l_curr_cycle, xlog->l_curr_block), 这就log空间真正的头指针,而不是reserve的头指针
    - 检查剩余空间是否够2个xlog_op_header.
    - xlog_in_core->ic_size - xlog_in_core->ic_offset < 2 * sizeof(xlog_op_header)
-   - 如果不够, 切换xlog_in_core
+   - 如果不够, 切换这个xlog_in_core
    > xlog_state_switch_iclogs(xlog, xlog_in_core, xlog_in_core->ic_size)
    - 释放使用计数, xlog_in_core->ic_refcnt --
-   - 如果计数减为0, 进一步修改状态,写回磁盘
+   - 如果计数减为0, 推进xlog_in_core的状态
    > xlog_state_release_iclog(xlog, xlog_in_core)
    - 重新获取xlog的当前可用的xlog_in_core
+   - 如果空间足够多,超过2个xlog_op_header的大小,使用它保存xfs_log_vec
    - 检查xlog_in_core的空闲空间, 如果超过len
    - xlog_in_core->ic_size - xlog_in_core->ic_offset >= len
-   - 表示仅使用当前xlog_in_core, reserve它的空间,其他人也可使用它
+   - 表示当前xlog_in_core不仅支持这次xfs_log_vec,其他人也可使用它
    - 增加xlog_in_core->ic_offset += len, coutinued_write = 0
    - 否则需要两个, 设置continued_write = 1
    - 切换当前使用的xlog_in_core, 别人会使用新的
@@ -2026,19 +2033,19 @@
    - logoffsetp指向数据在xlog_in_core中的位置
 
 ** xlog_regrant_reserve_log_space(xlog, xlog_ticket)
-   - 重新为xlog_ticket准备reserve空间
+   - 重新为xlog_ticket reserve空间
    - 如果t_cnt > 0, 减小xlog_ticket->t_cnt --
    - 释放没有使用的reserve空间, xlog_ticket->t_curr_res
    - 包括xlog->l_reserve_head / l_write_head
    > xlog_grant_sub_space(xlog, xlog->l_reserve_head->grant, xlog_ticket->t_curr_res)
-   - 设置xlog_ticket->t_curr_res = xlog_ticket->t_unit_res
-   - 总的reserve的空间是t_unit_res, t_curr_res表示还没有使用的reserve空间
+   - 设置xlog_ticket->t_curr_res = xlog_ticket->t_unit_res, 恢复满的reserve空间的大小
+   - 总的reserve的空间是t_unit_res, t_curr_res表示剩余的reserve空间
    - 重置xlog_ticket->xlog_res数组的索引和计数
    > xlog_tic_reset_res(xlog_ticket)
    - 如果xlog_ticket->t_cnt > 0, 就不需要reserve, xlog_ticket还有足够的
-   - 否则reserve空间
+   - 否则reserve空间, 这里使用xlog->l_reserve_head
    > xlog_grant_add_space(xlog, xlog->l_reserve_head->grant, xlog_ticket->t_unit_res)
-   - 又要重新设置xlog_ticket->t_curr_res = t_unit_res?
+   - 又要重新设置xlog_ticket->t_curr_res = t_unit_res? 别的地方会修改???
    > xlog_tic_reset_res(xlog_ticket)
 
 ** xlog_ungrant_log_space(xlog, xlog_ticket)
@@ -2054,78 +2061,100 @@
    > xfs_log_space_wake(xlog->xfs_mount)
 
 ** xlog_state_release_iclog(xlog, xlog_in_core)
-   - 减小xlog_in_core的使用计数
+   - 释放xlog_in_core的使用计数
    > atomic_dec_and_lock(xlog_in_core->ic_refcnt, xlog->l_icloglock)
    - 如果不是0, 直接退出
-   - 把xlog_in_core写回磁盘
+   - 否则处理xlog_in_core的状态
    - xlog_in_core->ic_state应该是XLOG_STATE_ACTIVE或XLOG_STATE_WANT_SYNC
-   - 如果是XLOG_STATE_WANT_SYNC, 设置lsn, 也就是最小的ail的xfs_lsn
+   - 如果不是XLOG_STATE_WANT_SYNC, 不再继续处理, 直接退出
+   - 否则把它写回磁盘
+   - 设置xlog_rec_header->h_tail_lsn为当前xfs_ail中最小的xfs_log_item的位置
+   - 这个xfs_log_item已经写回log队列, 但没有提交到FS空间, 所以他是log队列的尾
    > xlog_assign_tail_lsn(xlog->xfs_mount)
+   - 所以对于一个xlog_in_core, 他可以确定log队列的尾,他当前就是log队列的头
    - 修改xlog_in_core的状态
    - xlog_in_core->ic_state设置XLOG_STATE_SYNCING
    - xlog_in_core->xlog_in_core2->xlog_rec_header->h_tail_lsn = tail_lsn
    > xlog_verify_tail_lsn(xlog, xlog_in_core, tail_lsn)
-   - 如果状态改为XLOG_STATE_SYNCING发起写回操作
+   - 提交对应的xfs_buf的写请求
    > xlog_sync(xlog, xlog_in_core)
 
 ** xlog_state_switch_iclogs(xlog, xlog_in_core)
-   - 切换当前使用的xlog_in_core, 当前xlog_in_core->ic_state必须是XLOG_STATE_ACTIVE, 改为XLOG_STATE_WANT_SYNC
+   - 切换xlog当前指向的xlog_in_core
+   - 设置旧的xlog_in_core, 没有初始化新的xlog_in_core, 通过xlog->l_curr_block/cycle, 计算下一个xlog_in_core的磁盘位置
+   - 当前xlog_in_core->ic_state必须是XLOG_STATE_ACTIVE, 把它改为XLOG_STATE_WANT_SYNC
    - 获取它的xlog_in_core2->xlog_rec_header
-   - 设置h_prev_block = xlog->l_prev_block, 相当于建造一个回朔的链表, 可以倒叙遍历xlog_in_core
+   - 设置xlog_rec_header->h_prev_block = xlog->l_prev_block, 相当于建造一个回朔的链表, 可以倒序遍历xlog_in_core
    - 把xlog->l_curr_block/cycle给xlog->l_prev_block/cycle
-   - 下一个xlog_in_core的磁盘位置偏移当前xlog_in_core的大小
-   - eventual_size是xlog_in_core->ic_size或者0, ic_size表示xlog_in_core的数据空间, ic_offset表示数据量, 即使没有完全用完,但也不管浪费
+   - 计算xlog->l_curr_block/cycle, 也就是下一个xlog_in_core的磁盘位置
+   - 向前偏移当前xlog_in_core的大小
+   - eventual_size是xlog_in_core->ic_size或者0
+   - ic_size表示xlog_in_core的数据空间, 即使没有完全用完,浪费了空间
+   - 如果eventual_size是0, 替换为ic_offset, 表示实际有的数据量, 没有浪费
    - xlog->l_curr_block += BTOBB(eventual_size + xlog->l_iclog_hsize)
    - 如果xfs支持logv2, 让xlog->l_curr_block对齐到super_block->sb_logsunit
    - 如果xlog->l_curr_block超过l_logBBsize, 增加xlog->l_curr_cycle
    - 最后设置xlog->l_iclog = xlog_in_core->ic_next
 
 ** _xfs_log_force(xfs_mount, flags, log_flushed)
-   - 把xfs_cil积累的xfs_log_item全写回去.
+   - 把xfs_cil积累的xfs_log_item写到xlog_in_core
    > xlog_cil_force(xlog)
-   - 检查当前xlog_in_core xlog->l_iclog, 如果上面提交了它可能有数据,也可能前一个有数据.
-   - 如果log_in_core->ic_state == XLOG_STATE_DIRTY|XLOG_STATE_ACTIVE, 检查是否需要等待
-   - 如果xlog_in_core->ic_state == XLOG_STATE_DIRTY, 而且xlog_in_core->ic_refcnt == 0或者xlog_in_core->ic_offset = 0, 这个xlog_in_core没有使用, 检查前一个xlog_in_core->ic_prev, 数据可能提交到前一个xlog_in_core中.
-   - 如果它也是XLOG_STATE_ACTIVE|DIRTY, 要不就是没有使用,要不就是提交完成. 其他应该是在提交或回调过程中,需要等待那些操作.
-   - 否则当前xlog_in_core是XLOG_STATE_ACTIVE而且有人在使用或者有数据
-   - 如果没人使用, 肯定有数据.
-   - xlog_rec_header->h_lsn会怎么变化
-   - 把它状态改为XLOG_STATE_WANT_SYNC, 需要开始写回.
+   - 如果log_in_core->ic_state != XLOG_STATE_DIRTY|XLOG_STATE_ACTIVE, 必须等待, 至少当前xlog_in_core在写回或回调状态
+   - 否则检查具体的xlog_in_core, 可能不需要等待
+   - 如果xlog_in_core->ic_state == XLOG_STATE_DIRTY, 而且xlog_in_core->ic_refcnt == 0或者xlog_in_core->ic_offset = 0, 这个xlog_in_core没有使用
+   - 检查前一个xlog_in_core->ic_prev, 数据提交到前一个xlog_in_core中，它肯定指向log队列的头
+   - 如果它也是XLOG_STATE_ACTIVE|DIRTY, 也就是他的写回和回调完成，整个队列的xlog_in_core都完成, 不需要等待；否则它在写回或回调状态，等待它完成
+   - 否则处理当前xlog_in_core的其他状态，至少xlog_in_core->ic_state是XLOG_STATE_ACTIVE
+   - 如果xlog_in_core->ic_refcnt ==0, 肯定xlog_in_core->ic_offset>0, 根据上面的判断条件，没人在使用它
+   - 当前xlog_in_core有数据没有提交, 这里需要提交它，先切换xlog, 然后通过释放计数进一步推进ic_state
+   - 增加xlog_in_core->ic_refcnt, 切换xlog 
    > xlog_state_switch_iclogs(xlog, xlog_in_core, 0)
-   - 发起写回动作.
+   - 然后释放计数, 写回xlog_in_core
    > xlog_state_release_iclog(xlog, xlog_in_core)
-   - 然后检查它的状态, 如果xlog_rec_header->h_lsn不改变,而且状态不是XLOG_STATE_DIRTY, 需要等待, 他在回写或回调过程中,需要等待. 如果它的lsn改变或状态为DIRTY,说明它处理完了,不用等待.
-   - 其他任务在使用, 把它状态改为XLOG_STATE_WANT_SYNC, 其他使用者怎么办??
+   - 这里需要设置log_flushed, 表示当前任务写回log队列
+   - 锁住xlog_in_core, 计算是否要等待
+   - 这时xlog_in_core可能已经完成,虽然时间很短
+   - xlog_in_core->xlog_in_core2->xlog_rec_header->h_lsn可能会改变, 和上面不一样，而且ic_state变为XLOG_STATE_DIRTY, 不需要等待
+   - 否则需要等待
+   - 如果xlog_in_core->ic_refcnt !=0, 其他人正在使用, 只需要切换它, 别人释放时会掉交写回操作
+   - 然后等待这个xlog_in_core的完成
+   - 这里切换时直接限定xlog_in_core的大小, 虽然有别人在使用；别人不会继续改动ic_offset;否则会先切换它，然后修改.
    > xlog_state_switch_iclogs(xlog, xlog_in_core, 0)
-   - 如果需要等待, 而且flags & XFS_LOG_SYNC !=0, 等待它完成
+   - 最后是等待处理 如果参数flags没有XFS_LOG_SYNC, 直接退出
+   - 等待xlog_in_core->ic_force_wait, 在xlog_in_core的回调完成后会唤醒
    > xlog_wait(xlog_in_core->ic_force_wait, xlog->l_icloglock)
 
 ** xfs_log_force(xfs_mount, flags)
    > _xfs_log_force(xfs_mount, flags, NULL)
 
 ** _xfs_log_force_lsn(xfs_mount, xfs_lsn_t, flags, log_flushed)
-   - xfs_lsn_t是sequence, 把它对应的xfs_cil_ctx写回xlog_in_core, 并刷会磁盘
+   - xfs_lsn_t是sequence, 把它对应的xfs_cil_ctx写回xlog_in_core
    > xlog_cil_force_lsn(xlog, xfs_lsn_t)
-   - 它也返回了最后一个xlog_in_core的xfs_lsn_t
-   - 需要遍历xlog->l_iclog, 找到对应的xlog_in_core
-   - 找一个xlog_in_core->xlog_in_core2->xlog_rec_header->h_lsn == lsn
-   - 如果xlog_in_core->ic_state == XLOG_STATE_DIRTY, 直接退出, 已经提交完成.
-   - 如果xlog_in_core->ic_state == XLOG_STATE_ACTIVE, 应该能保证它就是当前使用的xlog_in_core
-   - 检查前一个xlog_in_core, xlog_in_core->ic_prev, 如果它的状态是XLOG_STATE_WANT_SYNC|SYNCING, 等待它完成 
+   - 它也返回了最后一个xlog_in_core的 xlog_rec_header->h_lsn
+   - 遍历xlog->l_iclog, 找到对应的xlog_in_core
+   - 如果xlog_in_core->ic_state == XLOG_STATE_DIRTY, 直接退出, 已经提交完成
+   - 如果xlog_in_core->ic_state == XLOG_STATE_ACTIVE, 正在使用中,需要写回并等待
+   - 等待分成2次，先检查前一个xlog_in_core, xlog_in_core->ic_prev
+   - 如果它的状态是XLOG_STATE_WANT_SYNC|SYNCING, 等待它的IO完成,然后再提交当前的xlog_in_core
    > xlog_wait(xlog_in_core->ic_prev->ic_write_wait, xlog->l_icloglock)
-   - 如果是第二次扫描
+   - 在xlog_in_core的IO回调中唤醒这个等待, 在callback之前
+   - 然后重新扫描，可能xlog_in_core已经完成，重复使用， xfs_lsn_t已经改变
+   - 如果还是XLOG_STATE_ACTIVE, 需要切换，写回并等待回调完成
    - xlog_in_core->ic_refcnt ++
-   - 更改它的状态
+   - 切换,可能推进它的状态
    > xlog_state_switch_iclogs(xlog, xlog_in_core, 0)
-   - 把xlog_in_core写回磁盘
+   - 释放计数，可能推进它的状态
    > xlog_state_release_iclog(xlog, xlog_in_core)
-   - 如果xlog_in_core->ic_state不是XLOG_STATE_ACTIVE|DIRTY, 而且flags & XFS_LOG_SYNC != 0, 必须等待当前xlog_in_core处理完???
+   - 最后是等待处理
+   - 如果xlog_in_core->ic_state不是XLOG_STATE_ACTIVE|DIRTY, 而且flags & XFS_LOG_SYNC != 0, 才需要等待
+   - 使用force的等待队列
    > xlog_wait(xlog_in_core->ic_force_wait, xlog->l_iclogwork)
 
 ** xfs_log_force_lsn(xfs_mount, xfs_lsn_t, flags)
    > _xfs_log_force_lsn(xfs_mount, xfs_lsn_t, flags, NULL)
 
 ** xlog_state_want_sync(xlog, xlog_in_core)
+   - 在xlog_in_core空间无法容纳更多xlog_op_header时使用
    - 改变xlog_in_core的状态,让他变为XLOG_STATE_WANT_SYNC
    - 如果xlog_in_core->ic_state是XLOG_STATE_ACTIVE, 通过切换实现
    > xlog_state_switch_iclogs(xlog, xlog_in_core, 0)
@@ -2138,20 +2167,47 @@
 ** xfs_log_ticket_get(xlog_ticket)
    - xlog_ticket->t_ref ++
 
+** xfs_log_calc_unit_res(xfs_mount, unit_bytes)
+   - 计算xlog_ticket占用的最大空间, 额外空间包括
+   - 包括xfs_trans_header的xlog_op_header
+   - XLOG_START_TRANS使用的xlog_op_header
+   - xfs_log_vec使用的xlog_op_header应该在参数里面, 但它可能会放在多个xlog_in_core中
+   - 需要多余的xlog_op_header, 和xlog_in_core2->xlog_rec_header数组的空间
+   - 但xlog_op_header的增长又会导致使用多余的xlog_in_core, 所以这里使用while循环处理
+   - 最后还有commit-rec, 使用一个xlog->l_iclog_hsize???
+   - 还有对齐空间2个BBSIZE,或sb_logsunit
+
 ** xlog_ticket_alloc(xlog, unit_bytes, cnt, client, permanent, xfs_km_flags_t)
    - 创建xlog_ticket, 它对应一个transaction. 
-   - 这里只是先预留这么多.因为提交到xlog_in_core时,切换xlog_ticket, 所以不一定使用这么多空间. 但空间还是从这类借用.
-   - 一个transaction的格式是<oph><trans-hdr><start-oph><reg1-oph><reg1><reg2-oph> --- <commit-oph>
-   - 根据unit_bytes计算需要预留的空间
-   - 1个xlog_op_header + 1个xfs_trans_header
-   - 1个xlog_op_header表示start trans, 它不带数据
-   - 如果一个xlog_in_core不够, 计算xlog_in_core的个数
-   - unit_bytes / (xlog->l_iclog_size - xlog->l_iclog_hsize)
-   - 每个xlog_in_core也得用xlog_op_header, 而且对应的xlog->l_inclog_hsize
-   - xlog_ticket->t_unit_res / t_curr_res = unit_bytes
-   - xlog_ticket->t_flags = XLOG_TIC_INITED
-   - 如果permanent != 0, xlog_ticket->t_flags 加上XLOG_TIC_PERM_RESERV表示
+   - 计算一次xfs_trans需要的空间
+   > xfs_log_calc_unit_res(xfs_mount, unit_bytes)
+   - 设置xlog_ticket->t_unit_res / t_curr_res = unit_bytes
+   - 设置xlog_ticket->t_cnt / t_ocnt = cnt
+   - 设置xlog_ticket->t_flags = XLOG_TIC_INITED
+   - 如果permanent != 0, 设置xlog_ticket->t_flags的XLOG_TIC_PERM_RESERV
+   - 重置计数
    > xlog_tic_reset_res(xlog_ticket)
+
+** xlog_verify_dest_ptr(xlog, ptr)
+   - xlog_ticket里面存储xfs_log_iovec数据的内存区域
+   - 检查ptr是否在这些范围内
+
+** xlog_verify_grant_tail(xlog)
+   - 检查xlog->l_write_header和xlog->l_tail_lsn, l_write_head不能是log队列的头, 但还是检查是否2者覆盖
+   - l_write_head为何不能多reserve??
+
+** xlog_verify_tail_lsn(xlog, xlog_in_core, xfs_lsn_t tail_lsn)
+   - 检查log队列的长度, 头是xlog->l_prev_cycle, 当前xlog_in_core没有写回
+   - 尾是xlog->l_tail_lsn
+   - 空闲空间不能超过当前xlog_in_core的长度, 也就是参数xlog_in_core
+   - xlog_in_core->ic_offset + xlog->l_iclog_hsize
+
+** xlog_verify_iclog(xlog, xlog_in_core, count, syncing)
+   - 在写回xlog_in_core之前,检查它的参数
+   - xlog_in_core的xfs_buf中每个block开头都不是XLOG_HEADER_MAGIC_NUM, 特殊的magic, 只有第一个才是
+   - 检查里面的每个xlog_op_header
+   - xlog_op_header->oh_clientid必须是XFS_LOG或XFS_TRANSACTION
+   - 根据xlog_op_header->oh_len查找下一个
 
 ** xlog_state_ioerror(xlog)
    - 设置xlog_in_core的错误标志
@@ -2165,21 +2221,25 @@
    > XFS_BUF_DONE(xfs_mount->m_sb_bp)
    - 直接退出??
    - 如果xlog->xlog_in_core->ic_state有XLOG_STATE_IOERROR, 直接退出
-   - 处理cil
+   - 如果logerror ==0, 写回xfs_cil
    > xlog_cil_force(xlog)
    - 添加标志xfs_mount->m_flags的XFS_MOUNT_FS_SHUTDOWN
-   - 关闭xfs_buf, xfs_sb使用的??
+   - 设置XBF_DONE,表示缓存的数据都是uptodate
    > XFS_BUF_DONE(xfs_mount->m_sb_bp)
    - 唤醒等待xlog空间的任务
    > xlog_grant_head_wake_all(xlog->l_reserve_head)
-   - 关闭xlog
-   - _xlog_log_force(xfs_mount, XFS_LOG_SYNC, NULL)
-   - 回调函数
+   - 如果当前xlog_in_core->ic_state没有XLOG_STATE_IOERROR, log没有错误,FS有严重错误
+   - 写回当前xlog_in_core, 也就是把所有的xlog_in_core都写回
+   > _xlog_log_force(xfs_mount, XFS_LOG_SYNC, NULL)
+   - 设置所有的xfs_in_core的错误标志
+   > xlog_state_ioerror(xlog)
+   - 执行callback任务,唤醒等待xlog_in_core的任务
    > xlog_state_do_callback(xlog, XFS_LI_ABORTED, NULL)
    
 ** xlog_iclogs_empty(xlog)
-   - 检查所有的xlog_in_core的xlog_op_headers.
-   - 如果有=0的,返回0. 否则返回1,表示没有空的xlog_in_core
+   - 检查所有的xlog_in_core->xlog_in_core2->xlog_rec_header->h_num_logops
+   - 表示xlog_in_core包含的xlog_op_header的个数
+   - 如果都为0返回1, 整个xlog都是空的
 
 ** 总结
    - xlog_in_core的状态
@@ -2218,10 +2278,27 @@
      - XLOG_STATE_COVER_DONE2, 在XLOG_STATE_COVER_NEED2,决定要写一个dummy, 变为这个状态. 下次再写一个dummy, 变为IDLE状态. 如果写了一个普通的xlog_in_core, 变为XLOG_STATE_COVER_NEED
 
    - 等待队列的使用
-     - xlog->l_flush_wait, 使用xlog_in_core是等待XLOG_STATE_ACTIVE状态.在xlog_in_core回调结束时唤醒. 回调结束会处理很多东西.
-     - xlog_in_core->ic_force_wiat, 等待一个xlog_in_core, 在xlog_in_core的回调函数中,如果它变为dirty(active)状态时唤醒.
-     - xlog_in_core->ic_write_wait, 等待xlog_in_core的写回完成. 这里只要要求xlog_in_core写到磁盘就可以,不用等回调完成.在xfs_buf的回调开始处使用
+     - xlog->l_flush_wait, 用来等待整个xlog
+       - 唤醒操作在xlog_in_core的回调处理, 可能完成一些xlog_in_core,如果当前xlog_in_core->ic_state是XLOG_STATE_ACITVE|XLOG_STATE_IOERROR时唤醒
+       - 等待操作是在查找当前可用的xlog_in_core,发现不是XLOG_STATE_ACTIVE
+     - xlog_in_core->ic_force_wiat, 等待单独的xlog_in_core
+       - 唤醒操作在xlog_in_core的callback阶段完成中,它的状态可能是XLOG_STATE_IOERROR|XLOG_STATE_ACTIVE, 也可能是XLOG_STATE_CALLBACK, 等待前面的没有变为XLOG_STATE_DIRTY的xlog_in_core
+       - 等待操作是在flush中, 如果xlog_in_core不是XLOG_STATE_DIRTY|XLOG_STATE_ACTIVE
+     - xlog_in_core->ic_write_wait, 等待xlog_in_core的写回完成
+       - 唤醒操作在xlog_in_core的回调中, IO完成后直接唤醒
+       - 等待操作仅仅在flush中,如果前一个xlog_in_core的状态是XLOG_STATE_SYNCING, 等待这个xlog_in_core的IO完成后,再提交当前xlog_in_core的IO
+
    - xfs_buf的回调函数在xfslogd_workqueue工作队列中执行.
+
+   - xlog_in_core的状态转换
+     - XLOG_STATE_ACTIVE:初始状态或者可用的状态. 从XLOG_STATE_DIRTY变为这个状态,需要所有的xlog_in_core有序的进入这个状态
+     - XLOG_STATE_WANT_SYNC: 等待IO状态. 在xlog_in_core切换出去后变为这个状态,在xlog_in_core空间已满后切换,或者force flush中切换. 如果还有人使用,还在往里面放xfs_log_vec, 等待任务完成, 完成后直接变为下一个状态。即使没有人使用,要想推进到下一个状态也是通过计数的增减实现
+     - XLOG_STATE_SYNCING:IO状态. 替换block的cycle, 计算checksum, 提交xfs_buf的IO
+     - XLOG_STATE_DONE_SYNC: 完成IO.在IO的回调函数中, 如果没有错误, 设置为这个状态.
+     - XLOG_STATE_DO_CALLBACK: 等待其他xlong_in_core的IO状态. 所有的xlog_in_core需要顺序的执行callback. 如果前面的xlog_in_core还没有完成IO,设置为XLOG_STATE_DO_CALLBACK, 让后面的xlog_in_core IO完成后执行它, 执行它时变为下一个XLOG_STATE_CALLBACK. 它也可能直接从XLOG_STATE_SYNCING变为XLOG_STATE_CALLBACK, IO完成后不需要等待别人,直接执行callback
+     - XLOG_STATE_CALLBACK: callback阶段, 开始处理callback回调
+     - XLOG_STATE_DIRTY:等待其他xlog_in_core的callback状态.  在callback完成之后,如果没有IOERROR,变为这个状态, 如果前面的xlog_in_core状态都变为XLOG_STATE_ACTIVE, 它也变为XLOG_STATE_ACTIVE,否则等待前面的xlog_in_core
+
    - 这里的主要功能
    - 管理xlog空间, 预留xlog空间, 无法分配时等待
    - mount操作,启动recovery操作, 初始化xlog,xlog_in_core, xfs_cil, xfs_ail等.
@@ -2251,98 +2328,91 @@
    #+end_src
 
 ** 总结
-   - 把总结放到前面
    - xfs_cil_ctx管理提交中的xfs_log_item. 它应该包含多个xfs_trans的xfs_log_item.
-   - 整个xfs_cil_ctx提交时使用一个xfs_log_vec, 里面包装xfs_op_header是XFS_TRANS_CHECKPOINT.而且最后包含一个空的xfs_log_vec,没有数据, xfs_log_iovec->i_type = XLOG_REG_TYPE_COMMIT, xfs_op_header->oh_flags = XLOG_COMMIT_TRANS. 它只会写一个空的xlog_op_header.
-   - xfs_cil_ctx的提交是有序的, 提交表示写入XLOG_COMMIT_TRANS的操作. 使用xfs_cil_ctx->xc_commit_wait队列等待, 提交到xlog_in_core后会设置xfs_cil_ctx->commit_lsn, 根据它表示已经提交
-   - 在xlog_in_core写到磁盘后触发xfs_cil_ctx->xfs_log_callback_t回调函数
+   - 整个xfs_cil_ctx提交时使用一个xfs_log_vec链表, 里面包装xlog_op_header是XFS_TRANS_CHECKPOINT
+   = 最后使用一个空的xfs_log_vec,没有数据, xfs_log_iovec->i_type = XLOG_REG_TYPE_COMMIT, xfs_op_header->oh_flags = XLOG_COMMIT_TRANS. 它只会写一个空的xlog_op_header.
+   - xfs_cil_ctx的提交是有序的, 写入的XLOG_COMMIT_TRANS是有序的,其他数据不保证. 使用xfs_cil_ctx->xc_commit_wait队列等待, 提交到xlog_in_core后会设置xfs_cil_ctx->commit_lsn, 根据它表示已经提交
+   - 在xlog_in_core写到磁盘后触发xfs_cil_ctx->xfs_log_callback_t回调函数, 把xfs_log_item放到xfs_ail中
+
    - 这里对外的功能就是2个. xfs_cil就是缓存层, xfs_cil缓存xfs_trans的xfs_log_item. xfs_cil_ctx管理xfs_log_item, 在提交之前缓存，提交之后等待结构,把它转移给ail
    - 提供接口提交xfs_trans到xfs_cil
    - 提供接口提交xfs_cil_ctx, 还有一个回调接口,在xfs_log_item写到xlog_in_core中,转移给ail
-   - xfs_mount->m_cil_workqueue用来周期提交任务,写回xfs_cil_ctx.它是并发的吗??
+
+   - xfs_cil提供一个xfs_log_item的缓存,批量提交给xlog_in_core. xfs_cil中xfs_log_item是有序的,但不保证他们在log队列中的顺序, 但它不保证xfs_ail中的顺序
+   - 只能保证xfs_log_rec在xlog_in_core中的顺序和xfs_ail中的顺序一致
 
 ** xlog_cil_ticket_alloc(xlog)
-   - 创建xlog_ticket
+   - 创建xlog_ticket,不会reserve任何空间. 虽然创建时会分配一些多余的,但后面重置为0, 但t_curr_unit不是0
    > xlog_ticket_alloc(xlog, 0, 1, XFS_TRANSACTION, 0, KM_SLEEP|KM_NOFS)
-   - xlog_ticket->t_trans_type = XFS_TRANS_CHECKPOINT
+   - 设置xlog_ticket->t_trans_type = XFS_TRANS_CHECKPOINT
    - xlog_ticket->t_curr_res = 0, 不预留空间, 使用xfs_trans的空间
 
 ** xlog_cil_init_post_recovery(xlog)
-   - 在创建xfs_cil时,创建了第一个xlog_cil_ctx. 这个函数是recovery xlog之后调用的,现在xlog空间已经准备好,可以预留空间.
+   - 在创建xfs_cil时,创建第一个xlog_cil_ctx. 
+   - 这个函数是recovery xlog之后调用的, 现在log队列已经准备好,可以预留空间.
    - 估计是创建xlog_ticket就需要xlog的信息,所以需要在恢复xlog之后才能使用.
-   - xlog->xlog_cil->xfs_cil_ctx->ticket分配xlog_ticket
+   - xlog->xlog_cil->xfs_cil_ctx->ticket分配特殊的xlog_ticket
+   - xfs_cil_ctx操作时使用的log空间来自于xfs_trans->xlog_ticket的空间
    > xlog_cil_ticket_alloc(xlog)
    - xfs_cil_ctx->sequence = 1
-   - xfs_cil_ctx->commit_lsn使用xlog->l_curr_cycle, xlog->l_curr_block, 这里还是看不懂,第二个xfs_cil_ctx提交时就不会等待第一个
-     
-** xlog_cil_prepare_log_vecs(xfs_trans)
-   - 格式化transaction的log item. 把数据放到xfs_log_vec中.
-   - xfs_trans->t_items队列中是xfs_log_item_desc, 它里面管理xfs_log_item指针? 为何不直接使用xfs_log_item
-   - 遍历这些xfs_log_item_desc
-   - 对于xfs_log_item_desc->lid_flags没有XFS_LID_DIRTY, 不处理
-   - 每个xfs_log_item构造一个xfs_log_vec
-   - 计算需要的xfs_log_iovec的数量niovecs
-   > IOP_SIZE(xfs_log_item)
-   > xfs_log_item_desc->xfs_log_item->xfs_item_ops->iop_size(xfs_log_item)
-   - 如果item数量为0, 不处理
-   - 格式化之后产生多个xfs_log_iovec
-   - 创建xfs_log_vec和对应数量的xfs_log_iovec. xfs_log_vec->lv_item = xfs_log_item
-   - 针对每个xfs_log_iovec, 格式化对应的数据. 这里也可能没有搬数据. 只是初始化指针
-   > IOP_FORMAT(xfs_log_item, xfs_log_iovec)
-   > xfs_log_item->xfs_item_ops -> iop_format(xfs_log_item, xfs_log_vec)
-   - 累加xfs_log_iovec->i_len, 给xfs_log_vec->lv_buf_len = len
-   - 分配空间xfs_log_vec->lv_buf
-   - 把xfs_log_iovec的数据搬到xfs_log_vec->buf中, 让xfs_log_iovec->i_addr指向新的位置.
-   - 把构造的xfs_log_vec放到xfs_log_vec->lv_next链表中.
+   - xfs_cil_ctx->commit_lsn指向log队列的头(xlog->l_curr_cycle, xlog->l_curr_block)
 
+** xlog_cil_lv_item_format(xfs_log_item, xfs_log_vec)
+   - 格式化xfs_log_item的数据, 至于数据放到哪里不清楚, 但指针在xfs_log_iovec中
+   > xfs_log_item->xfs_item_ops->iop_format(xfs_log_item, xfs_log_vec->xfs_log_iovec)
+   - 然后遍历这些xfs_log_iovec,把他们指向的内存数据复制到xfs_log_vec->lv_buf中
+   - 然后再把xfs_log_iovec的指针指向xfs_log_vec中的空间
+     
 ** xfs_cil_prepare_item(xlog, xfs_log_vec lv, xfs_log_vec old_lv, diff_len, diff_iovecs)
    - 在xfs_log_item放到cil之前, 更新它使用的xfs_log_vec. 而且累计它需要使用的空间
    - diff_len表示log的数据量, 每个item都有一个头部, diff_iovecs表示头的数量
    - 如果old_lv == NULL, xfs_log_item原来没有关联xfs_log_vec, 需要锁定资源
    > xfs_log_item->xfs_log_ops->iop_pin(xfs_log_item)
-   - 否则先释放旧的xfs_log_vec, 并释放计数
+   - 否则不需要锁定资源, 但释放旧的xfs_log_vec, 并释放计数
    - 设置xfs_log_vec->xfs_log_item->li_seq = xlog->xfs_cil->xfs_cil_ctl->sequence
 
 ** xlog_cil_insert_format_items(xlog, xfs_trans, diff_len, diff_iovecs)
+   - 如果xfs_trans->t_items为空, 严重错误!
    - 把xfs_log_item中的数据格式化,放到那里??
-   - 遍历xfs_trans->t_items队列上的xfs_log_item_desc，管理xfs_log_item
+   - 遍历xfs_trans->t_items队列上的xfs_log_item_desc
    - 如果xfs_log_item_desc->lid_flags没有XFS_LID_DIRTY, 不需要处理
    - 计算需要的空间, 如果返回niovecs ==0, 不需要处理
    > xfs_log_item->xfs_log_ops->iop_size(xfs_log_item, niovecs, nbytes）
    - 如果返回XFS_LOG_VEC_ORDERED,表示什么??
    - 准备xfs_log_item->xfs_log_vec成员,保存log的数据
    - 如果xfs_log_item已经有,而且足够大xfs_log_vec->lv_size, 直接使用它
-   - 格式化xfs_log_item的内容  
+   - 格式化xfs_log_item的数据
    > xlog_cil_lv_item_format(xfs_log_item, xfs_log_vec)
    - 如果原来不存在,或者不够大,直接分配新的
-   - 初始化新的xfs_log_vec, 它使用xfs_log_iovec指向的内存就在后面, xfs_log_iovec指向的内存在最后面,是一片连续的内容
-   - 关联xfs_log_vec和xfs_log_item
+   - 初始化新的xfs_log_vec, 它使用xfs_log_iovec数组内存在后面, xfs_log_vec->li_buf指向的内存在最后面, 里面存放格式化后的log数据
+   - 同样转移数据
+   > xlog_cil_lv_item_format(xfs_log_item, xfs_log_vec)
+   - 最后关联xfs_log_vec和xfs_log_item
    > xfs_cil_prepare_item(xlog, xfs_log_vec lv, xfs_log_vec old_lv, diff_len, diff_iovecs)
 
-** xlog_cil_insert_items(xlog, xfs_log_vec, xlog_ticket)
-   - 把xfs_log_vec->xfs_log_item放到cil中.
-   - 准备xfs_log_item使用的xfs_log_vec, 用来保存格式化之后的log数据
-   > xfs_cil_prepare_item(xlog, xfs_log_vec, len, diff_iovecs)
-   - 遍历xfs_trans->t_items队列上的xfs_log_item_desc，把对应的xfs_log_item放到xlog->xfs_cil_ctx中
+** xlog_cil_insert_items(xlog, xfs_trans)
+   - 把xfs_log_vec->xfs_log_item放到xfs_cil中
+   - 准备xfs_log_item, 分配xfs_log_vec空间,并转移数据
+   > xlog_cil_insert_format_items(xlog, xfs_trans, len, diff_iovecs)
+   - 遍历xfs_trans->t_items队列上的xfs_log_item_desc，把对应的xfs_log_item放到xlog->xfs_cil中
+   - 增加xfs_cil_ctx->nvecs += diff_iovecs
    - 把xfs_trans->t_busy中的xfs_extent_busy给xfs_cil_ctx->busy_extents
-   - 计算需要reserve的log空间 
+   - xfs_cil_ctx->xlog_ticket没有reserve空间
+   - 他向log队列写数据需要多余的数据, xlog_ticket->t_unit_res, 使用xfs_trans->xlog_ticket->t_curr_res填充这些空间
+   - 然后是xfs_log_vec使用的空间, 包括头xfs_log_iovec使用的xlog_op_header
    - len += sizeof(xlog_op_header) * diff_iovecs
-   - xlog_op_header数据类型是大端的, 磁盘中使用
-   - 如果xfs_cil_ctx->xlog_ticket->t_curr_res ==0, 需要使用xfs_trans->xlog_ticket->t_curr_res的空间, 转移的空间大小是xfs_cil_ctx->xlog_ticket->t_unit_res
-   - 修改xfs_cil_ctx
+   - 如果len需要多个xlog_in_core, 也就是使用额外的xlog_op_header, 还有xlog->l_iclog_hsize
+   - 同样增大xfs_cil_ctx->xlog_ticket->t_unit_res / t_curr_res
+   - 然后在xfs_trans->xlog_ticket->t_curr_res中减去这些空间, 预计消耗这些log空间
+   - 修改xfs_cil_ctx计数
    - xfs_cil_ctx->nvecs += diff_iovecs
-   - 如果xfs_cil_ctx->xlog_ticket->t_curr_res == 0, 它没有预留空间
-   - 从参数xlog_ticket中获取  xfs_cil_ctx->xlog_ticket->t_curr_res = t_unit_res
-   - xlog_ticket->t_curr_res -= xfs_cil_ctx->xlog_ticket->t_unit_res
-   - 如果上面累加的len>0, 检查是否需要多个xlog_in_core, 也就是多个对应的xlog_op_header, 还有xlog->l_iclog_hsize
-   - xfs_cil_ctx->space_used += len, 从xlog_ticket->t_curr_res中去掉这些预留的头数据的空间
+   - xfs_cil_ctx->space_used += len
+
+   - 这里功能是把xfs_trans放到xfs_cil中,而且转移log空间
    - 只有在这里才消耗了xlog_ticket的预留空间
-   - 这里的操作还是准备xfs_log_item, 为xfs_cil_ctx-xlog_ticket准备空间,不过是使用xfs_trans->xlog_ticket的空间.
-   - 提交xfs_trans的xfs_log_item, 只是为他分配内存把xlog数据保存起来,而且把它放到xfs_cil->xc_cil队列中. 提交xlog_in_core的事情交给xfs_cil_ctx
 
 ** xlog_cil_free_logvec(xlog_log_vec)
-   - 释放xfs_log_vec
-   - xfs_log_vec->lv_buf
+   - 释放xfs_log_vec链表
    - xfs_log_iovec->i_addr指向xfs_log_vec->lv_buf, 没有他分配内存.
 
 ** xlog_cil_committed(args, abort)
@@ -2356,51 +2426,68 @@
    - 释放xfs_cil_ctx->committing队列关系
    - 释放xfs_log_vec
    > xlog_cil_free_logvec(xfs_cil_ctx->lv_china)
-   - 又释放一遍xfs_cil_ctx->busy_extents
+   - 发送discard请求, 上面不会释放要求discard操作的xfs_busy_extent
    > xfs_discard_extents(xfs_mount, xfs_cil_ctx->busy_extents)
    > xfs_extent_busy_clear(xfs_mount, xfs_cil_ctx->busy_extents, false)
+   - 最后释放xfs_cil_ctx使用的内存
 
 ** xlog_cil_push(xlog)
-   - 把xfs_cil积累的xfs_log_item提交给xlog_in_core. 
+   - 把xfs_cil积累的xfs_log_item提交给xlog_in_core
    - 每次提交一匹,使用xfs_log_ctx管理他们.
-   - 首先创建新的xfs_cil_ctx new_ctx, 代替老的.
+   - 首先创建新的xfs_cil_ctx new_ctx, 后面代替xfs_cil->xc_ctx
    - 给它分配xfs_cil_ctx->xlog_ticket
    > xlog_cil_ticket_alloc(xlog)
-   - 获取原来xfs_cil->xfs_cil_ctx ctx
+   - 获取原来xfs_cil->xfs_cil_ctx ctx,下面的操作使用xfs_cil_ctx->xc_ctx_lock保护
    - 保证xfs_cil->xc_push_seq <= xfs_cil_ctx->sequence
    - sequence仅仅是一个计数,下面设置xfs_cil_ctx->sequence = old->sequence + 1
+   - 传递给xfs_log_item->li_seq, 用来区分xfs_cil_ctx
    - xfs_cil->xc_cil队列中是xfs_log_item, 如果为空,就没有可处理的,直接退出.
-   - xc_push_seq是调用者设定, 要表示要处理的xfs_cil_ctx
-   - 如果xfs_cil->xc_push_seq < xfs_cil_ctx->sequence, 直接退出, 因为这里只处理当前的xfs_cil.
-   - 遍历xfs_cil->xc_cil队列的xfs_log_item, 这是xfs_cil积累的, 在提交xfs_trans时把xfs_log_item转移到这里来.
-   - 把他们管理的xfs_log_item放到xfs_cil_ctx->lv_chain链表中. 放在原来的,而不是新的xfs_cil_ctx
+   - xc_push_seq是调用者设定, 表示有条件的写回xfs_cil_ctx
+   - 如果xfs_cil->xc_push_seq < xfs_cil_ctx->sequence, 直接退出
+   - 遍历xfs_cil->xc_cil队列的xfs_log_item
+   - 这是xfs_cil积累的, 在提交xfs_trans时把xfs_log_item转移到这里来.
+   - 把他们管理的xfs_log_item放到xfs_cil_ctx->lv_chain链表中
+   - 然后从xfs_cil中释放xfs_log_item, 而且释放对xfs_log_vec的管理
+   - 后面再通过xfs_log_vec,访问xfs_log_item, 放到xfs_ail管理中
    - 初始化新的xfs_cil_ctx, 让他代替旧的
    - xfs_cil_ctx->sequence = ctx->sequence + 1
    - xfs_cil_ctx->cil = xfs_cil, 建立关联关系 
    - xfs_cil->xc_current_sequence = xfs_cil_ctx->sequence
    - 把新的xfs_cil_ctx->committing放到队列xfs_cil->xc_committing
-   - 开始处理old xfs_cil_ctx
+
+   - 开始处理old xfs_cil_ctx, 把xfs_log_vec数据写到xlog_in_core
+   - 首先写入带有xfs_trans_header的xlog_op_header
    - 创建xfs_trans_header, 使用xfs_log_vec/xfs_log_iovec包装起来
    - xfs_trans_header->th_magic = XFS_TRANS_HEADER_MAGIC, ty_type = XFS_TRANS_CHECKPOINT
+   - xfs_trans_heaer->th_tid = xlog_ticket->t_tid, 这是随机数, 用来区别xfs_trans
+   - 准备一个xfs_log_iovec, 指向上面的内存数据
    - xfs_log_iovec->i_type = XLOG_REG_TYPE_TRANSHDR
-   - 把新的xfs_log_vec->lv_next和xfs_cil_ctx->lv_chain链表和一块,写回xlog_in_core
+   - 准备一个xfs_log_vec, 容纳这一个特殊的xfs_log_iovec
+   - 把xfs_cil_ctx->lv_chain链表放到这个特殊的xfs_log_vec后面,写回xlog_in_core
    > xlog_write(xlog, xfs_log_vec, xlog_ticket, xfs_cil_ctx->start_lsn, NULL, 0)
-   - xfs_cil_ctx->start_lsn应该用来索引xlog_in_core..
-   - 等待之前的xfs_cil_ctx提交完xlog_in_core数据.
+   - xfs_cil_ctx->start_lsn记录使用的第一个xlog_in_core
+
    - 遍历xfs_cil->xc_committing的xfs_cil_ctx
    - 处理老的xfs_cil_ctx, sequence < ctx->sequence
-   - 如果xfs_cil_ctx->commit_lsn = 0, 等待cil. commit_lsn的设定在下面.
+   - 如果哪些xfs_cil_ctx->commit_lsn = 0, 说明没有提交xfs_cil_ctx
+   - 什么情况下会乱序提交, 等待他们提交完成
    > xlog_wait(xfs_cil->xc_commit_wait, xfs_cil->xc_cil_lock)
-   - 如果老的xfs_cil_ctx都提交完成, 写回一个XLOG_CIMMIT_TRANS的包.
-   - 释放xlog_ticket, 应该是释放它.
+
+   - 如果前面的xfs_cil_ctx都提交完成, 当前xfs_cil_ctx才能算完成
+   - 写回一个XLOG_CIMMIT_TRANS的包, 然后释放xlog_ticket 
    > xfs_log_done(xlog->xfs_mount, xlog_ticket, xlog_in_core, 0)
+   - 这里返回一个xlog_in_core, 它不一定是上面xfs_cil_ctx->start_lsn对应的
+
    - 初始化xfs_cil_ctx->xfs_log_callback, 回调函数是xlog_cil_committed
-   - 把回调函数给对应的xlog_in_core, 也就是上面的xlog_op_header所在的
+   - 把回调函数给对应的xlog_in_core, XLOG_COMMIT_TRANS所在的xlog_in_core
    > xfs_log_notify(xlog->xfs_mount, xlog_in_core, xfs_cil_ctx->log_cb)
-   - 设置xfs_cil_ctx->commit_lsn, 唤醒其他等待的任务
+
+   - 设置xfs_cil_ctx->commit_lsn, 唤醒其他等待的xfs_cil_ctx的处理
    > wake_up_all(xfs_cil_ctx->xc_commit_wait)
-   - 最后释放使用的xlog_in_core
+   - 最后使用的xlog_in_core计数,可能会写回xlog_in_core
    > xfs_log_release_iclog(xlog->xfs_mount, xlog_in_core)
+
+   - 通过等待xfs_cil_ctx的提交,保证XLOG_COMMIT_TRANS的有序写入, 同样保证注册回调函数的有序, 同样保证了xfs_cil_ctx释放的有序,保证了xfs_ail中xfs_log_item的有序
 
 ** xlog_cil_push_work(work_struct)
    - work_struct是xfs_cil->xc_push_work, 执行上面的任务
@@ -2415,7 +2502,10 @@
    - 设置xfs_cil->xc_push_seq = xfs_cil->xc_current_sequence
    > queue_work(xlog->xfs_mount->m_cil_workqueue, xfs_cil->xc_push_work)
 
-** xlog_cil_push_foreground(xlog, xfs_lsn_t)
+   - 阈值这么大, 可能会有大量的缓存, 但应该不会有太多的xfs_cil_ctx
+   - 而xlog_in_core相对来说较小, 会有xfs_cil_ctx的积累
+
+** xlog_cil_push_foreground(xlog, xfs_lsn_t push_seq)
    - 处理xlog->xfs_cil, sequence应该是sequence之类的
    - 刷新xfs_cil->xc_push_work, 它是其他异步提交xfs_cil的任务
    > flush_work(xfs_cil->xc_push_work)
@@ -2423,49 +2513,60 @@
    - xfs_cil->xc_push_seq = push_seq
    - 直接执行写回
    > xlog_cil_push(xlog)
+   - 这里push_seq应该是最新的xfs_cil_ctx使用的,仅仅提交最新的xfs_cil_ctx, 或者强制提交特定的xfs_cil_ctx
 
+** 总结consequence
+   - xfs_cil->xc_current_sequence表示当前xfs_cil_ctx->sequence
+   - xfs_cil->xc_push_seq表示正在或已经提交的xfs_cil_ctx->sequence, 在提交过程中,如果没有xfs_log_item, 会设置为0
+   - xfs_cil_ctx->sequence, 根据这个排序, 或者唯一识别它
+
+** xlog_cil_empty(xlog)
+   - 检查xfs_cil->xc_cil是否为空,没有xfs_log_item
+   
 ** xfs_log_commit_cil(xfs_mount, xfs_trans, xfs_lsn_t commit_lsn, flags)
    - 把xfs_trans的数据放到xfs_cil_ctx中
-   - cil的log数据提交以xfs_cil_ctx为单位
+   - xfs_cil的log数据提交以xfs_cil_ctx为单位
    - 如果flags包含XLOG_TRANS_RELEASE_LOG_RES, log_flags使用XFS_LOG_REL_PREM_RESERV, 表示最后xlog_ticket被直接释放掉,不要重复使用??
-   - 把xfs_log_vec中的xfs_log_item给xfs_cil_ctx, 使用xfs_log_item->li_cil链表, 同时准备好xfs_log_vec
+   - 把xfs_log_vec中的xfs_log_item给xfs_cil_ctx, 使用xfs_log_item->li_cil链表
+   - 同时准备好xfs_log_vec, 转移xlog_ticket空间等
    > xlog_cil_insert_items(xlog, xfs_log_vec, xfs_trans->xlog_ticket)
    - xlog_ticket->t_curr_res < 0, reserve的空间不够? 关闭文件系统
-   - 设置xfs_trans->t_commit_lsn = xfs_cil_ctx->sequence, 这里应该是log磁盘位置???
+   - 设置xfs_trans->t_commit_lsn = xfs_cil_ctx->sequence, 记录xfs_trans使用的xfs_cil_ctx
+   - 如果xfs_trans是同步的, 根据它来flush xfs_cil_ctx
    - 释放xlog_ticket,这里不会写xlog_in_core的,因为xlog_ticket之前没有写过,所以t_flags & XLOG_TIC_INITED ==1, 但xfs_cil_ctx->xlog_ticket是被work_struct写过??
    > xfs_log_done(xfs_mount, xfs_trans->xlog_ticket, NULL, log_flags)
    - 释放reserve的fs空间,不是log空间
    - 修改xfs_sb计数在xfs_trans中的修改
    > xfs_trans_unreserve_and_mod_sb(xfs_trans)
-   - 释放transaction中的xfs_log_item_desc. unlock
+   - 释放xfs_trans中的xfs_log_item_desc,把sequence传递给xfs_log_item
    > xfs_trans_free_items(xfs_trans, commit_lsn, 0)
-   - 释放xfs_trans中的xfs_log_item_desc
    - 写回xfs_cil_ctx,当xfs_cil_ctx->space_used超过阈值,启动cil的work_struct, 写回xfs_cil_ctx
    > xlog_cil_push_background(xlog)
    
 ** xlog_cil_force_lsn(xlog, xfs_lsn_t sequence)
-   - 根据xfs_lsn_t, 把合适的cil放到log中
+   - 根据xfs_lsn_t / sequence, 把合适的xfs_cil_ctx放到log中
    - sequence <= xfs_cil->xc_current_sequence
    - 启动写回工作
    - xlog_cil_push_foreground(xlog, xfs_lsn_t sequence)
+   - 然后等待xfs_cil_ctx的完成,同样等待它之前的xfs_cil_ctx
    - 遍历xfs_cli->xc_committing队列的xfs_cil_ctx
-   - 如果xfs_cil_ctx->sequence > sequence 不处理
-   - 如果xfs_cil_ctl->commit_lsn = 0, 等待xfs_cil
+   - 如果发现没有写进去的, 去xfs_cil->xc_commit_wait上等待
    > xlog_wait(xfs_cil->xc_commit_wait, xfs_cil->xc_cil_lock)
+   - 这里返回xfs_cil_ctx使用的最后一个xlog_in_core的xfs_lsn_t, 可以用来flush xlog_in_core
   
 ** xfs_log_item_in_current_chkpt(xfs_log_item)
-   - 检查xfs_log_item是不是第一个?? 奇葩的情况
+   - 检查xfs_log_item是不是在当前xfs_cil_ctx中, 他所在的xfs_trans已经提交,而且提交在xfs_cil中 
    - 如果xfs_log_item->li_cil队列为空,返回false
    - 返回xfs_log_item->li_seq == xlog->xfs_cil->xfs_cil_ctl->sequence
 
 ** xlog_cil_init(xlog)
-   - 初始化xlog->l_cilp
+   - 初始化xlog->l_cilp, xfs_cil
    - 创建xfs_cil, xfs_cil_ctx
    - xfs_cil_ctx->sequence = 1
 
 ** xlog_cil_destroy(xlog)
    - 销毁xlog的xfs_cil
-   - 检查xfs_cil_ctx->xlog_ticket
+   - 先释放xfs_cil_ctx->xlog_ticket
    > xfs_log_ticket_put(xlog_ticket)
    - 然后释放xfs_cil_ctx / xfs_cil
 
@@ -2712,20 +2813,21 @@
 * xfs_trans_ail.c 
 
 ** 总结
-   - xfs_ail管理的xfs_log_item应该是已经写到磁盘中的,但这些xfs_log_item还没有合并到磁盘的metadata中. 这时系统崩溃了,可以根据xlog的数据来回复
+   - xfs_ail管理的xfs_log_item是已经写到磁盘中的,但这些xfs_log_item还没有合并到磁盘的metadata中. 这时系统崩溃了,可以根据xlog的数据来回复
    - 这里和xfs_log_item有交互, 在释放时需要调用push操作
-   - 这里提供给xlog接口,来释放xlog空间. 只要xfs_log_item合并到磁盘的metadata,对应的xlog空间就能释放.
+   - 这里提供给log接口,来释放log队列的数据. 只要xfs_log_item合并到磁盘的metadata,对应的log数据就能释放.
    - 这里提供给cil接口, 当xlog_in_core提交到磁盘时,它管理的xfs_log_item可以放到ail中.
 
 ** xfs_ail_check(xfs_ail, xfs_log_item)
-   - xfs_log_item->li_ail在xfs_ail->xa_ail队列中
+   - 检查xfs_log_item的参数, xfs_log_item->li_flags有XFS_LI_IN_AIL
+   - 表示xfs_log_item->li_ail在xfs_ail->xa_ail队列中
    - 而且xfs_log_item->li_lsn是有序的. 
    - xfs_log_item->li_lsn表示它所在的xlog_in_core的xlog_rec_header->h_lsn
+   - 参数xfs_log_item->li_lsn必须在xfs_ail的xfs_log_item的链表的表头和表尾的xfs_lsn_t之间
 
 ** xfs_ail_min(xfs_ail)
-   - 返回xfs_log_item->li_lsn最小的,也就是xfs_ail->xa_ail队列中的第一个
+   - 返回双链表的表头
    > list_first_entry(xfs_ail->xa_ail, xfs_log_item, li_ail)
-   - 这里并不是使用的第一个,而是xfs_ail中内嵌的list_head.
 
 ** xfs_ail_max(xfs_ail)
    - 双链表的最后一个
@@ -2736,10 +2838,12 @@
    - xfs_ail->xa_ail->prev == xfs_log_item->li_cil
   
 ** xfs_ail_min_lsn(xfs_ail)
-   - 使用xfs_ail->xa_lock保护上面的操作
+   - 先获取双链表表头xfs_log_item, 返回xfs_log_item->li_lsn
    > xfs_ail_min(xfs_ail)
+   - 如果没有xfs_log_item, 返回0
 
 ** xfs_ail_max_lsn(xfs_ail)
+   - 返回最大的xfs_lsn_t
    > xfs_ail_max(xfs_ail)
 
 ** xfs_trans_ail_cursor_init(xfs_ail, xfs_ail_cursor)
@@ -2749,7 +2853,7 @@
 ** xfs_trans_ail_cursor_next(xfs_ail, xfs_ail_cursor)
    - xfs_ail_cursor->xfs_log_item向后移动
    > xfs_ail_next(xfs_ail, xfs_log_item)
-   - 这里检查xfs_ail_cursor->item & 1, 如果有效,它应该指向开头, 然后找到下一个,也就是真正的第一个.
+   - 如果xfs_ail_cursor->item & 1, 如果无效,它应该从头重新查找
    > xfs_ail_min(xfs_ail)
 
 ** xfs_trans_ail_cursor_done(xfs_ail, xfs_ail_cursor)
@@ -2758,6 +2862,7 @@
 ** xfs_trans_ail_cursor_clear(xfs_ail, xfs_log_item)
    - 使xfs_ail上指向xfs_log_item的xfs_ail_cursor无效.
    - 遍历xfs_ail->xa_cursors, 判断xfs_ali_cursor->item == xfs_log_item
+   - 设置xfs_ail_cursor->xfs_log_item |= 1
 
 ** xfs_trans_ail_cursor_first(xfs_ail, xfs_ail_cursor, xfs_lsn_t)
    - 先初始化xfs_ail_cursor
@@ -2786,76 +2891,68 @@
    - 更新xfs_ail_cursor->item, 它指向list_head最后一个元素.
 
 ** xfs_ail_delete(xfs_ail, xfs_log_item)
-   - 释放xfs_log_item->li_ail队列
-
-** xfs_ail_cursor
-   #+begin_src 
-	struct list_head	list;
-	struct xfs_log_item	*item;   
-   #+end_src
-
-** xfs_ail 
-   #+begin_src 
-	struct xfs_mount	*xa_mount;
-	struct task_struct	*xa_task;
-	struct list_head	xa_ail;
-	xfs_lsn_t		xa_target;
-	xfs_lsn_t		xa_target_prev;
-	struct list_head	xa_cursors;
-	spinlock_t		xa_lock;
-	xfs_lsn_t		xa_last_pushed_lsn;
-	int			xa_log_flush;
-	struct list_head	xa_buf_list;  //里面应该是需要写回的xfs_buf
-	wait_queue_head_t	xa_empty;   
-   #+end_src
+   - 从xfs_ail中释放xfs_log_item
+   > xfs_ail_check(xfs_ail, xfs_log_item)
+   > xfs_trans_ail_cursor_clear(xfs_ail, xfs_Log_item)
 
 ** xfsaild_push(xfs_ail)
-   - xfs_ail中的xfs_log_item合并到文件系统的metedata, 它对应的xlog空间也可以释放.
-   - 检查是否写回cil/xlog_in_core
+   - xfs_ail中的xfs_log_item合并到文件系统, 它对应的log空间也可以释放.
+   - 检查是否需要写当前使用的xfs_cil_ctx, xlog_in_core
    - xfs_ail->xa_log_flush != 0 表示上次刷新没有完成,因为pin,或其他原因
    - xfs_ail->xa_last_pushed_lsn == 0 表示ail上次没有操作完所有的xfs_log_item
    - xfs_ail->xa_buf_list队列不是空  表示有xfs_buf没有写回, 也是因为pin
    - xfs_ail_min_lsn(xfs_ail)   表示xfs_ail中有xfs_log_item
-   - 同时满足上面4个条件,也就是需要写回cil/xlog_in_core
+   - 同时满足上面4个条件,也就是需要写回
    - 设置xfs_ail->xa_log_flush = 0
    > xfs_log_force(xfs_mount, XFS_LOG_SYNC)
+
    - xfs_ail->xa_target是xfs_lsn_t, 它表示要释放的xfs_log_item.  target
-   - 根据xfs_ail->xa_last_pushed_lsn找到对应的xfs_log_item
+   - 根据xfs_ail->xa_last_pushed_lsn找到对应的xfs_log_item, 并创建xfs_ail_cursor
+   - 从上次遍历的地方开始处理
    > xfs_trans_ail_cursor_first(xfs_ail, xfs_ail_cursor, xfs_ail->xa_last_pushed_lsn)
    - 如果找不到,直接退出
-   - 下面处理的xfs_log_item->xfs_lsn_t不能超过它target.
+
+   - 下面处理的xfs_log_item->xfs_lsn_t不能超过它xfs_ail->xa_target
    - 遍历xfs_ail->xa_ail队列, 停止条件是xfs_log_item->li_lsn >= target
-   - push xfs_log_item, push是什么操作??
-   > IOP_PUSH(xfs_log_item, xfs_ail->xa_buf_list)
+
+   - push xfs_log_item, 针对不同的xfs_log_item,处理不同 
+   - 同时收集释放的内存
+   > xfs_log_item->xfs_item_ops->iop_push(xfs_log_item, xfs_ail->xa_buf_list)
    - 根据返回结果,继续处理
    - 如果是XFS_ITEM_SUCCESS, 设置xfs_ail->xa_last_pushed_lsn = xfs_log_item->li_lsn. 
-   - 如果是XFS_ITEM_FLUSHING, flushing++ ??? 同样设置xa_last_pushed_lsn
-   - 如果是XFS_ITEM_PINNED,  xfs_ail->xa_log_flush ++, 被阻塞了
+   - 如果是XFS_ITEM_FLUSHING, flushing++,  同样设置xa_last_pushed_lsn
+   - 如果是XFS_ITEM_PINNED,   stuck ++, xfs_ail->xa_log_flush ++, 被阻塞了
    - 如果是XFS_ITEM_LOCKED, stuck ++
    - 处理下一个xfs_log_item
    > xfs_trans_ail_cursor_next(xfs_ail, xfs_ail_cursor)
-   - 这里没有使用xfs_log_item队列,而是使用了xfs_ail_cursor, 不会重复处理阻塞的xfs_log_item.
+   - 如果stuck > 100, 停止循环, 被阻塞的太多
+
    - 最后处理xfs_ail->xa_buf_list 上面的xfs_buf, 写回磁盘中
    > xfs_buf_delwri_submit_nowait(xfs_ail->xa_buf_list)
+
    - 根据上面统计的检查,更新结果.
    - 如果lsn >= target, 或者上面没有处理xfs_log_item, 说明xfs_ail空了, 可以等待一段时间再提交IO, xfs_ail->xa_last_pushed_lsn = 0, 返回50. 下次扫描是从头开始,因为xa_last_pushed_lsn是0
-   - 如果flushing + stuck / count > 90%, 也需要等待一段时间, 一些xfs_log_item不可用??  返回20, 设置xfs_ail->xa_last_pushed_lsn = 0, 下次从头开始扫描.
+   - 如果(flushing + stuck) / count > 90%, 也需要等待一段时间, 一些xfs_log_item不可用,  返回20, 设置xfs_ail->xa_last_pushed_lsn = 0, 下次从头开始扫描.
    - 否则返回10.
+
+   - 这里只是push xfs_log_item, 并没有在xfs_ail中释放对应的xfs_log_item
 
 ** xfsaild(void) 
    - 循环调用上面的函数,写回ail中的xfs_log_item
    - 检查xfs_ail->xa_target == xfs_ail->xa_target_prev, 说明没有新的任务
    - xfs_ail_min(xfs_ail) == 0, 没有xfs_log_item可处理
+   - 等待时间根据上面返回的值决定
    - 如果需要处理,调用上面的函数, 根据返回值等待
    > xfsaild_push(xfs_ail)
-   - 在调度之前,把任务设为TASK_INTERRUPTIBLE状态,只有被唤醒才继续执行??!
+   - 在调度之前,把任务设为TASK_INTERRUPTIBLE状态
 
 ** xfs_ail_push(xfs_ail, xfs_lsn_t)
-   - 把比xfs_lsn_t小的xfs_log_item写到log中
-   - 检查最小的xfs_log_item
+   - 启动xfsaild任务
+   - 检查是否有xfs_log_item，如果没有就不用启动
    - xfs_ail_min(xfs_ail)
-   - 如果返回NULL, 说明没有, 直接退出
-   - 原来target是这么来的
+   - 如果参数xfs_lsn_t < xfs_ail->xa_target, 也不需要启动
+   - xfsaild已经push了对应的xfs_log_item
+   - 否则设置xfs_ail->xa_target = 参数xfs_lsn_t
    > xfs_trans_ail_copy_lsn(xfs_ail, xfs_ail->xa_target, threshold_lsn)
    - 唤醒xfsaild任务
    > wake_up_process(xfs_ail->xa_task
@@ -2869,26 +2966,26 @@
 
 ** xfs_ail_push_all_sync(xfs_ail)
    - 这里发起push操作后,在xfs_ail->xa_empty上等待
-   - 这里循环操作, 停止条件是获取不到最大的lsn, 也就是xfs_ail没有xfs_log_item
+   - 这里循环操作, 停止条件是xfs_ail为空
    > xfs_ail_max(xfs_ail)
    - 准备等待
    > prepare_to_wait(xfs_ail->xa_empty, wait, TASK_UNINTERRUPTIBLE)
    - xfs_ail->xa_target = xfs_log_item->li_lsn
+   > 唤醒xfsaild任务
    
 ** xfs_trans_ail_update_bulk(xfs_ail, xfs_ail_cursor, xfs_log_item, nr_items, xfs_lsn_t)
    - 处理多个xfs_log_item, 在第3个参数是xfs_log_item指针数组.
-   - 遍历这些xfs_log_item, 放到xfs_ail管理中
+   - 遍历这些xfs_log_item, 放到xfs_ail管理中, 同时设置xfs_log_item->li_lsn = xfs_lsn_t
    - 如果xfs_log_item已经在xfs_ail队列中, xfs_log_item->li_flags 有XFS_LI_IN_AIL
-   - 检查参数xfs_lsn_t <= xfs_log_item->li_lsn,  这里不能操作这个xfs_log_item?? 为何xfs_lsn_t会变大?
-   - 否则要从队列中释放
+   - 检查参数xfs_lsn_t <= xfs_log_item->li_lsn, xfs_log_item已经在log队列中, 而且数据更新
+   - 否则要从队列中释放, 下面会更新它的li_lsn, 重新添加到队列中
    > xfs_ail_delete(xfs_ail, xfs_log_item)
    - 如果没有在xfs_ail中, 放到临时链表中
    - 循环完成后,把积累的xfs_log_item给xfs_ail->xa_ail链表
    > xfs_ail_splice(xfs_ail, xfs_ail_cursor, list_head, lsn)
    - 如果上面删除的xfs_log_item是xfs_ail中最小的
    > xfs_ail_min(xfs_ail)
-   - 当前xfs_ail在log空间中的尾指针需要向前移动
-   - 相当于释放了xlog空间
+   - log队列的尾指针可以向前移动,相当于释放了log空间
    - 修改xfs_mount->xlog->l_tail_lsn, 指向xfs_ail中最小的xfs_log_item->li_lsn
    > xfs_assign_tail_lsn_locked(xfs_ail->xa_mount)
    - 唤醒等待log空间的xfs_ticket, 唤醒xlog->l_write_head/l_reserve_head队列中的任务
@@ -2907,6 +3004,8 @@
    - 唤醒等待xlog空间的任务
    > xfs_log_space_wake(xfs_ail->xfs_mount)
 
+   - 应该是在unpin操作中,释放资源后,自动释放对应的xfs_log_item
+
 ** xfs_trans_ail_init(xfs_mount)
    - 初始化xfs_mount->xfs_ail, 这个也是全局的.
    - 启动线程
@@ -2917,7 +3016,6 @@
 
 * 总结
   - permanent的xlog_ticket是什么意思?
-  - xlog_ticket中的空间和xfs_cil_ctx怎么交互?
   - 如何区分xlog->l_write_head / xlog->l_reserve_head
 
 
