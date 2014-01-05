@@ -1,3 +1,56 @@
+* bmap
+  - 术语
+    - xfs_bmbt_rec:表示磁盘中保存的regular文件的extent信息, 它是这里最重要的, 表示数据的位置信息，包括磁盘位置和文件偏移. xfs_bmbt_rec_host表示xfs_ifork中对应的信息, 使用的数据类型是本地CPU的. xfs_bmbt_irec表示解析的extent信息. 所以xfs_bmbt_rec表示一个extent的数据, 文件的一块数据.
+
+    - 结点: 表示btree的结点，可能包括3中,根结点,内部结点，叶子节点.根结点可能和叶子结点一样，可能和根结点一样. 每个结点使用一个fsb磁盘块. 对于非根结点，磁盘块开头使用相同的数据结构, xfs_btree_block
+      
+** xfs_bmbt_rec
+   - 磁盘中的bmap btree使用的数据类型, 使用大端格式
+   - 对于于di_format有2种, XFS_DINODE_FMT_BTREE和XFS_DINODE_FMT_EXTENTS
+   - 对于XFS_DINODE_FMT_EXTENTS,就是在xfs_dinode里面保存xfs_bmbt_rec数组
+   - 对于XFS_DINODE_FMT_BTREE, 使用xfs_dinode保存树根, xfs_bmdr_block
+   - 根节点的key/value使用xfs_bmdr_key_t/fs_bmdr_ptr_t
+   - 内部节点头是xfs_btree_block, key/value使用xfs_bmbt_key / xfs_bmbt_ptr_t,和上面一样
+   - 叶子节点使用xfs_btree_block, value是xfs_bmbt_rec数组
+
+** xfs_bmbt_rec_host
+   - 数据结构和xfs_bmbt_rec一样,不会使用本地数据类型
+   - 保存在xfs_ifork中, data fork, xfs_inode->i_df
+   - 文件操作map之前,需要先把xfs_bmbt_rec从磁盘中读到xfs_ifork中, 一次性全读出来. xfs_ifork->if_flags的XFS_IFEXTENTS表示是否缓存xfs_bmbt_rec
+   - 对于XFS_DINODE_FMT_EXTENTS,读取xfs_dinode时把xfs_bmbt_rec读取出来, 直接设置XFS_IFEXTENTS标志
+   - 对于XFS_DINODE_FMT_BTREE,需要去btree中读取xfs_bmbt_rec_host(xfs_iread_extents),读取只会才设置XFS_IFEXTENTS. 初始化时设置xfs_ifork->fi_flags的XFS_IFBROOT, 表示文件使用XFS_DINODE_FMT_BTREE
+   - xfs_ifork存储xfs_bmbt_rec_host使用2种方法
+   - 一种是一维数组, 所有的xfs_bmbt_rec_host在xfs_ifork内部的静态数组,或者动态分配一个数组
+   - xfs_bmbt_rec在xfs_dinode的data fork, 使用XFS_DFORK_PTR直接访问
+   - 另一种是2维数组,使用xfs_ifork->fi_flags的XFS_IFEXTIREC区别
+   - 当xfs_bmbt_rec个数,也就是xfs_dinode->di_nextents < 4096/sizeof(xfs_bmbt_rec), 使用1维数组,否则扩展为2维数组
+   - 2维数组使用xfs_ext_irec管理xfs_bmbt_rec_host, 里面可能不是满的,使用中需要压缩整理
+
+   - xfs_ifork->if_flags还有XFS_IFINLINE, xfs_bmbt_rec不使用它. 它用于dir/attr/symlink的数组.
+
+** xfs_bmbt_irec
+   - 解析的xfs_bmbt_rec, 在操作btree中使用, 做数据转化使用
+   - 对于br_state来说有4种? 
+     - XFS_EXT_NORM 
+     - XFS_EXT_UNWRITTEN
+       - 有磁盘空间,但没有数据,也没有pagecache数据,刚为hole分配的磁盘
+     - XFS_EXT_DMAPI_OFFLINE
+     - XFS_EXT_INVALID
+       
+   - 对于br_startblock来说有2中,一种是有效的磁盘地址
+   - 另一种是无效的磁盘地址,表示delay allocation
+   - isnullstartblock(startblock)
+   - 2个特殊的无效地址? DELAYSTARTBLOCK / HOLESTARTBLOCK
+
+   - 修改btree之前,必须先修改xfs_ifork中缓存的
+
+   - 删除xfs_bmbt_rec_host操作
+   > xfs_bunmapi(xfs_trans, xfs_inode, xfs_fileoff_t bno, xfs_filblks_t len, flags, xfs_extnum_t nexts, xfs_fsblock_t firstblock, xfs_bmap_free_t, done)
+     - 查找(bno,len)交叉的xfs_bmbt_rec_host, 删除它覆盖的部分
+     - 对于delay allocation, 没有磁盘空间,只需释放预留的空间XFS_SBS_FDBLOCKS, 以及xfs_inode->i_delayed_blks计数
+     - 否则需要修改btree中对应的xfs_bmbt_rec, 而且通过xfs_bmap_free释放磁盘空间
+     > xfs_bmap_del_extent(xfs_inode, xfs_trans, idx, xfs_bmap_free, xfs_btree_cur, xfs_bmbt_irec)
+
 * xfs_aops.c
 
 ** xfs_count_page_state(page, delalloc, unwritten)
@@ -554,18 +607,22 @@
    > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
 
 * xfs_bmap.c 
-  - bmap tree
+  - 操作磁盘的bmap tree的函数
 
 ** xfs_bmdr_block 
-   - 这是数据节点使用的,后面是(key,value)点对
-   - 这个在xfs_dinode的fork中
+   - 这是btree根节点的头,后面是(key,value)对值
+   - 在xfs_dinode的data fork中保存
+   - 但在内存xfs_ifork中还是转化为xfs_btree_block
    #+BEGIN_SRC 
 	__be16		bb_level;	/* 0 is a leaf */
 	__be16		bb_numrecs;	/* current # of data records */   
    #+END_SRC
 
 ** xfs_btree_block 
-   - 每个btree节点使用的block使用的数据结构
+   - 每个btree节点在磁盘中保存时开头的数据结构
+   - 在这里, btree是bmbt, 保存文件的extent信息, 它在内存中放在xfs_ifork->if_broot中
+   - 根结点在磁盘中不使用这个数据结构
+
    #+BEGIN_SRC 
 	__be32		bb_magic;	/* magic number for block type */
 	__be16		bb_level;	/* 0 is a leaf */
@@ -584,31 +641,30 @@
    #+END_SRC
 
 ** xfs_bmbt_key 
-   - btree中节点使用的key, 分支指针使用磁盘块指针 
-   - xfs_bmbt_ptr_t, xfs_bmdr_ptr_t
+   - btree中非叶子节点使用的key, value是分支指针,使用子节点的磁盘位置
+   - xfs_bmbt_ptr_t, xfs_bmdr_ptr_t分配用于根结点和内部结点
+   - 这里磁盘位置是64位，一个文件的bmbt btree的结点可以不限于一个AG
 
    #+BEGIN_SRC 
 	__be64		br_startoff;	/* starting file offset */   
    #+END_SRC
 
-
 ** xfs_bmap_compute_maxlevels(xfs_mount, whichfork)
-   - 计算btree高度的最大值, 首先计算可能的叶子节点的最大值
-   - 对于data fork, 记录项最多是MAXEXTNUM, signed int
-   - 对于attr fork, 记录项最多MAXAEXTNUM, signed short
+   - 计算bmbt btree高度的最大值, 在mount操作时调用, 用来设置xfs_mount->m_bm_maxlevels[fork]
+   - 当叶子节点最多时,而且内部节点分支最少时,btree的高度最大
+   - 当叶子结点中xfs_bmbt_rec最少时, 叶子结点最多
+   - 先计算最多的xfs_bmbt_rec的数量 maxleafents
+   - 对于data fork, 叶子结点最多是xfs_dinode->di_nextents的数据类型决定, MAXEXTLEN, signed int32
+   - 对于attr fork, 叶子结点最多是xfs_dinode->di_anextents的数据类型决定, MAXAEXTNUM, signed int16
    - 叶子节点或内部节点的最小分支是xfs_mount->m_bmap_dmnr[2]
-   - 然后计算btree是最小分支时的高度
-   - 最后一个节点必须比跟节点小
+   - 最多的叶子结点时  maxblocks = maxleafents / xfs_mount->m_bmap_dmnr[0]
+   - 遍历计算每一层内部结点的最大值, 直到分支数小于根结点分支数
    - maxrootrecs = xfs_bmdr_maxrecs(xfs_mount, sz, 0)
-   - (sz-sizeof(xfs_bmdr_block_t) / (sizeof(xfs_bmdr_key_t) + sizeof(xfs_bmdr_ptr_t))
-   - sz表示data fork或attr fork的最小空间
-   > XFS_BMDR_SPACE_CALC(MINDBPTRS) / MINADBPTRS
-   - 为何不直接使用这2个宏??
+   - maxblocks = maxblocks / xfs_mount->m_bmap_dmnr[1]
 
 ** xfs_bmbt_lookup_eq(xfs_btree_cur, xfs_fileoff_t off, xfs_fsblock_t bno, xfs_filblks_t len, stat)
-   - btree查找可以精确到记录? 还是到叶子节点?
+   - 让xfs_bmbt_cur指向对应的xfs_bmbt_rec
    - 设置xfs_btree_cur->xfs_bmbt_irec的startoff/startblock/blockcount
-   - 为何要都设置? 查找是否存在对应的xfs_bmbt_irec? 
    > xfs_btree_lookup(xfs_btree_cur, XFS_LOOKUP_EQ, stat)
   
 ** xfs_bmbmt_lookup_ge(xfs_btree_cur, xfs_fileoff_t, xfs_fsblock_t, xfs_filblks_t, stat)
@@ -616,62 +672,70 @@
    > xfs_btree_lookup(xfs_btree_cur, XFS_LOOKUP_GE, stat)
 
 ** xfs_bmap_needs_btree(xfs_inode, whichfork)
-   - 当前是extent数组,才能转化成btree
-   - 检查xfs_icdinode->di_format/di_aformat, XFS_IFORK_FORMAT(xfs_inode, whichfork) == XFS_DINODE_FMT_EXTENTS
-   - 而且extent数量超过限制 
+   - 检查xfs_inode是否需要转化为使用btree存储xfs_bmbt_rec
+   - 如果xfs_ifork的磁盘格式使用XFS_DINODE_FMT_EXTENTS, 没有使用btree, xfs_icdinode->di_format/di_aformat
+   - XFS_IFORK_FORMAT(xfs_inode, whichfork)
+   - 而且xfs_bmbt_rec数量超过限制 xfs_dinode->di_nextents/di_anextents
    > XFS_IFORK_NEXTENTS(xfs_inode, whichfork)
+   - 最大值表示xfs_dinode可容纳的最多的xfs_bmbt_rec的数量
+   - 也就是data fork/attr fork的大小决定
    > XFS_IFORK_MAXEXT(xfs_inode, whichfork)
 
 ** xfs_bmap_wants_extents(xfs_inode, whichfork)
-   - 当前使用btree存储数据,转为extent
-   - 当前xfs_icdinode->di_format/di_aformat使用XFS_DINODE_FMT_BTREE
+   - 检查xfs_inode是否需要使用数组方式存储xfs_bmbt_rec
+   - 如果xfs_ifork现在使用XFS_DINODE_FMT_BTREE
    > XFS_IFORK_FORMAT(xfs_inode, whichfork)
-   - 而且extent低于限制 
+   - 而且xfs_bmbt_rec数量低于上面的限制
    > XFS_IFORK_MAXEXT(xfs_inode, whichfork)
 
 ** xfs_bmbt_update(xfs_btree_cur, xfs_fileoff_t, xfs_fsblock_t, xfs_filblks_t, xfs_exntst_t)
-   - 使用xfs_btree_cur转移数据
+   - 更新xfs_btree_cur当前指向的xfs_bmbt_rec
+   - 根据参数构造xfs_bmbt_rec, 它使用磁盘数据类型
    > xfs_bmbt_disk_set_allf(xfs_bmbt_cur->xfs_bmbt_irec, off, bno, len, state)
-   - 写给btree 
+   - 复制到xfs_buf的对应的位置
    > xfs_btree_update(xfs_btree_cur, xfs_btree_rec)
    - xfs_bmbt_irec中数据单位应该都是fsb
 
 ** xfs_bmap_worst_indlen(xfs_inode, xfs_filblks_t len)
-   - len是什么长度?
-   - 计算最坏情况下btree节点使用的block的个数?
-   - len / xfs_mount->m_bmap_dmxr[0] ?? 
+   - len表示文件数据块的长度,也可以算xfs_bmbt_irec的长度
+   - xfs_bmbt_irec的长度有时是无效的,可能用于delay allocation??
+   - 最坏情况下,可能需要len个xfs_bmbt_irec,计算需要的btree结点的个数
+   - 这里计算使用分支最大的情况, 使用level从0到最大高度遍历
+   - 计算每一层使用的分支节点数
+   > XFS_BM_MAXLEVELS(xfs_mount, XFS_DATA_FORK)
+   - 使用xfs_mount->m_bmap_dmxr[2]表示分支
 
 ** xfs_default_attroffset(xfs_inode)
    - 计算xfs_dinode中attr fock的默认开始位置
-   - 如果xfs_sb->sb_inodesize == 256, 只会留下2个节点的btree根结点使用的空间
+   - 如果xfs_sb->sb_inodesize == 256, 只会留下空间保存一个根结点，根结点有2个分支
    > XFS_LITINO(xfs_mount, xfs_icdinode->di_version) - XFS_BMDR_SPACE_CALC(MINABTPTRS)
-   - 否则偏移为包含MINABTPTRS*6个记录的根结点的空间,给data fork使用
+   - 否则预留空间保存一个根结点，结点包含MINABTPTRS*6/12个分支
    > XFS_BMDR_SPACE_CALC( 6 * MINABTPTRS)
 
 ** xfs_bmap_forkoff_reset(xfs_mount, xfs_inode, whichfork)
-   - 如果参数whichfork是XFS_ATTR_FORK
-   - 而且data fork使用XFS_DINODE_FMT_EXTENTS/XFS_DINODE_FMT_LOCAL
-   - 重新计算attr fork的空间 dfl_forkoff
+   - 重新设置xfs_icdinode->di_forkoff, attr fork数据改为使用XFS_DINODE_FMT_EXTENTS, 预留空间给data fork
+   - 操作attr fork, whichfork是XFS_ATTR_FORK, 文件是regular
+   - 重新计算dfl_forkoff
    > xfs_default_attroffset(xfs_inode) 
-   - 只有偏移扩大时才设置
+   - 当dlf_forkoff > xfs_icdinode->di_forkoff时才设置，用来增加data fork的空间
    - xfs_inode->icdinode->di_forkoff = dfl_forkoff / 8 
 
 ** xfs_bmap_sanity_check(xfs_mount, xfs_buf)
-   - xfs_buf里面是xfs_btree_block
+   - xfs_buf里面是xfs_btree_block,验证它的有效性
    - 检查magic, level
    - numrecs !=0, 也不超过最大分支xfs_mount->m_bmap_dmxr[level!=0]
 
 ** xfs_bmap_get_bp(xfs_btree_cur, xfs_fsblock_t bno)
-   - 查找xfs_btree_cur中和bno对应的xfs_buf?
-   - 首先查找xfs_btree_cur->bc_bufs, 它应该是是从跟到叶子节点的路径
-   - 然后遍历xfs_btree_cur->bc_tmp->t_items
-   - 查找里面的xsf_buf_log_item 
-   > XFS_BUF_ADDR(xfs_buf)
+   - 查找xfs_btree_cur路径中使用bno的xfs_buf
+   - 查找xfs_btree_cur->bc_bufs中的xfs_buf, 它应该是是从跟到叶子节点的路径
+   - XFS_BUF_ADDR(xfs_btree_cur->bc_bufs[i])
+   - 然后遍历xfs_btree_cur->bc_tp->t_items
+   - 查找里面的xsf_buf_log_item, 使用xfs_log_item->li_type == XFS_LI_BUF过滤
+   > XFS_BUF_ADDR(xfs_buf_log_item->xfs_buf)
 
 ** xfs_check_block(xfs_btree_block, xfs_mount, root, sz)
-   - xfs_btree_block是btree的内部节点
-   - 检查key是否是有序的
-   - 检查ptr是否有重复的
+   - xfs_btree_block是btree的内部节点, sz是结点大小
+   - 检查key是否是有序的, 检查ptr是否有重复的
    - 如果不满足,说明文件系统崩溃.. 
    - xfs_btree_block可能是根节点,在fork数据中
    > XFS_BMBT_KEY_ADDR(xfs_mount, xfs_btree_block, i)
@@ -681,14 +745,15 @@
    > xfs_btree_get_numrecs(xfs_btree_block)
 
 ** xfs_bmap_check_leaf_extents(xfs_btree_cur, xfs_inode, whichfork)
-   - 检查xfs_btree_cur中btree节点的数据有效性
-   - xfs_ifork使用XFS_DINODE_FMT_BTREE, attr fork操作都是用这些?
+   - 检查btree中所有xfs_bmbt_rec数据的有效性
+   - 只检查叶子结点和到第一个叶子的路径上的内部结点
+   - 如果xfs_inode->xfs_icdinode->di_format不是XFS_DINODE_FMT_BTREE, 直接退出
    - 获取xfs_ifork中的跟节点xfs_btree_block, xfs_ifork->if_broot
-   - 这里xfs_btree_block的数据结构是带大端的
+   - 这里xfs_btree_block的数据结构是大端数据类型的
    - 检查根结点的成员, level,key,value
    > xfs_check_block(xfs_btree_block, xfs_mount, 1, xfs_ifork->if_broot_bytes)xo
    - 然后检查btree的叶子节点的数据有效性
-   -这里没有全部遍历内部节点
+   - 这里没有全部遍历内部节点
    - 首先找到第一个叶子节点,使用内部节点的第一个分支
    - 先取出xfs_buf
    > xfs_bmap_get_bp(xfs_btree_cur, XFS_FSB_TO_DADDR(xfs_mount, bno))
@@ -713,127 +778,181 @@
    - bmap trace insert entry??
 
 ** xfs_bmap_validate_ret(xfs_fileoff_t bno, xfs_filblks_t len, flags, xfs_bmbt_irec, nmap, ret_nmap)
-   - 检查xfs_bmbt_irec数组, 哪里获取的?
+   - 检查xfs_bmbt_irec数组, 里面时文件数据的磁盘位置信息, 在写操作中使用
+   - 遍历每个xfs_bmbt_irec
    - xfs_bmbt_irec->br_blockcount >0, 它表示范围
-   - 如果flags有XFS_BMAPI_ENTIRE,(br_startoff,br_blockcount)必须在(bno,len)范围内
+   - 如果flags没有XFS_BMAPI_ENTIRE,(br_startoff,br_blockcount)必须在(bno,len)范围内
+   - XFS_BMAPI_ENTIRE表示返回整个xfs_bmbt_rec? 没有经过裁剪! 没有裁剪返回必须是覆盖???
    - 否则两个范围必须交叉
    - 而且相邻2个xfs_bmbt_irec不能交叉
    - br_startblock不能是DELAYSTARTBLOCK和HOLESTARTBLOCK
+   - br_state必须是XFS_EXT_NORM, XFS_EXT_UNWRITTEN
 
 ** xfs_bmap_add_free(xfs_fsblock_t bno, xfs_filblks_t len, xfs_bmap_free_t flist, xfs_mount)
    - 构造xfs_bmap_free_item, 记录(bno, len)
    - 把它放到参数xfs_bmap_free->xbf_first的链表中
    - 里面节点按照xfs_bmap_free_item->xbfi_startblock排序
+   - 这里有大量的检查
+   - bno不能是NULLFSBLOCK(-1),或其他无效地址, 必须是有效的磁盘地址, len>0
+   - isnullstartblock(bno)
+
+   - 这里bno分成2部分,一部分是STARTBLOCKVALBITS(17), 另一部分是STARTBLOCKMASKBITS(35), 也就是做为无效地址时,仅仅使用低17位??
+
+   - 对于xfs_fsblock_t的磁盘地址,分成AGNO和AGB, 前面是AG序号,后面是AG内部偏移
+   - AGB的位数根据AG大小而定, xfs_sb->sb_agblklog, 单位是FSB, xfs_mount->m_blkbb_log, xfs_sb->sb_blocksize
+
 
 ** xfs_bmap_del_free(xfs_bmap_free, xfs_bmap_free_item prev, xfs_bmap_free_item)
    - free是xfs_bmap_free->xbf_first链表上的节点, 删除free
-   - 减小xfs_bmap_free->xbf_count 
+   - 减小xfs_bmap_free->xbf_count --
 
 ** xfs_bmap_cancel(xfs_bmap_free)
    - 直接释放xfs_bmap_free的xfs_bmap_free_item节点
 
 ** xfs_bmap_btree_to_extents(xfs_trans, xfs_inode, xfs_btree_cur, logflags, whichfork)
-   - 把fork数据从btree改为extents, 把extents队列放到xfs_dinode中
-   - 在xfs_icdinode中,extents已经是数组格式?
-   - 检查当前的数据
+   - xfs_ifork中xfs_bmbt_rec_host的管理和磁盘的xfs_bmbt_rec是分开的
+   - 现在xfs_bmbt_rec还是使用XFS_DINODE_FMT_BTREE, 要改为使用XFS_DINODE_FMT_EXTENTS格式
+   - 现在xfs_ifork还管理着xfs_btree_block, 需要释放它
+
+   - 检查参数现在的状态, 获取xfs_ifork
    > XFS_IFORK(xfs_inode, whichfork)
-   - 现在xfs_ifork->if_flags有XFS_IFEXTENTS?
-   - xfs_icdinode->di_format是XFS_DINODE_FMT_BTREE 
+   - xfs_ifork->if_flags有XFS_IFEXTENTS, xfs_bmbt_rec都缓存到内存中
+   - xfs_icdinode->di_format是XFS_DINODE_FMT_BTREE
    > XFS_IFORK_FORMAT(xfs_inode, whichfork)
-   - 获取xfs_ifork中的跟节点xfs_btree_block, xfs_ifork->if_broot
+   - 获取xfs_ifork中的根结点xfs_btree_block, xfs_ifork->if_broot, 只有一个分支，而且高度是1
    - xfs_btree_block->bb_level ==1
    - xfs_btree_block->bb_numrecs ==1
    - xfs_bmbt_maxrecs(xfs_mount, xfs_ifork->if_broot_bytes, 0) ==1
-   - 只有一个分支,一个叶子节点, 但bb_numrecs和if_broot_bytes有什么区别??
-   - 读出这个叶子节点
+   - xfs_ifork使用xfs_btree_block和磁盘中xfs_bmdr_block不完全一样, 仅仅缓冲它数据
+   - xfs_btree_block的头包含比xfs_bmdr_block更多的数据
+   - 而且根结点中的分支信息xfs_bmdr_key/xfs_bmdr_ptr使用的内存和xfs_btree_block一块, 整个内存大小是if_btree_bytes
+   - 如果根结点中分支数量变化,需要重新分配内存块,修改数据
+   - 它不是xfs_bmdr_block的大小, 不是磁盘中结点的大小, 它表示内存中结点的大小
+
+   - 读出叶子节点, 也就是分支的指针
+   - xfs_btree_ptr指向的就是叶子结点磁盘位置
+   - 为何不直接使用xfs_btree_cur中的结点信息???
    > XFS_BMAP_BROOT_PTR_ADDR(xfs_mount, xfs_broot_block, 1, xfs_ifork->if_broot_bytes)
    > xfs_btree_read_bufl(xfs_mount, xfs_trans, cbno, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
+
    - 检查获取的xfs_bmbt_block 
    > XFS_BUF_TO_BLOCK(xfs_buf)
-   - 上面的xfs_btree_cur为何没有直接找到叶子节点?
    > xfs_btree_check_block(xfs_btree_cur, xfs_btree_block, 0, xfs_buf)
+
    - 释放叶子节点使用的block
    > xfs_bmap_add_free(cbno, 1, xfs_btree_cur->bc_private->xfs_bmap_free, xfs_mount)
-   - 减小xfs_inode->xfs_icdinode->di_nblocks
-   - 为何无效transaction? log xfs_buf?
+   - 减小xfs_inode->xfs_icdinode->di_nblocks --
+
+   - 为何无效transaction? log xfs_buf? 这里释放xfs_buf?
    > xfs_trans_binval(xfs_trans, xfs_buf)
-   - 更新xfs_ifork的broot
+
+   - 完全释放xfs_ifork使用的xfs_btree_block
    > xfs_iroot_realloc(xfs_inode, -1, whichfork)
-   - 更正xfs_btree_cur->bc_bufs[0] ???
-   - 检查xfs_ifork->if_broot == NULL
-   - 而且xfs_ifork->if_flags没有XFS_IFBROOT
+   - 检查xfs_ifork->if_broot == NULL, if_flags没有XFS_IFBROOT
+
    - 设置xfs_inode->xfs_icdinode->di_format
    > XFS_IFORK_FMT_SET(xfs_inode, whichfork, XFS_DINODE_FMT_EXTENTS)
-   - 最后设置参数logflags = XFS_ILOG_CORE|xfs_ilog_fext(whichfork)
-   - 这里怎么没有xfs_log_item??
+   - 最后设置返回参数logflags = XFS_ILOG_CORE|xfs_ilog_fext(whichfork)
+
+   - 这里对于xfs_icdinode的修改只有di_format,整个data fork的修改在哪里??
 
 ** xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, xfs_fsblock_t firstblock, xfs_bmap_free, xfs_btree_cur, wasdel, logflags, whichfork)
-   - 把磁盘的extents格式转化为btree格式
-   - 检查当前xfs_ifork 
+   - 把xfs_bmbt_rec的存储从XFS_DINODE_FMT_EXTENTS,变为XFS_DINODE_FMT_BTREE
+   - 需要在xfs_ifork中创建xfs_btree_block, 以及对应的节点,应该只需要一个
+
+   - 获取当前xfs_ifork 
    > XFS_IFORK_PTR(xfs_inode, whichfork)
-   - xfs_icdinode->di_format是XFS_DINODE_FMT_EXTENTS
+   - 现在xfs_icdinode->di_format是XFS_DINODE_FMT_EXTENTS
    > XFS_IFORK_FORMAT(xfs_inode, whichfork) == XFS_DINODE_FMT_EXTENTS
-   - 重新分配xfs_ifork的btree 
+
+   - 创建xfs_ifork使用的xfs_btree_block
    > xfs_iroot_realloc(xfs_inode, 1, whichfork)
-   - 设置xfs_ifork->if_flags的XFS_IFBROOT, 怎么不在分配时设置?
-   - 填充xfs_ifork->xfs_btree_block 
+   - 设置xfs_ifork->if_flags的XFS_IFBROOT
+
+   - 初始化xfs_ifork->xfs_btree_block 
    > xfs_btree_init_block_int(xfs_mount, xfs_btree_block, XFS_BUF_DADDR_NULL, XFS_BMAP_CRC_MAGIC, 1,1, xfs_inode->i_ino, XFS_BTREE_LONG_PTR|XFS_BTREE_CRC_BLOCKS)
+   - 只有一个分支, 设置owner为ino, 磁盘位置为XFS_BUF_DADDR_NULL
+
    - 准备xfs_btree_cur 
    > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, whichfork)
-   - 设置xfs_btree_cur->pc_private->b, 什么东西?
-   - 设置di_format 
+   - 初始化xfs_btree_cur->pc_private->b,应该用于磁盘为配
+
+   - 修改xfs_icdinode->di_format
    > XFS_IFORK_FMT_SET(xfs_inode, whichfork, XFS_DINODE_FMT_BTREE)
+
    - 准备xfs_alloc_args, 准备分配block
    - 设置xfs_alloc_args->fsbno = firstblock
    - 如果firstblock == NULLFSBLOCK, 使用inode的位置
-   > XFS_INO_TO_FSB(xfs_mount, xfs_inode->i_ino)
-   - 当然xfs_alloc_args->type也不一样
+   - 设置xfs_alloc_args->type = XFS_ALLOCTYPE_START_BNO
+   - 设置xfs_alloc_args->fsbno = XFS_INO_TO_FSB(xfs_mount, xfs_inode->i_ino)
+   - 如果不是NULLFSBLOCK, 而且xfs_bmap_free->xbf_low !=0, 分配连续的空间? 
+   - 设置xfs_alloc_args->type = XFS_ALLOCTYPE_START_BNO
+   - 设置xfs_alloc_args->fsbno = firstblock
+   - 否则就近分配?
+   - 设置xfs_alloc_args->type = XFS_ALLOCTYPE_NEAR_BNO
+   - 设置xfs_alloc_args->fsbno = firstblock
+   - 设置xfs_alloc_args->minlen = maxlen = prod = 1
    > xfs_alloc_vextent(xfs_alloc_args)
    - 分配不能失败? 因为已经reserve空间
    - 把xfs_alloc_args->fsbno给xfs_btree_cur->bc_private->b_firstblock?
-   - 增加xfs_btree_cur->bc_private->b_allocated
-   - 增加xfs_icdinode->di_nblocks
-   - 准备一个xfs_buf, 会读上来吗??
+   - 增加xfs_btree_cur->bc_private->b_allocated ++
+
+   - 增加xfs_icdinode->di_nblocks++
+   - 准备一个xfs_buf, 操作这个block, 只是分配内存建立影射
+   - 可能这个block对应的xfs_buf已经存在,可以直接使用
    > xfs_btree_get_bufl(xfs_mount, xfs_trans, xfs_alloc_args->fsbno, 0)
-   - 初始化xfs_buf, 写上头xfs_btree_block 
+
+   - xfs_buf作为叶子节点, 设置xfs_buf->b_ops = xfs_bmbt_buf_ops
+   - 首先初始化xfs_btree_block, 没有xfs_bmbt_rec
    > xfs_btree_init_block_int(xfs_mount, xfs_btree_block, xfs_buf->b_bn, XFS_BMAP_CRC_MAGIC, 0, 0, xfs_inode->i_ino, XFS_BTREE_LONG_PTR|XFS_BTREE_CRC_BLOCKS)
+
    - 然后把xfs_ifork中的xfs_bmbt_rec_host写到xfs_btree_block中
    > xfs_iext_get_ext(xfs_ifork, i)
-   - 跳过nullblock, 不写hole? 
+   - 过滤掉没有有效磁盘空间的, 有没有0的??
    > isnullstartblock(xfs_bmbt_get_startblock(xfs_bmbt_rec_host))
-   - 在xfs_ifork的extent矩阵中的格式是没有大短的,但写道xfs_buf中时,转化为大端 
-   - 比较xfs_ifork中的extent数量,需要和xfs_icdinode->di_nextents相同 
+   - 这里需要把xfs_bmbt_rec_host转化为xfs_bmbt_rec,做数据类型转化
+
+   - xfs_bmbt_rec的数量必须和xfs_icdinode->di_nextents相同?? 如何保证上面过滤掉的?? 
+   - 指向无效磁盘空间的xfs_bmbt_rec_host不会写到磁盘中??
    > XFS_IFORK_NEXTENTS(xfs_inode, whichfork)
+
    - 设置xfs_btree_block->bb_numrecs
    > xfs_btree_set_numrecs(xfs_btree_block, cnt)
-   - 然后设置btree根结点
+   - 初始化xfs_ifork->xfs_btree_block根结点, 加入这个分支
    > XFS_BMBT_KEY_ADDR(xfs_mount, xfs_btree_block, 1)
    - 第一个分支的key就是叶子节点第一个xfs_bmbt_rec的startoff
-   - 第一个xfs_bmbt_rec
    > XFS_BMBT_REC_ADDR(xfs_mount, xfs_btree_block, 1)
    > xfs_bmbt_disk_get_startoff(xfs_bmbt_rec)
-   - 设置第一个分支的value
+   - 设置第一个分支的指针就是上面xfs_buf的磁盘地址
    > XFS_BMBT_PTR_ADDR(xfs_mount, xfs_btree_block, 1, xfs_bmbt_get_maxrecs(xfs_btree_cur, level))
-   - value就是xfs_alloc_args->fsbno
+
    - 然后log叶子节点的改动
    - 首先是xfs_btree_block
    > xfs_btree_log_block(xfs_btree_cur, xfs_btree_block, XFS_BB_ALL_BITS)
-   - 然后是xfs_bmbt_rec 
+   - 然后是xfs_bmbt_rec数组
    > xfs_btree_log_recs(xfs_btree_cur, xfs_btree_block, 1, xfs_btree_block->bb_numrecs)
    - 最后设置logflags
    - XFS_ILOG_CORE|xfs_ilog_fbroot(whichfork)
 
+   - 这里修改的包括btree的叶子节点, xfs_ifork中的xfs_btree_block
+   - xfs_icdinode->di_format, 以及di_nblocks
+   - 完全没有修改xfs_icdinode的data fork
+
 ** xfs_bmap_local_to_extents_empty(xfs_inode, whichfork)
-   - 把磁盘格式从local改为extents??
+   - 把fork的磁盘格式从XFS_DINODE_FMT_LOCAL改为XFS_DINODE_FMT_EXTENTS, 虽然是空的extent数组
+   - 操作的不是regular文件的data fork!
    - 现在xfs_icdinode->di_format是XFS_DINODE_FMT_LOCAL
    > XFS_IFORK_FORMAT(xfs_inode, whichfork)
-   - 而且现在xfs_ifork->if_bytes ==0, extent数量是0 
+   - 而且现在xfs_ifork->if_bytes ==0, extent数量是0, extent是什么数据? 
    > XFS_IFORK_NEXTENTS(xfs_inode, whichfork)
-   - 重新设置forkoff? 
+   - 重新计算di_forkoff 
    > xfs_bmap_forkoff_reset(xfs_mount, xfs_inode, whichfork)
    - 去掉xfs_ifork->if_flags的XFS_IFINLINE, 设置XFS_IFEXTENTS 
    - 还有di_format的XFS_DINODE_FMT_EXTENTS 
    > XFS_IFORK_FMT_SET(xfs_inode, whichfork, XFS_DINODE_FMT_EXTENTS)
+
+   - 这里修改的是xfs_icdinode->di_format/di_forkoff
+   - 还有xfs_ifork->if_flags标志, 没有修改xfs_ifork中的数据
 
 ** xfs_bmap_local_to_extents(xfs_trans, xfs_inode, xfs_fsblock_t, xfs_extlen_t, logflag, whichfork, init_fn)
    - xfs_inode不是reg文件,而且whichfork必须是XFS_DATA_FORK?
@@ -1600,7 +1719,7 @@
    - 如果firstblock是NULLFSBLOCK? 更新minlen?? 
    > xfs_bmap_btalloc_nullfb(xfs_bmalloca, xfs_alloc_arg, blen)
    - 否则如果xfs_bmalloca->xfs_bmap_free->xbf_low !=0 ??
-   - 设置xfs_alloc_type 为XFS_ALLOCTYPE_START_BNO??
+   - 设置xfs_alloc_args->type 为XFS_ALLOCTYPE_START_BNO??
    - 设置xfs_alloc_arg->total/minlen = xfs_bmalloca->minlen??
    - 否则使用XFS_ALLOCTYPE_NEAR_BNO, total = xfs_bmalloca->total, minlen = xfs_bmalloca->minlen
    - 处理align? xfs_alloc_arg->prod = align
@@ -1612,7 +1731,7 @@
    - xfs_alloc_arg->alignment = xfs_mount->m_dalign?
    - 设置xfs_alloc_arg->minlen = blen - xfs_alloc_arg->alignment ??
    - 否则从文件开头分配?? 或者文件的第一次分配空间
-   - 设置xfs_alloc_type->type = XFS_ALLOCTYPE_THIS_BNO, alignment = 1, tryagain = 1, 失败后会尝试别的??
+   - 设置xfs_alloc_args->type = XFS_ALLOCTYPE_THIS_BNO, alignment = 1, tryagain = 1, 失败后会尝试别的??
    - 仔细设置xfs_alloc_arg, 开始分配空间 
    > xfs_alloc_vextent(xfs_alloc_arg)
    - 如果tryagain !=0, 而且没有分配成功, xfs_alloc_arg->fsbno == NULLFSBLOCK 
@@ -2216,50 +2335,3 @@
    - swap extents??
 
 ** xfs_swap_extents(xfs_inode ip, tip, xfs_swapext)
-* bmap总结
-
-** xfs_bmbt_rec
-   - 磁盘中的bmap btree使用的数据类型, 使用大端格式
-   - 对于于di_format有2种, XFS_DINODE_FMT_BTREE和XFS_DINODE_FMT_EXTENTS
-   - 对于XFS_DINODE_FMT_EXTENTS,就是在xfs_dinode里面保存xfs_bmbt_rec数组
-   - 对于XFS_DINODE_FMT_BTREE, 使用xfs_dinode保存树根, xfs_bmdr_block
-   - 根节点的key/value使用xfs_bmdr_key_t/fs_bmdr_ptr_t
-   - 内部节点头是xfs_btree_block, key/value使用xfs_bmbt_key / xfs_bmbt_ptr_t,和上面一样
-   - 叶子节点使用xfs_btree_block, value是xfs_bmbt_rec数组
-
-** xfs_bmbt_rec_host
-   - 数据结构和xfs_bmbt_rec一样,不会使用本地数据类型
-   - 保存在xfs_ifork中, data fork, xfs_inode->i_df
-   - 文件操作map之前,需要先把xfs_bmbt_rec从磁盘中读到xfs_ifork中, 一次性全读出来. xfs_ifork->if_flags的XFS_IFEXTENTS表示是否缓存xfs_bmbt_rec
-   - 对于XFS_DINODE_FMT_EXTENTS,读取xfs_dinode时把xfs_bmbt_rec读取出来, 一种直接设置XFS_IFEXTENTS标志
-   - 对于XFS_DINODE_FMT_BTREE,需要专门读取 (xfs_iread_extents),使用xfs_ifork->fi_flags的XFS_IFBROOT表示,读取只会才设置XFS_IFEXTENTS
-   - xfs_ifork存储xfs_bmbt_rec_host使用2种方法
-   - 一种是一维数组, 所有的xfs_bmbt_rec_host在xfs_ifork内部的静态数组,或者动态分配一个数组
-   - xfs_bmbt_rec在xfs_dinode的data fork, 使用XFS_DFORK_PTR直接访问
-   - 另一种是2维数组,使用xfs_ifork->fi_flags的XFS_IFEXTIREC区别
-   - 当xfs_bmbt_rec个数,也就是xfs_dinode->di_nextents < 4096/sizeof(xfs_bmbt_rec), 使用1维数组,否则扩展为2维数组
-   - 2维数组使用xfs_ext_irec, 里面可能不是满的,使用中需要压缩整理
-
-
-** xfs_bmbt_irec
-   - 解析的xfs_bmbt_rec, 在操作btree中使用, 做数据转化使用
-   - 对于br_state来说有4种? 
-     - XFS_EXT_NORM 
-     - XFS_EXT_UNWRITTEN
-       - 有磁盘空间,但没有数据,也没有pagecache数据,刚为hole分配的磁盘
-     - XFS_EXT_DMAPI_OFFLINE
-     - XFS_EXT_INVALID
-       
-   - 对于br_startblock来说有2中,一种是有效的磁盘地址
-   - 另一种是无效的磁盘地址,表示delay allocation
-   - isnullstartblock(startblock)
-   - 2个特殊的无效地址? DELAYSTARTBLOCK / HOLESTARTBLOCK
-
-   - 修改btree之前,必须先修改xfs_ifork中缓存的
-
-   - 删除xfs_bmbt_rec_host操作
-   > xfs_bunmapi(xfs_trans, xfs_inode, xfs_fileoff_t bno, xfs_filblks_t len, flags, xfs_extnum_t nexts, xfs_fsblock_t firstblock, xfs_bmap_free_t, done)
-     - 查找(bno,len)交叉的xfs_bmbt_rec_host, 删除它覆盖的部分
-     - 对于delay allocation, 没有磁盘空间,只需释放预留的空间XFS_SBS_FDBLOCKS, 以及xfs_inode->i_delayed_blks计数
-     - 否则需要修改btree中对应的xfs_bmbt_rec, 而且通过xfs_bmap_free释放磁盘空间
-     > xfs_bmap_del_extent(xfs_inode, xfs_trans, idx, xfs_bmap_free, xfs_btree_cur, xfs_bmbt_irec)

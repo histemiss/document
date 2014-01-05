@@ -513,29 +513,47 @@
    #+END_SRC
 
 ** xfs_btree_lookup(xfs_btree_cur, xfs_lookup_t, state)
-   - 查找的是什么, xfs_btree_cur->bc_rec?
-   - 初始化xfs_btree_ptr? 
+   - 根据xfs_btree_cur->bc_rec查找btree中的结点
+   - 初始化xfs_btree_ptr, 指向根结点
    > xfs_btree_cur->xfs_btree_ops->init_ptr_from_cur(xfs_btree_cur, xfs_btree_ptr)
-   - 开始向叶子结点遍历
-   - 对于一个结点,使用2分查找 
-   - 先获取结点的分支数 
+   - 从根结点向叶子结点遍历
+   - 准备结点的xfs_buf, xfs_btree_cur->bc_bufs[level]
+   - 可能已经缓存好,可能需要重新读取
+   > xfs_btree_lookup_get_block(xfs_btree_cur, level, xfs_btree_ptr, xfs_btree_block)
+   - 根据xfs_buf的地址检查已经缓存的xfs_buf的有效性
+   - 重新读取构造xfs_buf时，也会增加对应的使用计数,在xfs_btree_cur释放时才释放xfs_buf, 所以这里不会有xfs_buf的缓存问题
+   - 先获取结点的分支数
    > xfs_btree_get_numrecs(xfs_btree_block) 
-   - 如果结点分支数为0, 它必须是叶子结点,没有任何记录
-   - 查找对应的xfs_btree_key 
+   - 如果结点分支数为0,btree必须只有一个叶子结点, xfs_btree_cur->bc_nlevels ==1,而且没有结点
+   - 如果dir是XFS_LOOKUP_LE, xfs_btree_cur指向0,否则指向1
+   - 使用2分查找对应的xfs_btree_key 
    > xfs_lookup_get_search_key(xfs_btree_key, level, keyno, xfs_btree_block, key)
-   - 然后比较什么?? 
+   - 比较结点的记录和xfs_bmbt_irec
    > xfs_btree_cur->xfs_btree_ops->key_diff(xfs_btree_cur, xfs_btree_key)
-   - 查找介绍后根据level设置子结点指针 
+   - 查找设置level的子结点指针 xfs_btree_cur->bc_ptrs[level]
+   - 并且获取结点中分支的地址xfs_btree_ptr,继续遍历
    > xfs_btree_ptr_addr(xfs_btree_cur, keyno, xfs_btree_block)
    > xfs_btree_check_ptr(xfs_btree_cur, xfs_btree_ptr, 0, level)
-   - 设置xfs_btree_cur->bc_ptrs[level] = keyno
-   - 如果参数dir不是XFS_LOOKUP_LE?? 而且diff < 0,需要向前移动指针 
+   - 如果在查找中碰到分支的xfs_btree_key和要查找的xfs_bmbt_irec相同, 可以简化查找,只需要检查下面每个结点的第一个xfs_bmbt_rec
+   - 最后处理叶子结点, level==0
+   - 如果参数dir不是XFS_LOOKUP_LE, 而且diff < 0,需要向前移动指针, xfs_btree_cur必须指向大的xfs_bmbt_rec
    - 直接增加keyno, 也就是分支指针, 如果查找XFS_LOOKUP_EQ, 反正找不到,所以keyno没有意义也可以接受
    > xfs_btree_get_sibling(xfs_btree_cur, xfs_btree_block, xfs_btree_ptr, XFS_BB_RIGHTSIB)
-   - 如果dir是XFS_LOOKUP_GE, 既然找不到,也需要指向有意义的结点 
-   - 如果keyno超过分指数,需要指向下一个结点
+   - 如果dir是XFS_LOOKUP_GE, 需要指向有意义的结点 
+   - 如果keyno超过叶子节点的分支数,需要指向下一个叶子结点
    > xfs_btree_increment(xfs_btree_cur, 0, i)
-   - 最后根据keyno设置查找结果
+   - 最后根据keyno设置查找结果stat
+
+   - stat表示查找结果, 同时xfs_btree_cur的路径也也查找中变化
+   - 如果存在和xfs_btree_cur的xfs_bmbt_irec相同的xfs_bmbt_rec, 无论dir表示的查找方式是什么,都会返回stat=1, 而且xfs_btree_cur的路径指向这个xfs_bmbt_rec, 当让dir是XFS_LOOKUP_EQ/LE/GE里面都包含equal
+   - 在xfs_bmbt_rec不存在的情况下
+   - 对于XFS_LOOKUP_EQ, 肯定返回stat=0, 而且xfs_btree_cur的路径指向的xfs_bmbt_rec大于xfs_btree_cur中的xfs_bmbt_irec, 或者指向叶结点的中最后一个结点的后一个, 也就是无效的位置
+   - 对于XFS_LOOKUP_LE, 如果存在xfs_bmbt_rec小于xfs_btree_cur的xfs_bmbt_irec, 返回1, 而且xfs_btree_cur的路径指向这个xfs_bmbt_rec, 否则返回0, 路径指向的结点是第一个叶子结点中索引为0的无效位置
+   - 对于XFS_LOOKUP_GE, 如果存在大于xfs_btree_cur的xfs_bmbt_irec的,一定指向这个结点, 而且返回stat=1；否则返回stat=0, 而且它xfs_btree_cur的路径指向最后一个叶子结点的最后一个结点的后一个位置,同样是无效位置
+
+   - 在找不到的情况下,如果dir是XFS_LOOKUP_LE, xfs_btree_cur指向小的结点
+   - 如果dir是XFS_LOOKUP_EQ或XFS_LOOKUP_GE, xfs_btree_cur指向大的结点, XFS_LOOKUP_EQ可能指向无效的结点
+
 
 ** xfs_btree_updkey(xfs_btree_cur, xfs_btree_key, leven)
    - 更新xfs_btree_key路径上的结点的xfs_btree_key? 
