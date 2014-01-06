@@ -880,27 +880,27 @@
    - 修改xfs_icdinode->di_format
    > XFS_IFORK_FMT_SET(xfs_inode, whichfork, XFS_DINODE_FMT_BTREE)
 
-   - 准备xfs_alloc_args, 准备分配block
-   - 设置xfs_alloc_args->fsbno = firstblock
+   - 准备xfs_alloc_arg, 准备分配block
+   - 设置xfs_alloc_arg->fsbno = firstblock
    - 如果firstblock == NULLFSBLOCK, 使用inode的位置
-   - 设置xfs_alloc_args->type = XFS_ALLOCTYPE_START_BNO
-   - 设置xfs_alloc_args->fsbno = XFS_INO_TO_FSB(xfs_mount, xfs_inode->i_ino)
+   - 设置xfs_alloc_arg->type = XFS_ALLOCTYPE_START_BNO
+   - 设置xfs_alloc_arg->fsbno = XFS_INO_TO_FSB(xfs_mount, xfs_inode->i_ino)
    - 如果不是NULLFSBLOCK, 而且xfs_bmap_free->xbf_low !=0, 分配连续的空间? 
-   - 设置xfs_alloc_args->type = XFS_ALLOCTYPE_START_BNO
-   - 设置xfs_alloc_args->fsbno = firstblock
+   - 设置xfs_alloc_arg->type = XFS_ALLOCTYPE_START_BNO
+   - 设置xfs_alloc_arg->fsbno = firstblock
    - 否则就近分配?
-   - 设置xfs_alloc_args->type = XFS_ALLOCTYPE_NEAR_BNO
-   - 设置xfs_alloc_args->fsbno = firstblock
-   - 设置xfs_alloc_args->minlen = maxlen = prod = 1
-   > xfs_alloc_vextent(xfs_alloc_args)
+   - 设置xfs_alloc_arg->type = XFS_ALLOCTYPE_NEAR_BNO
+   - 设置xfs_alloc_arg->fsbno = firstblock
+   - 设置xfs_alloc_arg->minlen = maxlen = prod = 1
+   > xfs_alloc_vextent(xfs_alloc_arg)
    - 分配不能失败? 因为已经reserve空间
-   - 把xfs_alloc_args->fsbno给xfs_btree_cur->bc_private->b_firstblock?
+   - 把xfs_alloc_arg->fsbno给xfs_btree_cur->bc_private->b_firstblock?
    - 增加xfs_btree_cur->bc_private->b_allocated ++
 
    - 增加xfs_icdinode->di_nblocks++
    - 准备一个xfs_buf, 操作这个block, 只是分配内存建立影射
    - 可能这个block对应的xfs_buf已经存在,可以直接使用
-   > xfs_btree_get_bufl(xfs_mount, xfs_trans, xfs_alloc_args->fsbno, 0)
+   > xfs_btree_get_bufl(xfs_mount, xfs_trans, xfs_alloc_arg->fsbno, 0)
 
    - xfs_buf作为叶子节点, 设置xfs_buf->b_ops = xfs_bmbt_buf_ops
    - 首先初始化xfs_btree_block, 没有xfs_bmbt_rec
@@ -955,174 +955,233 @@
    - 还有xfs_ifork->if_flags标志, 没有修改xfs_ifork中的数据
 
 ** xfs_bmap_local_to_extents(xfs_trans, xfs_inode, xfs_fsblock_t, xfs_extlen_t, logflag, whichfork, init_fn)
-   - xfs_inode不是reg文件,而且whichfork必须是XFS_DATA_FORK?
+   - regular文件的data fork不使用XFS_DINODE_FMT_LOCAL, 所以这里操作的肯定不是regular的data fork, 可能其他文件或attr fork
    - 获取xfs_ifork 
    > XFS_IFORK_PTR(xfs_inode, whichfork)
-   - 而且磁盘格式是XFS_DINODE_FMT_LOCAL 
+   - 磁盘格式是XFS_DINODE_FMT_LOCAL 
    > XFS_IFORK_FORMAT(xfs_inode, whichfork)
-   - 如果xfs_ifork->if_bytes是0, 现在还没有extent数据 
+   - 如果xfs_ifork->if_bytes是0,表示xfs_ifork没有管理任何数据,也就是xfs_icdinode的fork区域没有数据
+   - 重新计算xfs_ifork的标志,和xfs_icdinode的id_forkoff/id_format, 直接退出
    > xfs_bmap_local_to_extents_empty(xfs_inode, whichfork)
-   - 否则分配空间?
-   - 现在xfs_ifork的格式应该是XFS_IFINLINE
-   - 准备xfs_alloc_args, 分配空间 
-   - xfs_alloc_args->minlen, maxlen, prod是1
-   > xfs_alloc_vextent(xfs_alloc_args)
-   - 读取对应的block 
-   > xfs_btree_get_bufl(xfs_alloc_args->xfs_mount, xfs_trans, xfs_alloc_args->fsbno, 0)
-   - 初始化xfs_buf, 而且把fork数据给xfs_buf
-   - 不确定里面是什么，只能说是fork数据
+
+   - 否则需要分配空间，使用xfs_bmbt_rec索引他们，而且把xfs_bmbt_rec放到fork区域
+   - 检查xfs_ifork->if_flags, 现在应该只有XFS_IFINLINE
+
+   - 分配磁盘空间, 准备xfs_alloc_arg
+   - 设置xfs_alloc_arg->minlen, maxlen, prod是1
+   - 设置xfs_alloc_arg->firstblock = 参数firstblock
+   - 如果firstblock是NULLFSBLOCK 
+   - 设置xfs_alloc_arg->fsbno 为inode的位置 
+   > XFS_INO_TO_FSB(xfs_alloc_arg->xfs_mount, xfs_inode->i_ino)
+   - 设置xfs_alloc_arg->type = XFS_ALLOCTYPE_START_BNO, 使用Inode后面的磁盘空间
+   - 否则使用firstblock, 设置xfs_alloc_arg->fsbno = firstblock, 使用这个位置附近的磁盘空间 
+   - 设置xfs_alloc_arg->type = XFS_ALLOCTYPE_NEAR_BNO
+   > xfs_alloc_vextent(xfs_alloc_arg)
+
+   - 构造xfs_buf, 分配内存空间准备写入空间的数据
+   > xfs_btree_get_bufl(xfs_alloc_arg->xfs_mount, xfs_trans, xfs_alloc_arg->fsbno, 0)
+   - 使用回调函数初始化, 应该是把xfs_ifork的inline数据写到xfs_buf中
    > init_fn(xfs_trans, xfs_buf, xfs_inode, xfs_ifork)
-   - 然后记录log? 
+   - 然后记录xfs_buf的修改, 数据量是xfs_ifork->if_bytes
    > xfs_trans_log_buf(xfs_trans, xfs_buf, 0, xfs_ifork->if_bytes -1 )
-   - 释放xfs_ifork的内存空间, fork数据已经到extent索引的block中
+
+   - 释放xfs_ifork的inline数据使用的内存
    > xfs_idata_realloc(xfs_inode, -xfs_ifork->if_bytes, whichfork)
-   - 只是重新设置forkoff
+   - xfs_ifork转化为保存xfs_bmbt_rec_host数组
    > xfs_bmap_local_to_extents_empty(xfs_inode, whichfork)
-   - 增加extent? 
-   - 原来xfs_ifork中是local数据，现在添加一个xfs_bmbt_rec_host索引上面创建的xfs_buf
+   - 目前只有一个xfs_bmbt_rec_host, 分配对应的内存空间, 应该还是使用xfs_ifork自己的空间
    > xfs_iext_add(xfs_ifork, 0, 1)
-   - 获取这个xfs_bmbt_rec_host
+   - 初始化xfs_bmbt_rec_host
    > xfs_iext_get_ext(xfs_ifork, 0)
-   - 填充对应的位置信息
-   > xfs_bmbt_set_allf(xfs_bmbt_rec_host, 0, xfs_alloc_args->fsbno, 1, XFS_EXT_NORM)
-   - 设置fork使用的extent数量为1
+   - 把上面磁盘位置信息放进去, br_startoff是0
+   > xfs_bmbt_set_allf(xfs_bmbt_rec_host, 0, xfs_alloc_arg->fsbno, 1, XFS_EXT_NORM)
+
+   - 设置xfs_icdinode, di_anextents/di_nextents, di_nblocks = 1
    > XFS_IFORK_NEXT_SET(xfs_inode, whichfork, 1)
-   - xfs_inode->xfs_icdinode->di_nblocks = 1
-   - logflags, 添加对应的log标志 XFS_ILOG_DEXT
+
+   - 计算logflags, 表示应该log xfs_inode的哪些数据, XFS_ILOG_CORE表示xfs_icdinode, 还有对应的fork
+   - 添加对应的log标志 XFS_ILOG_DEXT
    > xfs_ilog_fext(whichfork)
 
-** xfs_bmap_add_attrfork_btree(xfs_trans, xfs_inode, xfs_fsblock_t, xfs_bmap_free, flags)
-   - 设置data fork?
-   - 如果xfs_inode->xfs_ifork->if_broot_bytes <= XFS_IFORK_DSIZE(xfs_inode)
-   - 只需要设置flags的XFS_ILOG_DBROOT???
-   - 否则先去磁盘查找  
-   - 准备xfs_btree_cur 
-   > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, XFS_DATA_FORK)
-   - 设置xfs_btree_cur->bc_private->b->xfs_bmap_free, firstblock为参数xfs_fsblock_t
-   - 查找第一个叶子节点??
-   > xfs_bmbt_lookup_ge(xfs_btree_cur, 0, 0, 0, stat)
-   - 创建新的root? 
-   > xfs_btree_new_iroot(xfs_btree_cur, flags, stat)
-   - 更新参数xfs_fsblock_t为xfs_btree_cur->bc_private->b->firstblock
+   - 这里修改xfs_icdinode与fork相关的成员, 还有对应的fork部分的数据,把它的数据放到单独的block中
+   - fork部分应该填入xfs_bmbt_rec数组,但这里没有实现???
+   - 还需要重新设置xfs_ifork, 对应的管理xfs_bmbt_rec_host
 
-** xfs_bmap_add_attrfork_extents(xfs_trans, xfs_inode, xfs_fsblock_t firstblock, xfs_bmap_free, flags)
-   - 处理data fork?
-   - 如果xfs_bmbt_rec_host数据占的空间没有超过限制, 直接返回
-   > xfs_inode->xfs_ifork->di_nextents * sizeof(xfs_bmbt_rec) <= XFS_IFORK_DSIZE(xfs_inode)
-   - 否则需要转化为XFS_DINODE_FMT_BTREE 
-   > xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, xfs_btree_cur, 0, flags, XFS_DATA_FORK)
-   - 如果上面有xfs_btree_cur,还要释放它??
-   - 设置xfs_btree_cur->bc_private->b->allocated = 0
+   - xfs的inode的数据分成3部分, xfs_dinode/xfs_icdinode, 2个fork/xfs_ifork
+   - xfs_icdinode/xfs_ifork是对磁盘中xfs_dinode所在的block的数据的缓存, 上面的修改都没有改动磁盘的数据，甚至写入对应的xfs_buf
+   - 所以这里的修改只是操作xfs_icdinode, 缓存固定的metadata;和xfs_ifork,缓存fork的metadata
+   - 内存和磁盘的数据最终必须是一致的，但他们管理使用不同的格式, xfs_icdinode和xfs_dinode可能使用相同的格式, xfs_ifork和fork使用完全不同的格式
+
+** xfs_bmap_add_attrfork_btree(xfs_trans, xfs_inode, xfs_fsblock_t firstblock, xfs_bmap_free, flags)
+   - 当attr fork要变为XFS_DINODE_FMT_BTREE格式, 但在xfs_dinode中对应的空间不够, 需要缩减data attr占用的空间
+   - 而且data fork使用XFS_DINODE_FMT_BTREE, 通过增加它的高度，使根结点只有一个分支，来释放data fork的空间
+   - 如果现在data fork占用的空间没有超过限制, 不需要释放, 直接返回
+   - 设置flags的XFS_ILOG_DBROOT, 表示要log data fork的xfs_bmdr_block?
+   - xfs_inode->xfs_ifork->if_broot_bytes <= XFS_IFORK_DSIZE(xfs_inode)
+   - 否则增加xfs_ifork->xfs_btree_block的高度
+   - 准备xfs_btree_cur
+   > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, XFS_DATA_FORK)
+   - 设置xfs_btree_cur->bc_private->b->xfs_bmap_free, firstblock为参数firstblock
+   - 查找第一个叶子节点
+   > xfs_bmbt_lookup_ge(xfs_btree_cur, 0, 0, 0, stat)
+   - 分配一个新的根结点
+   > xfs_btree_new_iroot(xfs_btree_cur, flags, stat)
+   - 更新参数firstblock = xfs_btree_cur->bc_private->b->firstblock
+   - 释放xfs_btree_cur 
    > xfs_btree_del_cursor(xfs_btree_cur, XFS_BTREE_NOERROR)
 
+** xfs_bmap_add_attrfork_extents(xfs_trans, xfs_inode, xfs_fsblock_t firstblock, xfs_bmap_free, flags)
+   - attr fork的空间太小, 需要压缩data fork的空间
+   - 当前data fork使用XFS_DINODE_FMT_EXTENTS, 如果超过限制，变为使用XFS_DINODE_FMT_BTREE格式
+   - 如果xfs_bmbt_rec_host的数量没有超过限制, 直接返回
+   > xfs_inode->xfs_ifork->di_nextents * sizeof(xfs_bmbt_rec) <= XFS_IFORK_DSIZE(xfs_inode)
+   - 否则xfs_ifork转化为XFS_DINODE_FMT_BTREE 
+   > xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, xfs_btree_cur, 0, flags, XFS_DATA_FORK)
+
 ** xfs_bmap_add_attrfork_local(xfs_trans, xfs_inode, xfs_fsblock_t, xfs_bmap_free_t, flags)
-   - 如果fork数据不够多,不需要转化?  xfs_inode->xfs_ifork->if_bytes 
+   - attr fork空间太小, 需要加锁data fork的空间
+   - 当前data fork使用XFS_DINODE_FMT_LOCAL, 转化为XFS_DINODE_FMT_EXTENTS格式
+   - 现在data fork占用的空间是xfs_ifork->if_bytes
    > XFS_IFORK_DSIZE(xfs_inode)
+   - 如果没有超过限制,直接返回, 否则需要转化
    - 如果是dir文件,使用xfs_da_args实现 
    > xfs_dir2_sf_to_block(xfs_da_args)
-   - 如果是link文件 
+   - 如果是link文件, 分配一个block保存数据
    > xfs_bmap_local_to_extents(xfs_trans, xfs_inode, firstblock, 1, flags, XFS_DATA_FORK, xfs_symlink_local_to_remote)
-   - reg文件的extent影射信息不会使用local? 
+   - 不可能是其他文件
 
 ** xfs_bmap_add_attrfork(xfs_inode, size, rsvd)
-   - 增加attr数据?? 原来是non-attributed?
-   - 必须在transaction之外?
-   - xfs_inode->xfs_icdinode->di_forkoff必须是0? 没有data attr数据
-   - 构造transaction 
+   - 向attr fork中写入数据, 数据量是size
+   - 现在attr fork中没有数据?? xfs_icdinode->di_forkoff==0, 表示attr fork空间为0
+   > XFS_IFORK_Q(xfs_inode) ==0
+
+   - 构造专门的xfs_trans
    > xfs_trans_alloc(xfs_mount, XFS_TRANS_ADDAFORK)
-   - 预留空间??
+   - 估计可能占用的最多的磁盘空间, 这是reserve的FS磁盘空间, 下面xfs_mount->m_resv是reserve的log队列的空间
    > XFS_ADDAFORK_SPACE_RES(xfs_mount)
-   - 如果rsvd >0, 设置xfs_trans->t_flags的XFS_TRANS_RESERVE 
-   - 什么东西??
-   > xfs_trans_reserve(xfs_trans, blks, XFS_ADDAFORK_LOG_RES(xfs_mount), 0, XFS_TRANS_PERM_LOG_RES, XFS_ADDAFORK_LOG_COUNT)
-   - 设置xfs_ifork->di_aformat为XFS_DINODE_FMT_EXTENTS? 还要处理attr fork? 
-   - 锁住trans? 
+   - 如果rsvd >0, 设置xfs_trans->t_flags的XFS_TRANS_RESERVE, 表示磁盘空间不够时,使用预留的空间
+   - reserve FS磁盘空间和log队列空间
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_addafork, blks, 0)
+
+   - 锁住xfs_inode
+   > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL)
+   - 设置xfs_ifork->di_aformat为XFS_DINODE_FMT_EXTENTS, 都没有数据为何还要设置为XFS_DINODE_FMT_EXTENTS?
+
+   - 创建xfs_inode使用的xfs_inode_log_item, 放到xfs_trans中
    > xfs_trans_ijoin(xfs_trans, xfs_inode, XFS_ILOCK_EXCL)
-   - log inode? 
+   - 把对xfs_icdinode的修改标注到xfs_inode_log_item中
    > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
-   - 重新设置xfs_icdinode->di_forkoff 
+
+   - 根据data fork的数据计算xfs_icdinode->di_forkoff,现在还是0
    - 对于XFS_DINODE_FMT_DEV, 就是sizeof(xfs_dev_t)/8
    - 对于XFS_DINODE_FMT_UUID, 就是sizeof(uuid_t) /8
    - 对于XFS_DINODE_FMT_LOCAL/EXTENTS/BTREE 
    > xfs_attr_shortform_bytes(xfs_inode, size)
    - 如果计算的无效,使用默认的 
    > xfs_default_attroffset(xfs_inode)
-   - 创建attr fork, 设置xfs_ifork->if_flags的XFS_IFEXTENTS? 为何要使用这个?
-   - 初始化xfs_bmap_free, 都从新设为0
-   - 根据xfs_icdinode->di_format, 创建data fork使用的空间
-   - 如果是XFS_DINODE_FMT_LOCAL 
+
+   - 创建attr fork使用的xfs_ifork
+   - 设置xfs_ifork->if_flags的XFS_IFEXTENTS, attr fork直接使用xfs_bmbt_rec_host管理空间??
+
+   - 初始化xfs_bmap_free, 都从新设为0, 用来分配空间
+   - 重新计算data fork的存储格式, di_format
+   - 如果使用过量的空间,需要转化为其他格式,释放空间给attr fork
+   - 如果是XFS_DINODE_FMT_LOCAL,可能转化为XFS_DINODE_FMT_EXTENTS
    > xfs_bmap_add_attrfork_local(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, logflags)
-   - 如果是XFS_DINODE_FMT_EXTENTS 
+   - 如果是XFS_DINODE_FMT_EXTENTS, 可能转化为XFS_DINODE_FMT_BTREE
    > xfs_bmap_add_attrfork_extents(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, logflags)
-   - 如果是XFS_DINODE_FMT_BTREE 
+   - 如果是XFS_DINODE_FMT_BTREE, 可能增加高度
    > xfs_bmap_add_attrfork_btree(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, logflags)
-   - 根据上面的logflags, log inode 
+
+   - 根据上面的logflags, 计算xfs_inode_log_item的标志
    > xfs_trans_log_inode(xfs_trans, xfs_inode, logflags)
-   - 最后释放上面操作中多余的block? 
+   - 上面的操作应该不会释放空间!! 
+   - 如果有的话, 释放这些空间, 创建对应的xfs_efd_log_item
    > xfs_bmap_finish(xfs_trans, xfs_bmap_free, committed)
-   - 提交transaction 
+
+   - 提交xfs_trans, 可能不是开始的xfs_trans, 上面释放空间时就会替换为新的
    > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
 
 ** xfs_bmap_read_extents(xfs_trans, xfs_inode, whichfork)
-   - 首先获取xfs_ifork, xfs_btree_block, xfs_ifork->if_broot
+   - 把磁盘中btree中的xfs_bmbt_rec全部缓存到xfs_ifork中
+   - 只需要先找到第一个叶子节点,然后使用右兄弟指针，遍历所有的叶子节点
+
+   - 首先获取xfs_ifork, 以及btree的根结点xfs_btree_block / xfs_ifork->if_broot
    > XFS_IFORK_PTR(xfs_inode, whichfork)
-   - 首先根据节点的第一个分支,找到第一个叶子节点
-   - 根结点第一个分支
+   - 根据节点的第一个分支,找到第一个叶子节点
+   - 获取根结点第一个分支指针
    > XFS_BMAP_BROOT_PTR_ADDR(xfs_mount, xfs_btree_block, 1, xfs_ifork->if_broot_bytes)
+   - 循环向下遍历, 使用xfs_buf读取节点的数据
    > xfs_btree_read_bufl(xfs_mount, xfs_trans, bno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
    - 获取xfs_btree_block, XFS_BUF_TO_BLOCK(xfs_buf)
    - 获取第一个分支指针 
    > XFS_BMBT_PTR_ADDR(xfs_mount, xfs_btree_block, 1, xfs_mount->m_bmap_dmxr[1])
-   - 然后遍历这些叶子节点,获取对应的xfs_bmbt_rec数据
-   - xfs_bmbt_rec数组长度是xfs_ifork->if_bytes决定
-   - 获取叶子节点xfs_btree_block 
+   - 然后释放xfs_buf, 使用上面指针的地址继续循环
+   > xfs_trans_brelse(xfs_trans, xfs_buf)
+   
+   - 然后遍历这些叶子节点,获取对应的xfs_bmbt_rec数据, 把数据复制给xfs_ifork
+   - xfs_bmbt_rec数组长度不能xfs_ifork->if_bytes, 也就是xfs_dinode->di_nextents/di_anextents
+
+   - 开始处理一个叶子节点, 获取xfs_btree_block
+   - 检查它包含的xfs_bmbt_rec的数量, 不能超过上面xfs_ifork的限制
    > xfs_btree_get_numrecs(xfs_btree_block)
-   - 检查是否超过xfs_ifork在内存中的限制
    - 检查xfs_buf的xfs_btree_block成员
    > xfs_bmap_sanity_check(xfs_mount, xfs_buf, 0)
-   - 遍历叶子节点里面的xfs_bmbt_rec数组
-   - 放到xfs_ifork中, 数据类型从大端转为host
-   > xfs_iext_get_ext(xfs_ifork, i)
-   - xfs_bmbt_rec/xfs_bmbt_host/xfs_bmbt_irec是一个东西
-   - 检查xfs_bmbt_irec的xfs_exntst_t
-   > xfs_check_nostate_extents(xfs_ifork, start, num_recs)
-   - 读取兄弟叶子节点 
-   > xfs_btree_read_bufl(xfs_mount, xfs_trans, bno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
-   > xfs_trans_brelse(xfs_trans, xfs_buf)
+   - 首先预读右兄弟节点
+   > xfs_btree_reada_bufl(xfs_mount, nextbno, 1, xfs_bmbt_buf_ops)
 
-** xfs_bmap_search_multi_extents(xfs_ifork, xfs_fileoff_t, eof, xfs_extnum_t, xfs_bmbt_iret got, xfs_bmbt_irec prev)
-   - 根据xfs_fileoff_t, 查找对应的xfs_bmbt_rec
-   - xfs_extnum_t是对应的xfs_bmbt_rec的索引, 后面2个参数是结果,一个是前一个xfs_bmbt_rec, 一个是当前的
-   - 如果xfs_fileoff_t指向hole, 返回下一个, 如果超过文件大小, eof设置为1
-   - 查找xfs_ifork的ic的xfs_bmbt_rec_host矩阵
+   - 遍历叶子节点里面的xfs_bmbt_rec数组
+   - 放到xfs_ifork中, 转化数据类型为xfs_bmbt_rec_host
+   > xfs_iext_get_ext(xfs_ifork, i)
+   - 检查xfs_bmbt_irec->br_state
+   > xfs_check_nostate_extents(xfs_ifork, start, num_recs)
+   - 处理完成释放xfs_buf 
+   > xfs_trans_brelse(xfs_trans, xfs_buf)
+   - 读取兄弟叶子节点, 继续循环
+   > xfs_btree_read_bufl(xfs_mount, xfs_trans, bno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
+
+** xfs_bmap_search_multi_extents(xfs_ifork, xfs_fileoff_t bno, eof, xfs_extnum_t, xfs_bmbt_iret got, xfs_bmbt_irec prev)
+   - 在xfs_ifork中查找bno对应的xfs_bmbt_rec_host, 它应该覆盖bno
+   - xfs_extnum_t是xfs_bmbt_rec_host的索引
+   - 后面2个参数是结果,prev指向前一个xfs_bmbt_rec, got指向要查找的结果
+
+   - 查找xfs_ifork的xfs_bmbt_rec_host矩阵
    > xfs_iext_bno_to_ext(xfs_ifork, bno, lastx)
-   - 如果找到, 而且不是第一个, lastx>0
-   - 获取前一个xfs_bmbt_rec, 转化为xfs_bmbt_irec
+   - 如果找不到xfs_bmbt_rec_host覆盖bno, lastx指向下一个 
+   - 如果bno超过文件大小, lastx = xfs_ifork->if_bytes, 也就是最后一个xfs_bmbt_rec后面一个无效位置
+
+   - 如果返回的lastx>0,他可能是无效的, 但lastx-1是有效的
+   - 获取前一个xfs_bmbt_rec_host, 转化为xfs_bmbt_irec
    > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, lastx-1), xfs_bmbt_irec)
-   - 如果没有超过界线 xfs_ifork->if_bytes / sizeof(xfs_bmbt_rec)
-   - 读取找到的 
+   - 否则prev是空的, br_startoff = NULLFILEOFF(-1)
+
+   - 如果lastx有效表示找到xfs_bmbt_rec_host, 即使它可能不覆盖bno
+   - 设置eofp = 0, 获取对应的xfs_bmbt_irec给got, 返回这个xfs_bmbt_rec_host, 虽然
+
+   - 否则表示没有找到, 设置eofp = 1, 使got和prev一样, 返回NULL
    > xfs_bmbt_get_all(xfs_bmbt_rec_host, xfs_bmbt_irec)
-   - 如果没有找到和是的, 设置eof = 1, 使用前一个xfs_bmbt_irec
+
+   - 如果xfs_ifork中根本没有xfs_bmbt_rec_host, 什么都返回NULL
 
 ** xfs_bmap_search_extents(xfs_inode, xfs_fileoff_t, fork, eofp, xfs_extnum_t lastexp, xfs_bmbt_irec gotp, xfs_bmbt_irec prep)
-   - 获取xfs_ifork 
+   - 在xfs_ifork中查找xfs_bmbt_rec_host / xfs_bmbt_irec
    > XFS_IFORK_PTR(xfs_inode, whichfork)
-   - 查找xfs_bmbt_irec 
    > xfs_bmap_search_multi_extents(xfs_ifork, bno, eof, lastxp, xfs_bmbt_irec gotp, prevp)
-   - 如果是data fork, 而且返回的xfs_bmbt_irec->br_startblock是0, 返回NULL?
+   - 检查返回的结果, xfs_bmbt_irec->br_startblock不能是0???
 
-** xfs_bmap_first_unused(xfs_trans, xfs_inode, xfs_extlen_t, xfs_fileoff_t, whichfork)
-   - 查找(xfs_fileoff_t后面的,长度超过xfs_extlen_t的hole
-   - whichfork? 查找文件的第一个hole? 
+** xfs_bmap_first_unused(xfs_trans, xfs_inode, xfs_extlen_t len, xfs_fileoff_t first_unused, whichfork)
+   - 查找first_unused后面的,长度超过len的hole的xfs_bmbt_rec_host, 返回它在xfs_ifork中的索引
    - 对于reg可以理解, 对于dir怎么回事?
    - xfs_icdinode->di_format/di_aformat必须是XFS_DINODE_FMT_BTREE/LOCAL/EXTENTS
-   - 如果是XFS_DINODE_FMT_LOCAL, 直接返回0,没有hole?
+   - 如果是XFS_DINODE_FMT_LOCAL, 直接返回0
    - 获取xfs_ifork 
    > XFS_IFORK_PTR(xfs_inode, whichfork)
-   - 如果xfs_ifork->if_flags没有XFS_IFEXTENTS, 读取extents数据? 
+   - 如果xfs_ifork->if_flags没有XFS_IFEXTENTS, 读取xfs_bmbt_rec数据
    > xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
-   - 遍历所有的xfs_bmbt_rec_host 
+   - 遍历所有的xfs_bmbt_rec_host, 查找一个xfs_bmbt_rec_host,它和前一个之间的空洞超过(first_unused, len)
+   - 为何不先查找first_unused对应的xfs_bmbt_rec_host? 
    > xfs_iext_get_ext(xfs_ifork, index)
+   - max表示前一个xfs_bmbt_rec_host的结束位置
    - 检查2个xfs_bmbt_rec_host之间的距离
    > xfs_bmbt_get_startoff(xfs_bmbt_rec_host)
    - off >= lowest+len 保证下面的比较不会溢出?
@@ -1719,7 +1778,7 @@
    - 如果firstblock是NULLFSBLOCK? 更新minlen?? 
    > xfs_bmap_btalloc_nullfb(xfs_bmalloca, xfs_alloc_arg, blen)
    - 否则如果xfs_bmalloca->xfs_bmap_free->xbf_low !=0 ??
-   - 设置xfs_alloc_args->type 为XFS_ALLOCTYPE_START_BNO??
+   - 设置xfs_alloc_arg->type 为XFS_ALLOCTYPE_START_BNO??
    - 设置xfs_alloc_arg->total/minlen = xfs_bmalloca->minlen??
    - 否则使用XFS_ALLOCTYPE_NEAR_BNO, total = xfs_bmalloca->total, minlen = xfs_bmalloca->minlen
    - 处理align? xfs_alloc_arg->prod = align
@@ -1731,7 +1790,7 @@
    - xfs_alloc_arg->alignment = xfs_mount->m_dalign?
    - 设置xfs_alloc_arg->minlen = blen - xfs_alloc_arg->alignment ??
    - 否则从文件开头分配?? 或者文件的第一次分配空间
-   - 设置xfs_alloc_args->type = XFS_ALLOCTYPE_THIS_BNO, alignment = 1, tryagain = 1, 失败后会尝试别的??
+   - 设置xfs_alloc_arg->type = XFS_ALLOCTYPE_THIS_BNO, alignment = 1, tryagain = 1, 失败后会尝试别的??
    - 仔细设置xfs_alloc_arg, 开始分配空间 
    > xfs_alloc_vextent(xfs_alloc_arg)
    - 如果tryagain !=0, 而且没有分配成功, xfs_alloc_arg->fsbno == NULLFSBLOCK 
