@@ -1039,7 +1039,7 @@
    > xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, xfs_btree_cur, 0, flags, XFS_DATA_FORK)
 
 ** xfs_bmap_add_attrfork_local(xfs_trans, xfs_inode, xfs_fsblock_t, xfs_bmap_free_t, flags)
-   - attr fork空间太小, 需要加锁data fork的空间
+   - attr fork空间太小, 需要压缩data fork的空间
    - 当前data fork使用XFS_DINODE_FMT_LOCAL, 转化为XFS_DINODE_FMT_EXTENTS格式
    - 现在data fork占用的空间是xfs_ifork->if_bytes
    > XFS_IFORK_DSIZE(xfs_inode)
@@ -1052,7 +1052,7 @@
 
 ** xfs_bmap_add_attrfork(xfs_inode, size, rsvd)
    - 向attr fork中写入数据, 数据量是size
-   - 现在attr fork中没有数据?? xfs_icdinode->di_forkoff==0, 表示attr fork空间为0
+   - 现在attr fork中没有数据, xfs_icdinode->di_forkoff==0, 表示attr fork空间为0
    > XFS_IFORK_Q(xfs_inode) ==0
 
    - 构造专门的xfs_trans
@@ -1153,7 +1153,7 @@
    - 如果返回的lastx>0,他可能是无效的, 但lastx-1是有效的
    - 获取前一个xfs_bmbt_rec_host, 转化为xfs_bmbt_irec
    > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, lastx-1), xfs_bmbt_irec)
-   - 否则prev是空的, br_startoff = NULLFILEOFF(-1)
+   - 否则prev设为无效, br_startoff = NULLFILEOFF(-1)
 
    - 如果lastx有效表示找到xfs_bmbt_rec_host, 即使它可能不覆盖bno
    - 设置eofp = 0, 获取对应的xfs_bmbt_irec给got, 返回这个xfs_bmbt_rec_host, 虽然
@@ -1161,8 +1161,13 @@
    - 否则表示没有找到, 设置eofp = 1, 使got和prev一样, 返回NULL
    > xfs_bmbt_get_all(xfs_bmbt_rec_host, xfs_bmbt_irec)
 
-   - 如果xfs_ifork中根本没有xfs_bmbt_rec_host, 什么都返回NULL
-
+   - 如果xfs_ifork中没有xfs_bmbt_rec_host, 什么都返回NULL, eof=1
+   - 如果xfs_ifork中有xfs_bmb_rec_host
+   - 如果bno超过文件大小,eof=1, 而且prev/got/lastidx都指向最后一个, 返回NULL
+   - 如果bno没有超过eof,没有hole, got/xfs_bmbt_rec_host/lastidx指向找到的, eof=0
+   - 如果bno没有超过eof,有hole, got/xfs_bmbt_rec_host/lastidx指向bno后面的xfs_bmbt_rec, eof =0
+   - 如果bno没有超过eof,但是第一个, prev->br_startoff是NULLFILEOFF, 否则指向got前面的xfs_bmbt_rec
+     
 ** xfs_bmap_search_extents(xfs_inode, xfs_fileoff_t, fork, eofp, xfs_extnum_t lastexp, xfs_bmbt_irec gotp, xfs_bmbt_irec prep)
    - 在xfs_ifork中查找xfs_bmbt_rec_host / xfs_bmbt_irec
    > XFS_IFORK_PTR(xfs_inode, whichfork)
@@ -1178,26 +1183,29 @@
    > XFS_IFORK_PTR(xfs_inode, whichfork)
    - 如果xfs_ifork->if_flags没有XFS_IFEXTENTS, 读取xfs_bmbt_rec数据
    > xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
-   - 遍历所有的xfs_bmbt_rec_host, 查找一个xfs_bmbt_rec_host,它和前一个之间的空洞超过(first_unused, len)
+   - 遍历所有的xfs_bmbt_rec_host, 查找一个xfs_bmbt_rec_host,它和前一个之间没有临接,而且距离超过len
    - 为何不先查找first_unused对应的xfs_bmbt_rec_host? 
    > xfs_iext_get_ext(xfs_ifork, index)
    - max表示前一个xfs_bmbt_rec_host的结束位置
-   - 检查2个xfs_bmbt_rec_host之间的距离
+   - off表示当前xfs_bmbt_rec_host的开始位置
    > xfs_bmbt_get_startoff(xfs_bmbt_rec_host)
+   - 比较max和off,判断在两个xfs_bmbt_rec_host之间是否存在空洞
    - off >= lowest+len 保证下面的比较不会溢出?
    - off-max >= len, hole长度超过len
+   - 如果找到first_unused返回max, 也就是空洞的开始位置, 否则返回eof, 最后一个xfs_bmbt_rec_host的结束位置
 
-** xfs_bmap_last_before(xfs_trans, xfs_inode, xfs_fileoff_t, whichfork)
-   - 
+** xfs_bmap_last_before(xfs_trans, xfs_inode, xfs_fileoff_t last_block, whichfork)
+   - 查找last_block之前的使用磁盘的文件位置, 如果它本来就有磁盘位置,不需要修改
+   - 在directory操作中使用
    - 先检查di_format/di_aformat, 必须是XFS_DINODE_FMT_BTREE/LOCAL/EXTENTS
    - 如果是XFS_DINODE_FMT_LOCAL, 返回0
    - 获取xfs_ifork, 准备xfs_bmbt_rec_host 
    > xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
-   - 根据xfs_fileoff_t查找xfs_bmbt_rec_host 
+   - 查找last_block-1对应的xfs_bmbt_rec_host
    > xfs_bmap_search_extents(xfs_inode, bno, whichfork, eof, xfs_extnum_t, xfs_bmbt_irec got, xfs_bmbt_irec prev)
-   - 如果eof==1, 或者extent没有覆盖xfs_fileoff_t,不能直接使用
-   - 如果xfs_bmbt_irec->br_startoff是NULLFILEOFF, 返回0??
-   - 否则使用前一个xfs_bmbt_irec的范围最大值
+   - 如果eof==1, 表示超出文件范围, 或者找到的xfs_bmbt_rec_host没有覆盖bno, 说明last_block处没有磁盘信息
+   - 如果prev->br_startoff是NULLFILEOFF, 表示文件没有xfs_bmbt_rec信息, 设置last_block=0
+   - 否则它在空洞里面, 更新为前面的xfs_bmbt_irec的结束位置
    > xfs_bmbt_irec->br_startoff + br_blockcount
 
 ** xfs_bmap_last_extent(xfs_trans, xfs_inode, whichfork, xfs_bmbt_irec, is_empty)
@@ -1206,35 +1214,39 @@
    > xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
    - 根据xfs_ifork->if_bytes计算最后一个xfs_bmbt_rec索引数
    > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, nextents-1), xfs_bmbt_irec)
+   - 如果没有xfs_bmbt_rec_host数据,设置is_empty = 1
 
 ** xfs_bmap_isaeof(xfs_bmalloca, whichfork)
+   - 用来计算xfs_bmalloca->aeof, 表示要创建的xfs_bmbt_rec是否在文件最后
    - 获取最后一个xfs_bmbt_rec 
    > xfs_bmap_last_extent(NULL, xfs_bmalloca->xfs_inode, whichfork, xfs_bmbt_irec, is_empty)
-   - 检查xfs_bmalloca->offset是否是在文件最后
-   - 这里并不是使用磁盘位置,而是文件偏移,也就是说有没有造成hole?
-   - 记录在xfs_bmalloca->aeof
-   - 这是hole extent?
+   - 检查xfs_bmalloca->offset是否超过eof
+   - 如果上面返回is_empty = 1, 没有xfs_bmbt_rec信息, 设置aeof=1, 任何分配都超过eof
+   - 如果xfs_bmalloca->offset >= xfs_bmbt_irec->br_startoff + br_blockcount, 设置aeof =1
+   - 如果它在最后一个xfs_bmbt_rec_irec范围内,而且它没有磁盘空间, 设置aeof=1
    > isnullstartblock(xfs_bmbt_irec->br_startblock)
 
+   - 这时分配空间需要对齐地址??
+
 ** xfs_bmap_last_offset(xfs_trans, xfs_inode, xfs_fileoff_t, whichfork)
-   - 获取文件最大偏移
+   - 获取文件最大偏移, 使用xfs_bmbt_rec_host数据计算
    - 如果是XFS_DINODE_FMT_LOCAL, 返回0
-   - 如果不是XFS_DINODE_FMT_BTREE/EXTENTS,返回EIO??
-   - 获取最后一个xfs_bmbt_rec 
+   - 如果不是XFS_DINODE_FMT_BTREE/EXTENTS,返回EIO
+   - 获取最后一个xfs_bmbt_irec
    > xfs_bmap_last_extent(NULL, xfs_inode, whichfork, xfs_bmbt_irec, is_empty)
-   - 返回xfs_bmbt_irec->br_startoff + br_blockcount
+   - 设置last_block = xfs_bmbt_irec->br_startoff + br_blockcount
 
 ** xfs_bmap_one_block(xfs_inode, whichfork)
-   - 检查data/attr fork是否只有一个block?
-   - 检查xfs_icdinode->di_nextents/di_anextents 
+   - 检查data/attr fork是否只有一个block, 在attr操作中使用
+   - 如果xfs_icdinode->di_nextents/di_anextents !=1, 返回0, 只能有一个节点
    > XFS_IFORK_NEXTENTS(xfs_inode, whichfork)
-   - 如果不是XFS_DINODE_FMT_EXTENTS, 也不可能?? btree会有多个?
+   - 如果不是XFS_DINODE_FMT_EXTENTS, 返回0, btree还需要包括根结点??
    - 获取第一个xfs_bmbt_irec 
    > XFS_IFORK_PTR(xfs_inode, whichfork)
    > xfs_iext_get_ext(xfs_ifork, 0)
    > xfs_bmbt_get_all(xfs_bmbt_rec_hsot, xfs_bmbt_irec)
    - bt_startoff ==0, 而且br_blockcount ==1
-   - 如果是data fork, xfs_inode->i_size必须是sb_blocksize?
+   - 如果是data fork, xfs_inode->i_size必须是sb_blocksize, 上面映射的文件长度是1
 
 ** xfs_bmalloca 
    #+BEGIN_SRC 
@@ -1270,7 +1282,8 @@
    #+END_SRC
 
 ** xfs_bmap_add_extent_delay_real(xfs_bmalloca)
-   - 从delayed allocation转化为real allocation? 
+   - xfs_bmalloca分配空间之后, 更新xfs_bmalloca->got, 原来是delayalloc的xfs_bmbt_irec
+   - 转化为使用有效的磁盘空间
    - xfs_bmalloca->got是分配的xfs_bmbt_irec, new
    - 获取data fork, xfs_bmalloca->xfs_inode->xfs_ifork 
    > XFS_IFORK_PTR(xfs_inode, XFS_DATA_FORK)
