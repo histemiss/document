@@ -1671,218 +1671,271 @@
    - startblock会有改变,影响到XFS_SBS_FDBLOCKS的计数
 
 ** xfs_bmap_add_extent_hole_real(xfs_bmalloca, whichfork)
-   - 给hole的xfs_bmbt_rec添加磁盘信息 
-   - 分配的磁盘信息在xfs_bmalloca->got中,还没有放到xfs_ifork中
+   - xfs_bmalloca->idx指向的xfs_bmbt_rec_host是hole,分配磁盘后，索引有效的磁盘空间
+   - 分配的磁盘信息在xfs_bmalloca->got中
+
    - 获取对应的xfs_ifork 
    > XFS_IFORK_PTR(xfs_inode, whichfork)
-   - 操作的xfs_bmbt_rec_host是xfs_bmalloca->idx, xfs_bmalloca->got是分配的xfs_bmbt_irec
-   - 这个xfs_bmbt_irec->br_startblock必须是有效的 
+
+   - 新的xfs_bmbt_irec->br_startblock必须指向有效的磁盘地址
    > isnullstartblock(new->br_startblock)
+   - xfs_bmalloca->idx有效, 指向xfs_ifork中的xfs_bmbt_rec_host
+
    - 获取2端的xfs_bmbt_irec/xfs_bmbt_rec_host
-   - xfs_bmalloca->idx指向right, idx-1指向left, 分别获取对应的xfs_bmbt_irec 
+   - xfs_bmalloca->idx指向右端的, idx-1指向左端的, 分别获取对应的xfs_bmbt_irec
+   - 果然xfs_ifork中还没有这个hole的xfs_bmbt_rec
    > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, idx-1), left)
-   - 根据xfs_bmbt_irec->br_startblock计算合并的条件
+
+   - 计算合并和插入的条件
    - 如果存在xfs_bmbt_rec_host, 设置BMAP_LEFT_VALID 
    - 如果磁盘位置无效, 设置BMAP_LEFT_DELAY 
    > isnullstartblock(left->br_startblock)
    - 如果文件偏移磁盘位置连续, 而且不是BMAP_LEFT_DELAY, 而且br_state一样,可以合并设置BMAP_LEFT_CONTIG
+
    - 如果state是BMAP_LEFT_CONGIT|BMAP_RIGHT_CONTIG, 可以合并3个xfs_bmbt_irec
-   - 首先更新xfs_ifork, 修改left的blockcount 
+   - 更新左端的xfs_bmbt_rec_host, 表示合并后的, 更新br_blockcount
+   - idx已经指向左端的
    > xfs_bmbt_set_blockcount(xfs_iext_get_ext(xfs_ifork, idx), left->br_blockcount + new->br_blockcount + right->br_blockcount)
-   - 删除right对应的xfs_bmbt_rec_host
+   - 删除右端的xfs_bmbt_rec_host, 
    > xfs_iext_remove(xfs_inode, idx+1, 1, state)
-   - 修改di_nextents或者di_anextents 
+   - 减小xfs_icdinode->di_nextents/di_anextents,需要删除右端的xfs_bmbt_rec
    > XFS_IFORK_NEXT_SET(inode, whichfork, XFS_IFORK_NEXTENTS(xfs_inode, whichfork) - 1)
-   - 更新btree中的xfs_bmbt_rec
-   - 查找right对应的xfs_bmbt_rec, 直接删除
+   - 如果xfs_bmalloca->xfs_btree_cur无效, 没有使用btree管理xfs_bmbt_rec 
+   - 不需要删除xfs_bmbt_rec, 只需要返回XFS_ILOG_CORE | xfs_ilog_fext(whichfork), 在xfs_icdinode写回时,会把fork数据写回
+   - 否则操作btree, 删除右端的xfs_bmbt_rec, 修改左端的xfs_bmbt_rec
    > xfs_bmbt_lookup_eq(xfs_btree_cur, right->br_startoff, br_blockcount, ..)
    > xfs_bmbt_delete(xfs_btree_cur, i)
-   - 修改left对应的xfs_bmbt_rec 
    > xfs_btree_decrement(xfs_btree_cur, 0, i)
    > xfs_bmbt_update(xfs_btree_cur, left->br_startoff, left->br_startblock, left->br_blockcount + new->br_blockcount + right->br_blockcount, left->br_state)
-   - 如果state是BMAP_LEFT_CONTIG, 直接合并前2个extent
-   - 修改left对应的xfs_bmbt_rec_host的长度
+
+   - 如果state是BMAP_LEFT_CONTIG, 把got合并到左端的xfs_bmbt_rec/xfs_bmbt_rec_host
+   - 修改左端的xfs_bmbt_rec_host的长度
    > xfs_bmbt_set_blockcount(xfs_iext_get_ext(xfs_ifork, idx), left->br_blockcount, new->br_blockcount)
-   - 同时修改btree中的xfs_bmbt_rec
+   - xfs_bmbt_rec的总数量没有变化
+   - 如果xfs_bmalloca->xfs_btree_cur无效, xfs_bmbt_rec在fork区域,不需要修改, 直接返回xfs_ilog_fext(whichfork)
+   - 否则需要修改左端的xfs_bmbt_rec
    > xfs_bmbt_lookup_eq(xfs_btree_cur, left->br_startoff, ...)
    > xfs_bmbt_update(xfs_btree_cur, left->br_startoff, left->br_startblock, left->br_blockcount + new->br_blockcount, left->br_state)
-   - 如果state是BMAP_RIGHT_CONTIG, 只需要合并后面2个xfs_bmbt_rec_host 
-   - 更新xfs_ifork的xfs_bmbt_rec_host 
-   - 修改right的startoff, startblock
+
+   - 如果state是BMAP_RIGHT_CONTIG, 把got合并到右端的xfs_bmbt_rec/xfs_bmbt_rec_host中
+   - 更新右端的xfs_bmbt_rec_host, 修改br_startoff, br_startblock, br_blockcount
    > xfs_bmbt_set_allf(xfs_iext_get_ext(xfs_ifork, idx), new->br_startoff, new->br_startblockoff, new->br_blockcount + right->br_blockcount, new->br_state)
-   - 然后更新btree的xfs_bmbt_rec 
+   - 然后更新右端的xfs_bmbt_rec
    > xfs_bmbt_lookup_eq(xfs_btree_cur, right->br_startoff, right->br_startblock, right->br_blockcount, i)
-   - 还有额外的更新state
    > xfs_bmbt_update(xfs_btree_cur, new->br_startoff, new->br_startblock, new->br_blockcount + left->br_blockcount, right->br_state)
-   - 如果state是0, 没法合并,需要插入xfs_bmbt_rec(_host)
+
+   - 如果state是0, 没法合并,需要插入xfs_bmbt_rec/xfs_bmbt_rec_host
    - 首先操作xfs_ifork, 插入新的xfs_bmbt_rec_host
    - 在idx位置处, 使用的数据就是new
    > xfs_iext_insert(xfs_ifork, idx, 1, new)
-   - 然后插入btree的xfs_bmbt_rec 
-   - 首先准备xfs_btree_cur, 这个查找是什么操作???
+   - 增加xfs_icdinode->di_nextents/di_anextents, 下面返回的rval中需要包含XFS_ILOG_CORE
+   - 如果xfs_bmalloca->xfs_btree_cur无效,现在不需要插入xfs_bmbt_rec, 仅仅返回xfs_ilog_fext(whichfork)
+   - 否则插入btree的xfs_bmbt_rec, 让xfs_btree_cur指向相应的位置
    > xfs_bmbt_lookup_eq(xfs_btree_cur, new->br_startoff, new->br_startblock, new->br_blockcount, i)
-   > 把new给xfs_btree_cur->bc_rec->xfs_bmbt_irec
+   - 设置xfs_btree_cur->bc_rec->b->br_state
    > xfs_bmbt_insert(xfs_btree_cur, i)
+
    - 最后检查xfs_inode的di_format/di_aformat是否需要转化
    > xfs_bmap_needs_btree(xfs_inode, whichfork)
    > xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, xfs_btree_cur, 0, logflags, whichfork)
 
 ** xfs_bmap_extsize_align(xfs_mount, xfs_bmbt_irec gotp, xfs_bmbt_irec prev, xfs_extlen_t extsz, rt, eof, delay, convert, xfs_fileoff_t off, xfs_extlen_t len)
-   - 参数的2个xfs_bmbt_irec应该在(off,len)2端
-   - 调整新的extent的大小?
-   - (off,len)表示需要的extent? 记录为(orig_off, orig_end)
-   - (gotp->br_startoff, br_blockcount)表示分配的结果?
-   - 如果delay==0, eof==0, 而且上面2个范围覆盖, 表示覆盖已经存在的xfs_bmbt_rec, 直接返回
+   - (off,len)是xfs_bmalloca的成员, 表示即将分配磁盘空间的文件偏移, 这里需要做对齐,但又不能和2端的重叠
+   - 参数的2个xfs_bmbt_irec对应查找xfs_ifork时返回的2个连续的xfs_bmbt_rec_host
+   - 如果(off,len)是hole, 参数2个xfs_bmbt_irec是在2端的, 如果是delalloc, (off,len)应该在got范围内
+
+   - 如果convert !=0, 直接返回
+   - 如果delay==0, eof==0, (off,len)和got交叉, 直接返回
+
    - 使(orig_off,orig_end)对extsz对齐,变为(align_off, align_alen)
-   - xfs_bmbt_irec->br_startoff的NULLFILEOFF表示什么?? 最大偏移?
-   - 获取前一个xfs_bmbt_irec覆盖的范围, 当前分配的文件范围不能和他重叠
-   - 如果prev->br_startoff是NULLFILEOFF, 结束范围就是prevo = 0
-   - 如果不是, 但它是hole, prevo = br_startoff
-   - prev->br_startblock == HOLDSTARTBLOCK,  
-   - 否则 prevo = br_startoff + br_blockcount
+
+   - 检查前一个xfs_bmbt_irec, 如果br_startoff != NULLFILEOFF, 表示它是有效的
+   - 获取他的范围, 当前分配的文件范围不能和他重叠
+   - 如果prev->br_startoff == NULLFILEOFF, prevo = 0, 表示文件开头
+   - 如果是HOLESTARTBLOCK, prevo = br_startoff, 哪里构造hole的xfs_bmbt_irec?
+   - 否则, 它是有效的 prevo = br_startoff + br_blockcount
    - 如果align_off < prevo, 调整align_off = prevo
-   - 检查(align_off, align_alen)是否和后面的覆盖??
-   - 如果eof ==0, 而且got->br_startoff != NULLFILEOFF, 这个xfs_bmbt_irec是有效的范围
-   - 否则nexto是NULLFILEOFF/-1,也就是不用检查
-   - 如果它是delay?? delay !=0,而且br_startblock == HOLDSTARTBLOCK
-   - 或者是hole? delay ==0, 而且br_startblock == DELAYSTARTBLOCK
+
+   - 检查got对应的xfs_bmbt_irec, 如果eof==0 或者 br_startoff != NULLFILEOFF, 它才是有效的
+   - 如果delay !=0,而且br_startblock == HOLDSTARTBLOCK, 表示为hole
+   - 如果delay ==0,而且br_startblock == DELAYSTARTBLOCK, 表示delalloc
    - 表示当前的xfs_bmbt_irec可以覆盖它,设置nexto = br_startoff + br_blockcount
    - 否则不能覆盖, 设置nexto = br_startoff
-   - 如果eof ==0, 检查align_off + align_alen > nexto, 调整align_off = nexto - align_alen
+   - 如果align_off + align_alen > nexto, 调整align_off = nexto - align_alen, 向前移动范围
+
    - 最后把(align_off, align_alen)给参数(off, len)
 
 ** xfs_bmap_adjacent(xfs_bmalloca)
-   - 首先计算xfs_bmalloca->blkno, 表示分配block时开始的磁盘位置
+   - 首先计算xfs_bmalloca->blkno, 分配磁盘空间时建议的位置
+
    - 如果为eof分配空间, 而且前面的xfs_bmbt_irec有磁盘空间, xfs_bmalloca->prev 
-   - prev->br_startoff != NULLFILEOFF, 文件偏移有效
-   - 磁盘空间有效 
+   - prev->br_startoff != NULLFILEOFF, 文件偏移有效, br_startblock表示磁盘空间有效 
    > isnullstartblock(prev->br_startblock)
-   - 而且磁盘结束位置没有超过ag
+   - 而且它的磁盘结束位置没有超过AG
    - 设置blkno = prev->br_startblock + prev->br_blockcount
-   - 如果xfs_bmalloca->offset在上面计算的blkno后面,而且没有超过ag边界,也就是有效的
-   - 如果不是为eof分配空间, 检查2边的xfs_bmbt_irec, prev/gotp
-   - 如果prev的文件偏移和磁盘位置都有效
-   - prevbno = prev->br_startoff + prev->br_blockcount
-   - 如果prevbno有效, 没有跨ag边界
-   - 使用这个磁盘位置分配空间
-   - 如果xfs_bmalloca->offset有效,表示文件偏移? 检查它和prev文件偏移的距离
+   - 对应的文件位置的距离是adjuest xfs_bmalloca->offset - (br_startoff + br_blockcount)
+   - 如果adjuest>0, 最好预留出空间给以后的分配使用,当然需要blkno + adjuest有效
+
+   - 如果不是为eof分配空间, 检查2端的xfs_bmbt_irec, prev/gotp
+   - 如果prev的文件偏移和磁盘位置都有效, br_startoff != NULLFILEOFF, br_startblock不是delalloc
+   > isnullstartblock(br_startblock)
+   - 可以使用他的磁盘范围的结束位置 prevbno = prev->br_startoff + prev->br_blockcount
+   - (offset,len)表示这次操作的文件范围, 计算和prev的距离
    - adjuest = xfs_bmalloca->offset - prev->br_startoff - prev->br_blockcount
    - 如果偏移不算大 XFS_ALLOC_GAP_UNITS * xfs_bmalloca->length
-   - 而且prevbno + prevdiff也可以使用, 没有超过ag边界, 设置prevbno += adjuest
-   - 否则设置prevdiff += adjuest ?  这不是翻倍?? 计算文件偏移的距离???
-   - 检查后面的xfs_bmbt_irec, 如果startblock有效 
+   - 而且prevbno + prevdiff也可以使用, 没有超过AG边界, 设置prevbno += adjuest
+   - 否则设置prevdiff += adjuest, 翻倍文件偏移, 在后面会和后面的文件偏移比较
+
+   - 检查后面的xfs_bmbt_irec, 这里怎么保证它和(off,len)不重叠??
+   - 如果他的磁盘地址有效, 就因为它有磁盘位置,也能保证不会重叠
    > isnullstartblock(got->br_startblock)
-   - 文件偏移的距离是 
+   - 计算文件偏移的距离
    - got->br_startoff - xfs_bmalloca->offset
    - 如果距离不算太大 XFS_ALLOC_GAP_UNITS * xfs_bmalloca->length, 而且磁盘位置做偏移后也有效
-   - ISVALID(br_startblock - ajuest, startblock), 没有跨越ag边界
-   - 可以使用的分配地址是br_startblock - adjuest
-   - 如果距离太大, 但偏移之后还是有效的磁盘位置, 使用的提示地址是br_blockcount - xfs_bmalloca->length, 距离是adjuest - xfs_bmalloca->length
-   - 否则不能移动br_blockcount, 而且是距离翻倍???  gotdiff
+   - ISVALID(br_startblock - ajuest, startblock), 没有跨越AG边界
+   - 可以使用的分配地址是br_startblock - adjuest, 因为2者不想叫,所以adjuest > len
+   - 如果距离太大，或者偏移之后超过AG边界, 可以使用的提示地址是br_blockcount - xfs_bmalloca->length, 计算距离gotdiff += adjuest - len
+   - 不是严格的2倍, 反而很混乱
+   - 否则在br_blockcount前面找不到合适的空间, 距离翻倍, gotdiff += adjuest
+
    - 最后比较prevdiff和gotdiff, 使用比较小的对应的磁盘位置 
    > prevdiff > gotdiff ? prevbno : gotbno
 
+   - 反正比较混乱!!
+
 ** xfs_bmap_btalloc_nullfb(xfs_bmalloca, xfs_alloc_arg, xfs_extlen_t blen)
-   - 准备xfs_alloc_arg ??
-   - 如果xfs_bmalloca->userdata有效,而且是filestream?? 
+   - 在分配空间时,如果没有一个提示的起始地址, 需要查找一个合适的
+
+   - 如果xfs_bmalloca->userdata有效,而且是filestream, 分配方法是XFS_ALLOCTYPE_NEAR_BNO
    > xfs_inode_is_filestream(xfs_inode)
-   - 使用XFS_ALLOCTYPE_NEAR_BNO方式分配,否则使用XFS_ALLOCTYPE_START_BNO??
-   - xfs_bmalloca->fsbno是有效的??
+   - 否则使用XFS_ALLOCTYPE_START_BNO
+
+
+
+   - 遍历所有的AG, 直到找到一个xfs_perag, 它的最大空闲空间超过xfs_alloc_arg->maxlen
+   - 从xfs_bmalloca->fsbno里面的AG开始遍历, 如果无效从0开始
    > XFS_FSB_TO_AGNO(xfs_mount, xfs_alloc_arg->fsbno)
-   - 开始遍历ag?  遍历为了分配blen空间,而且准备足够的ag
    > xfs_perag_get(xfs_mount, ag) 
-   - 如果ag没有page free 信息?? 先读上来  
+   - 读取AG的pgf数据,获取磁盘空间信息
    > xfs_alloc_pagf_init(xfs_mount, xfs_alloc_arg->xfs_trans, ag, XFS_ALLOC_FLAG_TRYLOCK)
    - 检查xfs_perag中最长的连续空间
    > xfs_alloc_longest_free_extent(xfs_mount, xfs_perag) 
    - 使用blen统计最长的空间
-   - 如果是filestream?  准备新的ag??
-   > xfs_filestream_new_ag(xfs_alloc_arg, xfs_perag)
-   - 循环结束的条件是遍历所有的ag, 或者blen超过xfs_alloc_arg->maxlen??
-   - 如果没有找到合适的ag, blen < xfs_alloc_arg->minlen 
+
+   - 如果没有找到合适的AG, 而且blen < xfs_alloc_arg->minlen 
    - 设置xfs_alloc_arg->minlen = xfs_bmalloca->minlen??
-   - 如果找到的足够大的extent, 先使用找到的
-   - 设置xfs_alloc_arg->minlen = blen ?
-   - 否则设置xfs_alloc_arg->minlen = xfs_alloc_arg->maxlen
-   - 这里是为了准备xfs_alloc_arg->minlen?? 
+   - 如果blen < xfs_alloc_arg->maxlen, 说明没有足够大的AG
+   - 设置xfs_alloc_arg->minlen = blen, 但尽量分配足够长的空间
+   - 否则设置xfs_alloc_arg->minlen = xfs_alloc_arg->maxlen, 的确没有空间
+
+   - 在分配开始之前, 准备xfs_alloc_arg->minlen, 并找一个最有大小blen
 
 ** xfs_bmap_btalloc(xfs_bmalloca)
    - 分配xfs_bmalloc需要的空间
-   - 检查是否需要align ? 
-   - 使用align调整分配的范围??
+
+   - 首先对齐文件的范围, 只有为普通文件数据配分空间时才对齐
+   - xfs_bmalloca->userdata !=0
+   - 而且这个文件要求地址对齐
+   > xfs_get_extsz_hint(xfs_inode)
    > xfs_bmap_extsize_align(xfs_mount, xfs_bmalloca->got, prev, align, 0, xfs_bmalloca->eof, 0, conv, xfs_bmalloca->offset, xfs_bmalloca->length)
-   - 根据xfs_bmalloca->firstblock找到对应的ag, 它可能是NULLFSBLOCK
-   - 如果是NULLFSBLOCK, 使用inode的位置作为分配的提示位置
+
+   - 计算xfs_bmalloca->blkno, 表示分配空间的提示位置
+   - 使用xfs_bmalloca->firstblock, 如果它是NULLFSBLOCK, 使用xfs_dinode的位置
    > XFS_INO_TO_FSB(xfs_mount, xfs_inode->i_ino)
-   - 调整磁盘偏移?? xfs_bmalloca->blkno
-   - 准备xfs_alloc_arg
-   - 设置xfs_trans, xfs_mount
+   - 如果是filestream, 复杂一些
+   - 然后根据文件中的xfs_bmbt_irec, 精确磁盘位置
+   > xfs_bmap_adjacent(xfs_bmalloca)
+   - 但这里计算之后不一定使用, 因为可能使用不同于firstblock的AG
+
+   - 准备xfs_alloc_arg, 设置xfs_trans, xfs_mount
    - 提示磁盘位置fsbno = xfs_bmalloca->blkno
    - maxlen = MIN(xfs_bmalloca->length, XFS_ALLOC_AG_MAX_USABLE(xfs_mount))
    - firstblock = xfs_bmalloca->firstblock ??
-   - 如果firstblock是NULLFSBLOCK? 更新minlen?? 
+   - 如果firstblock是NULLFSBLOCK, 计算minlen, 统计blen
    > xfs_bmap_btalloc_nullfb(xfs_bmalloca, xfs_alloc_arg, blen)
-   - 否则如果xfs_bmalloca->xfs_bmap_free->xbf_low !=0 ??
+   - 否则 如果xfs_bmalloca->xfs_bmap_free->xbf_low !=0 ??
    - 设置xfs_alloc_arg->type 为XFS_ALLOCTYPE_START_BNO??
    - 设置xfs_alloc_arg->total/minlen = xfs_bmalloca->minlen??
    - 否则使用XFS_ALLOCTYPE_NEAR_BNO, total = xfs_bmalloca->total, minlen = xfs_bmalloca->minlen
-   - 处理align? xfs_alloc_arg->prod = align
-   - 如果xfs_bmalloca->offset % xfs_alloc_arg->prod !=0, 设置mod = prod/align - mod
-   - 否则sb_blocksize > PAGE_CACHE_SIZE, 设置prod = 1, mod = 0 ??
-   - 否则prod = PAGE_CACHE_SIZE >> sb_blocklog, mod = prod - offset % prod??
-   - 如果xfs_bmalloca->xfs_bmap_free->xbf_flow == 0, 而且xfs_bmalloca->aeof !=0, 什么意思?
-   - 如果xfs_bmalloca->offset !=0, 不是从文件开头分配??
-   - xfs_alloc_arg->alignment = xfs_mount->m_dalign?
-   - 设置xfs_alloc_arg->minlen = blen - xfs_alloc_arg->alignment ??
-   - 否则从文件开头分配?? 或者文件的第一次分配空间
+
+   - 处理align, xfs_alloc_arg->prod, mod
+   - 如果align > 0, 设置prod = align, mod = (prod - offset%prod) % prod
+   - 否则align = 0, 如果sb_blocksize > PAGE_CACHE_SIZE, 设置prod = 1, mod = 0
+   - 否则prod = PAGE_CACHE_SIZE >> sb_blocklog, mod = prod - offset % prod
+
+   - 如果xfs_bmalloca->xfs_bmap_free->xbf_flow == 0, 表示磁盘空间很多, 在分配失败时设置
+   - 而且文件初次分配空间或在文件结尾分配空间 xfs_bmalloca->aeof = 1, 需要做地址对齐
+   - 如果xfs_bmalloca->offset ==0, 从文件开头分配
+   - xfs_alloc_arg->alignment = stripe_align
+   - 设置xfs_alloc_arg->minlen = blen - xfs_alloc_arg->alignment, minalignslop = 0
+   - 否则从文件结尾分配
    - 设置xfs_alloc_arg->type = XFS_ALLOCTYPE_THIS_BNO, alignment = 1, tryagain = 1, 失败后会尝试别的??
+
    - 仔细设置xfs_alloc_arg, 开始分配空间 
    > xfs_alloc_vextent(xfs_alloc_arg)
    - 如果tryagain !=0, 而且没有分配成功, xfs_alloc_arg->fsbno == NULLFSBLOCK 
-   - 重新分配
+   - 重新分配, 更新type, fsbno, alignment, minlen
    > xfs_alloc_vextent(xfs_alloc_arg)
+
    - 如果还没有成功, 而且isalianged ==1, 去掉align条件,重新分配
    - 设置xfs_alloc_arg->alignment = 0
+   > xfs_alloc_vextent(xfs_alloc_arg)
+
    - 如果还没有成功, 而且xfs_alloc_arg->minlen > xfs_bmalloca->minlen
-   - 使用XFS_ALLOCTYPE_START_BNO方式 
-   - 如果还没有成功,而且是nullfb??
-   - 使用XFS_ALLOCTYPE_FIRST_AG,  total = xfs_bmalloca->minlen ??
-   - 如果分配成功, xfs_bmalloca->blkno = xfs_alloc_arg->fsbno
-   - 如果xfs_bmalloca->firstblock == NULLFSBLOCK, 设置他为fsbno
-   - xfs_bmalloca->length = xfs_alloc_arg->len
+   - 使用XFS_ALLOCTYPE_START_BNO方式, 更新xfs_alloc_arg->minlin
+   > xfs_alloc_vextent(xfs_alloc_arg)
+
+   - 如果还没有成功,而且是firstblock==NULLFSBLOCK
+   - 使用XFS_ALLOCTYPE_FIRST_AG,尝试其他的AG?
+   - 设置fsbno = 0, total = xfs_bmalloca->minlen, minleft = 0
+   > xfs_alloc_vextent(xfs_alloc_arg)
+   - 设置xfs_bmap_free->xbf_low = 1
+
+   - 如果分配成功, 设置xfs_bmalloca->blkno = xfs_alloc_arg->fsbno,length = xfs_alloc_arg->len
+   - 如果xfs_bmalloca->firstblock == NULLFSBLOCK, 设置fsbno = blkno, 以后分配使用
+   - 所以新的xfs_bmbt_irec的长度还得根据磁盘分配结果而定
+
    - 增加xfs_inode->xfs_icdinode->id_nblocks += xfs_alloc_arg->len 
-   - log inode, 因为修改了nblock??
+   - log xfs_icdinode
    > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+
+   - 如果xfs_bmalloca->wasdel !=0, 减小对应的delalloc空间  xfs_inode->i_delayed_blks -= len
 
 ** xfs_bmap_alloc(xfs_bmalloca)
    > xfs_bmap_btalloc(xfs_bmalloca)
 
 ** xfs_bmapi_trim_map(xfs_bmbt_irec val, xfs_bmbt_irec got, xfs_fileoff_t bno, xfs_filblks_t len, xfs_fileoff_t obno, xfs_fileoff_t end, n, flags)
-   - 参数都什么意义??
-   - 如果flags有XFS_BMAPI_ENTIRE, 或者got的文件偏移在bono之前
-   > br_startoff + br_blockcount  < obno
-   - 不用trim? 把got给val?? 如果got没有磁盘空间,设置val->br_startblock = DELAYSTARTBLOCK
+   - 在读取或创建新的xfs_bmbt_rec_host之后,放到xfs_bmbt_irec数组中
+   - val/n操作xfs_bmbt_irec数组, (obno,end)表示操作总的范围, got表示新获取的, (bno,len)表示当前要求获取的,它和got可能相同
+
+   - 如果flags有XFS_BMAPI_ENTIRE, 或者got的文件偏移在bono之前, 怎么可能在前面?
+   - 不用trim? 把got给val?? 
+   - 如果got->br_startblock不是有效的,设置val->br_startblock = DELAYSTARTBLOCK
+
    - 设置val->br_startoff = obno
    - 如果got->br_startblock不是有效的, 设置br_blockcount = DELAYSTARTBLOCK
-   - 否则需要对磁盘位置做偏移? 
+   - 否则需要对磁盘位置做偏移, (bno, length)可能在got内部 
    - val->br_startblock = got->br_startblock + bno - got->br_startoff
-   - 长度需要考虑(bno, end), got的长度 
+   - 设置val->br_startblock, 不超过(obno,end), 也不能超过got->br_blockcount - (bno - got->br_startoff)
    - XFS_FILBLKS_MIN(en - bno, got->br_blockcount - (bno - got->br_startoff))
    - state使用got->br_state
 
+   - 太混乱!!
+
 ** xfs_bmapi_update_map(xfs_bmbt_irec map, xfs_fileoff_t bno, xfs_filblks_t len, xfs_fileoff_t bono, xfs_fileoff_t end, n, flags)
-   - 首先检查参数
-   - val范围必须在end之前?? val不能超过(obno, len)
-   - 计算val后面的范围?? 
-   - (bno, len) = (br_startoff+br_blockcount, end - bno)
+   - 上面填充了xfs_bmbt_irec, 检查它是否可以和前面的xfs_bmbt_irec合并,如果不能,向前移动n指针
+
+   - 刚刚处理或当前的xfs_bmbt_irec不能超过(obno, len)
+   - 更新(bno, len) = (br_startoff+br_blockcount, end - bno), 指向后面的空间
    - 如果n>0, val->br_startoff == val[-1]->br_startoff ? 和前面的范围重叠??
    - 如果n>0, val->br_blockcount != DELAYSTARTBLOCK, 而且前一个xfs_bmbt_irec的磁盘空间有效
    - val[-1]->br_startblock 不是DELAYSTARTBLOCK, HOLDSTARTBLOCK
    - 而且他的磁盘位置和val临接, flags有XFS_BMAPI_IGSTATE, 文件偏移肯定也临接
-   - 更新val[-1]->br_blockcount += val->br_blockcount
+   - 更新val[-1]->br_blockcount += val->br_blockcount, 合并2个xfs_bmbt_irec
    - 如果n>0, 而且val和前面的xfs_bmbt_irec都是DELAYSTARTBLOCK, 而且文件偏移挨着, 合并2个xfs_bmbt_irec
    - 更新val[-1]->br_blockcount, br_state
-   - 最后n!=0或者val的文件偏移没超过obno?? 向前移动val, n 
+   - 如果n==0, 而且xfs_bmbt_irec->br_startoff + br_blockcount < obno, 它不是操作想要的, 没有操作
+   - 其他情况, 向前移动xfs_bmbt_irec/n指针
 
 ** xfs_bmapi_read(xfs_inode, xfs_fileoff_t bno, xfs_filblks_t len, xfs_bmbt_irec val, nmap, flags)
    - 处理xfs_bmbt_irec数组?? 数组长度是nmap
