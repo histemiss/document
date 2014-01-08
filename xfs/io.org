@@ -1938,109 +1938,150 @@
    - 其他情况, 向前移动xfs_bmbt_irec/n指针
 
 ** xfs_bmapi_read(xfs_inode, xfs_fileoff_t bno, xfs_filblks_t len, xfs_bmbt_irec val, nmap, flags)
-   - 处理xfs_bmbt_irec数组?? 数组长度是nmap
-   - 根据flags计算xfs_ifork
-   - flags有XFS_BMAPI_ATTRFORK就是XFS_ATTR_FORK, 否则就是XFS_DATA_FORK 
+   - 获取(bno,len)范围内的xfs_bmbt_rec_host
+   - flags只能包含XFS_BMAPI_ATTRFORK, XFS_BMAPI_ENTIRE, XFS_BMAPI_IGSTATE
+   - 不能包含XFS_BMAPI_METADATA, 也就是只能获取文件数据的xfs_bmbt_irec
+
+   - 根据flags获取xfs_ifork, flags有XFS_BMAPI_ATTRFORK就是XFS_ATTR_FORK, 否则就是XFS_DATA_FORK 
    > XFS_IFORK_PTR(xfs_inode, whichfork)
    - 如果xfs_ifork->if_flags没有XFS_IFEXTENTS,先读取xfs_bmbt_rec数据 
    > xfs_iread_extents(NULL, xfs_inode, whichfork)
    - 根据bno查找xfs_bmbt_irec 
    > xfs_bmap_search_extents(xfs_inode, bno, whichfork, eof, lastx, xfs_bmbt_irec, prev) 
-   - 然后查找(bno, len)范围内的xfs_bmbt_irec, 放到参数(val, nmap)中??
-   - trim?? 可能会合并??
+   - 然后遍历(bno, len)范围内的xfs_bmbt_irec, 放到参数val指向的xfs_bmbt_irec数组中
+
+   - 如果查找返回eof==1, 或者(bno,len)超过最后一个xfs_bmbt_rec_host的范围
+   - 直接构造hole的xfs_bmbt_irec, 放到mval数组中
+   - br_startblock = HOLESTARTBLOCK, br_startoff=bno或者最后一个xfs_bmbt_rec_host的结束位置
+   - br_blockcount = end - br_startoff, br_state = XFS_EXT_NORM
+   - 如果got->br_startoff > bno, 表示bno处在hole中, 同样构造一个xfs_bmbt_irec,放到mval数组中
+   - br_startoff = bno, br_startblock = HOLESTARTBLOCK 
+   - br_blockcount = min(got->br_startoff - bno, len)
+
+   - 否则bno在got的覆盖中, 应该不会bno在got后面, 把got放到mval中
+   - 把无效的br_startblock转化为DELAYSTARTBLOCK
    > xfs_bmapi_trim_map(val, xfs_bmbt_irec got, bno, len, obno, end, nflags)
-   - 更新什么??  bno会向后移动??
+   - 向前移动(bno,len), 尝试合并val中的xfs_bmbt_irec, 如果不能向前移动mval指针
    > xfs_bmapi_update_map(val, bno, len, obno, end, n, flags)
-   - 如果xfs_bmbt_irec->br_startoff > bno, 中间有hole, 同样也创建一个xfs_ifork中没有的 
-   - (bno, HOLESTARTBLOCK, br_startoff-bno, XFS_EXT_NORM)
-   - 对于hole, state竟然是XFS_EXT_NORM
-   - 然后向前移动xfs_bmbt_irec 
+   - 然后获取下一个xfs_bmbt_rec_host, 继续循环
    > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, lastx), xfs_bmbt_irec)
+   - 如果找不到, 就设置eof = 1, 构造一个hole
+
+   - 从xfs_ifork中取出来的xfs_bmbt_irec给IO使用时, 如果是delalloc的, br_startblock转化为DELAYSTARTBLOCK
+   - 而hole的xfs_bmbt_irec不会在xfs_iforl中, 在获取的时候构造出来,给IO使用
 
 ** xfs_bmap_reserve_delalloc(xfs_inode, xfs_fileoff_t aoff, xfs_filblks_t len, xfs_bmbt_irec got, xfs_bmbt_irec prev, xfs_extnum_t lastx, eof)
    - delay allocation时的预留空间??
-   - 先计算alen?  XFS_FILBLKS_MIN(len, MAXEXTLEN, got->br_startoff - aoff)
-   - 计算extent长度的默认值?? 
+   - 构造一个delalloc的xfs_bmbt_irec, 范围是(aoff, len)
+   - 如果eof ==0, 他不能和后一个重叠, 检查alen
+   - XFS_FILBLKS_MIN(len, MAXEXTLEN, got->br_startoff - aoff)
+   - 处理文件位置对齐
    > xfs_get_extsz_hint(xfs_inode)
-   - 使用他调整分配长度?? 
+   - 这里会修改alen, 为保证他修改之后不超过MAXEXTLEN, 首先设置的短一些 
+   - XFS_FILBLKS_MIN(len, MAXEXTLEN - 2*extsz +1)
+   - 这里的参数delay =1, 而且prev,got已经处理过br_startblock, 不能和后面delalloc的重叠,但可以和hole的重叠
    > xfs_bmap_extsize_align(xfs_mount, got, prev, extsz, rt, eof, 1, 0, aoff, alen) 
-   - 计算indlen?? 
+   - 计算可能使用的btree的空间indlen
    > xfs_bmap_worst_indlen(xfs_inode, alen)
-   - 修改计数XFS_SBS_FDBLOCKS?? 这时预留空间?? 
+
+   - 为数据reserve磁盘空间
    > xfs_icsb_modify_counters(xfs_mount, XFS_SBS_FDBLOCKS, -alen, 0)
-   - 还有indlen? 
+   - 为btree修改reserve磁盘空间
    > xfs_icsb_modify_counters(xfs_mount, XFS_SBS_FDBLOCKS, -indlen, 0)
-   - 增加xfs_inode->i_delayed_blks += alen
-   - 设置got的信息?? 
+   - 增加xfs_inode->i_delayed_blks += alen, delalloc使用的空间增多
+
+   - 把新的xfs_bmbt_irec的信息给got
    - (aoff, nullstartblock(indlen), alen, XFS_EXT_NORM) 
-   - 然后插入xfs_bmbt_rec_host ? 
+   - 插入到xfs_ifork中
    > xfs_bmap_add_extent_hole_delay(xfs_inode, lastx, got)
-   - 检查插入结果?? 
+   - 重新从xfs_ifork中获取,检查它的参数
    > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, lastx), got)
    
 ** xfs_bmapi_delay(xfs_inode, xfs_fileoff_t bno, xfs_filblks_t len, xfs_bmbt_irec val, nmap, flags)
-   - 首先检查xfs_bmbt_rec是否已经缓存到xfs_ifork中, xfs_ifork->if_flags没有XFS_IFEXTENTS
+   - 获取(bno,len)范围内的xfs_bmbt_irec数组
+   - flags不可能有XFS_BMAPI_ENTIRE之外的标志, 当然也可以没有XFS_BMAPI_ENTIRE, 只能操作普通文件数据
+
+   - 如果xfs_ifork->if_flags没有XFS_IFEXTENTS, 把xfs_bmbt_rec缓存到xfs_ifork中
    > xfs_iread_extents(NULL, xfs_inode, XFS_DATA_FORK)
    - 根据bno查找xfs_bmbt_rec_host 
    > xfs_bmap_search_extents(xfs_inode, bno, XFS_DATA_FORK, eof, lastx, xfs_bmbt_irec got, prev)
-   - 遍历xfs_bmbt_rec_host, 查找覆盖(bno, len)的
-   - 如果xfs_bmbt_irec->br_startoff > bno, 有一个hole的extent 
+   - 遍历(bno,len)范围内的xfs_bmbt_rec_host
+
+   - 如果eof ==1或者xfs_bmbt_irec->br_startoff > bno, 没有对应的xfs_bmbt_rec_host, 也就是有一个hole
+   - 构造一个delalloc的xfs_bmbt_irec
    > xfs_bmapi_reserve_delalloc(xfs_inode, bno, len, xfs_bmbt_irec got, prev, lastx, eof)
-   - 把它放到参数中 
+   - 把它放到返回参数中
    > xfs_bmapi_trim_map(xfs_bmbt_irec, got, bno, len, obno, end, n, flags)
+   - 向前移动(bno,len), 以及xfs_bmbt_irec指针
    > xfs_bmapi_update_map(xfs_bmbt_irec val, bno, len, obno, end, n, flags)
-   - 获取下一个xfs_bmbt_rec_host 
+   - 获取下一个xfs_bmbt_rec_host
    > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, lastx), got)
 
+   - 获取xfs_ifork中的xfs_bmbt_irec, 对于hole的范围,构造delalloc的xfs_bmbt_irec, 插入到xfs_ifork中, 而且reserve磁盘空间
    
 ** __xfs_bmapi_allocate(xfs_bmalloca)
-   - 根据xfs_bmalloca->flags判断分配data fork, 还是attr fork
-   - 获取xfs_ifork
-   - 如果xfs_bmalloca->wasdel !=0, 按照xfs_bmalloca->got分配空间
+   - 为xfs_bmalloca分配磁盘空间
+
+   - 根据xfs_bmalloca->flags查找xfs_ifork, 根据XFS_BMAPI_ATTRFORK标志
+   - 如果xfs_bmalloca->wasdel !=0, 按照xfs_bmalloca->got分配空间, 表示为delalloc的xfs_bmbt_irec分配磁盘空间
    - (length, offset) = (got->br_blockcount, br_startoff)
    - 如果xfs_bmalloca->idx >0, 获取前一个xfs_bmbt_irec 
    > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, idx-1), xfs_bmalloca->prev)
-   - 如果不是delay allocation?? 需要计算分配长度
-   - XFS_FILBLKS_MIN(xfs_bmalloca->length, MAXEXTLEN)
-   - xfs_bmalloca->eof ==0, length不能超过got->br_startoff - offset
-   - 不能和got指向的xfs_bmbt_irec重叠??
+   - 否则为hole的xfs_bmbt_irec分配空间, 还不存在xfs_bmbt_rec_host
+   - 限制xfs_bmalloca->length 
+   > XFS_FILBLKS_MIN(xfs_bmalloca->length, MAXEXTLEN)
+   - 如果eof ==0, 不能和got重叠
+   > XFS_FILBLKS_MIN(xfs_bmalloca->length, got->br_startoff - offset)
    - 如果bmalloca->flags没有XFS_BMAPI_METADATA, 设置xfs_bmalloca->userdata
    - 如果offset ==0, 设置为XFS_ALLOC_INITIAL_USER_DATA,否则是XFS_ALLOC_USERDATA
-   - 如果xfs_bmalloca->flags有XFS_BMAPI_CONTIG, 设置minlen = length, 否则为1. 这里分配的单位是fsb??
-   - 检查是否需要对齐分配  xfs_mount->m_dalign > 0
-   - 如果是分配userdata xfs_bmalloca->flags没有XFS_BMAPI_METADATA, 而且whichfork是XFS_DATA_FORK
+   - 如果xfs_bmalloca->flags有XFS_BMAPI_CONTIG, 设置minlen = length, 否则为1, 表示xfs_bmbt_irec可以分裂成多个,使用分散的磁盘空间
+
+   - 如果XFS支持对齐xfs_mount->m_dalign > 0, 而且为普通文件数据分配磁盘空间
+   - xfs_bmalloca->flags没有XFS_BMAPI_METADATA, 而且whichfork是XFS_DATA_FORK
    - 而且xfs_bmalloca->length > xfs_mount->m_dalign 
+   - 计算xfs_bmalloca->aeof, 在分配时会加一些要求
    > xfs_bmap_isaeof(xfs_bmalloca, whichfork)
-   - 分配空间  
+   - 为xfs_bmalloca分配磁盘空间  
    > xfs_bmap_alloc(xfs_bmalloca)
-   - 设置xfs_btree_cur->bc_private->b_firstblock = xfs_bmalloca->firstblock?? 为什么??
-   - 如果没有分配空间, xfs_bmalloca->blkno == NULLFSBLOCK, 直接返回?
-   - 如果xfs_ifork->if_flags有XFS_IFBROOT? 而且xfs_bmalloca->cur ==NULL?? 需要补充btree操作??
-   - 准备xfs_btree_cur? 
+
+   - 如果xfs_bmalloca->xfs_bmap_free->xbf_low !=0, 表示磁盘空闲空间太少, 设置xfs_bmalloca->minleft = 0
+   - 如果xfs_bmalloca->xfs_btree_cur有效, 设置xfs_btree_cur->bc_private->b->firstblock = xfs_bmalloca->firstblock
+   - 如果没有分配空间, xfs_bmalloca->blkno == NULLFSBLOCK, 直接返回
+   - 如果xfs_ifork->if_flags有XFS_IFBROOT,什么时候改成btree? 准备xfs_bmalloca->cur
    > xfs_bmbt_init_cursor(xfs_mount, xfs_bmalloca->xfs_trans, xfs_inode, whichfork)
    - 设置xfs_btree_cur->bc_private->b_firstblock = xfs_bmalloca->firstblock, xfs_bmap_free
-   - 增加xfs_bmalloca->nallocs ??
-   - 把分配的空间给xfs_bmalloca->got
+   - 增加xfs_bmalloca->nallocs
+   - 根据分配的结果设置xfs_bmalloca->got
    - (offset, length, blkno, XFS_EXT_NORM) -> (br_startoff, br_blockcount, br_startblock, br_state)
    - 如果xfs_bmalloca->wasdel ==0, 而且xfs_bmalloca->flags有XFS_BMAPI_PREALLOC, 这是pre-allocation
    - 设置got->br_state = XFS_EXT_UNWRITTEN
-   - 把新的xfs_bmbt_irec写回xfs_ifork/btree 
-   - 如果xfs_bmalloca->wasdel !=0 
+   - 把新的xfs_bmbt_irec写回xfs_ifork/btree
+   - 如果xfs_bmalloca->wasdel !=0, 处理delalloc的xfs_bmbt_irec
+   - 在xfs_ifork中已经存在xfs_bmbt_rec_host范围包含got, 需要分裂或合并删除
+   - 在btree中还没有对应的xfs_bmbt_rec, 需要合并或插入新的
    > xfs_bmap_add_extent_delay_real(xfs_bmalloca)
-   - 否则写回hole?? 
+   - 否则got是hole的xfs_bmbt_irec, xfs_ifork/btree中都没有对应的
    > xfs_bmap_add_extent_hole_real(xfs_bmalloca, whichfork)
+   - 计算上面返回的logflags, 给xfs_bmalloca->logflags
    - 重新获取对应的xfs_bmbt_irec 
    > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, idx), xfs_bmalloca->got)
 
 ** xfs_bmapi_convert_unwritten(xfs_bmalloca, xfs_bmbt_irec, xfs_filblks_t, flags)
-   - 如果xfs_bmbt_irec是XFS_EXT_UNWRITTEN, 而且flags有XFS_BMAPI_PREALLOC?? 直接返回  unwritten -> real??
-   - 如果是XFS_EXT_NORM, 而且flags不是XFS_BMAPI_PREALLOC|XFS_BMAPI_CONVERT?? 直接返回 real->unwritten ??
-   - 如果xfs_ifork->if_flags是XFS_IFBROOT, 表示磁盘中使用btree存储数据?? 准备xfs_btree_cur  
+   - 根据flags转化xfs_bmbt_irec->br_state
+   - 如果br_state ==XFS_EXT_UNWRITTEN, 表示磁盘空间没有数据unwritten, 否则表示正常的real
+   - br_state是XFS_EXT_UNWRITTEN, 而且flags没有XFS_BMAPI_PREALLOC, 表示unwritten转化为real的
+   - br_state是XFS_EXT_NORM, 而且flags同时包含XFS_BMAPI_PREALLOC|XFS_BMAPI_CONVERT,表示real转化为unwritten
+
+   - 如果xfs_ifork->if_flags是XFS_IFBROOT, 表示磁盘中使用btree存储数据, 准备xfs_btree_cur
    > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, whichfork)
-   - 设置xfs_btree_cur->bc_private->b->xfs_bmap_free = xfs_bmalloca->firstblock, xfs_bmap_free? 哪里使用??
-   - 重新计算xfs_bmbt_irec
-   - 如果原来是XFS_EXT_UNWRITTEN, 变为XFS_EXT_NORM, 否则变为XFS_EXT_UNWRITTEN??
-   - 处理xfs_ifork/btree?
+   - 设置xfs_btree_cur->bc_private->b->xfs_bmap_free = xfs_bmalloca->firstblock, xfs_bmap_free, 在分配磁盘空间中使用
+
+   - 修改xfs_bmbt_irec->br_state, 反转状态
+   - 如果原来是XFS_EXT_UNWRITTEN, 变为XFS_EXT_NORM, 否则变为XFS_EXT_UNWRITTEN
+
+   - 更新xfs_ifork和btree
+   - 已经存在对应的xfs_bmbt_rec_host/xfs_bmbt_rec, 包含参数xfs_bmbt_rec_host
+   - 更新它们的br_state, 可能会分裂和合并删除原来的xfs_bmbt_rec
    > xfs_bmap_add_extent_unwritten_real(xfs_trans, xfs_inode, idx, xfs_btree_cur, xfs_bmbt_irec, firstblock, xfs_bmap_free, logflags)
    - 需要把上面计算的logflags收集到xfs_bmalloca->logflags 
 
@@ -2048,81 +2089,100 @@
    - 把xfs_bmbt_irec写回磁盘? 作相应的转化?
    - 首先检查参数, xfs_inode的di_format必须是XFS_DINODE_FMT_EXTENTS/BTREE
    - flags不能有XFS_BMAPI_IGSTATE?
-   - 获取whichfork对应的xfs_ifork
-   - 如果firstblock == NULLFSBLOCK? 计算xfs_bmalloc->minleft
-   - 否则会使用firstblock分配, 设置xfs_bmalloca->minleft = 0
-   - 在分配空间时,不要紧挨着xfs_inode分配?
-   - 如果xfs_ifork使用XFS_DINODE_FMT_BTREE存储数据, 设置xfs_bmalloca->minleft = xfs_btree_block->bb_level +1?
-   - 否则设置为1
+
+   - 根据flags对应的xfs_ifork
+   - 如果firstblock == NULLFSBLOCK, 计算xfs_bmalloc->minleft, 在磁盘分配时,需要保证的空闲空间
+   - 如果使用btree, 设置xfs_bmalloca->minleft = xfs_btree_block->bb_level + 1
+   - 否则设置minleft = 1
    - 如果xfs_ifork还没有缓存xfs_bmbt_rec, 读取数据, xfs_ifork->if_flags没有XFS_IFEXTENTS
    > xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
    - 查找bno对应的xfs_bmbt_irec 
    > xfs_bmap_search_extents(xfs_inode, bno, whichfork, eof, xfs_bmalloca->idx, xfs_bmalloca->got, xfs_bmalloca->prev)
+
    - 准备xfs_bmalloca, 使用参数的(xfs_bmap_free, firstblock)
+   - userdata = 0, 在后面会根据flags处理它, total使用参数total, 表示需要的磁盘空间
    - 如果flags有XFS_BMAPI_STACK_SWITCH, 设置xfs_bmalloca->stack_switch = 1, 在后面会使用workqueue分配磁盘
    - 遍历(bno, len)的范围, 处理它所覆盖的xfs_bmbt_rec_host
-   - 如果eof!=0, 或者got->br_startoff > bno, 表示没有xfs_bmbt_rec包含bno
+
+   - 如果eof!=0, 或者got->br_startoff > bno, 表示bno在hole的xfs_bmbt_rec_host中
    - 如果不是hole, 但got->br_startblock无效, 这是delalloc
    > isnullstartblock(got->br_startblock)
    - 如果是hole或者delalloc, 需要分配空间
    - 设置xfs_bmalloca的eof/conv/wasdel/offset/flags/length 
+   - 如果flags有XFS_BMAPI_CONVERT, 设置conv = 1
    > xfs_bmapi_allocate(xfs_bmalloca)
    - 创建的xfs_bmbt_irec在xfs_bmalloca->got中,已经添加到xfs_ifork/btree中
-   - 参数太混乱???
+
+   - 把新的或找到的xfs_bmbt_rec_host放到返回参数xfs_bmbt_irec数组中
    > xfs_bmapi_trim_map(val, got, bno, len, obno, end, n, flags)
-   - 修改xfs_bmbt_irec->br_state, 应该把XFS_EXT_UNWRITTEN改为XFS_EXT_NORM, 并同步给xfs_ifork/btree
+   - 根据flags修改xfs_bmbt_irec->br_state
+   - 对于新的xfs_bmbt_irec, 已经根据flags设置,如果是已经存在的xfs_bmbt_rec_host, 需要根据flags转换
    > xfs_bmapi_convert_unwritten(xfs_bmalloca, val, len, flags)
-   - 根据结果更新xfs_bmbt_irec数组, 而且前向移动bno,len
+   - 前向移动(bno,len), 和xfs_bmbt_irec指针
    > xfs_bmapi_update_map(val, bno, len, obno, end, n, flags)
+
    - 处理下一个xfs_bmbt_rec_host 
    > xfs_bmbt_get_all(xfs_iext_get_ext(xfs_ifork, idx), xfs_bmalloca->got)
+
    - 检查di_format/di_aformat是否需要改变
    > xfs_bmap_wants_extents(xfs_inode, whichfork)
    > xfs_bmap_btree_to_extents(xfs_trans, xfs_inode, xfs_btree_cur, tmp_logflags, whichfork)
-   - 把上面的操作记录到log中
-   - 检查xfs_bmalloca->logflags, 决定需要log哪些数据,XFS_ILOG_DEXT/XFS_ILOG_AEXT
+   - 把上面的操作记录到xfs_bmalloca->logflags
+
+   - 检查xfs_bmalloca->logflags, 决定需要log哪些数据,XFS_ILOG_CORE/XFS_ILOG_DEXT/XFS_ILOG_AEXT
    > xfs_ilog_fext(whichfork)
    - 如果format不是XFS_DINODE_FMT_EXTENTS, 不需要log data fork中的数据
    - 检查log_flags的XFS_ILOG_DBROOT/XFS_ILOG_ABROOT, format不是XFS_DINODE_FMT_BTREE, 也不需要log data fork中的根节点数据
    > xfs_trans_log_inode(xfs_trans, xfs_inode, xfs_bmalloca->logflags)
-   - 更新firstblock, 设置为xfs_bmalloca->xfs_btree_cur->bc_private->b->firstblock
+
+   - 更新参数firstblock, 设置为xfs_bmalloca->xfs_btree_cur->bc_private->b->firstblock
 
 ** xfs_bmap_del_extent(xfs_inode, xfs_trans, xfs_extnum_t idx, xfs_bmap_free, xfs_btree_cur, xfs_bmbt_irec del, logflags, whichfork)
-   - 更新或删除xfs_bmbt_irec?
-   - 首先获取idx对应的xfs_bmbt_irec 
+   - 在xfs_ifork/btree中删除xfs_bmbt_irec的磁盘映射信息, 并且更新xfs_icdinode/xfs_ifork的相关属性
+   - 首先获取idx对应的xfs_bmbt_irec got
    > xfs_iext_get_ext(xfs_ifork, idx)
    > xfs_bmbt_get_all(xfs_bmbt_rec_host, got)
-   - got必须覆盖del对应的xfs_bmbt_irec?
-   - 如果got是delay allocation, 它的磁盘空间无效 
+   - got必须覆盖del对应的xfs_bmbt_irec
+   - 如果got是delalloc, del必须也是delalloc
    > isnullstartblock(got->br_startblock)
-   - del也必须是delay allocation
-   - 如果delay ==0, got不是delay allocation
-   - 删除一个磁盘的xfs_bmbt_rec, 需要释放磁盘空间 
-   - 查找对应的xfs_bmbt_rec 
+
+   - 如果delay ==0, 要删除的不是delalloc, 需要释放它管理的磁盘空间
+   - 设置logflags = XFS_ILOG_CORE, 需要修改xfs_icdinode->di_nblocks, 它所使用的磁盘总量
+   - 设置do_fx = 1, 后面使用xfs_bmap_free释放xfs_bmbt_irec映射的磁盘空间
+   - 准备xfs_btree_cur, 指向对应的xfs_bmbt_rec 
    > xfs_bmbmt_lookup_eq(xfs_btree_cur, got->br_startoff, got->br_startblock, got->br_blockcount, i)
-   - 如果delay !=0, 不需要删除磁盘空间
+   - 如果delay !=0, 要删除的是delalloc的xfs_bmbt_irec 
+   - 它没有磁盘空间, 不需要操作btree, do_fx = 0
+   - 但要处理delalloc的空间数量, 使用da_old记录got的delalloc长度
+   > startblockval(got->br_startblock)
+
    - 根据del和got的范围操作xfs_bmbt_rec
-   - 如果完全重叠, 直接删除xfs_bmbt_rec_host 
+   - 如果完全重叠, 直接删除xfs_bmbt_rec_host/xfs_bmbt_rec
    > xfs_iext_remove(xfs_inode, idx, 1, BMAP_ATTRFORK / 0)
-   - 如果delay ==0, 还要删除磁盘的xfs_bmbt_rec 
+   - 如果delay ==0, 还要删除磁盘的xfs_bmbt_rec
    > xfs_btree_delete(xfs_btree_cur, i)
-   - 修改xfs_inode->xfs_icdinode->di_nextents 
+   - 减小xfs_inode->xfs_icdinode->di_nextents 
    > XFS_IFORK_NEXT_SET(xfs_inode, whichfork, XFS_IFORK_NEXTENTS(xfs_inode, whichfork) - 1)
-   - 设置flags的XFS_ILOG_CORE,如果这里没有xfs_btree_cur? 不需要操作btree, 但需要操作xfs_dinode? 设置对应的标志 
+   - 设置logflags的XFS_ILOG_CORE
+   - 如果这里xfs_btree_cur无效, 需要更新fork数据, 设置对应的标志
    > xfs_ilog_fext(whichfork)
-   - 如果是start一样,但end不一样, 只需要修改xfs_bmbt_rec_host?
+   - 否则需要操作btree, 删除xfs_bmbt_rec 
+   > xfs_btree_delete(xfs_btree_cur, i)
+
+   - 如果是start一样,但end不一样,只需要修改xfs_bmbt_rec_host, 减小它的范围
    > xfs_bmbt_set_startoff(xfs_bmbt_rec_host, del->br_startoff + del->br_blockcount)
    > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, got->br_blockcount - del->br_blockcount)
-   - 如果delay !=0, 还需要修改startblock 
+   - 如果delay !=0, 还需要修改startblock, 表示delalloc的空间
    > xfs_bmap_worst_indlen(xfs_inode, tmp)
    > xfs_bmbt_set_startblock(xfs_bmbmt_rec_host, nullstartblock(tmp))
-   - 如果delay ==0, 需要修改磁盘位置 
+   - 如果delay ==0, 需要对磁盘开始位置做偏移, 这里是有效的磁盘位置
    > xfs_bmbt_set_startblock(xfs_bmbt_rec_host, del->br_startblock + del->br_blockcount)
-   - 而且修改对应的btree节点 
    - 如果xfs_btree_cur == NULL, 只需要再后面log对应的xfs_dinode 
    > xfs_ilog_fext(whichfork)
-   - 否则直接修改btree 
+   - 否则直接修改btree的xfs_bmbt_rec
    > xfs_bmbt_update(xfs_btree_cur, del->br_startoff + br_blockcount, del->br_blockcount + br_blockcount, got->br_blockcount - del->br_blockcount, got->br_state)
+   - 这里没有修改xfs_icdinode->di_nextents, 所以不需要XFS_ILOG_CORE
+
    - 如果是end一样,start不一样, 做类似的修改
    - 对于xfs_bmbt_rec_host, 修改br_blockcount 
    > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, got->br_blockcount - del->br_blockcount)
@@ -2131,58 +2191,71 @@
    > xfs_bmbt_set_startblock(xfs_bmbt_rec_host, nullstartblock(tmp))
    - 否则还需要修改btree 
    > xfs_bmbt_update(xfs_btree_cur, got->br_startoff, got->br_startblock, got->br_blockcount - del->br_blockcount, got->br_state)
+
    - 如果start和end都不一样,需要把got分成3段, 创建新的xfs_bmbt_rec_host
    - 首先更新第一段 
    > xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, del->br_startoff - got->br_startoff)
    - 如果delay ==0, 需要修改btree的xfs_bmbt_rec 
-   - 先修改第一部分的blockcount
    > xfs_bmbmt_update(xfs_btree_cur, got->br_startoff, ...)
    - 然后插入第三部分
    > xfs_btree_increment(xfs_btree_cur, i)
    - xfs_btree_cur->bc_rec->xfs_bmbt_irec = new
    > xfs_btree_insert(xfs_btree_cur, i)
-   - 增加xfs_icdinode->di_nextents
+   - 增加xfs_icdinode->di_nextents++
    - 如果delay !=0, 不需要btree操作,只需要计算2部分的startblock 
-   - 他们不是真正的磁盘空间,而是一些分配磁盘的辅助信息 
    - 第一部分
    > xfs_bmap_worst_indlen(xfs_inode, temp)
    > xfs_bmbt_set_startblock(xfs_bmbt_rec_host, nullstartblock(temp))
    - 第三部分做同样的处理
    - 把第三部分的xfs_bmbt_irec放到xfs_ifork中
    > xfs_iext_insert(xfs_inode, idx+1, 1, xfs_bmbmt_irec, state)
+
+   - 如果do_fx ==1, 释放磁盘空间
+   > xfs_bmap_add_free(xfs_bmbt_irec->br_startblock, br_blockcount, xfs_bmap_free, xfs_mount)
    - 修改xfs_inode->xfs_icdinode->di_nblocks -= nblks
-   - 这里还要释放相关的磁盘空间 
-   > xfs_bmap_add_free(del->br_startblock, del->br_blockcount, xfs_bmap_free, xfs_mount)
+   - 如果是delalloc, 释放reserve的磁盘空间
+   - xfs_icsb_modify_counters(xfs_mount, XFS_SBS_FDBLOCKS, da_old - da_new, 0)
+   - 最后返回logflags
 
 ** xfs_bunmap(xfs_trans, xfs_inode, xfs_fileoff_t bno, xfs_filblks_t len, flags, xfs_extnum_t nexts, xfs_fsblock_t firstblock, xfs_bmap_free flist, done)
-   - 获取对应的xfs_ifork, 准备xfs_bmbt_rec_host信息 
+   - 删除(bno, len)范围内的磁盘空间
+   - 根据flags获取对应的xfs_ifork
+   > XFS_IFORK_PTR(xfs_inode, whichfork)
+   - 准备xfs_bmbt_rec_host信息 
    > xfs_iread_extents(xfs_trans, xfs_inode, whichfork)
-   - 如果没有xfs_bmbt_rec信息,直接返回??
+   - 如果xfs_inode没有xfs_bmbt_rec信息,也就没有磁盘空间
+   - xfs_ifork->if_bytes是0
+
    - 处理(bno, len)范围内的xfs_bmbt_rec_host
    - 如果参数nexts有效,处理的个数收到限制
    - 设置bno为范围终点 bno+len
    - 查找最后一个xfs_bmbt_irec
    > xfs_bmap_search_extents(xfs_inode, bno, whichfork, eof, lastx, got, prev)
-   - 如果eof !=0, 根据xfs_bmbt_irec更新bno
-   - 如果xfs_ifork->if_flags有XFS_IFBROOT, 说明磁盘使用btree储存fork信息, 准备xfs_btree_cur
-   - 开始循环处理所有的xfs_bmbt_irec 
+   - 如果eof !=0, 找到最后一个xfs_bmbt_rec_host, 从它向前遍历
+   - 如果xfs_ifork->if_flags有XFS_IFBROOT, 说明磁盘使用btree储存xfs_bmbt_rec, 准备xfs_btree_cur
+
+   - 开始循环处理所有的xfs_bmbt_irec
+   - 如果当前xfs_bmbt_irec->br_startoff在bno后面, 处理下一个 --lastx
+   - bno表示范围的终点, start是起点
    > xfs_iext_get_ext(xfs_ifork, lastx)
    > xfs_bmbt_get_all(xfs_bmbt_rec_host, xfs_bmbt_irec)
-   - 首先它的范围必须和参数范围有交叉, end > start
-   - 如果是交叉, 创建一个临时的xfs_bmbt_irec, 使用参数的范围设置
-   - 否则可以使用查找的xfs_bmbt_irec
-   - 如果这个xfs_bmbt_irec是delay allocation, 释放预留的磁盘空间? 
+   
+   - 使用新的xfs_bmbt_irec表示要删除的, 根据got和(start, bno)修正这个要删除的范围
+   - 如果got不是delalloc, 需要设置有效的br_startblock, 而且去掉xfs_btree_cur->bc_private->b->flags的XFS_BTCUR_BPRV_WASDEL
+   - 否则需要释放对应的delalloc空间
    > xfs_icsb_modify_counters(xfs_mount, XFS_SBS_FDBLOCKS, del->br_blockcount, 0)
    - 减小xfs_inode->i_delayed_blks -= del->br_blockcount
-   - 删除对应的xfs_bmbt_irec 
+   - 而且设置xfs_btree_cur->bc_private->b->flags的XFS_BTCUR_BPRV_WASDEL
+   - 在xfs_ifork/btree中删除xfs_bmbt_irec
    > xfs_bmap_del_extent(xfs_inode, xfs_trans, lastx, xfs_bmap_free, xfs_btree_cur, xfs_bmbt_irec, mtp_logflags, whichfork)
+
    - 循环完成后,检查di_format/di_aformat是否需要转化 
    > xfs_bmap_needs_btree(xfs_inode, whichfork)
    > xfs_bmap_extents_to_btree(xfs_trans, xfs_inode, firstblock, xfs_bmap_free, xfs_btree_cur, 0, tmp_logflags, whichfork)
    - 这里还得检查是否从btree转到extents 
    > xfs_bmap_wants_extents(xfs_inode, whichfork)
    > xfs_bmap_btree_to_extents(xfs_trans, xfs_inode, xfs_btree_cur, tmp_logflags, whichfork)
-   - 最后log处理 
+   - 最后处理logflags 
    > xfs_trans_log_inode(xfs_trans, xfs_inode, logflags)
 
 * xfs_bmap_util.c
@@ -2196,30 +2269,38 @@
    - 对于realtime的文件是直接移位实现
 
 ** xfs_bmap_finish(xfs_trans, xfs_bmap_free, committed)
-   - transaction完成时使用,释放xfs_bmap_free中的extent
-   - xfs_trans->t_flags必须有XFS_TRANS_PERM_LOG_RES
+   - xfs_trans提交之前使用,释放xfs_bmap_free中积累的磁盘空间
+   - xfs_trans->t_flags必须有XFS_TRANS_PERM_LOG_RES??
    - 如果xfs_bmap_free->xbf_count ==0, 直接返回  设置committed = 0
-   - 创建一个xfs_bmap_free_item的log
+
+   - 创建一个xfs_bmap_free_item
    > xfs_trans_get_efi(xfs_trans, xfs_bmap_free->xbf_count)
-   - 遍历xfs_bmap_free初始化xfs_bmap_free_item
+   - 遍历xfs_bmap_free, 填充xfs_bmap_free_item
    > xfs_trans_log_efi_extent(xfs_trans, xfs_efi_log_item, xfs_bmap_free_item->xbfi_startblock, xfs_bmap_free_item->xbfi_blockcount)
-   - 复制参数xfs_trans, 备份xfs_trans_res? 
+
+   - 复制一个xfs_trans, 使用和原来xfs_trans相同的xfs_trans_res的信息
    > xfs_trans_dup(xfs_trans)
    - 提交原来的xfs_trans 
    > xfs_trans_commit(xfs_trans, 0)
-   - 释放ticket 
+   - 原来的xfs_trans->t_flags有XFS_TRANS_PERM_LOG_RES, 所以不会释放xlog_ticket, 但会释放它一部分的log空间, 或重新给它分配log空间, 根据xfs_trans->t_log_count而定
+   - 释放原来的ticket使用计数
    > xfs_log_ticket_put(xfs_trans->xlog_ticket)
-   - 重新reserve空间? 就是上面备份的  
+
+   - 构造xfs_trans_res, 他备份原来的xfs_trans的信息, 而且tr_logflags = XFS_TRANS_PERM_LOG_RES
+   - 重新reserve log空间, 如果原来的没有用完, xlog_ticket->t_cnt > 0, 不会分配
    > xf_trans_reserve(xfs_trans, xfs_trans_res, 0, 0)
+
    - 构造xfs_efd_log_item
    > xfs_trans_get_efd(xfs_trans, xfs_efi_log_item, xfs_bmap_free->xbf_count)
    - 遍历xfs_bmap_free的xfs_bmap_free_item
-   - 先释放内存  
+   - 先释放磁盘空间
    > xfs_free_extent(xfs_trans, xfs_bmap_free_item->xbfi_startblock, xbfi_blockcount)
-   - 同时设置xfs_efd_log_item 
+   - 同时填充xfs_efd_log_item 
    > xfs_trans_log_efd_extent(xfs_trans, xfs_efd_log_item, xbfi_startblock, xbfi_blockcount)
+   - 同时释放xfs_bmap_free_item
    > xfs_bmap_del_free(xfs_bmap_free_item, NULL, xfs_bmap_free)
-   - 最后怎么没有提交xfs_trans??
+
+   - 最后返回这个新的xfs_trans
 
 ** xfs_bmap_rtalloc(xfs_bmalloca)
    - realtime的文件使用
@@ -2231,11 +2312,11 @@
    > complete(xfs_bmalloca->done)
 
 ** xfs_bmapi_allocate(xfs_bmalloca)
-   - 如果xfs_bmalloca->stack_switch ==0, 直接调用? 
+   - 如果xfs_bmalloca->stack_switch ==0, 直接调用
    > __xfs_bmapi_allocate(xfs_bmalloca)
    - 否则使用workqueue
    > queue_work(xfs_alloc_wq, xfs_bmalloca->work)
-   - 等待结果 
+   - 等待结果, 这个done是栈上的
    > wait_for_completion(xfs_bmalloca->done)
 
 ** xfs_bmap_eof(xfs_inode, xfs_fileoff_t endoff, whichfork, eof)
@@ -2245,20 +2326,26 @@
    - 比较endoff 和xfs_bmbt_irec->br_startoff + br_blockcount
 
 ** xfs_bmap_count_leaves(xfs_ifork, xfs_extnum_t idx, numrecs, count)
-   - 累计xfs_ifork中的(idx,numrecs)的xfs_bmbt_rec_host的长度
+   - 累计xfs_ifork中的(idx,numrecs)索引的xfs_bmbt_rec_host管理的文件范围长度
+
    - 获取对应的xfs_bmbt_rec_host 
    > xfs_iext_get_ext(xfs_ifork, idx)
    - 累加br_blockcount
    > xfs_bmbt_get_blockcount(xfs_bmbt_rec_host)
 
 ** xfs_bmap_disk_count_leaves(xfs_mount, xfs_btree_block, numrecs, count)
-   - xfs_btree_block是叶子节点,遍历numrecs个xfs_bmbt_rec
+   - xfs_btree_block是叶子节点,遍历numrecs个xfs_bmbt_rec, 累计它们管理的文件范围长度
+   - 因为他们都有对应的磁盘空间, 可能没有数据, 所以这里相当于磁盘空间长度
+
    > XFS_BMBT_REC_ADDR(xfs_mount, xfs_bmbt_rec, indx)
    - 累加blockcount 
    > xfs_bmbt_disk_get_blockcount(xfs_bmbt_rec)
 
 ** xfs_bmap_count_tree(xfs_mount, xfs_trans, xfs_ifork, xfs_fsblock_t blockno, levelin, count)
-   - 遍历xfs_ifork使用的btree的总的空间,包含节点使用的block数量, 还有xfs_bmbt_rec映射的磁盘数量
+   - 计算blockno对应的btree节点使用的磁盘空间
+   - 如果是内部节点, 需要向下遍历
+   - 如果是叶子节点, 需要遍历里面的所有xfs_bmbt_rec
+
    - 读取AG中blockno对应的block, 它是extent映射btree的节点
    > xfs_btree_read_bufl(xfs_mount, xfs_trans, bno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
    - 获取xfs_btree_block 
@@ -2275,6 +2362,7 @@
    > XFS_BMBT_PTR_ADDR(xfs_mount, xfs_btree_block, 1, xfs_mount->m_bmap_dmxr[1])
    > xfs_bmap_count_tree(xfs_mount, xfs_trans, xfs_ifork, bno, level, count)
    > xfs_trans_brelse(xfs_trans, xfs_buf)
+
    - 如果是叶子节点, 使用右兄弟指针遍历所有的叶子节点
    - xfs_btree_block->bb_u->l->bb_rightsib
    - 同时累加xfs_bmbt_rec管理的磁盘长度 
@@ -2284,10 +2372,13 @@
    > xfs_btree_read_bufl(xfs_mount, xfs_trans, bno, 0, xfs_buf, XFS_BMAP_BTREE_REF, xfs_bmbt_buf_ops)
 
 ** xfs_bmap_count_blocks(xfs_trans, xfs_inode, whichfork, count)
+   - 获取bmbt btree使用的总的磁盘空间 
+
    - 获取需要操作的xfs_ifork 
    > XFS_IFORK_PTR(xfs_inode, whichfork)
    - 如果di_format使用XFS_DINODE_FMT_EXTENTS,xfs_ifork在磁盘中没有使用btree,应该相当于根结点只是一个叶子节点
    > xfs_bmap_count_leaves(xfs_ifork, 0, xfs_ifork->if_bytes / sizeof(xfs_bmbt_rec), count)
+
    - 否则根结点使用xfs_btree_block
    - 得到根结点第一个分支指针
    > XFS_BMAP_BROOT_PTR_ADDR(xfs_mount, xfs_btree_block, 1, xfs_ifork->if_broot_bytes)
@@ -2369,123 +2460,157 @@
 ** xfs_bmap_punch_delalloc_range(xfs_inode, xfs_fileoff_t start_fsb, xfs_fileoff_t length)
    - 遍历(start_fsb, length)范围内的xfs_bmbt_irec
    > xfs_bmapi_read(xfs_inode, start_fsb, 1, xfs_bmbt_irec, nmaps, XFS_BMAPI_ENTIRE)
-   - 如果不是delay allocation ?? 直接跳过??
+   - 如果不是delalloc, 直接跳过, 处理下一个
    > xfs_bmbt_irec->br_startblock  != DELAYSTRATBLOCK
-   - br_blockcount !=0, 肯定不能是0?
-   - 准备空的xfs_bmap_free
-   - 如果找到delay alloc的xfs_bmbt_irec, 说明start_fsb对应的文件偏移怎么样?
-   - 释放底层的xfs_bmbt_irec
+   - 否则在xfs_ifork中释放它, 它没有对应的磁盘空间, 没有对应的xfs_bmbt_rec
+   - 准备xfs_bmap_free, 但根本不会用到, 既没有bmbt btree的操作,也就是磁盘空间的操作
    > xfs_bunmapi(NULL, xfs_inode, start_fsb, 1, 0, 1, firstblock, xfs_bmap_free, done)
-   - 然后增加start_fsb ++, 继续查找, 这样效率也太慢了
+   - 然后增加start_fsb ++, 继续查找
 
 ** xfs_can_free_eofblocks(xfs_inode, force)
-   - 检查是否删除eof后面的磁盘空间? prealocation/append?
+   - 检查是否删除eof后面的磁盘空间, delalloc和prealloc导致的?!
+   - 如果不是普通文件, 直接返回
+   > S_ISREG(xfs_icdinode->di_mode)
    - 如果xfs_inode->i_size ==0, 而且xfs_inode->i_delayed_blks ==0, 而且inode的address_space->nrpages==0. 磁盘中文件为0, 而且没有pagecache, 返回0
-   - 如果xfs_inode->xfs_ifork->if_flags没有XFS_IFEXTENTS,还没有缓存xfs_bmbt_rec, 肯定没有IO或者preallocation. 之前的不会考虑
-   - xfs_inode->xfs_ifork->if_flags的XFS_DIFLAG_PREALLOC和XFS_DIFLAG_APPEND表示有空间
-   - 如果force ==0或者xfs_inode->i_delayed_blks==0, 返回true,表示可以释放多余磁盘
-   - 否则返回false, 没有必要或没有空间可释放
+   - 如果xfs_inode->xfs_ifork->if_flags没有XFS_IFEXTENTS,还没有缓存xfs_bmbt_rec, 肯定没有IO或者preallocation
+   - 如果xfs_inode->xfs_ifork->if_flags有XFS_DIFLAG_PREALLOC和XFS_DIFLAG_APPEND表示有额外的磁盘空间
+   - 而且如果force ==0或者xfs_inode->i_delayed_blks==0, 返回false, 表示不用释放他们
+   - 其他情况,需要释放eof后面的磁盘空间
 
 ** xfs_free_eofblocks(xfs_mount, xfs_inode, need_iolock)
    - 在inode释放时调用 inode_operations->evict 间接使用
+   - 释放eof后面的磁盘空间 
+
    - 获取xfs_inode大小, end_fsb 普通文件就是 inode->i_size 
    > XFS_B_TO_FSB(xfs_mount, XFS_ISIZE(xfs_inode))
+   - 需要释放的范围是(end_fsb, -1)
+
    - 查找end_fsb使用的xfs_bmbt_irec 
    > xfs_bmapi_read(xfs_inode, end_fsb, map_len, xfs_bmbt_irec, 1, 0)
-   - 如果没有问题,而且xfs_bmbt_irec不是hole, 使用delayed alloc, xfs_inode->i_delayed_blks >0
+   - 如果能找到对应的xfs_bmbt_rec_host, 只要文件有xfs_bmbt_rec, 肯定能找到!!
+   - 而且不是hole, br_startblock != HOLESTARTBLOCK
+   - 或者文件使用delalloc, xfs_inode->i_delayed_blks >0
    - 需要释放eof后面的磁盘空间
-   - 构造xfs_trans, 这是inactive事件?
+
+   - 构造xfs_trans, 这是inactive事件
    > xfs_trans_alloc(xfs_mount, XFS_TRANS_INACTIVE)
    - 锁住文件
    > xfs_ilock_nowait(xfs_inode, XFS_IOLOCK_EXCL)
+   - reserve空间,只需要log空间
    > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_itruncate, 0, 0)
    - 把xfs_inode放到xfs_trans中
    > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
-   - 不需要更新xfs_dinode->di_size?? 文件数据已经写回去? 怎么会有NULL file?
+   - 使用truncate操作释放xfs_bmbt_rec,以及对应的磁盘空间
    > xfs_itruncate_extents(xfs_trans, xfs_inode, XFS_DATA_FORK, XFS_ISIZE(xfs_inode))
    - 提交xfs_trans 
    > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
    > xfs_inode_clear_eofblocks_tag(xfs_inode)
-   - 怎么会有超过eof的xfs_bmbt_rec_host?? 哪里分配的? 或者修改了size?
 
 ** xfs_alloc_file_space(xfs_inode, xfs_off_t offset, len, alloc_type)
-   - 为文件的(offset,len)范围分配空间? preallocation?
-   - alloc_type表示分配的目的, 必须XFS_BMAPI_PREALLOC,XFS_BMAPI_CONVERT
+   - 为文件的(offset,len)范围分配空间, 同样在fallocate中释放
+   - alloc_type表示分配的目的, XFS_BMAPI_PREALLOC, 表示空间不会写入数据, XFS_BMAPI_CONVERT,表示需要改变已经有的空间的状态
+
    - 如果文件extent需要地址对齐, 获取xfs_inode->xfs_icdinode->di_extsize
    > xfs_get_extsz_hint(xfs_inode)
    - 对开始偏移和结束偏移都对齐
+
    - 首先预留磁盘空间, 计算预留数量还需要考虑btree的更新使用的磁盘空间
-   - 不应该2个btree?
    > XFS_DIOSTRAT_SPACE_RES(xfs_mount, resblks)
-   - 创建xfs_trans, XFS_TRANS_DIOSTRAT?? 战略??
+
+   - 创建xfs_trans, XFS_TRANS_DIOSTRAT
    > xfs_trans_alloc(xfs_mount, XFS_TRANS_DIOSTRAT)
+   - 使用write的log空间数量
    > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_write, resblks, resrtextents)
    - 锁住xfs_inode, 并添加到xfs_trans中 
    > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL)
    > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
-   - 创建xfs_bmbt_rec_host? 准备一个xfs_bmap_free?? 
+   - 准备一个xfs_bmap_free
    > xfs_bmap_init(xfs_bmap_free, firstfsb)
-   - 分配磁盘空间,或改变preallocation的空间
+   - 如果是hole或delalloc, 分配磁盘空间, 构造对应的xfs_bmbt_rec
+   - 可能会改变现有的xfs_bmbt_rec, 改为XFS_FMT_UNWRITTEN, 相当于删除数据
    > xfs_bmapi_write(xfs_trans, xfs_inode, startoffset_fsb, allocatsize_fsb, alloc_type, firstfsb, 0, xfs_bmbt_irec, nmaps, xfs_bmap_free)
-   - 为何会释放内存??
+   - 分配过程中会释放磁盘空间?? 可能会合并btree节点, 释放对应的磁盘空间
    > xfs_bmap_finish(xfs_trans, xfs_bmap_free, committed)
    - 提交xfs_trans 
    > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
-   - 根据分配的空间,向前移动startoffset_fsb, 直到分配足够的空间
+   - 根据分配的空间,向前移动startoffset_fsb, 直到分配足够的空间, 结束循环
 
 ** xfs_zero_remaining_bytes(xfs_inode, startoff, endoff)
-   - 处理没有地址对齐的空间?
+   - 处理没有block对齐的文件范围, 使用xfs_buf实现IO, 而不是pagecache
+
    - 如果startoff超过eof, 直接返回
    > XFS_ISIZE(xfs_inode)
-   - 如果endoff > eof, 设置为eof
-   - 准备一个xfs_buf,大小是blocksize 
+   - 如果endoff > eof, 设置为endoff = eof
+
+   - 准备一个xfs_buf,大小是blocksize, 分配page, 建立映射
    > xfs_buf_get_uncached(xfs_buftarg, BTOBB(xfs_sb->sb_blocksize), 0)
-   - 遍历(startoff, endoff)之间的xfs_bmbt_irec 
+
+   - 遍历(startoff, endoff)范围
+   - 获取每一个fsb的磁盘位置信息
    > xfs_bmapi_read(xfs_inode, offset_fsb, 1, xfs_bmbt_irec, nmaps, 0)
-   - xfs_bmbt_irec->br_startoff必须和offset_fsb相同, 如何保证?
-   - 如果xfs_bmbt_irec是hole, br_startblock == HOLDSTRATBLOCK, 不处理
-   - xfs_bmbt_irec不能是delalloc?  DELAYSTRATBLOCK
-   - 如果br_state是XFS_EXT_UNWRITTEN, 直接返回,不处理
+   - 如果没找到, 结束循环, 没有磁盘信息, 正好处在hole中
+   - xfs_bmbt_irec->br_startoff必须和offset_fsb相同, 在获取xfs_bmbt_irec时会修改这些范围
+   - 如果xfs_bmbt_irec是hole, br_startblock == HOLDSTRATBLOCK, 继续循环
+   - xfs_bmbt_irec不可能是DELAYSTRATBLOCK, 因为这时pagecache数据已经写回,所以应该没有delalloc的数据
+   - 如果br_state是XFS_EXT_UNWRITTEN, 有磁盘空间, 但没有数据, 不需要写0
+
    - 准备xfs_buf, 去掉XBF_DONE,XBF_WRITE, 设置XBF_READ
-   - 设置地址为xfs_bmbt_irec->br_startblock, 读取数据 
-   > xfsbdstrat(xfs_mount, xfs_buf)
+   - 设置地址为xfs_bmbt_irec->br_startblock, 先读取数据
+   > xfs_buf_iorequest(xfs_buf)
    > xfs_buf_iowait(xfs_buf)
    - 然后设置(startoff, endoff)在这个block内的数据设置为0. 这里的xfs_buf只有一个block
    - 然后把xfs_buf写回去, 去掉XBF_DONE,XBF_READ, 设置XBF_WRITE 
-   > xfsbdstrat(xfs_mount, xfs_buf)
+   > xfs_buf_iorequest(xfs_mount, xfs_buf)
    > xfs_buf_iowait(xfs_buf)
    - 然后操作下一个block
 
 ** xfs_free_file_space(xfs_inode, xfs_off_t offset, len)
-   - 释放(offset,len)范围内的磁盘空间?
+   - 释放(offset,len)范围内的磁盘空间, 在fallocate中制造hole时使用
+
    - 首先等待dio完成  
    > inode_dio_wait(inode)
    - 等待数据写回磁盘 
    > fiemap_write_and_wait_range(inode->address_space, offset, -1)
-   - 如果offset,len没有block地址对齐,需要把不需要释放的磁盘写为0
-   - 如果(offset,len)在一个block上面,直接清空对应的数据, 而且不需要其他操作
+   - 释放pagecache中的page 
+   > truncate_pagecache_range(inode, offset, -1)
+   - (offset,len)必须使用xfs_sb->sb_blocklog或PAGE_CACHE_SIZE对齐
+
+   - 如果(offset,len)在一个block/fsb上面,直接清空对应的数据, 直接退出
    > xfs_zero_remaining_bytes(xfs_inode, offset, len-1)
-   - 如果跨越多个block, 需要把2头的数据清空 
+
+   - 如果跨越多个block, 先把2头没有地址对齐的数据清空 
    > xfs_zero_remaining_bytes(xfs_inode, XFS_FSB_TO_B(xfs_mount, endoffset_fsb) - 1)
-   - 然后释放中间的对齐的block
-   - 构造xfs_trans
+   - 普通的IO,如果不会修改metadata是不会使用xfs_trans
+
+   - 然后释放中间的空间, 循环操作,直到没有xfs_bmbt_rec_host可释放
+   - 构造xfs_trans, 设置xfs_trans->t_flags的XFS_TRANS_RESERVE, 可以使用特殊的磁盘空间
+   - 这里构造的xfs_trans竟然是DIOSTRAT??
    > xfs_trans_alloc(xfs_mount, XFS_TRANS_DIOSTRAT)
    > xfs_trans_reserve(xfs_trans, xfs_mount->m_resv->tr_write, resblks, 0)
-   - log inode? 
+   - 这里可能修改xfs_icdinode/xfs_ifork,所以先把xfs_trans中
    > xfs_trans_ijoin(xfs_trans, xfs_inode, 0)
+   - 构造xfs_bmap_free/firstblock
    > xfs_bmap_init(xfs_bmap_free, firstfsb)
-   - 修改btree/xfs_ifork信息
-   > xfs_bunmapi(xfs_trans, xfs_inode, startoffset_fsb, ...)
+   - 删除对应的xfs_bmbt_rec/xfs_bmbt_rec_host,已经他们映射的磁盘空间
+   - 最多修改2个xfs_bmbt_rec_host?? 因为xfs_trans的限制?
+   > xfs_bunmapi(xfs_trans, xfs_inode, startoffset_fsb, endoffset_fsb - startoffset_fsb, 0, 2, firstblock, xfs_bmap_free, done)
    - 然后释放磁盘空间 
    > xfs_bmap_finish(xfs_trans, xfs_bmap_free, committed)
+   - 提交xfs_trans
    > xfs_trans_commit(xfs_trans, XFS_TRANS_RELEASE_LOG_RES)
 
-** xfs_zero_file_space(xfs_inode, end, len)
-   - 遍历(end,len)文件范围, 首先删除pagecache 
-   > xfs_alloc_file_space(xfs_inode, start_boundary, end_boundary - start_boundary - 1)
-   - 然后分配磁盘空间,创建xfs_bmbt_rec, 修改状态为XFS_FMT_UNWRITTEN
-   - 如果地址不是对齐的, 把其他block中的部分数据清0
-   - 下面使用address_operations实现
+** xfs_zero_file_space(xfs_inode, offset, len)
+   - ioctl使用, 把(offset,len)范围内数据重置为0
+
+   - 把(offset,len)使用sb_blocklog或PAGE_CACHE_SIZE对齐
+   - 首先删除pagecache的page
+   > truncate_pagecache_range(inode, start_boundary, end_boundary-1)
+   - 如果有hole, 分配磁盘空间, 创建xfs_bmbt_rec, br_state是XFS_FMT_UNWRITTEN
+   - 如果有xfs_bmbt_rec, 把状态改为XFS_FMT_UNWRITTEN
+   > xfs_alloc_file_space(xfs_inode, start_boundary, end_boundary - start_boundary - 1, XFS_BMAPI_PREALLOC | XFS_BMAPI_CONVERT)
+
+   - 如果地址不是对齐的, 把开始和结尾的block中的部分数据写0
+   - 使用address_operations实现
    > xfs_iozero(xfs_inode, offset, start_boundary - offset)
 
 ** xfs_swap_extents_check_format(xfs_inode ip, xfs_inode tmpip)
