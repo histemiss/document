@@ -54,7 +54,8 @@
 * xfs_aops.c
 
 ** xfs_count_page_state(page, delalloc, unwritten)
-   - 检查page的状态
+   - 通过buffer_head计算page的状态
+
    - 遍历page的buffer_header 
    > page_buffers(page)
    - 检查buffer_head的状态
@@ -88,68 +89,76 @@
    #+END_SRC
 
 ** xfs_destroy_ioend(xfs_ioend)
-   - IO完成后释放xfs_ioend, 需要释放buffer_head, bio, inode?
-   - 遍历io_buffer_head队列的buffer_head 
+   - IO完成后释放xfs_ioend, 需要释放buffer_head, bio, inode??
+
+   - 遍历xfs_ioend->io_buffer_head队列的buffer_head, 使用buffer_head->b_private构造链表
    > buffer_head->b_end_io(buffer_head, xfs_ioend->io_error)
-   - 如果xfs_ioend->io_iocb有效, 才调用回调??
-   > inode_dio_done(xfs_ioend->io_inode)
-   - 如果是异步, xfs_ioend->io_isasync 
-   > aio_complete(xfs_ioend->io_iocb, xfs_ioend->io_result, 0)
-   - 这里回唤醒kiocb??
-   - 最后释放xfs_ioend 
+   - 最后释放xfs_ioend
 
 ** xfs_ioend_is_append(xfs_ioend)
-   - 检查是否是append io?
-   - xfs_ioend->io_offset + io_size > xfs_inode->xfs_icdinode->di_size ?? 
+   - 检查IO是否增加文件大小
+   - xfs_ioend->io_offset + io_size > xfs_inode->xfs_icdinode->di_size 
 
 ** xfs_setfilesize_trans_alloc(xfs_ioend)
-   - 构造xfs_trans 
+   - 在IO完成后, 会修改文件大小, 这里构造xfs_trans做准备
    > xfs_trans_alloc(xfs_mount, XFS_TRANS_FSYNC_TS)
-   - 预留空间, XFS_FSNC_TS_LOG_RES??
-   > xfs_trans_reserve(xfs_trans, 0, XFS_FSYNC_TS_LOG_RES(xfs_mount), 0, 0,0)
-   - 把上面创建的xfs_trans给xfs_ioend->io_append_trans
+   - 只会reserve log空间
+   > xfs_trans_reserve(xfs_trans, xfs_mount->m_res->tr_fsyncs, 0, 0)
+   - 把创建的xfs_trans给xfs_ioend->io_append_trans
+   - 上面reserve空间时修改t_pflags, 这里直接恢复
+   > current_restore_flags_nested(xfs_trans->t_pflags, PF_FSTRANS)
    
 ** xfs_setfilesize(xfs_ioend) 
-   - IO完成后释放更新文件大小
+   - IO完成后更新文件大小
+
    - 锁住inode 
    > xfs_ilock(xfs_inode, XFS_ILOCK_EXCL) 
-   - 计算新的文件大小, 它不能超过i_size, 而且必须比di_size大才需要更新??
-   - 在a_ops->write中回更新i_size
+   - 如果xfs_ioend->io_offset + io_size > i_size, 更新xfs_icdinode->di_size
    > xfs_new_eof(xfs_inode, xfs_ioend->io_offset + io_size)
-   - 设置xfs_inode->xfs_icdinode->di_size 
+   - 构造xfs_inode_log_item, 并放到xfs_trans中
    > xfs_trans_ijoin(xfs_trans, xfs_inode, XFS_ILOCK_EXCL)
    > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 提交xfs_trans 
+   > xfs_trans_commit(xfs_trans, 0)
 
 ** xfs_finish_ioend(xfs_ioend)
-   - 释放xfs_ioend的使用计数,如果减为0, 释放资源?
+   - bio的回调函数使用
+
+   - 释放xfs_ioend的使用计数
    > atomic_dec_and_test(xfs_ioend->io_remaining) 
-   - 如果xfs_ioend->io_type == XFS_IO_UNWRITTEN? 
+   - 如果减为0, 表示IO完成. 否则直接返回
+
+   - 如果xfs_ioend->io_type == XFS_IO_UNWRITTEN, 需要更新xfs_bmbt_irec->br_state, 使用xfs_mount->m_unwritten_workqueue执行xfs_ioend->io_work
    > queue_work(xfs_mount->m_unwritten_workqueue, xfs_ioend->io_work)
-   - 如果是append IO? 或者directIO 
+   - 如果需要更新文件大小, 使用xfs_mount->m_data_workqueue执行xfs_ioend->io_work
+   - xfs_ioend->io_append_trans有效或者是direct_IO
    > xfs_ioend_is_append(xfs_ioend)
    > queue_work(xfs_mount->m_data_workqueue, xfs_ioend->io_work)
-   - 否则直接释放xfs_ioend 
+   - 否则直接释放xfs_ioend的buffer_head
    > xfs_destroy_ioend(xfs_ioend)
 
 ** xfs_end_io(work_struct)
-   - 参数是xfs_ioend->io_work
-   - 什么是XFS_IO_UNWRITTEN, 只分配空间,但没有写数据?
+   - 参数是xfs_ioend->io_work, xfs_ioend的IO完成之后处理metadata
+
+   - 如果xfs_ioend->io_type是XFS_IO_UNWRITTEN, 表示IO空间对应的xfs_bmbt_irec->br_state还是XFS_EXT_UNWRITTEN, 现在已经写入数据, 需改为XFS_EXT_NORM
    > xfs_iomap_write_unwritten(xfs_inode, xfs_ioend->io_offset, xfs_ioend->io_size)
-   - 如果是direct IO, 修改文件大小? 
+   - 如果是direct IO, 而且需要修改文件大小
+   > xfs_ioend_is_append(xfs_ioend)
+   - direct io不会提前构造xfs_trans
    > xfs_setfilesize_trans_alloc(xfs_ioend)
    > xfs_setfilesize(xfs_ioend)
-   - 如果只是append? 
+   - 如果xfs_ioend->xfs_trans有效, 直接把inode写到log空间
    > xfs_setfilesize(xfs_ioend)
    - 最后释放xfs_ioend 
    > xfs_destroy_ioend(xfs_ioend)
 
 ** xfs_finish_ioend_sync(xfs_ioend)
-   - 释放xfs_ioend->io_remaining计数 
+   - 释放xfs_ioend->io_remaining使用计数 
    - 这是同步方式, 直接调用
    > xfs_end_io(xfs_ioend->io_work)
 
 ** xfs_alloc_ioend(inode, type)
-   - 构造xfs_ioend, 只是设置io_type = type? 
+   - 构造xfs_ioend, 只是设置io_type = type
 
 ** xfs_bmbt_irec 
    - extent数据, 单位都是  inode->i_blkbits
@@ -161,71 +170,76 @@
    #+END_SRC
 
 ** xfs_map_blocks(inode, offset, xfs_bmbt_irec, type, nonblocking)
-   - 查找offset对应的extent?
-   - 如果type == XFS_IO_UNWRITTEN, 忽略state? XFS_BMAPI_IGSTATE
+   - 在address_space要把pagecache写回磁盘时调用, address_space_operations->writepage
+   - 为offset所在的block查找磁盘空间, block的大小是inode->i_blkbits
+
+   - 如果type == XFS_IO_UNWRITTEN, 设置bmapi_flags的XFS_BMAPI_IGSTATE, 再查找时忽略xfs_bmbt_rec_host的状态, 只需要找到对应的磁盘空间
+
    - 先锁住inode, 使用XFS_ILOCK_SHARED 
    > xfs_ilock_nowait(xfs_inode, XFS_ILOCK_SHARED)
    - 如果锁不住,而且nonblocking!=0, 返回EAGAIN
    - 否则等待这个锁 
    > xfs_ilock(xfs_inode, XFS_ILOCK_SHARED)
-   - 开始查找extent, 范围是(offset, -1)
-   - 最大值是super_block->s_maxbytes
-   - 转化为FSB 
+   - 转化文件偏移, 使用fsb单位
    > XFS_B_TO_FSB(xfs_mount, offset)
-   - 只会返回1个xfs_bmbt_irec
+   - 查找对应的xfs_bmbt_rec_host信息, 直接放在函数参数中
    > xfs_bmapi_read(xfs_inode, offset_fsb, end_fsb-offset_fsb, xfs_bmbt_irec, nimaps, bmapi_flags)
    - 释放xfs_inode的锁 
    > xfs_iunlock(xfs_inode, XFS_ILOCK_SHARED)
-   - 如果type是XFS_IO_DELALLOC,而且没有找到xfs_bmbt_irec, 或者找到的是hole 
+   - 如果type是XFS_IO_DELALLOC,而且写的文件范围是delalloc的, 而且没找到对应的磁盘空间, 或者找到的xfs_bmbt_irec->br_startblock表示delalloc, 需要分配磁盘空间
    > isnullstartblock(xfs_bmbt_irec->br_startblock)
-   - 更新btree? 
-   > xfs_iomap_write_unwritten(xfs_inode, offset, count, xfs_bmbt_irec)
+   > xfs_iomap_write_allocate(xfs_inode, offset, xfs_bmbt_irec)
 
 ** xfs_imap_valid(xfs_inode, xfs_bmbt_irec, offset)
    - 验证xfs_bmbt_irec的有效性
    - offset应该在xfs_bmbt_irec->br_startoff和br_blockcount之间
-   - 两者单位是什么?  xfs_inode->i_blkbits, 是bb还是fsb?
+   - offset单位转化为xfs_inode->i_blkbits
+   - 所以xfs_inode->i_blkbits 和 super_block->s_blocksize_bits, super_block->s_blocksize, 和xfs_sb->sb_blocksize是一样的
 
 ** xfs_end_bio(bio, error)
-   - bio的回调函数
-   - 处理bio->bi_private,也就是xfs_ioend
+   - bio的回调函数, 处理bio->bi_private,也就是xfs_ioend
+
    - 根据bio->bi_flags的BIO_UPTODATE确定io的结果
-   - 首先处理bio 
+   - 首先释放bio 
    > bio_put(bio)
+   - 然后继续处理xfs_ioend
    > xfs_finish_ioend(xfs_ioend)
 
 ** xfs_submit_ioend_bio(writeback_control, xfs_ioend, bio)
-   - 提交bio, 首先配置bio
+   - 设置bio的回调函数, 提交bio
+
    - 增加xfs_ioend->io_remaining计数
    - 设置bio->bi_end_io = xfs_end_bio 
    > submit_bio(writeback_control->sync_mode == WB_SYNC_ALL? WRITE_SYNC:WRITE, bio)
 
 ** xfs_alloc_ioend_bio(buffer_head)
-   - 构造bio, 为何使用多个iovec?
+   - 为buffer_head构造bio,使用多个iovec, 后面合并处理多个buffer_head
+
    > bio_get_nr_vecs(buffer_head->b_bdev)
    > bio_alloc(GFP_NOIO, nvecs)
-   - 计算bio的起始位置??
+   - 设置bio的磁盘位置
    > buffer_head->b_blocknr * buffer_head->b_size >>9
 
 ** xfs_start_buffer_writeback(buffer_head)
    - 检查buffer_head的状态，必须是BH_Mapped, BH_Locked 
    - 不能是BH_Delay? BH_Unwritten??
-   - 异步写? 通用的函数, 使bio回调通用的函数
+   - 设置buffer_head的回调函数, 在xfs_ioend完成之后会调用他的回调函数
+   - 设置BH_Async_Write标志
    > mark_buffer_async_write(buffer_head)
    - 设置BH_Uptodate, 清除BH_Dirty 
    > set_buffer_uptodate(buffer_head)
    > clear_buffer_dirty(buffer_head)
-   - 没有衍生的操作? 比如修改计数?
 
 ** xfs_start_page_writeback(page, clear_dirty, buffers)
-   - 写回page? 检查page的状态
+   - 在IO之前设置page的状态
+
    - 必须有PG_locked, 而且没有PG_writeback
-   - 如果clear_dirty !=0, 修改标志 
+   - 如果clear_dirty !=0, 去掉PG_dirty标志
    > clear_page_dirty_for_io(page)
-   - 准备启动bio 
+   - 设置PG_writeback, PAGECACHE_TAG_WRITEBACK, 去掉PAGECACHE_TAG_TOWRITE, 根据PG_dirty, 去掉PAGECACHE_TAG_DIRTY 
    > set_page_writeback(page)
    > unlock_page(page)
-   - 如果buffers ==0, 没有必要IO? 
+   - 如果buffers ==0, 没有必要IO, 结束page的写操作
    > end_page_writeback(page)
 
 ** bio_add_buffer(bio, buffer_head)
@@ -233,12 +247,13 @@
    > bio_add_page(bio, buffer_head->b_page, buffer_head->b_size, bh_offset(buffer_head))
 
 ** xfs_submit_ioend(writeback_control, xfs_ioend, fail)
+   - 提交xfs_ioend管理的IO
+
    - xfs_ioend是单链表, 使用xfs_ioend->io_list
    - 遍历每个xfs_ioend中的buffer_head
    - 修改buffer_head的标志
    > xfs_start_buffer_writeback(buffer_head)
-   - 再次遍历, 提交bio 
-   - 首先分配bio
+   - 再次遍历, 提交bio, 如果还没有bio, 先构造一个
    > xfs_alloc_ioend_bio(buffer_head)
    - 后续的buffer_head可以合并到这里
    > bio_add_buffer(bio, buffer_head)
