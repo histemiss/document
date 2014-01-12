@@ -214,7 +214,8 @@ typedef struct xfs_buf {
    #+END_SRC
 
 ** xfs_buftarg 
-   - 为何设备相关的信息放在这里??
+   - 管理xfs_buf的磁盘信息, 在IO中使用的信息
+
    #+BEGIN_SRC 
 	dev_t			bt_dev;
 	struct block_device	*bt_bdev;
@@ -231,46 +232,48 @@ typedef struct xfs_buf {
 
 ** xfs_buf_flags_t 
    #+BEGIN_SRC 
-	{ XBF_READ,		"READ" }, \
-	{ XBF_WRITE,		"WRITE" }, \
-	{ XBF_READ_AHEAD,	"READ_AHEAD" }, \
-	{ XBF_ASYNC,		"ASYNC" }, \
-	{ XBF_DONE,		"DONE" }, \
-	{ XBF_STALE,		"STALE" }, \
-	{ XBF_SYNCIO,		"SYNCIO" }, \
-	{ XBF_FUA,		"FUA" }, \
-	{ XBF_FLUSH,		"FLUSH" }, \
-	{ XBF_TRYLOCK,		"TRYLOCK" },	/* should never be set */\
-	{ XBF_UNMAPPED,		"UNMAPPED" },	/* ditto */\
-	{ _XBF_PAGES,		"PAGES" }, \
-	{ _XBF_KMEM,		"KMEM" }, \
-	{ _XBF_DELWRI_Q,	"DELWRI_Q" }, \
+	{ XBF_READ,		"READ" },
+	{ XBF_WRITE,		"WRITE" }, 
+	{ XBF_READ_AHEAD,	"READ_AHEAD" },
+	{ XBF_ASYNC,		"ASYNC" },
+	{ XBF_DONE,		"DONE" },
+	{ XBF_STALE,		"STALE" }, 
+	{ XBF_SYNCIO,		"SYNCIO" },
+	{ XBF_FUA,		"FUA" },
+	{ XBF_FLUSH,		"FLUSH" },
+	{ XBF_TRYLOCK,		"TRYLOCK" },
+	{ XBF_UNMAPPED,		"UNMAPPED" }, /* 如果使用多个page缓存数据, 不使用vmap建立地址影射*/
+	{ _XBF_PAGES,		"PAGES" }, \ /*使用page保存数据, 需要给page建立影射,访问数据. 如果一个page, 可直接使用page的直接影射;如果多个page, 需要vmap影射为多个连续的地址,访问多个page. */
+	{ _XBF_KMEM,		"KMEM" }, \  /*使用heap的内存保存数据, 而且使用它的地址访问, 可以反向得到page指针*/
+	{ _XBF_DELWRI_Q,	"DELWRI_Q" }, /*在ail的iop_push操作中, 回收的xfs_buf设置这个标志*/
 	{ _XBF_COMPOUND,	"COMPOUND" }
    #+END_SRC
 
 ** xfs_buf_is_vmapped(xfs_buf)
-   - vmapped什么意思??
+   - 对于使用多个page的xfs_buf, 空间比较大, 地址影射使用vma
+   - 使用连续的地址空间访问全部的page
    - xfs_buf->b_addr !=NULL, 而且xfs_buf->b_page_count > 1
 
 ** xf_buf_vmap_len(xfs_buf)
-   - vmap是映射到内存??
+   - 当xfs_buf使用vmap时,计算内存空间长度
+   - b_offset应该是第一个page的偏移,开头一部分没有使用
    - xfs_buf->b_page_count * PAGE_SIZE  - xfs_buf->b_offset
 
 ** xfs_buf_stale(xfs_buf)
    - 设置xfs_buf->b_flags的XBF_STALE, 去掉_XBF_DELWRI_Q标志??
    - 设置xf_buf->b_lru_ref = 0
-   - 如果xfs_buf->b_state没有XFS_BSTATE_DISPOSE
+   - 如果xfs_buf->b_state没有XFS_BSTATE_DISPOSE, 表示它在lru队列中
    - 释放xfs_buf->b_lru链表, 他在xfs_buf->xfs_buftarg->bt_lru链表中
-   - 并且减小xfs_buf->b_hold计数
+   - 如果xfs_buf在lru队列中, 减小xfs_buf->b_hold计数
 
 ** xfs_buf_get_maps(xfs_buf, map_count)
-   - 准备xfs_buf使用的xfs_buf_map
+   - 准备xfs_buf的xfs_buf_map数组使用的内存
    - 设置xfs_buf->b_map_count = map_count
-   - 如果是1, 让xfs_buf->b_maps指向xfs_buf->__b_map数组
+   - 如果是1, 让xfs_buf->b_maps指向xfs_buf->__b_map数组, 使用成员数组
    - 否则分配内存
 
 ** xfs_buf_free_maps(xf_buf)
-   - 释放xfs_buf->b_maps的内存
+   - 释放xfs_buf->b_maps的内存, xfs_buf_map数组
    - 需要检查它是否指向xfs_buf->__b_map
 
 ** _xfs_buf_alloc(xfs_buftarg, xfs_buf_map, nmaps, xfs_buf_flags_t)
@@ -285,59 +288,67 @@ typedef struct xfs_buf {
    - 设置xfs_buf->b_bn 为第一个xfs_buf_map[0]->bm_bn, 第一个xfs_buf_map的位置
    
 ** _xfs_buf_get_pages(xfs_buf, page_count, xfs_buf_flags_t)
-   - 准备xfs_buf->b_pages指针数组
+   - 分配xfs_buf->b_pages指针数组使用的内存
    - 设置xfs_buf->b_page_count = page_count
-   - 如果page_count < XB_PAGES(2), 使用内部的静态数组  xfs_buf->b_page_array
-   - 否则分配动态内存 
+   - 如果page_count < XB_PAGES(2), 使用成员数组  xfs_buf->b_page_array
+   - 否则分配内存保存page指针
 
 ** _xfs_buf_free_pages(xfs_buf)
    - 释放xfs_buf->b_pages的动态内存 
 
 ** xfs_buf_free(xfs_buf)
-   - 释放xfs_buf??
-   - xfs_buf->b_lru不能在任何队列上??
-   - 如果xfs_buf->b_flags有_XBF_PAGES, 说明它使用page的映射??
-   - 如果使用vmap, virtual-map?? 
+   - 释放xfs_buf, 以及它的资源, 内存影射,page或内存块, 指针数组
+
+   - xfs_buf->b_lru不能在任何队列上
+   - 如果xfs_buf->b_flags有_XBF_PAGES, 说明它使用page保存数据, 需要释放对应的影射和page
+   - 如果使用vmap
    > xfs_buf_is_vmapped(xfs_buf)
+   - 释放影射使用的资源
    > vm_unmap_ram(xfs_buf->b_addr - xfs_buf->b_offset, xfs_buf->b_page_count)
    - 释放分配的page
    > __free_page(page)
-   - 如果xfs_buf->b_flags有_XBF_KMEM
-   - 使用动态的内存,缓存磁盘的数据?? 
+   - 否则如果xfs_buf->b_flags有_XBF_KMEM
+   - 使用小的内存块保存数据, 直接释放
    > kmem_free(xfs_buf->b_addr)
-   - 最后释放page指针和xfs_buf_map指针 
+   - 最后释放page指针数组和xfs_buf_map指针数组使用的内存
    > _xfs_buf_free_pages(xfs_buf)
    > xfs_buf_free_maps(xfs_buf)
    - 释放xfs_buf自己 
-     
+
 ** xfs_buf_allocate_memory(xfs_buf, flags)
-   - 检查xfs_buf->b_length, 缓存的磁盘空间
+   - 为xfs_buf准备内存, 缓存磁盘中的数据
+
    - 如果length < PAGE_SIZE, 使用heap的内存 
    > kmem_alloc(size, KM_NOFS)
    - 把内存指针给xfs_buf->b_addr
    - 即使使用动态内存, 也还要获取对应的page指针, 还要保证这块内存不能跨page边界
+   - 可能在IO底层使用DMA,所以保证物理地址连续
    - 直接比较 (b_addr + size ) & PAGE_MASK 和 b_addr & PAGE_MASK
    - 如果不满足要求,跳到后面,分配整个page
-   - 获取b_addr针对page的偏移 
+   - 设置b_addr针对page的偏移 
    > offset_in_page(xfs_buf->b_addr)
    - 获取对应的page指针,给xfs_buf->b_pages[0]
    > virt_to_page(xfs_buf->b_addr)
    - 设置xfs_buf->b_flags的XBF_KMEM
+
    - 如果length >= PAGE_SIZE, 或者上面分配的内存不满足要求, 分配page缓存数据
    - 需要的内存不限于xfs_buf->b_length, 需要对start和end对PAGE_CACHE对齐
-   - 多分陪了没事,使用xfs_buf->b_offset做偏移 
+   - 多分配了没事,使用xfs_buf->b_offset做偏移 
+   - 先分配page指针数组
    > _xfs_buf_get_pages(xfs_buf, page_count, flags)
    - 设置xfs_buf->b_flags的_XBF_PAGES
-   - 针对page指针分配page
+   - 分配page内存, 但这里没有建立影射
+   > alloc_page(gfp_mask)
 
 ** _xfs_buf_map_pages(xfs_buf, flags)
-   - xfs_buf使用page缓存数据, 计算xfs_buf->b_addr
-   - xfs_buf->b_flags有_XBF_PAGES
+   - xfs_buf使用page缓存数据, 建立地址影射,设置xfs_buf->b_addr
+
+   - xfs_buf->b_flags必须有_XBF_PAGES
    - 如果xfs_buf->b_page_count ==1, 直接获取对应的page的地址 
    > page_address(xfs_buf->b_pages[0]) + xfs_buf->b_offset 
-   - 如果flags有XBF_UNMAPPED ?? 为何不用xfs_buf->b_flags??
-   - 直接设置xfs_buf->b_addr = NULL
-   - 其他方式使用vmap?? 
+   - 如果flags有XBF_UNMAPPED, 不需要建立地址映射
+   - 直接设置xfs_buf->b_addr = NULL, 直接返回
+   - 否则使用vmap
    > vm_map_ram(xfs_buf->b_pages, xfs_buf->b_page_count, -1, PAGE_KERNEL) 
    - 当然还得做偏移 xfs_buf->b_addr += xfs_buf->b_offset
 
