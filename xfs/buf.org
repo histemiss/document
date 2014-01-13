@@ -1,4 +1,5 @@
 * 数据结构
+
 ** xfs_buftarg
   #+begin_src 
   
@@ -99,35 +100,6 @@ typedef struct xfs_buf {
   - 在xfs_buf.c中还实现了xfs_buf数据的IO,所以它用来操作metadata. 而映射的是磁盘偏移.
   - 它不像btrfs一样,使用文件管理整个磁盘空间,而是使用内存直接和磁盘交换数据.
 
-** xfs_buf的bio回调函数
-   - 在xfs_buf_ioapply_map中根据xfs_buf_map提交io请求,构造并发送bio, 设置bio->bi_end_io = xfs_buf_bio_end_io
-   > xfs_buf_bio_end_io
-   - 一个xfs_buf会提交多个bio, 但不会多个xfs_buf共用bio???
-   - 一个xfs_buf_map对应一个bio, 使用xfs_buf->b_io_remaining表示提交个数
-     
-   > _xfs_buf_ioend
-   - xfs_buf->b_io_remaining --, 如果变为0, 调用xfs_buf的回调xfs_buf_ioend
-     
-   > xfs_buf_ioend(xfs_buf, schedule)
-   - schedule是否使用work_queue
-   - 如果xfs_buf->b_error = 0, 设置xfs_buf->b_flags的XBF_DONE
-   - 如果xfs_buf->b_iodone 或者 读并且xfs_buf->b_ops有效, 或者 xfs_buf->b_flags有XBF_ASYNC标志, 这里要使用xfs_buf_iodone_work, 说明有io完成后的处理.
-   - 如果schedule ==1, 使用work_queue, 否则直接调用, 任务都是xfs_buf_iodone_work
-   > queue_work(xfslogd_workqueue, xfs_buf->b_iodone_work)
-   - 如果上面都无效, 使用简单的同步, 而且b_flags去掉XBF_READ/WRITE/READ_AHEAD??
-   > complete(xfs_buf->b_iowait)
-
-   > xfs_buf_iodone_work(work_struct)
-   - 去掉b_flags标志XBF_READ/WRITE/READ_HEAD, 为何去掉??
-   - 如果是read, 而且xfs_buf->b_ops有效, 而且b_flags有XBF_DONE
-   > xfs_buf->b_ops->verify_read(xfs_buf)
-   - 最后是同步操作, 这里完全不同
-   - 如果b_iodone有效, 同步和释放操作在里面
-   > (xfs_buf->b_iodone)(xfs_buf)
-   - 如果xfs_buf->b_flags包含XBF_ASYNC, 仅仅释放xfs_buf, 这是异步的,而且没有等待
-   > xfs_buf_relse(xfs_buf)
-   - 否则唤醒xfs_buf->b_iowait
-   > complete(xfs_buf->b_iowait)
 ** xfs_buf_flags
 
   #+begin_src 
