@@ -91,92 +91,13 @@ typedef struct xfs_buf {
   - 使用xfs_buf->xfs_buf_map数组管理映射
   - xfs_buf->b_pages管理page数组
   - 如果xfs_buf->b_length < PAGE_CACHE_SIZE,给它slob的内存使用. 但它使用的内存不能跨越page边界, 虽然分配了slab内存,但还是把把内存指针转化为page指针和page偏移给xfs_buf->b_offset / b_pages / b_page_count, 这是_XBUF_KMEM
-  - 否则分配page. xfs_buf_map->bm_bn是文件偏移,还是磁盘位置?? 应该是文件偏移! page来源于zone,而不是pagecache.
-  - xfs_buf的page使用vmalloc的空间访问, xfs_buf->b_addr表示内存指针.
+  - 如果使用1个page, 使用直接地址映射, 否则使用vmalloc的空间访问, xfs_buf->b_addr表示内存指针.
   - xfs_perag->pag_buf_tree使用rb tree管理所有的xfs_buf, 索引使用xfs_buf->b_bn
-  - xfs_buf的创建可以使用xfs_buftarg/xfs_buf_map, 先根据xfs_buf_map创建xfs_buf, 然后给它申请内存,读取底层数据.
-  - xfs_buf的创建还可以给定(addr,numblks), 应该是磁盘位置? 分配内存,然后设定磁盘位置.
   - xfs_buf还可能会使用分配好的内存,把虚拟地址映射回page,给xfs_buf->b_pages
-  - 在xfs_buf.c中还实现了xfs_buf数据的IO,所以它用来操作metadata. 而映射的是磁盘偏移.
-  - 它不像btrfs一样,使用文件管理整个磁盘空间,而是使用内存直接和磁盘交换数据.
-
-** xfs_buf_flags
-
-  #+begin_src 
-#define XFS_BUF_FLAGS \
-	{ XBF_READ,		"READ" }, \   //buffer用途, read
-	{ XBF_WRITE,		"WRITE" }, \  //write
-	{ XBF_READ_AHEAD,	"READ_AHEAD" }, \   //异步的readahead
-	{ XBF_ASYNC,		"ASYNC" }, \    //异步操作
-	{ XBF_DONE,		"DONE" }, \     //所有的page都是uptodate
-	{ XBF_STALE,		"STALE" }, \    //buf没有用
-	{ XBF_SYNCIO,		"SYNCIO" }, \   //同步IO
-	{ XBF_FUA,		"FUA" }, \      //write throught模式? 直接写回去不缓冲?
-	{ XBF_FLUSH,		"FLUSH" }, \    //write之前flush操作
-	{ XBF_TRYLOCK,		"TRYLOCK" },	/* should never be set */\
-	{ XBF_UNMAPPED,		"UNMAPPED" },	/* ditto */\
-	{ _XBF_PAGES,		"PAGES" }, \    //使用page存储数据,在IO中使用,使用vmap映射访问
-	{ _XBF_KMEM,		"KMEM" }, \     //使用help内存?
-	{ _XBF_DELWRI_Q,	"DELWRI_Q" }, \ //延时写?  delay write?
-	{ _XBF_COMPOUND,	"COMPOUND" }, \  //compound buffer
-	{ _XBF_LRU_DISPOSE,	"LRU_DISPOSE" }  //discard操作
-   
-  #+end_src
-  - xfs_buf->b_flags
+  - xfs_buf空闲是缓存到xfs_buftarg->br_lru中, 定期回收xfs_buf, 回收时减小b_lru_ref, 如果减为0就释放xfs_buf
+  - 不同的xfs_buf, 使用不同的初始值, AGF/AGI使用的最大, 还有ino,alloc,bmbt的btree节点, 还有xfs_dinode等
 
 * xfs_buf.c
-
-** xfs_buf
-   #+BEGIN_SRC 
-	/*
-	 * first cacheline holds all the fields needed for an uncontended cache
-	 * hit to be fully processed. The semaphore straddles the cacheline
-	 * boundary, but the counter and lock sits on the first cacheline,
-	 * which is the only bit that is touched if we hit the semaphore
-	 * fast-path on locking.
-	 */
-	struct rb_node		b_rbnode;	/* rbtree node */
-	xfs_daddr_t		b_bn;		/* block number of buffer */
-	int			b_length;	/* size of buffer in BBs */
-	atomic_t		b_hold;		/* reference count */
-	atomic_t		b_lru_ref;	/* lru reclaim ref count */
-	xfs_buf_flags_t		b_flags;	/* status flags */
-	struct semaphore	b_sema;		/* semaphore for lockables */
-
-	/*
-	 * concurrent access to b_lru and b_lru_flags are protected by
-	 * bt_lru_lock and not by b_sema
-	 */
-	struct list_head	b_lru;		/* lru list */
-	spinlock_t		b_lock;		/* internal state lock */
-	unsigned int		b_state;	/* internal state flags */
-	wait_queue_head_t	b_waiters;	/* unpin waiters */
-	struct list_head	b_list;
-	struct xfs_perag	*b_pag;		/* contains rbtree root */
-	xfs_buftarg_t		*b_target;	/* buffer target (device) */
-	void			*b_addr;	/* virtual address of buffer */
-	struct work_struct	b_iodone_work;
-	xfs_buf_iodone_t	b_iodone;	/* I/O completion function */
-	struct completion	b_iowait;	/* queue for I/O waiters */
-	void			*b_fspriv;
-	struct xfs_trans	*b_transp;
-	struct page		**b_pages;	/* array of page pointers */
-	struct page		*b_page_array[XB_PAGES]; /* inline pages */
-	struct xfs_buf_map	*b_maps;	/* compound buffer map */
-	struct xfs_buf_map	__b_map;	/* inline compound buffer map */
-	int			b_map_count;
-	int			b_io_length;	/* IO size in BBs */
-	atomic_t		b_pin_count;	/* pin count */
-	atomic_t		b_io_remaining;	/* #outstanding I/O requests */
-	unsigned int		b_page_count;	/* size of page array */
-	unsigned int		b_offset;	/* page offset in first page */
-	unsigned short		b_error;	/* error code on I/O */
-	const struct xfs_buf_ops	*b_ops;
-
-#ifdef XFS_BUF_LOCK_TRACKING
-	int			b_last_holder;
-#endif   
-   #+END_SRC
 
 ** xf_buf_map 
    - 对应的磁盘映射信息, 下面磁盘位置是绝对地址??
@@ -207,8 +128,8 @@ typedef struct xfs_buf {
 	{ XBF_READ,		"READ" },
 	{ XBF_WRITE,		"WRITE" }, 
 	{ XBF_READ_AHEAD,	"READ_AHEAD" },
-	{ XBF_ASYNC,		"ASYNC" },
-	{ XBF_DONE,		"DONE" },
+	{ XBF_ASYNC,		"ASYNC" },  /*表示发送xfs_buf请求后,是否等待*/
+	{ XBF_DONE,		"DONE" },   /*已经完成磁盘的IO请求, 说明内存和磁盘数据是一致的*/
 	{ XBF_STALE,		"STALE" }, 
 	{ XBF_SYNCIO,		"SYNCIO" },
 	{ XBF_FUA,		"FUA" },
@@ -325,102 +246,125 @@ typedef struct xfs_buf {
    - 当然还得做偏移 xfs_buf->b_addr += xfs_buf->b_offset
 
 ** _xfs_buf_find(xfs_buftarg, xfs_buf_map, nmaps, xfs_buf_flags, xfs_buf new)
+   - 根据xfs_buf_map的磁盘位置，在对应的AG中查找是否有缓存的xfs_buf
+
    - 检查xfs_buf_map的参数,磁盘位置blkno和长度len
    - blkno不能超过文件系统的容量xfs_sb->sb_dblocks
-   - len必须大于xfs_buftarg->bt_sshift
+   - len必须大于xfs_buftarg->bt_sshift, sectorsize
+
    - 根据blkno计算agno, 获取对应的xfs_perag
    > xfs_perag_get(xfs_mount, xfs_daddr_to_agno(xfs_mount, blkno))
    - xfs_perag->pag_buf_tree里面管理所有的xfs_buf->b_rbnode, 使用磁盘位置排序xfs_buf->b_bn
    - 使用blkno查找, 如果已经存在一个, xfs_buf->b_length必须相同
    - 如果length不相同,这个xfs_buf必须是无效的, xfs_but->b_flags有XBF_STALE
-   - 如果找不到,把新的xfs_buf插入到rbtree中, 如果找到返回它
+   - 如果找不到,把参数new插入到rbtree中, 如果找到返回它
 
 ** xfs_buf_get_map(xfs_buftarg, xfs_buf_map, nmaps, xfs_buf_flags_t)
-   - 首先根据xfs_buf_map查找 
+   - 获取xfs_buf_map对应的xfs_buf, 如果不存在, 构造新的
+
+   - 首先查找xfs_perag
    > _xfs_buf_find(xfs_buftarg, xfs_buf_map, nmaps, xfs_buf_flags_t, NULL)
    - 如果找不到, 创建新的
    > _xfs_buf_alloc(xfs_buftarg, xfs_buf_map, nmaps, xfs_buf_flags_t)
-   - 分配heap内存或者page 
+   - 分配heap内存或者page
    > xfs_buf_allocate_memory(xfs_buf, flags)
    - 重新查找或者插入到rbtree 
+   - 所以在xfs_perag中的xfs_buf是有内存的
    > _xfs_buf_find(xfs_buftarg, xfs_buf_map, nmaps, flags, xfs_buf)
-   - 如果上面使用page, 可能还没有建立page映射, xfs_buf->b_addr ==NULL
+   - 无论是已经存在的, 还是新创建的,都有内存, 但可能没有建立映射
+   - 根据xfs_buf->b_addr,建立内存映射
    > _xfs_buf_map_pages(xfs_buf, flags)
    
 ** _xfs_buf_read(xfs_buf, xfs_buf_flags_t flags)
-   - xfs_buf->b_maps[0]->bm_bn必须是有效磁盘位置?? 为何不用xfs_buf->b_bn?  XFS_BUF_DADDR_NULL
-   - 去掉xfs_b_flags的xfs_buf->b_flags, 去掉XBF_WRITE | XBF_ASYNC | XBF_READ_AHEAD
-   - 添加 flags & (XBF_READ | XBF_ASYNC | XBF_READ_AHEAD ) ??
-   - 几乎是重新设置为flags? 
+   - 发送读请求, 获取xfs_buf的磁盘数据
+
+   - flags没有XBF_WRITE
+   - xfs_buf->b_maps[0]->bm_bn必须是有效磁盘位置, 为何不用xfs_buf->b_bn, XFS_BUF_DADDR_NULL
+   - 去掉xfs_buf->b_flags 的 XBF_WRITE | XBF_ASYNC | XBF_READ_AHEAD
+   - 添加 flags & (XBF_READ | XBF_ASYNC | XBF_READ_AHEAD )
+   - 几乎是重新设置为flags
    > xfs_buf_iorequest(xfs_buf)
    - 如果flags有XBF_ASYNC, 直接返回
-   - 否则等待io完成 
+   - 否则等待io完成, xfs_buf->b_iowait
    > xfs_buf_iowait(xfs_buf)
 
 ** xfs_buf_read_map(xfs_buftarg, xfs_buf_map, nmaps, xfs_buf_flags_t, xfs_buf_ops)
-   - 根据xfs_buf_map构造xfs_buf 
+   - 构造一个xfs_buf读取xfs_buf_map的磁盘数据
+
+   - 根据xfs_buf_map构造xfs_buf, 或使用缓存的
    > xfs_buf_get_map(xfs_buftarg, xfs_buf_map, nmaps, xfs_buf_flags_t)
-   - 检查io是否完成, xfs_buf之前已经存在??
+
+   - 如果xfs_buf->b_flags有XBF_DONE, 表示IO已经完成, 不需要发送IO请求
    > XFS_BUF_ISDONE(xfs_buf) 
-   - 如果没有完成IO, 设置xfs_buf->xfs_buf_ops, 启动读操作 
+   - 否则读回数据,设置xfs_buf->xfs_buf_ops
    > _xfs_buf_read(xfs_buf, flags)
-   - 如果已经完成, 而且flags有XFS_ASYNC, 这是readahead??
-   - 释放xfs_buf的锁,和使用计数
+   - 如果IO已经完成, 而且flags有XFS_ASYNC, 这是readahead
+   - 释放xfs_buf计数, 上面查找时增加计数, 并释放xfs_buf->b_sema锁
    > xfs_buf_relse(xfs_buf)
-   - 如果不是异步, 去掉xfs_buf->b_flags的XBF_READ ??
+   - 如果不是异步, 去掉xfs_buf->b_flags的XBF_READ, 读操作完成后直接去掉这个标志
 
 ** xfs_buf_readahead_map(xfs_buftarg, xfs_buf_map, nmaps, xfs_buf_ops)
+   - 预读xfs_buf的数据, 发送请求之后直接退出
+
    - 检查bdi的阻塞 
    > bdi_read_congested(xfs_buftarg->backing_dev_info
-   - 预读xfs_buf 
+   - 预读xfs_buf, 如果有缓存, 可直接返回, 而且不影响计数
+   - 否则发送IO请求, 在IO完成后的回调中释放计数
    > xfs_buf_read_map(xfs_buftarg, xfs_buf_map, nmaps, XBF_TRYLOCK | XBF_ASYNC |XBF_READ_AHEAD, xfs_btree_ops)
 
-** xfs_buf_read_uncached(xfs_buftarg, xfs_addr_t, numblks, flags, xfs_btree_ops)
-   - 根据磁盘位置创建xfs_buf 
+** xfs_buf_read_uncached(xfs_buftarg, xfs_daddr_t daddr, numblks, flags, xfs_btree_ops)
+   - 读取daddr指向的磁盘数据, 不使用缓存的xfs_buf, 也就不使用它缓存的数据
+   - 在mount和growfs时使用, 探测daddr磁盘地址是否有效
+
+   - 根据磁盘位置创建xfs_buf, 它不会去xfs_perag中查找, 直接构造,分配内存建立地址映射
    > xfs_buf_get_uncached(xfs_buftarg, numblks, flags)
-   - 这种情况只能包含一个xfs_buf_map, xfs_buf->b_map_count =1
-   - 设置xfs_buf->b_bn = daddr, 设置xfs_buf->b_maps[0]->bm_bn = daddr
+   - 构造一个xfs_buf_map, xfs_buf->b_map_count =1, 设置为(daddr,numblks)
    - 设置xfs_buf->b_flags的XBF_READ, xfs_buf->xfs_buf_ops
-   - 读取对应的磁盘数据?? 
-   > xfsbdstrat(xfs_mount, xfs_buf)
+   - 发送IO请求
+   > xfs_buf_iorequest(xfs_buf)
    - 等待IO完成  
    > xfs_buf_iowait(xfs_buf)
 
 ** xfs_buf_set_empty(xfs_buf, numblks)
-   - 清空xfs_buf使用的page
+   - 重置xfs_buf的内存信息和磁盘信息, 只留下数据长度
+
+   - 释放xfs_buf使用的page
    > _xfs_buf_free_pages(xfs_buf)
-   - 这里仅仅设置xfs_buf->b_length / b_io_length = numblks
-   - 磁盘地址设为 xfs_buf->b_bn, 第一个xfs_bmap_map等都设为XFS_BUF_DADDR_NULL 
+   - 设置xfs_buf->b_length / b_io_length = numblks
+   - 磁盘地址设为无效 xfs_buf->b_bn和第一个xfs_bmap_map等都设为XFS_BUF_DADDR_NULL 
 
 ** mem_to_page(addr)
-   - 检查addr是什么内存?? 获取对应的page指针
+   - 反响映射内存地址, 获取使用的page指针
+
    - 如果是vmap映射的 
    > is_vmalloc_addr(addr)
-   - vmalloc_to_page(addr)
-   - 如果不是vmap, 就是直接映射??
+   > vmalloc_to_page(addr)
+   - 如果不是vmap, 就是直接映射, 包含直接映射的情况
    > virt_to_page(addr)
 
 ** xfs_buf_associated_memory(xfs_buf, mem, len)
    - 设置xfs_buf的内存地址, mem是已经分配的,可能包括多个page
-   - 设置xfs_buf->b_offset为页内偏移  mem & (PAGE_SIZE - 1)
+
+   - 计算xfs_buf->b_offset为页内偏移  mem & (PAGE_SIZE - 1)
    - 根据 ( len + offset)计算page个数 
    - 分配page指针数组 
    > _xfs_buf_get_pages(xfs_buf, page_count, 0)
    - 设置mem使用的page指针  
    > mem_to_page(addr)
-   - 设置xfs_buf->b_len / b_io_length = len
+   - 设置xfs_buf->b_len = buflen, 长度包括第一个page的偏移
+   - 设置b_io_length = len, 表示数据长度
    - b_len的单位是BB (512)
 
 ** xfs_buf_get_uncached(xfs_buftarg, numblks, flags)
+   - 构造一个新的xfs_buf, 不使用xfs_perag缓存的
+
    - 构造临时的xfs_buf_map, 来创建xfs_buf
    - _xfs_buf_alloc(xfs_buftarg, xfs_buf_map, 1, 0)
    - 分配page 
    > _xfs_buf_get_pages(xfs_buf, page_count, 0)
    > alloc_page(xb_to_gfp(flags))
    - 设置xfs_buf->b_flags的_XBF_PAGES
-   - 建立映射, 
-   - 如果是单个page,使用直接映射
-   - 如果多个page, 使用vmap, 分配一块连续的虚拟空间
+   - 建立映射,如果是单个page,使用直接映射, 如果多个page, 使用vmap, 分配一块连续的虚拟空间
    > _xfs_buf_map_pages(xfs_buf, flags)
 
 ** xfs_buf_hold(xfs_buf)
@@ -430,12 +374,10 @@ typedef struct xfs_buf {
    - 释放xfs_buf->b_hold计数, 使用xfs_perag->pag_buf_lock锁住 
    - 如果计数不为0, 直接返回
    - 如果为0, 开始释放xfs_buf
-   - 如果xfs_buf不是stale, b_flags没有XBF_STALE
-   - 而且xfs_buf->b_lru_ref > 0 ???
-   - 缓存到lru队列中
-   - 把xfs_buf->b_lru放到xfs_buf->xfs_buftarg->bt_lru中
-   - 如果原来没有在lru队列中,需要去掉xfs_buf->b_state的XFS_BSTATE_DISPOSE??, 增加xfs_buf->b_hold计数
-   - 否则直接释放xfs_buf, 或者他是stale, 或者lru为lru计数为1
+   - 如果xfs_buf不是stale, b_flags没有XBF_STALE, 而且xfs_buf->b_lru_ref > 0
+   - 缓存到lru队列中, 把xfs_buf->b_lru放到xfs_buf->xfs_buftarg->bt_lru中
+   - 如果原来没有在lru队列中,需要去掉xfs_buf->b_state的XFS_BSTATE_DISPOSE, 增加xfs_buf->b_hold计数
+   - 否则直接释放xfs_buf, 或者他是stale, 或者b_lru_ref为1
    - 如果xfs_buf->b_state有XFS_BSTATE_DISPOSE, 表示它在lru队列中,释放链表
    - 释放rbroot关系  
    > xfs_buf_free(xfs_buf)
@@ -453,147 +395,174 @@ typedef struct xfs_buf {
    - 解锁xfs_buf->b_sema, 并把xfs_buf->b_last_holder改为-1
 
 ** xfs_buf_wait_unpin(xfs_buf)
-   - 等待xfs_buf->b_pin_count?
+   - 等待xfs_buf->b_pin_count, 在发送写IO之前等待
+   - 在把xfs_log_item添加到xfs_cil之前,把log数据复制到xfs_log_vec中, 但还是锁住xfs_log_item修改的对象
+   - 在xlog_in_core写回数据后, 把xfs_log_item给xfs_ail, 可以释放xfs_log_item的对象
+
    - 如果b_pin_count ==0, 直接返回
    - 否则在xfs_buf->b_waiters上睡眠
 
 ** xfs_buf_iodone_work(work_struct)
-   - 使用work_struct同时IO完成??
+   - xfs_buf的IO完成后, 可能需要继续检查数据有效性, 使用workqueue完成
+
    - 根据xfs_buf->b_flags计算IO方向, read/write
-   - 去掉xfs_buf->b_flags的XBF_READ | XBF_WRITE | XBF_READ_AHEAD ??
-   - 如果read, 而且xfs_buf->b_flags有XBF_DONE, 而且没有错误 xfs_buf->b_error ==0 
+   - 去掉xfs_buf->b_flags的XBF_READ | XBF_WRITE | XBF_READ_AHEAD, 表示IO已经完成
+
+   - 如果read, 而且xfs_buf->b_flags有XBF_DONE, 而且没有错误 xfs_buf->b_error ==0
+   - 检验读回的数据是否有效
    > xfs_buf->xfs_buf_ops->verify_read(xfs_buf)
+
    - 如果xfs_buf->b_iodone !=0, 调用回调函数
    > xfs_buf->b_iodone(xfs_buf)
    - 否则没有设置回调函数, 如果xfs_buf是异步IO, xfs_buf->b_flags有XBF_ASYNC标志
    - 直接解锁并释放这个xfs_buf
    > xfs_buf_relse(xfs_buf)
-   - 最后如果是同步IO, 唤醒xfs_buf->b_iowait
+   - 最后如果是同步IO, 唤醒xfs_buf->b_iowait, 没有释放xfs_buf
    > complete(xfs_buf->b_iowait)
 
 ** xfs_buf_ioend(xfs_buf, schedule)
-   - 哪里使用的回调函数??
+   - 很多地方使用这个函数, 表示在IO完成后调用. 如果发送IO时有错误,也会调用
+   - IO完成后的调度, 可以直接完成回调, 也可以使用workqueue完成回调
+
    - 如果xfs_buf->b_error ==0, 设置xfs_buf->b_flags的XBF_DONE
-   - 如果xfs_buf->b_iodone有效, 或者read, 或者异步，必须调用IO完成函数
+   - 如果xfs_buf->b_iodone有效, 或者read, 或者异步，IO完成后处理这些回调操作
    - 如果schedule ==1, 使用work_queue完成 
    > queue_work(xfslogd_workqueue, xfs_buf->b_iodone_work)
    - 否则直接执行 
    > xfs_buf_iodone_work(xfs_buf->b_iodone_work)
-   - 其他情况, IO没有完成,不是需要验证的读操作, 而且是同步的
+   - 其他情况,xfs_buf是同步的, 而且没有验证, 而且b_iodone没有回调请求
    - 去掉xfs_buf->b_flags的XBF_READ | XBF_WRITE | XBF_READ_AHEAD
-   - 唤醒等待的任务 
+   - 唤醒等待的任务
    > complete(xfs_buf->b_iowait)
 
 ** xfs_buf_ioerror(xfs_buf, error)
    - 设置xfs_buf->b_error = error
 
 ** xfs_buf_ioerror_alert(xfs_buf, func)
-   - 输出提示信息?? 
+   - 输出错误信息
 
 ** xfs_bioerror(xfs_buf)
-   - IO错误处理??
-   - 设置错误 
+   - 发送IO请求时出错, 设置xfs_buf的错误状态
+
+   - 设置xfs_buf->b_error
    > xfs_buf_ioerror(xfs_buf, EIO)
    - 去掉xfs_buf->b_flags的XBF_READ, XFS_DONE, 怎么知道这个read操作? 
    > xfs_buf_stale(xfs_buf)
+   - 唤醒等待的任务
    > xfs_buf_ioend(xfs_buf, 0)
 
 ** xfs_bioerror_relse(xfs_buf)
-   - IO错误处理函数, 不是使用ioend, 而是直接释放xfs_buf
+   - IO错误处理函数, 不会触发任何回调处理, 而且直接释放xfs_buf
+
    - 去掉xfs_buf->b_flags的XBF_READ, 设置XBF_DONE 
    > xfs_buf_stale(xfs_buf)
-   - 设置xfs_buf->b_iodone = NULL, 去过是同步的, 唤醒等待的任务
+   - 设置xfs_buf->b_iodone = NULL
+   - 如果是同步的, 唤醒等待的任务
    > xfs_buf_ioerror(xfs_buf, EIO)
    > complete(xfs_buf->b_iowait)
    - 否则直接释放它 
    > xfs_buf_relse(xfs_buf)
 
 ** xfs_bdstrat_cb(xfs_buf)
-   - 如果文件系统在关闭 
+   - 提交IO请求
+
+   - 如果文件系统在关闭,计数xfs_buf的IO请求
    > XFS_FORCED_SHUTDOWN(xfs_mount)
-   - 直接调用错误处理
-   - 如果没有回调xfs_buf->b_iodone == NULL, 而且不是同步读
+   - 如果没有回调xfs_buf->b_iodone == NULL, 而且不是同步读, 直接释放xfs_buf
    > xfs_bioerror_relse(xfs_buf)
-   - 否则只设置错误?? 使用通用的ioend
+   - 否则只设置错误, 使用通用的回调函数, 可以去处理xfs_buf->b_iodone
    > xfs_bioerror(xfs_buf)
-   - 如果没有问题, 提交bio? 
+
+   - 如果没有问题, 提交bio
    > xfs_buf_iorequest(xfs_buf)
 
 ** xfs_bwrite(xfs_buf)
+   - 写回xfs_buf的数据
+
    - 设置xfs_buf->b_flags的XBF_WRITE, 去掉XBF_ASYNC | XBF_READ | _XBF_DELWRI_Q
-   - 写都是异步的?? 
    > xfs_bdstrat_cb(xfs_buf)
    - 等待io 
    > xfs_buf_iowait(xfs_buf)
 
-** xfsbdstrat(xfs_mount, xfs_buf)
-   - 先检查xfs_mount 
-   > XFS_FORCED_SHUTDOWN(xfs_mount)
-   - 使用错误处理
-   > xfs_bioerror_relse(xfs_buf)
-   - 直接发送IO请求 
-   > xfs_buf_iorequest(xfs_buf)
-   
 ** _xfs_buf_ioend(xfs_buf, schedule)
-   - 减小xfs_buf->b_io_remaining?  如果减为1, 调用结束函数 
+   - 在bio的回调中使用. 初始化时xfs_buf->b_io_remaining=1
+   - xfs_buf可能使用多个bio, 每个bio都会增加1,最后一个完成的bio调用整个xfs_buf的回调函数
+   - 提交完成bio后减1。 放置所有的xfs_buf的bio提交完成之前,触发回调函数
+
+   - 减小xfs_buf->b_io_remaining, 如果减为0, 调用结束函数 
+   > atomic_dec_and_test(xfs_buf->b_io_remaining)
    > xfs_buf_ioend(xfs_buf, schedule)
 
 ** xfs_buf_bio_end_io(bio, error)
    - bio的回调函数, bio->bi_private是xfs_buf
-   - 如果xfs_buf->b_error ==0, 更新它
+
+   - 如果xfs_buf->b_error ==0, 更新它.如果已经有错误, 不会覆盖
    > xfs_buf_ioerror(xfs_buf, -error)
-   - 如果xfs_buf->b_error ==0, 而且使用vmap, 而且是read操作, 无效vmap?   
-   - 空操作,难道是刷cache?
+   - 如果xfs_buf->b_error ==0, 而且使用vmap, 而且是read操作, 无效vmap地址空间
+   - 空操作,应该为了dma和cpu的数据一致性
    > invalidate_kernel_vmap_range(addr, xfs_buf_vmap_len(xfs_buf))
    - 调用通知函数, 这里要求使用work_struct
    > _xfs_buf_ioend(xfs_buf, 1)
    > bio_put(bio)
 
 ** xfs_buf_ioapply_map(xfs_buf, map, buf_offset, count, rw)
-   - 获取磁盘位置 xfs_buf->b_maps[map]->bm_bn 
-   - buf_offset对应的page已经页内偏移
+   - 为xfs_buf->b_maps[map]发送IO请求, 内存地址是xfs_buf的page, 需要偏移buf_offset
+   - 这一个xfs_buf_map可能使用多个bio
+
+   - 磁盘起始位置是xfs_buf->b_maps[map]->bm_bn 
+   - buf_offset对应的page页内偏移, 后面根据它找到page,已经page内部偏移
    - IO数据量是min(count, xfs_buf_map[map]->bm_len)
-   - 增加xfs_buf->b_io_remaining
-   - 构造bio, 这里准备的iovec长度不超过BIO_MAX_SECTORS(256pages)和xfs_buf->b_page_count
+   - 先增加xfs_buf->b_io_remaining, 它对应每个bio
+   - 构造bio, 它包含的iovec长度不超过BIO_MAX_SECTORS(256pages)和xfs_buf->b_page_count
    > xfs_alloc(GFP_NOIO, nr_pages)
    - 设置bio的block_device, 磁盘位置bi_sector是上面xfs_buf_map的地址
    - 回调函数是xfs_buf_bio_end_io
    - bio->bi_private是xfs_buf 
-   - 遍历xfs_buf里面的page 
+
+   - 遍历xfs_buf里面的page
    - 这里的offset和page_index根据上面的buf_offset计算
    > bio_add_page(bio, xfs_buf->b_pages[page_index], nbytes, offset)
-   - 如果bio无法添加IO,先提交一个,然后创建新的bio
-   - 提交bio 
+   - 如果bio无法添加内存数据,先提交,创建新的bio
    > submit_bio(rw, bio)
+   - 当然bio准备错误, 结束IO
+   - 减小xfs_buf->b_io_remaining --
+   > xfs_buf_ioerror(xfs_buf, EIO)
+   > bio_put(bio)
 
 ** _xfs_buf_ioapply(xfs_buf)
-   - 根据xfs_buf的标志计算IO的方向
+   - 根据xfs_buf的标志计算IO类型
+
    - 如果xfs_buf->b_flags有XBF_WRITE, 写操作
    - 如果xfs_buf->b_flags有XBF_SYNCIO, rw是WRITE_SYNC, 否则是WRITE
    - 如果xfs_buf->b_flags有XBF_FUA, 设置rw的REQ_FUA
    - 如果xfs_buf->b_flags有XBF_FLUSH, 设置rw的REQ_FLUSH
-   - 验证xfs_buf的数据  
+   - 写操作之前验证xfs_buf的数据  
    > xfs_buf->xfs_buf_ops->verify_write(xfs_buf)
+
    - 如果xfs_buf->b_flags有XBF_READ_AHEAD, 设置rw = READA 
    - 其他情况设置为rw = READ
-   - 最后设置rw的REQ_META, 这里只会读取metadata?? 普通数据的IO??
+   - 最后设置rw的REQ_META, xfs_buf只处理metadata
    - 获取xfs_buf->b_offset / b_io_length, 提交bio 
    - 先停止块设备 
    > xfs_start_plug(plug)
    - 遍历xfs_buf->b_map_count, 每次提交一个xfs_buf_map的IO
+   - offset起始是xfs_buf->b_offset, 应该对应第一个page的对齐
+   - size是xfs_buf->b_io_length, 也包含第一个page的偏移
    > xfs_buf_ioapply_map(xfs_buf, i, offset, size, rw)
    - xfs_finish_plug(plug)
 
 ** xfs_buf_iorequest(xfs_buf)
-   - xfs_buf->b_flags不能有_XBF_DELWRI_Q ??
-   - 如果xfs_buf->b_flags有XBF_WRITE, 等待pin?? 
+   - xfs_buf->b_flags不能有_XBF_DELWRI_Q, 普通的IO
+
+   - 如果xfs_buf->b_flags有XBF_WRITE, 等待log完成
    > xfs_buf_wait_unpin(xfs_buf)
    - 增加使用计数 
    > xfs_buf_hold(xfs_buf)
    - 设置xfs_buf->b_io_remaining = 1 
    - 提交bio 
    > _xfs_buf_ioapply(xfs_buf)
-   - 为何这里还要释放??
+   - 释放计数, 如果bio都完成, 这里触发回调函数 
+   - 否则最后一个bio完成时触发回调函数
    > _xfs_buf_ioend(xfs_buf, 1)
    - 释放xfs_buf的使用计数
    > xfs_buf_rele(xfs_buf)
@@ -615,53 +584,62 @@ typedef struct xfs_buf {
    - 对于xfs_buf, 完全使用page的直接映射访问
    - 根据boff定位xfs_buf中的内存page
    - 检查mode, 如果是XBRW_ZERO, 设置xfs_buf对应的空间为0
-   - 如果是XBRW_READ, 从xfs_buf总复制数据
+   - 如果是XBRW_READ, 从xfs_buf中复制数据
    - 如果是XBRW_WRITE, 把data写到xfs_buf中
 
 ** xfs_buftarg_wait_rele(list_head, lru_lock, arg)
-   - 等待释放??
+   - 遍历xfs_buftarg->bt_lru的xfs_buf使用的回调函数
+   - 释放xfs_buf时,如果xfs_buf->b_lru_ref > 0, 把它放到xfs_buftarg->bt_lru中
+
    - 第一个参数list_head是xfs_buf->b_lru, 最后一个参数是链表 list_head
-   - 如果xfs_buf->b_hold > 1, 返回LRU_SKIP??
-   - 否则释放lru链表关系
-   - 设置xfs_buf->b_lru_ref = 0, 添加xfs_buf->b_state的XFS_BSTATE_DISPOSE
-   - 把xfs_buf->b_lru放到arg链表中
+   - 如果xfs_buf->b_hold > 1, 返回LRU_SKIP, 不能释放它
+   - 如果不能锁住xfs_buf, 返回LRU_SKIP, 也不能释放它
+   - 否则释放lru链表关系, 设置xfs_buf->b_lru_ref = 0, 添加xfs_buf->b_state的XFS_BSTATE_DISPOSE
+   - 把xfs_buf->b_lru放到参数arg链表中
    - 最后返回LRU_REMOVED
 
 ** xfs_wait_buftarg(xfs_buftarg)
-   - 循环检查xfs_buftarg->bt_lru链表, 如果还有xfs_buf, 释放它?
+   - 在umount或freeze之前使用, 释放缓存的所有xfs_buf
+
+   - 循环检查xfs_buftarg->bt_lru链表, 如果还有xfs_buf, 释放它
    - 这里循环退出条件是这个链表个数? 为何不直接用空判断?
    > list_lru_count(xfs_buftarg->bt_lru)
-   - 遍历链表,使用xfs_buftarg_wait_rele处理它 
+   - 遍历链表,使用xfs_buftarg_wait_rele处理它
    > list_lru_walk(xfs_buftarg->bt_lru, xfs_buftarg_wait_rele, list_head, LOGN_MAX)
-   - 如果上面list_head中收集了xfs_buf, 释放他们  
+   - 释放收集的xfs_buf
    > xfs_buf_rele(xfs_buf)
+   - 如果回收不完,等待0.1s
 
 ** xfs_buftarg_isolate(list_head, lru_lock, arg)
-   - 也是一个遍历的回调函数, 处理xfs_buf->b_lru_ref计数
+   - 遍历xfs_buftarg->bt_lru的xfs_buf使用的回调函数, 回收缓存的xfs_buf
+
    - 锁住xfs_buf, 如果锁不住,返回LRU_SKIP 
-   > 减小xfs_buf->b_io_remaining， 如果已经是0,返回LRU_ROTATE?? 
-   - 设置xfs_buf->b_state的XFS_BSTATE_DISPOSE, 放到arg链表中  
+   > 减小xfs_buf->b_lru_ref， 如果已经是0,返回LRU_ROTATE, 不处理它!!
+   - 设置xfs_buf->b_state的XFS_BSTATE_DISPOSE, 放到arg链表中, 下面会重新释放它
+   - 如果l_lru_ref > 0, 可能再放回xfs_buftarg->br_ref上面
      
 ** xfs_buftarg_shrink_scan(shrinker, shrink_control)
    - 在xfs_buftarg->bt_lru上回收可以释放的xfs_buf 
    > list_lru_walk_node(xfs_buftarg->bt_lru, shrinker->nid, xfs_buftarg_isolate, dispose, nr_to_scan)
-   - 释放他们
+   - 重新释放他们
    > xfs_buf_rele(xfs_buf)
-   - IO中的xfs_buf应该不会在lru中,应该只会回收内存
 
 ** xfs_buftarg_shrink_count(shrinker, shrink_count)
-   - 计算可回收的xfs_buf的个数? 
+   - 计算可回收的xfs_buf的个数
    > list_lru_count_node(xfs_buf->bt_lru, shrink_control->nid)
 
 ** xfs_free_buftarg(xfs_mount, xfs_buftarg)
    - 释放xfs_buftarg
+
    - 注销xfs_buftarg->bt_shrinker
-   - 如果xfs_mount->m_flags有XFS_MOUNT_BARRIAR?? 
+   - 如果xfs_mount->m_flags有XFS_MOUNT_BARRIAR
    - 给磁盘发送flush操作
    > xfs_blkdev_issue_flush(xfs_buftarg)
    - 最后释放xfs_buftarg内存
 
 ** xfs_setsize_buftarg_flags(xfs_buftarg, blocksize, sectorsize, verbose)
+   - 设置xfs_buftarg设备相关参数
+
    - 设置xfs_buftarg->bt_bsize = blocksize
    - bt_sshift = log(sectorsize), bt_smask是sectorsize的位掩码
    - 设置block_device->bd_block_size, 还有对应的blockfs的inode 
@@ -669,11 +647,12 @@ typedef struct xfs_buf {
    - 竟然可以在fs设置blockdevice
 
 ** xfs_setsize_buftarg_early(xfs_buftarg, block_device)
-   - 在mount之前的操作??
-   - 使用PAGE_SIZE作为blocksize, 磁盘默认的sectorsize?
+   - 在mount之前的操作,使用默认值
+   - 使用PAGE_SIZE作为blocksize, 磁盘默认的sectorsize
    > xfs_setsize_buftarg_flags(xfs_buftarg, PAGE_SIZE, bdev_logical_block_size(block_device), 0)
 
 ** xfs_setsize_buftarg(xfs_buftarg, blocksize, sectorsize)
+   - 应该是mount之后使用, 已经从xfs_sb中取出来有效值
    > xfs_setsize_buftarg_flags(xfs_buftarg, blocksize, sectorsize, 1)
 
 ** xfs_alloc_buftarg(xfs_mount, block_device, external, fsname)
@@ -687,7 +666,8 @@ typedef struct xfs_buf {
    > register_shrinker(xfs_buftarg->bt_shrinker)
 
 ** xfs_buf_delwri_queue(xfs_buf, list_head)
-   - 把xfs_buf放到delayed write队列中
+   - 把xfs_buf放到参数list_head队列中, 延迟写操作
+
    - 如果xfs_buf->b_flags有_XBF_DELWRI_Q, 它已经在队列中,返回false
    - 设置xfs_buf->b_flags的_XBF_DELWRI_Q, 而且把xfs_buf->b_list放到参数list_head中, 增加xfs_buf->b_hold计数
 
@@ -696,37 +676,46 @@ typedef struct xfs_buf {
    - 根据xfs_buf->xfs_map_buf[0]->bm_bn
 
 ** __xfs_buf_delwri_submit(list_head buffer_list, io_list, wait)
-   - 提交xfs_buf的写操作?
+   - 延迟写操作
+
    - 遍历buffer_list里的xfs_buf->b_list
-   - 如果wait ==0, 而且xfs_buf被别人使用? pin ?  跳过这个xfs_buf
+   - 如果wait ==0, 不需要等待xfs_buf
+   - 而且xfs_buf在log操作中, 跳过这个xfs_buf, 增加pinned计数
    > xfs_buf_ispinned(xfs_buf)
-   - 否则尝试锁住, 如果锁不住也跳过
+   - 如果锁不住也跳过
    - 如果wait !=0, 锁住xfs_buf, 而且等待锁操作
    > xfs_buf_lock(xfs_buf)
-   - 检查xfs_buf->b_flags的_XBF_DELWRI_Q? 其他人可能写回?? 
-   - 释放链表, 释放这个xfs_buf 
+
+   - 如果xfs_buf->b_flags没有_XBF_DELWRI_Q, 它已经不能继续延迟写操作
+   - 直接释放它
    > xfs_buf_relse(xfs_buf)
-   - 如果可以释放,把他们集中到io_list链表
+   - 否则把他们集中到io_list链表
+
    - 根据磁盘位置排序
    > list_sort(NULL, io_list, xfs_buf_map)
+   - 积累磁盘IO
    > blk_start_plug(plug)
    - 遍历io_list里的xfs_buf, 去掉_XBF_DELWRI_Q | XBF_ASYNC
    - 设置XBF_WRITE
-   - 根据wait设置XBF_ASYNC
-   - 如果wait ==0, 还要删除xfs_buf->b_list队列
-   - 如果wait !=0, 估计外面回等待这些IO 
+   - 如果wait ==0, 还要删除xfs_buf->b_list队列, 设置XBF_ASYNC
+   - 如果wait !=0, 估计外面回等待这些IO
+   - 提交bio请求
    > xfs_bdstrat_cb(xfs_buf)
+   - 提交磁盘IO
    > blk_finish_plug(plug)
 
 ** xfs_buf_delwri_submit_nowait(list_head)
    - 使用异步方式写回队列中的xfs_buf 
    > __xfs_buf_delwri_submit(buffer_list, io_list, false)
-   - 这里的io_list没有用, wait ==0, 所以删除了链表
+   - 这里的io_list没有用, wait ==0, 直接删除io_list, 而且异步释放xfs_buf
 
 ** xfs_buf_delwri_submit(list_head)
-   - 同步写回一串的xfs_buf, 这里回把有IO的xfs_buf放到io_list中
+   - 写回list_head中的xfs_buf, 他们是延迟写操作积累的xfs_buf
+   - 在xfs_ail中使用, 应该是iop_push操作积累的xfs_buf
+
+   - 先提交bio, 而且xfs_buf是同步的, 不会在异步操作中释放xfs_buf
    > __xfs_buf_delwri_submit(buffer_list, io_list, true)
-   - 然后等待他们  
+   - 然后等待这些xfs_buf的IO
    > xfs_buf_iowait(xfs_buf)
    > xfs_buf_relse(xfs_buf)
 
@@ -734,243 +723,7 @@ typedef struct xfs_buf {
    - 构造xfs_buf使用的kmem_zone
    - 构造workqueue, 为异步的IO服务
    - IO回调函数可能在软中断中,不能在里面做验证或回调用户的程序, 所以在workqueue中完成
-* xfs_bmap_btree.c
-  - 操作文件extent影射 
-    
-** xfs_bmdr_block
-   - bmap结点的头?? 为何不是xfs_btree_block?
-   #+BEGIN_SRC 
-	__be16		bb_level;	/* 0 is a leaf */
-	__be16		bb_numrecs;	/* current # of data records */   
-   #+END_SRC
 
-** xfs_extent_state(xfs_filblks_t blks, extent_flag)
-   - 如果extent_flag !=0, 返回XFS_EXT_UNWRITTEN
-   - 否则返回XFS_EXT_NORM
-
-** xfs_bmdr_to_bmbt(xfs_inode, xfs_bmdr_block, dblocklen, xfs_btree_block, rblocklen)
-   - 把xfs_bmdr_block转化为xfs_btree_block 
-   - xfs_btree_block的数据不会保存起来??
-   - 检查xfs版本,是否支持crc, 设置xfs_btree_block->bc_flags
-   > xfs_sb_version_hascrc(xfs_mount->xfs_sb)
-   - 这里xfs_btree_block中的指针都是用64位? 
-   > xfs_btree_init_block_int(xfs_mount, xfs_btree_block, XFS_BUF_DADDR_NULL, XFS_BMAP_CRC_MAGIC, 0, 0, xfs_inode->i_ino, XFS_BTREE_LONG_PTR|XFS_BTREE_CRC_BLOCKS) 
-   - 设置level, numrecs
-   - 复制xfs_btree_key数组, xfs_btree_ptr数组
-   - 完全不会经过数据类型的大小端变换
-
-** __xfs_bmbt_get_all(l0, l1, xfs_bmbt_irec)
-   - (l0,l1)是xfs_bmbt_rec_host格式
-   - 转化为xfs_bmbt_irec
-   - 对于xfs_bmbt_irec->br_state, 只有2中
-   - 如果l0中为0, 使用XFS_EXT_NORM, 否则使用XFS_EXT_UNWRITTEN
-
-** xfs_bmbt_get_all(xfs_bmbt_rec_host r, xfs_bmbmt_irec)
-   > __xfs_bmbt_get_all(r->l0, r->l1, xfs_bmbt_irec)
-
-** xfs_bmbt_get_blockcount(xfs_bmbt_rec_host)
-   - 获取其中的br_blockcount, 也就是l1的低21位.. 
-
-** xfs_bmbt_get_startblock(xfs_bmbt_rec_host)
-   - 获取其中的br_startblock
-
-** xfs_bmbt_get_startoff(xfs_bmbt_rec_host)
-   - 获取startoff 
-
-** xfs_bmbt_get_state(xfs_bmbt_rec_host)
-   - 获取state 
-
-** xfs_bmbt_disk_get_blockcount(xfs_bmbt_rec) 
-   - 处理的是磁盘数据类型,大端的 
-
-** xfs_bmbt_disk_get_startoff(xfs_bmbt_rec)
-** xfs_bmbt_set_allf(xfs_bmbt_rec_host, xfs_fileoff_t startoff, xfs_fsblock_t startblock, xfs_filblks_t blockcount, xfs_extst_t state)
-   - state只能是XFS_EXT_NORM或XFS_EXT_UNWRITTEN
-   - 然后使用位偏移, 计算对应l0, l1
-
-** xfs_bmbt_set_all(xfs_bmbt_rec_host, xfs_bmbt_irec)
-   > xfs_bmbt_set_allf(..)
-
-** xfs_bmbt_disk_set_allf(xfs_bmbt_rec, ..)
-   - 位操作之后,转化为大端数据类型
-
-** xfs_bmbt_disk_set_all(xfs_bmbt_rec, xfs_bmbt_irec)
-   > xfs_bmbt_disk_set_allf(...)
-
-** xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, xfs_filblks_t )
-** xfs_bmbt_set_startblock(xfs_bmbt_rec_host, xfs_fsblock_t v)
-   - 磁盘位置一直使用xfs_fsblock_t, 应该是包括agno,agbno
-
-** xfs_bmbt_set_startoff(xfs_bmbt_rec_host, xfs_fileoff_t)
-
-** xfs_bmbt_set_state(xfs_bmbt_rec_host, xfs_exntst_t)
-
-** xfs_bmbt_to_bmdr(xfs_mount, xfs_btree_block, rblocklen, xfs_bmdr_block, dblocklen)
-   - 把xfs_btree_block的数据填充到xfs_bmdr_block
-   - 如果xfs_bmdr_block的信息量比xfs_btree_block少, xfs_btree_block的xfs_buf是怎么来的？它使用的不是磁盘的缓存?? 还是专门的内存??
-   - 只会处理level, numrecs
-   - 然后把xfs_btree_key/xfs_btree_ptr复制过去
-
-** xfs_check_nostate_extents(xfs_ifork, xfs_extnum_t idx, xfs_extnum_t num)
-   - 遍历xfs_ifork的(idx,num)范围内的xfs_bmbt_rec_host
-   - 获取对应的xfs_bmbt_rec_host 
-   > xfs_iext_get_ext(xfs_ifork, idx)
-   - 检查里面的state, 必须全部为0??
-
-** xfs_bmbt_dup_cursor(xfs_btree_cur)
-   - 复制一个xfs_btree_cur?
-   - 构造一个新的 
-   > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_btree_cur->bc_private->b->xfs_inode, whichfork)
-   - 复制xfs_btree_cur->bc_private->b的所有成员
-
-** xfs_bmbt_update_cursor(xfs_btree_cur src, xfs_btree_cur dst)
-   - 根据src更新dst
-   - dst的firstblock != NULLFSBLOCK?? 而且2个使用的xfs_bmap_free相同??
-   - 把src的allocated加到dst中,而且设置src的为0
-   - 设置dst的firstblock为src的
-
-** xfs_bmbt_alloc_block(xfs_btree_cur, xfs_btree_ptr start, xfs_btree_ptr new, length, stat)
-   - 构造xfs_alloc_arg, 设置xfs_mount /xfs_trans
-   - 参数length没有使用
-   - 使用xfs_btree_cur->bc_private->b->firstblock作为提示信息,设置xfs_alloc_arg->fsbno
-   - 设置xfs_alloc_arg->firstblock = xfs_alloc_arg->fsbno
-   - 如果xfs_alloc_arg->fsbno == NULLFSBLOCK,
-   - 使用参数start作为提示信息??
-   - 分配类新选择XFS_ALLOCTYPE_START_BNO
-   - 计算xfs_alloc_arg->minleft? 
-   > xfs_trans_et_block_res(xfs_trans)
-   - 如果上面不是NULLFSBLOCK,可以使用, 而且xfs_btree_cur的xfs_bmap_free->xbf_low !=0??
-   - 使用分配方式为XFS_ALLOCTYPE_START_BNO
-   - 其它条件使用XFS_ALLOCTYPE_NEAR_BNO
-   - 设置xfs_alloc_arg->minlen / maxlen / prod = 1
-   - wasdel根据xfs_btree_cur的bc_flags的XFS_BTCUR_BPRV_WASDEL??
-   - 如果wasdel ==0, 而且没有空闲空间?? 返回ENOSPC？？
-   > xfs_trans_get_block_res(xfs_trans)
-   - 分配空间 
-   > xfs_alloc_vextent(xfs_alloc_arg)
-   - 如果分配失败,而且设定了xfs_alloc_arg->minleft? 换一种分配方式 
-   - 使用XFS_ALLOCTYPE_FIRST_AG
-   - 分配成功后更新xfs_btree_cur-bc_private
-   - 设置firstblock = xfs_alloc_arg->fsbno, allocated ++
-   - 增加xfs_inode->xfs_icdinode->di_nblocks
-   - 还要log这个修改!! 
-   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
-   - 把地址给xfs_btree_ptr, 返回stat =1
-
-** xfs_btree_free_block(xfs_btree_cur, xfs_buf)
-   - 把xfs_buf的地址添加到xfs_btree_cur的xfs_bmap_free 
-   > xfs_bmap_add_free(xfs_fsblock_t, 1, xfs_btree_cur->bc_private->b->xfs_bmap_free, xfs_mount)
-   - 减小xfs_inode->xfs_icdinode->di_nblocks --
-   - 记录xfs_inode修改 
-   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
-   - trans什么操作?? 
-   > xfs_trans_binval(xfs_trans, xfs_buf)
-
-** xfs_bmbt_get_minrecs(xfs_btree_cur, level)
-   - 获取最小的分支数??
-   - 如果是根结点, level == xfs_btree_cur->bc_nlevels -1, 计算xfs_ifork最大的空间, 取其一半
-   > xfs_bmbt_maxrecs(xfs_mount, xfs_ifork->if_broot_bytes, level ==0) /2 
-   - 否则使用xfs_mount->m_bmap_dmnr[ level !=0 ]
-
-** xfs_bmbt_get_maxrecs(xfs_btree_cur, level)
-   - 如果是根结点, 根结点也可以是叶子结点?? 
-   > xfs_bmbt_maxrecs(xfs_mount, xfs_ifork->if_broot_bytes, level ==0) 
-   > xfs_mount->m_bmap_dmxr[level != 0] 
-
-** xfs_bmbt_get_dmaxrecs(xfs_btree_cur, level)
-   - 获取磁盘中一个结点支持的最多记录个数??
-   - 如果不是跟结点, 使用xfs_map->m_bmap_dmxr[level !=0], 和上面一样
-   - 否则不一样?? 
-   > xfs_bmdr_maxrecs(xfs_mount, xfs_bmbt_cur->bc_private->b->forksize, level != 0)
-     
-** xfs_bmbt_init_key_from_rec(xfs_btree_key, xfs_btree_rec) 
-   - xfs_btreekey是xfs_bmbt_key, 使用文件偏移
-   - 但这里的数据类型是大端的  __be64
-   - 返回xfs_btree_rec的bt_startoff
-
-** xfs_bmbt_inti_rec_from_key(xfs_btree_key, xfs_btree_rec) 
-   - 根据xfs_btree_key初始化xfs_btree_rec, 也就是xfs_bmbt_rec
-   - 只设置文件偏移 startoff 
-
-** xfs_bmbt_init_rec_from_cur(xfs_btree_cur, xfs_btree_rec)
-   - 使用xfs_btree_cur->bc_rec->b, 也就是xfs_bmbt_irec
-   > xfs_bmbt_disk_set_all(xfs_bmbt_rec->xfs_bmbt_rec, xfs_btree_cur->bc_rec->xfs_bmbt_irec)
-
-** xfs_bmbt_init_ptr_from_cur(xfs_bmbt_cur, xfs_btree_ptr)
-   - 设置为0?? 不是NULL
-
-** xfs_bmbt_key_diff(xfs_btree_cur, xfs_btree_key)
-   - 比较xfs_btree_key和要查找的记录的关系
-   - xfs_btree_key是文件偏移,而且数据结构是大端的, 先转化为普通的数据类型
-   - 然后和xfs_btree_cur->bc_rec->b->br_startoff比较 
-
-** xfs_bmbt_verify(xfs_buf)
-   - xfs_buf里面是xfs_btree_block, 检查它的格式??
-   - magic, crc, uuid, blkno, owner不能是0
-   - level不能超过xfs_mount->m_bm_maxlevels[]
-   - numrecs不能超过 xfs_mount->m_bmap_dmxr[]
-   - 而且兄弟指针不能为NULLDFSBNO, 或者为0, 或者和当前的结点在一个ag中
-
-** xfs_bmbt_read_verify(xfs_buf)
-   - 先计算crc
-   > xfs_btree_lblock_verify_crc(xfs_buf)
-   - 然后检查xfs_btree_block
-   > xfs_bmbt_verify(xfs_buf)
-
-** xfs_bmbt_write_verify(xfs_buf)
-   - 写之前的验证
-   - 检查xfs_btree_block
-   > xfs_bmbt_verify(xfs_buf)
-   - 然后计算crc, 谁用呢? 
-   > xfs_btree_lblock_calc_crc(xfs_buf)
-   
-** xfs_buf_ops xfs_bmbt_buf_ops 
-   - 包装上面的2个verify函数, 给xfs_btree_ops使用
-
-** xfs_bmbt_keys_inorder(xfs_btree_cur, xfs_btree_key k1, k2)
-   - 返回 k1 < k2, 需要先转化为本地的数据类型
-
-** xfs_bmbt_recs_inorder(xfs_bmbt_cur, xfs_btree_rec r1, r2)
-   - 比较范围是否有序
-   - r1->br_startoff + r1->br_blockcount <= r2->br_startoff
-
-** xfs_btree_ops xfs_bmbt_ops
-   - 构造回调函数指针 
-
-** xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, whichfork)
-   - 构造新的xfs_btree_cur
-   - 设置参数xfs_mount, xfs_trans
-   - bc_nlevels需要跟结点,在xfs_ifork中保存 
-   > xfs_ifork->if_broot->bb_level + 1
-   - bc_blocklog是什么?? xfs_sb->sb_blocklog
-   - bc_flags设置为XFS_BTREE_LONG_PTR | XFS_BTREE_ROOT_IN_INODE
-   - 然后是xfs_btree_cur->bc_private->b
-   - forksize是对应的xfs_ifork在xfs_dinode中的空间大小 
-   > XFS_IFORK_SIZE(xfs_inode, whichfork)
-   - xfs_inode, whichfork
-   - 其他的都设为0, 哪里分配的xfs_bmap_free?? 
-
-** xfs_bmbt_maxrecs(xfs_mount, blocklen, leaf)
-   - 对于磁盘中结点长度为blocklen, 计算支持的做多记录数?? 
-   - 减去头部XFS_BMBT_BLOCK_LEN(xfs_mount), 磁盘中xfs_bmdr_block不是没有crc等??
-   - 对于叶子结点,返回blocklen /= sizeof(xfs_bmbt_rec)
-   - 对于内部结点,返回blocklen /= (sizeof(xfs_bmbt_key + xfs_bmbt_ptr))
-   - 这里没有使用xfs_btree_key / xfs_btree_ptr, 应该是更精确了.. 
-
-** xfs_bmdr_maxrecs(xfs_mount, blocklen, leaf)
-   - 对于普通的非跟结点,还是使用xfs_btree_block
-   - 对于在xfs_dinode的跟结点,使用xfs_bmdr_block, 不需要xfs_btree_block重复的成员
-   - blocklen -= sizeof(xfs_bmdr_block)
-   - 对于叶子结点, blocklen /= sizeof(xfs_bmdr_rec)
-   - 对于内部结点, blocklen /= (sizeof(xfs_bmdr_key) + sizeof(xfs_bmdr_ptr))
-
-** xfs_bmdr_change_owner(xfs_trans, xfs_inode, whichfork, xfs_ino_t new_owner, list_head buffer_list)
-   - 修改xfs_ifork的xfs_inode?这个可以移动?? 
-   - 创建一个xfs_btree_cur 
-   > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, whichfork)
-   - 遍历所有的结点, 修改对应的owner成员
-   > xfs_btree_change_owner(xfs_btree_cur, new_owner, buffer_list)
-   - 删除xfs_btree_cur
 * xfs_trans_buf.c
 
 ** xfs_buf_log_format 
@@ -1611,3 +1364,240 @@ typedef struct xfs_buf {
 ** 总结
    - 在bmap操作中使用它, 不仅metadata的extent使用它,file的IO也回使用它.在修改block map时,向写入trans中的efi,最后写入efd  xfs_bmap_finish
 
+* xfs_bmap_btree.c
+  - 操作文件extent影射 
+    
+** xfs_bmdr_block
+   - bmap结点的头?? 为何不是xfs_btree_block?
+   #+BEGIN_SRC 
+	__be16		bb_level;	/* 0 is a leaf */
+	__be16		bb_numrecs;	/* current # of data records */   
+   #+END_SRC
+
+** xfs_extent_state(xfs_filblks_t blks, extent_flag)
+   - 如果extent_flag !=0, 返回XFS_EXT_UNWRITTEN
+   - 否则返回XFS_EXT_NORM
+
+** xfs_bmdr_to_bmbt(xfs_inode, xfs_bmdr_block, dblocklen, xfs_btree_block, rblocklen)
+   - 把xfs_bmdr_block转化为xfs_btree_block 
+   - xfs_btree_block的数据不会保存起来??
+   - 检查xfs版本,是否支持crc, 设置xfs_btree_block->bc_flags
+   > xfs_sb_version_hascrc(xfs_mount->xfs_sb)
+   - 这里xfs_btree_block中的指针都是用64位? 
+   > xfs_btree_init_block_int(xfs_mount, xfs_btree_block, XFS_BUF_DADDR_NULL, XFS_BMAP_CRC_MAGIC, 0, 0, xfs_inode->i_ino, XFS_BTREE_LONG_PTR|XFS_BTREE_CRC_BLOCKS) 
+   - 设置level, numrecs
+   - 复制xfs_btree_key数组, xfs_btree_ptr数组
+   - 完全不会经过数据类型的大小端变换
+
+** __xfs_bmbt_get_all(l0, l1, xfs_bmbt_irec)
+   - (l0,l1)是xfs_bmbt_rec_host格式
+   - 转化为xfs_bmbt_irec
+   - 对于xfs_bmbt_irec->br_state, 只有2中
+   - 如果l0中为0, 使用XFS_EXT_NORM, 否则使用XFS_EXT_UNWRITTEN
+
+** xfs_bmbt_get_all(xfs_bmbt_rec_host r, xfs_bmbmt_irec)
+   > __xfs_bmbt_get_all(r->l0, r->l1, xfs_bmbt_irec)
+
+** xfs_bmbt_get_blockcount(xfs_bmbt_rec_host)
+   - 获取其中的br_blockcount, 也就是l1的低21位.. 
+
+** xfs_bmbt_get_startblock(xfs_bmbt_rec_host)
+   - 获取其中的br_startblock
+
+** xfs_bmbt_get_startoff(xfs_bmbt_rec_host)
+   - 获取startoff 
+
+** xfs_bmbt_get_state(xfs_bmbt_rec_host)
+   - 获取state 
+
+** xfs_bmbt_disk_get_blockcount(xfs_bmbt_rec) 
+   - 处理的是磁盘数据类型,大端的 
+
+** xfs_bmbt_disk_get_startoff(xfs_bmbt_rec)
+** xfs_bmbt_set_allf(xfs_bmbt_rec_host, xfs_fileoff_t startoff, xfs_fsblock_t startblock, xfs_filblks_t blockcount, xfs_extst_t state)
+   - state只能是XFS_EXT_NORM或XFS_EXT_UNWRITTEN
+   - 然后使用位偏移, 计算对应l0, l1
+
+** xfs_bmbt_set_all(xfs_bmbt_rec_host, xfs_bmbt_irec)
+   > xfs_bmbt_set_allf(..)
+
+** xfs_bmbt_disk_set_allf(xfs_bmbt_rec, ..)
+   - 位操作之后,转化为大端数据类型
+
+** xfs_bmbt_disk_set_all(xfs_bmbt_rec, xfs_bmbt_irec)
+   > xfs_bmbt_disk_set_allf(...)
+
+** xfs_bmbt_set_blockcount(xfs_bmbt_rec_host, xfs_filblks_t )
+** xfs_bmbt_set_startblock(xfs_bmbt_rec_host, xfs_fsblock_t v)
+   - 磁盘位置一直使用xfs_fsblock_t, 应该是包括agno,agbno
+
+** xfs_bmbt_set_startoff(xfs_bmbt_rec_host, xfs_fileoff_t)
+
+** xfs_bmbt_set_state(xfs_bmbt_rec_host, xfs_exntst_t)
+
+** xfs_bmbt_to_bmdr(xfs_mount, xfs_btree_block, rblocklen, xfs_bmdr_block, dblocklen)
+   - 把xfs_btree_block的数据填充到xfs_bmdr_block
+   - 如果xfs_bmdr_block的信息量比xfs_btree_block少, xfs_btree_block的xfs_buf是怎么来的？它使用的不是磁盘的缓存?? 还是专门的内存??
+   - 只会处理level, numrecs
+   - 然后把xfs_btree_key/xfs_btree_ptr复制过去
+
+** xfs_check_nostate_extents(xfs_ifork, xfs_extnum_t idx, xfs_extnum_t num)
+   - 遍历xfs_ifork的(idx,num)范围内的xfs_bmbt_rec_host
+   - 获取对应的xfs_bmbt_rec_host 
+   > xfs_iext_get_ext(xfs_ifork, idx)
+   - 检查里面的state, 必须全部为0??
+
+** xfs_bmbt_dup_cursor(xfs_btree_cur)
+   - 复制一个xfs_btree_cur?
+   - 构造一个新的 
+   > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_btree_cur->bc_private->b->xfs_inode, whichfork)
+   - 复制xfs_btree_cur->bc_private->b的所有成员
+
+** xfs_bmbt_update_cursor(xfs_btree_cur src, xfs_btree_cur dst)
+   - 根据src更新dst
+   - dst的firstblock != NULLFSBLOCK?? 而且2个使用的xfs_bmap_free相同??
+   - 把src的allocated加到dst中,而且设置src的为0
+   - 设置dst的firstblock为src的
+
+** xfs_bmbt_alloc_block(xfs_btree_cur, xfs_btree_ptr start, xfs_btree_ptr new, length, stat)
+   - 构造xfs_alloc_arg, 设置xfs_mount /xfs_trans
+   - 参数length没有使用
+   - 使用xfs_btree_cur->bc_private->b->firstblock作为提示信息,设置xfs_alloc_arg->fsbno
+   - 设置xfs_alloc_arg->firstblock = xfs_alloc_arg->fsbno
+   - 如果xfs_alloc_arg->fsbno == NULLFSBLOCK,
+   - 使用参数start作为提示信息??
+   - 分配类新选择XFS_ALLOCTYPE_START_BNO
+   - 计算xfs_alloc_arg->minleft? 
+   > xfs_trans_et_block_res(xfs_trans)
+   - 如果上面不是NULLFSBLOCK,可以使用, 而且xfs_btree_cur的xfs_bmap_free->xbf_low !=0??
+   - 使用分配方式为XFS_ALLOCTYPE_START_BNO
+   - 其它条件使用XFS_ALLOCTYPE_NEAR_BNO
+   - 设置xfs_alloc_arg->minlen / maxlen / prod = 1
+   - wasdel根据xfs_btree_cur的bc_flags的XFS_BTCUR_BPRV_WASDEL??
+   - 如果wasdel ==0, 而且没有空闲空间?? 返回ENOSPC？？
+   > xfs_trans_get_block_res(xfs_trans)
+   - 分配空间 
+   > xfs_alloc_vextent(xfs_alloc_arg)
+   - 如果分配失败,而且设定了xfs_alloc_arg->minleft? 换一种分配方式 
+   - 使用XFS_ALLOCTYPE_FIRST_AG
+   - 分配成功后更新xfs_btree_cur-bc_private
+   - 设置firstblock = xfs_alloc_arg->fsbno, allocated ++
+   - 增加xfs_inode->xfs_icdinode->di_nblocks
+   - 还要log这个修改!! 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - 把地址给xfs_btree_ptr, 返回stat =1
+
+** xfs_btree_free_block(xfs_btree_cur, xfs_buf)
+   - 把xfs_buf的地址添加到xfs_btree_cur的xfs_bmap_free 
+   > xfs_bmap_add_free(xfs_fsblock_t, 1, xfs_btree_cur->bc_private->b->xfs_bmap_free, xfs_mount)
+   - 减小xfs_inode->xfs_icdinode->di_nblocks --
+   - 记录xfs_inode修改 
+   > xfs_trans_log_inode(xfs_trans, xfs_inode, XFS_ILOG_CORE)
+   - trans什么操作?? 
+   > xfs_trans_binval(xfs_trans, xfs_buf)
+
+** xfs_bmbt_get_minrecs(xfs_btree_cur, level)
+   - 获取最小的分支数??
+   - 如果是根结点, level == xfs_btree_cur->bc_nlevels -1, 计算xfs_ifork最大的空间, 取其一半
+   > xfs_bmbt_maxrecs(xfs_mount, xfs_ifork->if_broot_bytes, level ==0) /2 
+   - 否则使用xfs_mount->m_bmap_dmnr[ level !=0 ]
+
+** xfs_bmbt_get_maxrecs(xfs_btree_cur, level)
+   - 如果是根结点, 根结点也可以是叶子结点?? 
+   > xfs_bmbt_maxrecs(xfs_mount, xfs_ifork->if_broot_bytes, level ==0) 
+   > xfs_mount->m_bmap_dmxr[level != 0] 
+
+** xfs_bmbt_get_dmaxrecs(xfs_btree_cur, level)
+   - 获取磁盘中一个结点支持的最多记录个数??
+   - 如果不是跟结点, 使用xfs_map->m_bmap_dmxr[level !=0], 和上面一样
+   - 否则不一样?? 
+   > xfs_bmdr_maxrecs(xfs_mount, xfs_bmbt_cur->bc_private->b->forksize, level != 0)
+     
+** xfs_bmbt_init_key_from_rec(xfs_btree_key, xfs_btree_rec) 
+   - xfs_btreekey是xfs_bmbt_key, 使用文件偏移
+   - 但这里的数据类型是大端的  __be64
+   - 返回xfs_btree_rec的bt_startoff
+
+** xfs_bmbt_inti_rec_from_key(xfs_btree_key, xfs_btree_rec) 
+   - 根据xfs_btree_key初始化xfs_btree_rec, 也就是xfs_bmbt_rec
+   - 只设置文件偏移 startoff 
+
+** xfs_bmbt_init_rec_from_cur(xfs_btree_cur, xfs_btree_rec)
+   - 使用xfs_btree_cur->bc_rec->b, 也就是xfs_bmbt_irec
+   > xfs_bmbt_disk_set_all(xfs_bmbt_rec->xfs_bmbt_rec, xfs_btree_cur->bc_rec->xfs_bmbt_irec)
+
+** xfs_bmbt_init_ptr_from_cur(xfs_bmbt_cur, xfs_btree_ptr)
+   - 设置为0?? 不是NULL
+
+** xfs_bmbt_key_diff(xfs_btree_cur, xfs_btree_key)
+   - 比较xfs_btree_key和要查找的记录的关系
+   - xfs_btree_key是文件偏移,而且数据结构是大端的, 先转化为普通的数据类型
+   - 然后和xfs_btree_cur->bc_rec->b->br_startoff比较 
+
+** xfs_bmbt_verify(xfs_buf)
+   - xfs_buf里面是xfs_btree_block, 检查它的格式??
+   - magic, crc, uuid, blkno, owner不能是0
+   - level不能超过xfs_mount->m_bm_maxlevels[]
+   - numrecs不能超过 xfs_mount->m_bmap_dmxr[]
+   - 而且兄弟指针不能为NULLDFSBNO, 或者为0, 或者和当前的结点在一个ag中
+
+** xfs_bmbt_read_verify(xfs_buf)
+   - 先计算crc
+   > xfs_btree_lblock_verify_crc(xfs_buf)
+   - 然后检查xfs_btree_block
+   > xfs_bmbt_verify(xfs_buf)
+
+** xfs_bmbt_write_verify(xfs_buf)
+   - 写之前的验证
+   - 检查xfs_btree_block
+   > xfs_bmbt_verify(xfs_buf)
+   - 然后计算crc, 谁用呢? 
+   > xfs_btree_lblock_calc_crc(xfs_buf)
+   
+** xfs_buf_ops xfs_bmbt_buf_ops 
+   - 包装上面的2个verify函数, 给xfs_btree_ops使用
+
+** xfs_bmbt_keys_inorder(xfs_btree_cur, xfs_btree_key k1, k2)
+   - 返回 k1 < k2, 需要先转化为本地的数据类型
+
+** xfs_bmbt_recs_inorder(xfs_bmbt_cur, xfs_btree_rec r1, r2)
+   - 比较范围是否有序
+   - r1->br_startoff + r1->br_blockcount <= r2->br_startoff
+
+** xfs_btree_ops xfs_bmbt_ops
+   - 构造回调函数指针 
+
+** xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, whichfork)
+   - 构造新的xfs_btree_cur
+   - 设置参数xfs_mount, xfs_trans
+   - bc_nlevels需要跟结点,在xfs_ifork中保存 
+   > xfs_ifork->if_broot->bb_level + 1
+   - bc_blocklog是什么?? xfs_sb->sb_blocklog
+   - bc_flags设置为XFS_BTREE_LONG_PTR | XFS_BTREE_ROOT_IN_INODE
+   - 然后是xfs_btree_cur->bc_private->b
+   - forksize是对应的xfs_ifork在xfs_dinode中的空间大小 
+   > XFS_IFORK_SIZE(xfs_inode, whichfork)
+   - xfs_inode, whichfork
+   - 其他的都设为0, 哪里分配的xfs_bmap_free?? 
+
+** xfs_bmbt_maxrecs(xfs_mount, blocklen, leaf)
+   - 对于磁盘中结点长度为blocklen, 计算支持的做多记录数?? 
+   - 减去头部XFS_BMBT_BLOCK_LEN(xfs_mount), 磁盘中xfs_bmdr_block不是没有crc等??
+   - 对于叶子结点,返回blocklen /= sizeof(xfs_bmbt_rec)
+   - 对于内部结点,返回blocklen /= (sizeof(xfs_bmbt_key + xfs_bmbt_ptr))
+   - 这里没有使用xfs_btree_key / xfs_btree_ptr, 应该是更精确了.. 
+
+** xfs_bmdr_maxrecs(xfs_mount, blocklen, leaf)
+   - 对于普通的非跟结点,还是使用xfs_btree_block
+   - 对于在xfs_dinode的跟结点,使用xfs_bmdr_block, 不需要xfs_btree_block重复的成员
+   - blocklen -= sizeof(xfs_bmdr_block)
+   - 对于叶子结点, blocklen /= sizeof(xfs_bmdr_rec)
+   - 对于内部结点, blocklen /= (sizeof(xfs_bmdr_key) + sizeof(xfs_bmdr_ptr))
+
+** xfs_bmdr_change_owner(xfs_trans, xfs_inode, whichfork, xfs_ino_t new_owner, list_head buffer_list)
+   - 修改xfs_ifork的xfs_inode?这个可以移动?? 
+   - 创建一个xfs_btree_cur 
+   > xfs_bmbt_init_cursor(xfs_mount, xfs_trans, xfs_inode, whichfork)
+   - 遍历所有的结点, 修改对应的owner成员
+   > xfs_btree_change_owner(xfs_btree_cur, new_owner, buffer_list)
+   - 删除xfs_btree_cur
