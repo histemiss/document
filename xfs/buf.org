@@ -986,6 +986,8 @@ typedef struct xfs_buf {
 
 ** xfs_blft 
    - 在xfs_buf_log_format->blf_flags里面
+   - 表示xfs_buf中数据的类型, 包含磁盘的所有的metadata类型
+
    #+begin_src 
 	XFS_BLFT_UNKNOWN_BUF = 0,
 	XFS_BLFT_UDQUOT_BUF,
@@ -1009,12 +1011,22 @@ typedef struct xfs_buf {
 	XFS_BLFT_MAX_BUF = (1 << XFS_BLFT_BITS),   
    #+end_src
 
-** xfs_buf_item_size_segment(xfs_buf_log_item, xfs_buf_log_format)
-   - 遍历xfs_buf_log_format->blf_data_map, 里面连续为1的一段使用一个xfs_log_iovec. 查找需要的xfs_log_iovec数量.
-   - 对于连续的一段,也是每一位都检查
-   > xfs_buf_offset(xfs_buf, next_bit * XFS_BLF_CHUNK) == xfs_buf_offset(xfs_buf, last_bit * XFS_BLF_CHUNK) + XFS_BLF_CHUNK
+** xfs_buf_log_format_size(xfs_buf_log_format)
+   - 计算xfs_buf_log_format的有效长度, 后面数组blf_data_map的长度有xfs_buf_log_format->blf_map_size决定
 
-** xfs_buf_item_size(xfs_log_item)
+** xfs_buf_item_size_segment(xfs_buf_log_item, xfs_buf_log_format)
+   - 遍历xfs_buf_log_format->blf_data_map, 里面连续为1的位使用一个xfs_log_iovec. 查找需要的xfs_log_iovec数量.
+   - 先找到置位的偏移, 然后继续向下找, 可能前进一位, 就是连续的
+   - 可能前进多位, 就是不连续的, 需要增加xfs_log_vec的个数
+   - 先前查找时，即使前进一位, 也要检查对应xfs_buf中的内存地址是否连续. 怎么会不连续??
+   > xfs_next_bit(xfs_buf_log_format->blf_data_map, xfs_buf_log_format->blf_map_size, 0)
+   > xfs_buf_offset(xfs_buf, next_bit * XFS_BLF_CHUNK) == xfs_buf_offset(xfs_buf, last_bit * XFS_BLF_CHUNK) + XFS_BLF_CHUNK
+   - 返回的log_vec的个数, 第一个保存xfs_buf_log_format的内容
+   - 还需要统计占用的log队列空间, 第一个是xfs_buf_log_format_size, 每一位使用XFS_BLF_CHUNK/128
+
+** xfs_buf_item_size(xfs_log_item, nvecs, nbytes)
+   - 为xfs_log_item创建xfs_log_vec时使用, 计算xfs_log_iovec的个数,以及log数据的大小
+
    - 如果xfs_buf_log_item->bli_flags & XFS_BLI_STALE == 1), 不用再log数据,只要xfs_log_format  xfs_buf_log_item->bli_format_count 表示xfs_buf_log_format的个数
    - 否则遍历每个xfs_buf_log_format, 累加每个需要的xfs_log_iovec个数
    > xfs_buf_item_size_segment(xfs_buf_log_item, xfs_buf_log_format)
