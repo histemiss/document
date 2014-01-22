@@ -756,69 +756,79 @@ typedef struct xfs_buf {
    #+end_src
 
 ** xfs_trans_buf_item_match(xfs_trans, xfs_buftarg, xfs_buf_map, nmaps)
-   - 检查xfs_buf_map映射的空间在xfs_trans中??
-   - xfs_buf_map数组的空间是连续?? 累加他们的长度
+   - xfs_trans中是否有xfs_buf_log_item, 它的xfs_buf使用xfs_buf_map映射的空间
+
+   - 获取空间的位置, 第一个xfs_buf_map->bm_bn, 长度是累加xfs_buf_map->bm_len
    - 遍历xfs_trans->t_items
-   - xfs_log_item->li_type = XFS_LI_BUF xfs_log_item才是xfs_buf_log_item
+   - 只检查xfs_buf_log_item, xfs_log_item->li_type = XFS_LI_BUF
+   - 比较xfs_buftarg, xfs_buf->xfs_buf_map和b_length
    - xfs_buf_log_item->bli_buf->b_target = xfs_buftarg, 使用相同的设备
    - xfs_buf_log_item->bli_buf->b_maps[0].bm_bn = map[0].bm_bn
    - xfs_buf_log_item->bli_buf->b_length = len
-   - 满足这些条件,返回xfs_buf_log_item->bli_buf. 为何只比较xfs_buf_map[0].bm_bn??
 
 ** _xfs_trans_bjoin(xfs_trans, xfs_buf, reset_recur)
    - 把xfs_buf填加到xfs_trans
-   - 给xfs_buf创建xfs_buf_log_item, 还有xfs_buf_log_format
+
+   - 给xfs_buf创建xfs_buf_log_item, xfs_buf_log_format
    > xfs_buf_item_init(xfs_buf, xfs_trans->xfs_mount)
+   - 增加xfs_buf_log_item->bli_refcount
+   - 如果reset_recur !=0, 设置xfs_buf_log_item->bli_recur = 0
+   - 它表示在xfs_trans中的关联的xfs_log_item的个数??
    - 创建xfs_log_item_desc, 放到xfs_trans->lid_trans队列中.
    > xfs_trans_add_item(xfs_trans, xfs_buf_log_item->xfs_log_item)
    - 设置xfs_buf->b_transp = xfs_trans
 
 ** xfs_trans_bjoin(xfs_trans, xfs_buf)
-   - 没有reset_cur??
+   - 设置reset_cur
    > _xfs_trans_bjoin(xfs_trans, xfs_buf, 0)
 
 ** xfs_trans_get_buf_map(xfs_trans, xfs_buftarg, xfs_buf_map, nmaps, xfs_buf_flags)
-   - 如果xfs_trans = NULL, 只是普通的获取block map信息
+   - 获取xfs_buf_map对应的xfs_buf
+
+   - 如果xfs_trans = NULL,去xfs_perag中找一个,创建一个xfs_buf
    > xfs_buf_get_map(xfs_buftarg, xfs_buf_map, nmaps, flags)
+
    - 先在xfs_trans中找是否有对应的xfs_buf 
    > xfs_trans_buf_item_match(xfs_trans, xfs_buftarg, xfs_buf_map, nmaps)
    - 如果能找到, 获取xfs_buf_log_item, xfs_buf_log_item->bli_recur ++, 返回找到的
-   - 如果找不到, 还得去找对应的xfs_buf_map信息
+
+   - 如果找不到, 先创建xfs_buf
    > xfs_buf_get_map(xfs_buftarg, xfs_buf_map, nmaps, flags)
    - 把它填加到xfs_trans中
    > _xfs_trans_bjoin(xfs_trans, xfs_buf, 1)
 
 ** xfs_trans_getsb(xfs_trans, xfs_mount, flags)
-   - 如果xfs_trans == NULL, 就是一个普通的操作?
-   - 获取xfs_sb->m_sb_bp
+   - 获取xfs_sb所在的xfs_buf
+
+   - 如果xfs_trans == NULL, 直接获取xfs_sb->m_sb_bp
    > xfs_getsb(xfs_mount, flags)
-   - 如果xfs_trans != NULL, 就是对应的xfs_buf的log操作
-   - 如果xfs_buf->b_transp == xfs_trans, 它已经在xfs_trans管理中,上面怎么不用这个判断??
-   - xfs_buf->b_fspriv就是xfs_buf_log_item, xfs_buf_log_item->bli_recur ++ 返回
+
+   - 否则检查xfs_mount->m_sb_bp
+   - 如果xfs_buf->b_transp == xfs_trans, 它已经在xfs_trans管理中
+   - xfs_buf->b_fspriv就是xfs_buf_log_item, xfs_buf_log_item->bli_recur ++ 返回这个xfs_log_item
    - 否则,先去找到xfs_buf 
    > xfs_getsb(xfs_mount, flags)
    - 填加到xfs_trans中
    > _xfs_trans_bjoin(xfs_trans, xfs_buf, 1)
 
 ** xfs_trans_read_buf_map(xfs_mount, xfs_trans, xfs_buftarg, xfs_buf_map, nmaps, xfs_buf_flags, xfs_buf, xfs_buf_ops)
-   - 如果xfs_trans == NULL,根据xfs_buf_map直接去xfs_perag中查找. 即使找不到也会创建一个,以及对应的xfs_buf, 把磁盘数据读出来.
+   - 读取xfs_buf_map对应的磁盘数据, 并返回对应的xfs_buf
+
+   - 如果xfs_trans == NULL,根据xfs_buf_map直接去xfs_perag中查找, 找不到也会创建一个
    > xfs_buf_read_map(xfs_buftarg, xfs_buf_map, nmaps, flags, xfs_buf_ops)
-   - 如果没找到xfs_buf, 返回EAGAIN
-   - 如果没有问题,把它使用倒数第2个参数返回
+
    - 如果xfs_trans != NULL, 去xfs_trans中查找
    > xfs_trans_buf_item_match(xfs_trans, xfs_buftarg, xfs_buf_map, nmaps)
-   - 如果找到xfs_buf, 检查它的状态
+   - 如果找到xfs_buf, 而且没有XBF_DONE, 需要发送读请求
    - xfs_buf必须是锁着的
    > xfs_buf_islocked(xfs_buf)
-   - xfs_buf->xfs_trans是参数xfs_trans, xfs_buf->b_fspriv是xfs_buf_log_item
-   - 检查xfs_buf->b_flags的XBF_DONE, 如果没有,说明数据是无效的??
-   - 这里要去发起读操作
-   - 设置xfs_buf->b_ops = ops
+   - 设置xfs_buf->b_ops = ops, XBF_READ
    - 启动读IO
-   > xfsbdstrat(xfs_trans->xfs_mount, xfs_buf)
+   > xfs_buf_iorequest(xfs_buf)
    - 等待io
    > xfs_buf_iowait(xfs_buf)
    - 既然找到xfs_buf_log_item, xfs_buf_log_item->bli_recur ++, 返回找到的xfs_buf
+
    - 如果找不到xfs_buf, 就需要去创建,并读取磁盘数据
    > xfs_buf_read_map(xfs_buftarg, xfs_buf_map, nmaps, flags, xfs_buf_ops)
    - 如果返回NULL, 创建失败,返回ENOMEM
@@ -828,79 +838,102 @@ typedef struct xfs_buf {
 ** xfs_trans_brelse(xfs_trans, xfs_buf)
    - 如果xfs_trans = NULL, 普通的释放xfs_buf
    > xfs_buf_relse(xfs_buf)
-   - 否则从xfs_trans中释放它. 如果它有改动,估计要写到log中
+
    - 检查xfs_buf / xfs_buf_log_item的状态
    - xfs_buf->b_transp = xfs_trans
    - xfs_buf_log_item->xfs_log_item->li_type = XFS_LI_BUF
-   - xfs_buf_log_item->bli_flags 没有 XFS_BLI_STALE??
+   - xfs_buf_log_item->bli_flags 没有 XFS_BLI_STALE
    - xfs_buf_log_item->xfs_buf_log_format->blf_flags 没有 XFS_BLF_CANCEL
    - 如果xfs_buf_log_item->bli_recur > 0, xfs_buf_log_item->bli_recur --, 直接返回, 这只是一个多重解锁.
-   - xfs_buf_log_item->xfs_log_item->xfs_log_item_desc->lid_flags & XFS_LID_DIRTY !=0, 说明它需要保存修改的数据,直接返回
-   - 否则这里应该释放xfs_buf
-   - 如果xfs_buf->bli_flags & XFS_BLI_STALE !=0, 直接返回. 但上面检查是怎么回事.
+   = xfs_buf_log_item->bli_recur实现一层计数管理
+
+   - 如果xfs_buf_log_item->xfs_log_item->xfs_log_item_desc->lid_flags 有 XFS_LID_DIRTY, 不能释放,直接返回
+   - 如果xfs_buf->bli_flags有XFS_BLI_STALE, 也不能释放, 直到xfs_trans完成后释放
+
    - 删除xfs_log_item_desc, 释放它和xfs_trans的关系
    > xfs_trans_del_item(xfs_buf_log_item->xfs_log_item)
    - xfs_buf_log_item->bli_refcount --
-   - 检查xfs_buf_log_item是否有log数据
+
+   - 如果xfs_buf_log_item没有记录任何xfs_buf的数据, 释放xfs_buf_log_item
    > xfs_buf_item_dirty(xfs_buf_log_item)
-   - 如果没有,释放xfs_buf_log_item
    > xfs_buf_item_relse(xfs_buf)
+
    - 最后释放xfs_buf的使用计数
    > xfs_buf_relse(xfs_buf)
+   
+   - 有可能还没有释放xfs_buf, xfs_buf_log_item
+
+   - xfs_buf_log_item->bli_flags和xfs_log_item_desc->lid_flags的XFS_LID_DIRTY什么区别??
 
 ** xfs_trans_bhold(xfs_trans, xfs_buf)
    - 设置xfs_buf_log_item->bli_flags |= XFS_BLI_HOLD
-   - 这里会检查xfs_buf状态
-   - xfs_buf->xfs_trans, xfs_buf->b_fspriv
 
 ** xfs_trans_bhold_release(xfs_trans, xfs_buf)
    - 取消hold标志
    - 首先大量的检查, 最后是简单的设置 xfs_buf_log_item->bli_flags &= ~XFS_BLI_HOLD
 
 ** xfs_trans_log_buf(xfs_trans, xfs_buf, first, last)
-   - 设置(first, last)区间, 在xfs_trans提交时,必须保存到log中
-   - 设置xfs_buf的标志  xfs_buf->b_flags & XBF_DONE
+   - log xfs_buf的(first,last)区间的数据
+
+   - 设置xfs_buf->b_flags的XBF_DONE, 别的任务使用时不能读取数据
    - 设置xfs_buf / xfs_log_item的回调函数
    - 回调函数把xfs_buf从ail中释放,当写回磁盘时把它销毁
    - xfs_buf->b_iodone  = xfs_buf_iodone_callbacks
    - xfs_buf_log_item->xfs_log_item->li_cb = xfs_buf_iodone
-   - 检查xfs_buf_log_item->bli_flags & XFS_BLI_STALE, 它表示这个xfs_buf被释放了.这里又重新使它有效, 去掉xfs_buf_log_item->bli_flags的XFS_BLI_STALE, xfs_buf->b_flags的XBF_STALE, 还有xfs_buf_log_format->blf_flags的XFS_BLF_CANCEL
+
+   - 检查xfs_buf_log_item->bli_flags & XFS_BLI_STALE, 它表示这个xfs_buf被释放了
+   - 这里又重新使用它, 去掉xfs_buf_log_item->bli_flags的XFS_BLI_STALE, xfs_buf->b_flags的XBF_STALE, 还有xfs_buf_log_format->blf_flags的XFS_BLF_CANCEL
+
    - 设置xfs_trans->t_flags的XFS_TRANS_DIRTY, xfs_buf_log_item->xfs_log_item->xfs_log_item_desc->lid_flags的XFS_LID_DIRTY, xfs_buf_log_item->bli_flags的XFS_BLI_LOGGED
    - 把xfs_buf放到标记到xfs_buf_log_format中
    > xfs_buf_item_log(xfs_buf_log_item, first, last)
 
 ** xfs_trans_binval(xfs_trans, xfs_buf)
-   - 无效xfs_trans管理的xfs_buf. 因为要释放它,所以不用把它写回磁盘. 对于xfs_buf_log_item, 使用XFS_BLF_CANCEL
-   - 相当于记录xfs_buf的状态
-   - 如果xfs_buf->xfs_buf_log_item->bli_flags & XFS_BLI_STALE !=0, 它已经无效, 直接退出. 这里有大量的检查
+   - xfs_buf的空间被释放,所以标志为数据无效, 不需要写回磁盘
+   - 但在再利用之前,需要等待对应的xfs_buf_log_item写回log队列
+
+   - 如果xfs_buf->xfs_buf_log_item->bli_flags有XFS_BLI_STALE, 它已经无效, 直接退出
+   - 这里会确认它的状态
    - xfs_buf_log_item->bli_flags & (XFS_BLI_LOGGED | XFS_BLI_DIRTY) ==0
    - xfs_buf_log_format->blf_flags的XFS_BLF_MASK表示xfs_buf里面是什么数据
    - xfs_buf_log_item->xfs_buf_log_format->blf_flags & XFS_BLF_INODE_BUF ==0
    - xfs_buf_log_item->xfs_buf_log_format->blf_flags & XFS_BLF_CANCEL !=0
    - xfs_buf_log_item->xfs_log_item->xfs_log_item_desc->lid_flags & XFS_LID_DIRTY !=0
    - xfs_trans->t_flags & XFS_TRANS_DIRTY !=0
-   - 如果它还不是无效的,先修改xfs_buf标志
-   - xfs_buf->b_flags |= XBF_STALE
-   - 还有xfs_buf_log_item / xfs_buf_log_format XFS_BLF_CANCEL
-   - 遍历xfs_buf_log_item->bli_formats数组, 把xfs_buf_log_format->blf_data_map中数据清空,那些数据不再使用
+
+   - 否则修改xfs_buf标志
+   - 设置xfs_buf->b_flags |= XBF_STALE, 去掉XFS_BLI_INODE_BUF, XFS_BLI_LOGGED, XFS_BLI_DIRTY
+   - 去掉xfs_buf_log_format->xfs_buf_log_format 的XFS_BLF_INODE_BUF, XFS_BLFT_MASK, 设置XFS_BLF_CANCEL
+   - XFS_BLFT_MASK表示xfs_buf_log_item里面数据的意义
+   - 遍历xfs_buf_log_item->bli_formats数组, 把xfs_buf_log_format->blf_data_map中数据清空
+
    - 设置xfs_log_item_desc->lid_flags的XFS_LID_DIRTY
    - 设置xfs_buf->t_flags 的XFS_TRANS_DIRTY
    
 ** xfs_trans_inode_buf(xfs_trans, xfs_buf)
    - 设置xfs_buf_log_item->bli_flags的XFS_BLI_INODE_BUF标志
-   - 在xfs_buf_log_format中记录类型
-   - 用于unlink处理??
+   - 设置xfs_buf_log_format->blf_type
+   > xfs_trans_buf_set_type(xfs_trans, xfs_buf, XFS_BLFT_DINO_BUF)
+
+   - xfs_buf_log_item->bli_flags和xfs_buf_log_format->blf_type是不同的东西
 
 ** xfs_trans_stale_inode_buf(xfs_trans, xfs_buf)
-   - xfs_buf里面是xfs_dinode, 要释放这个xfs_buf
+   - xfs_dinode的空间xfs_buf被释放, 设置对应的xfs_buf
+
    - 设置xfs_buf_log_item->bli_flags的XFS_BLI_STALE_INODE
    - 设置xfs_log_item的回调函数
    - xfs_buf_log_item->bli_item->li_cb = xfs_buf_iodone
 
 ** xfs_trans_inode_alloc_buf(xfs_trans, xfs_buf)
-   - 记录这个xfs_buf中有新alloc的inode
+   - xfs_buf里面的空间是新分配的,保存xfs_dinode
    - 添加xfs_buf_log_item->bli_flags的XFS_BLI_INODE_ALLOC_BUF
-   - 设置inode标志
+   - 修改xfs_buf_log_format类型 
+   > xfs_trans_buf_set_type(xfs_trans, xfs_buf, XFS_BLFT_DINO_BUF)
+
+** xfs_trans_ordered_buf(xfs_trans, xfs_buf)
+   - 这个xfs_log_item会穿越log过程, 可以等待某些log数据写回?? 
+   - 但不会增加任何log数据
+   - 设置xfs_buf_log_item->bli_flags的XFS_BLI_ORDERED
 
 ** xfs_blft 
    #+begin_src 
@@ -962,6 +995,9 @@ typedef struct xfs_buf {
    #+end_src
 
 ** xfs_buf_log_item
+   - 这里包含2个xfs_buf_log_format成员, bli_formats, __bli_format
+   - 如果xfs_buf只有一个xfs_buf_map, bli_formats指向__bli_format
+   - 否则bli_formats指向xfs_buf_log_format数组, 但使用__bli_format->blf_flags, 表示整个xfs_buf的log状态. 在log的iop_format中, 把__bli_format->bli_flags给bli_formats
    #+begin_src 
 	xfs_log_item_t		bli_item;	/* common item structure */
 	struct xfs_buf		*bli_buf;	/* real buffer pointer */
@@ -1015,130 +1051,192 @@ typedef struct xfs_buf {
    - 计算xfs_buf_log_format的有效长度, 后面数组blf_data_map的长度有xfs_buf_log_format->blf_map_size决定
 
 ** xfs_buf_item_size_segment(xfs_buf_log_item, xfs_buf_log_format)
-   - 遍历xfs_buf_log_format->blf_data_map, 里面连续为1的位使用一个xfs_log_iovec. 查找需要的xfs_log_iovec数量.
+   - 遍历xfs_buf_log_format->blf_data_map, 里面连续为1的位使用一个xfs_log_iovec
+   - 查找需要的xfs_log_iovec数量; 每一位对应log的XFS_BLF_CHUNK, 计算全部log的数据量
+
+   - xfs_buf_log_format->blf_data_map大小时xfs_buf_log_format->blf_map_size
    - 先找到置位的偏移, 然后继续向下找, 可能前进一位, 就是连续的
    - 可能前进多位, 就是不连续的, 需要增加xfs_log_vec的个数
    - 先前查找时，即使前进一位, 也要检查对应xfs_buf中的内存地址是否连续. 怎么会不连续??
    > xfs_next_bit(xfs_buf_log_format->blf_data_map, xfs_buf_log_format->blf_map_size, 0)
    > xfs_buf_offset(xfs_buf, next_bit * XFS_BLF_CHUNK) == xfs_buf_offset(xfs_buf, last_bit * XFS_BLF_CHUNK) + XFS_BLF_CHUNK
    - 返回的log_vec的个数, 第一个保存xfs_buf_log_format的内容
-   - 还需要统计占用的log队列空间, 第一个是xfs_buf_log_format_size, 每一位使用XFS_BLF_CHUNK/128
+   - log总数据两包括2部分, 第一个xfs_log_iovec保存xfs_buf_log_format, 后面的xfs_log_iovec保存若干个XFS_BLF_CHUNK/128
+   > xfs_buf_log_format_size(xfs_buf_log_format)
 
 ** xfs_buf_item_size(xfs_log_item, nvecs, nbytes)
-   - 为xfs_log_item创建xfs_log_vec时使用, 计算xfs_log_iovec的个数,以及log数据的大小
+   - 为xfs_log_item创建xfs_log_vec时使用, 计算xfs_log_iovec的个数,以及log数据量
 
-   - 如果xfs_buf_log_item->bli_flags & XFS_BLI_STALE == 1), 不用再log数据,只要xfs_log_format  xfs_buf_log_item->bli_format_count 表示xfs_buf_log_format的个数
-   - 否则遍历每个xfs_buf_log_format, 累加每个需要的xfs_log_iovec个数
+   - 如果xfs_buf_log_item->bli_flags有 XFS_BLI_STALE, 不用再log数据, 只需要处理xfs_buf_log_item的xfs_buf_log_format数组
+   - xfs_buf_log_item->bli_format_count 表示xfs_buf_log_format的个数
+
+   - 如果xfs_buf_log_item->bli_flags有XFS_BLI_ORDERED, 用来记录顺序? 不会log数据, 返回nvecs = XFS_LOG_VEC_ORDERED/-1
+
+   - 否则遍历xfs_buf_log_item的xfs_buf_log_format数组, 累加每个需要的xfs_log_iovec个数
    > xfs_buf_item_size_segment(xfs_buf_log_item, xfs_buf_log_format)
 
 ** xfs_buf_item_format_segment(xfs_buf_log_item, xfs_log_iovec, offset, xfs_buf_log_format)
-   - 把xfs_buf_log_item和xfs_buf_log_format放到xfs_log_iovec中.
-   - 第一个xfs_log_iovec指向xfs_buf_log_format, 设置xfs_buf_log_item_format->blf_flags = xfs_buf_log_item->__bli_format->blf_flags. 参数xfs_buf_log_format是xfs_buf_log_item->bli_formats数组里的, xfs_buf_log_item->__bli_format是什么??
-   - 第一个xfs_io_iovec->t_type = XLOG_REG_TYPE_BFORMAT. 
-   - 如果xfs_buf->bli_flags &XFS_BLI_STALE, xfs_buf_log_format->blf_flags & XFS_BLF_CANCEL ==1, 直接退出
-   - 然后遍历xfs_buf_log_format->blf_data_map, 找出设置位的一段范围
-   - 根据位的位置计算数据在xfs_buf中的偏移
+   - 处理xfs_buf_log_format管理的数据, 获取相应的磁盘位置和数量给xfs_log_iovec数组, 参数在xfs_buf_log_item的xfs_buf_log_fmrat数组中
+   - xfs_buf包含多个xfs_buf_map, 每个对应一个xfs_buf_map_mat
+
+   - 首先处理把xfs_buf_log_format放到xfs_log_iovec中, 类型是XLOG_REG_TYPE_BFORMAT
+   > xfs_buf_log_format_size(xfs_buf_log_format)
+   
+   - 如果xfs_buf_log_item->bli_flags包含XFS_BLI_STALE, 直接退出, 不需要log数据
+   - 遍历xfs_buf_log_format->blf_data_map中的位
+   > xfs_next_bit(xfs_buf_log_format->blf_data_map, xfs_buf_log_format->blf_map_size, last_bit+1)
+   - 对于每一个连续的区域使用一个xfs_log_iovec, 遍历方式和上面计算空间的方式一样
+   - 根据位的位置计算数据在xfs_buf中的偏移, 开始位置是参数offset
    - buffer_offset = offset + first_bit * XFS_BLF_CHUNK
+   - 获取xfs_buf数据的磁盘位置
    - xfs_log_iovec->i_addr = xfs_buf_offset(xfs_buf, buffer_offset)
    - xfs_log_iovec->i_len = nbits * XFS_BLF_CHUNK
    - xfs_log_iovec->i_type = XLOG_REG_TYPE_BCHUNK
-   - 最后设置 xfs_buf_log_format->blf_size = nvecs, xfs_log_iovec的个数.
+   - 最后设置 xfs_buf_log_format->blf_size = nvecs, xfs_log_iovec的个数, 在搬运数据时会写回它
 
 ** xfs_buf_item_format(xfs_log_item, xfs_log_iovec)
-   - xfs_log_item属于xfs_buf_log_item, 还不确定xfs_buf里面是什么数据
-   - 如果xfs_buf_log_item->bli_flags & XFS_BLI_INODE_BUF ==1, 这里面装xfs_dinode, 设置xfs_buf_log_item->__bli_format->blf_flags的XFS_BLF_INODE_BUF. 它会传递给所有的xfs_buf_log_format
-   - 遍历所有的xfs_buf_log_format, 填充相关的xfs_log_iovec
+   - iop_format接口函数, 准备log xfs_buf_log_item的数据,计算xfs_log_iovec信息
+
+   - 如果xfs_buf_log_item->bli_flags有XFS_BLI_INODE_BUF, 设置xfs_buf_log_item->__bli_format->blf_flags的XFS_BLF_INODE_BUF, xfs_buf里面是xfs_dinode
+   - 如果xfs_buf_log_item->bli_flags里面有XFS_BLI_ORDERED, 没有XFS_BLI_STALE, 不需要log操作, 直接返回
+   - 遍历所有的xfs_buf_log_format, 填充各自的xfs_log_iovec
    > xfs_buf_item_format_segment(xfs_buf_log_item, xfs_log_iovec, offset, xfs_buf_log_item->bli_formats[i]
    - 数组中一个xfs_buf_log_format对应一个xfs_buf_map
 
 ** xfs_buf_item_pin(xfs_log_item)
-   - 增加xfs_buf_log_item->bli_refcount, xfs_buf_log_buf->xfs_buf->b_pin_count
+   - 增加xfs_buf_log_item->bli_refcount, 表示xfs_buf_log_item的使用计数
+
+   - 增加xfs_buf_log_item->xfs_buf->b_pin_count
+   - iop_pin接口实现, 在提交xfs_trans时使用, 在xlog_in_core写操作完成后的回调中使用unpin
+   - 在xfs_buf的写回操作中等待b_pin_count计数
+   - 这里的xfs_buf全部是metadata, 大多有是2种,inode和btree节点使用的, 其他都是AG使用的特殊数据
+   - 在ail完成之后的iop_push中回收需要写回的xfs_buf, 一块发送延时写.
 
 ** xfs_buf_item_unpin(xfs_log_item, remove)
-   - 首先减小 xfs_buf_log_item->bli_refcount --
+   - 首先减小 xfs_buf_log_item->bli_refcount --, 如果减为0,设置freed = 1
    - 然后是  xfs_buf->b_pin_count --  , 如果减为0,唤醒xfs_buf->b_waiters
    > wake_up_all(xfs_buf->b_waiters)
-   - 检查xfs_buf_log_item->bli_flags & XFS_BLI_STALE, 如果变为stale, 而且free==1, 删除这个xfs_log_item
-   - 如果remove==1, 释放xfs_log_item_desc
+
+   - 检查xfs_buf_log_item->bli_flags & XFS_BLI_STALE, 如果变为stale, 而且freed ==1, 删除xfs_log_item
+   - 如果remove==1, 释放xfs_trans中的xfs_log_item_desc
    > xfs_trans_del_item(xfs_log_item)
-   - 要是放xfs_log_item, 如果是inode   xfs_buf_log_item->bli_flags & XFS_BLI_STALE_INODE ==1
+   - 如果xfs_buf_log_item->bli_flags有XFS_BLI_STALE_INODE, 这是被回收的inode使用的空间
+   - 直接执行IO回调汉书
    > xfs_buf_do_callbacks(xfs_buf)
    - 清空xfs_buf->b_fspriv/b_iodone
-   - 否则是普通的buf, 释放ail
+   - 否则是普通的buf, 释放ail, 它肯能在ail中,也可能不在
    > xfs_trans_ail_delete(xfs_ail, xfs_log_item,SHUTDOWN_LOG_IO_ERROR)
-   - 释放xfs_log_item
+   - 释放xfs_buf_log_item, 同时包含xfs_log_item
    > xfs_buf_item_relse(xfs_buf)
-   - 最后释放xfs_buf
+   - 释放xfs_buf
    > xfs_buf_relse(xfs_buf)
-   - 如果free==1, 而且remove==1,即使xfs_log_item不是stale的,也要把它删除
-   - 因为错误??
+   - 在这里看来xfs_buf分成2种,inode使用的xfs_buf特殊处理, 它的空间分配和释放需要额外的操作,不仅仅分配AG的空间
+
+   - 如果free==1, 而且remove==1, stale !=1, 这是IO错误时使用的
    - 设置xfs_buf->b_flags的XBF_ASYNC, 去掉XBF_DONE
    > xfs_buf_ioerror(xfs_buf, EIO)
-   - 设置stale, 调用xfs_buf的回调xfs_buf_ioend
+   - 设置XBF_STALE, 同时释放lru链表
    > xfs_buf_stale(xfs_buf)
+   - 调用IO回调函数
    > fs_buf_ioend(xfs_buf, 0)
 
+   - 如果xfs_log_item没有错误,而且数据有效, 它回到ail中,即使没有使用者,也不会释放
+
 ** xfs_buf_item_push(xfs_log_item, list_head)
-   - 要把xfs_buf写回磁盘, 检查是否满足要求
-   - 首先是pin,  xfs_buf->b_pin_count. 
-   - 在IOP_PIN操作中增加, 表示它在xfs_cil中. IOP_UNPIN是
-   > xfs_buf_ispinned(xfs_buf)
-   - 添加队列要锁住xfs_buf
+   - iop_push接口, 在ail任务中调用,写回xfs_buf_log_item的xfs_buf数据,就可以回收xfs_buf_log_item, 来回收log队列空间
+
+   - 如果xfs_buf->b_pin_count > 0, 返回XFS_ITEM_PINNED. 
+   - xfs_log_item重复使用了? 为何没有在ail中删除??
+
+   - 锁住xfs_buf, 下面队列操作使用
    > xfs_buf_trylock(xfs_buf)
-   - 把它放到list_head队列中, 设置_XBF_DELWRI_Q
+   - 如果锁不住,返回XFS_ITEM_LOCKED
+
+   - 把它放到参数list_head队列中,也就是xfs_ail->xa_buf_list, 设置_XBF_DELWRI_Q
    > xfs_buf_delwri_queue(xfs_buf, list_head)
+   - 如果已经在里面,返回XFS_ITEM_FLUSHING, 其他情况返回XFS_ITEM_SUCCESS
 
 ** xfs_buf_item_unlock(xfs_log_item)
-   - 释放xfs_log_item关联的xfs_buf?
-   - 去掉xfs_buf->bli_flags的XFS_BLI_LOGGED|XFS_BLI_HOLD标志
-   - 如果xfs_buf->bli_flags & XFS_BLI_STALE ==1, 这里不处理, 只是减小xfs_buf->bli_refcount
-   - 检查xfs_buf_log_item的bitmap中是否还有xlog的数据, 哪里清除这些bitmap
-   - 遍历xfs_buf_log_item->bli_formats数组
+   - iop_lock接口, 释放xfs_buf关联的xfs_buf_log_item
+   - 在提交xfs_trans后, 释放它管理的xfs_log_item_desc
+   - xfs_log_item已经使用xfs_log_vec转移到xfs_cil中, 而且log的数据已经复制
+
+   - 如果xfs_log_item->li_flags有XFS_LI_ABORTED, 表示xfs_trans取消, 或者IO错误???
+   - 去掉xfs_buf->bli_flags的XFS_BLI_LOGGED|XFS_BLI_HOLD|XFS_BLI_ORDERED标志
+
+   - 如果xfs_buf->bli_flags有XFS_BLI_STALE, 表示xfs_buf已经释放? xfs_buf_log_item怎么处理?
+   - xfs_buf_log_item->xfs_buf_log_format->blf_flags必须有XFS_BLF_CANCEL 
+   - 如果abort ==0, 直接减小xfs_buf_log_item->bli_refcount, 哪里回释放它??
+
+   - 检查是否有脏数据? 如果flags有XFS_BLI_DIRTY, 肯定有脏数据
+   - 否则遍历xfs_buf_log_item的xfs_buf_log_format数组, 检查xfs_buf_log_format->bli_formats数组, 如果有置位的,表示有脏数据
    > xfs_bitmap_empty(xfs_buf_log_format->blf_data_map, map_size)
-   - 如果没有数据, 释放xfs_buf_log_item. 
-   - 关联xfs_buf的使用xfs_buf_log_item->li_bio_list组成链表, xfs_buf还会使用下一个
+
+   - 减小xfs_buf_log_item->bli_refcount, 如果减为0,尝试释放xfs_buf_log_item
+   - 如果没有脏数据, 释放xfs_buf和xfs_buf_log_item的关系, 也释放了xfs_buf_log_item
    > xfs_buf_item_relse(xfs_buf)
-   - 如果还有,只是减小xfs_buf_log_item->refcount
+   - 如果aborted !=0, 同样释放xfs_buf_log_item
+   - 如果在ail中, xfs_log_item->li_flags有XFS_LI_IN_AIL
+   > xfs_trans_ail_delete(xfs_ail, xfs_log_item, SHUTDOWN_LOG_IO_ERROR)
+   - 然后释放xfs_buf_log_item 
+   > xfs_buf_item_relse(xfs_buf)
+
+   - 最后如果flags没有XFS_BLI_HOLD, 释放xfs_buf计数  
+   > xfs_buf_relse(xfs_buf)
 
 ** xfs_buf_item_committed(xfs_log_item, xfs_lsn_t )
-   - 对于普通的xfs_log_item, 返回参数. 
-   - 如果xfs_buf_log_item->bli_flags & XFS_BLI_INODE_ALLOC_BUF !=0, 而且xfs_log_item->li_lsn !=0, 返回它,应该比参数xfs_lsn_t早
+   - iop_committed接口, 在xlog_in_core的回调函数中, 说明xfs_cil已经写回log队列
+   - 写的位置是xfs_lsn_t, 这个不一定是整个xfs_cil开始的位置, 不一定是确切位置
+   - 获取xfs_buf已经关联的xfs_lsn_t, 表示重新写到log队列中
+
+   - 对于普通的xfs_log_item, 返回参数xfs_lsn_t
+   - 如果xfs_buf_log_item->bli_flags有XFS_BLI_INODE_ALLOC_BUF, 而且xfs_log_item->li_lsn !=0, 返回它,应该比参数xfs_lsn_t早
 
 ** xfs_buf_item_committing(xfs_log_item, xfs_lsn_t)
    - 空函数
 
 ** xfs_buf_item_get_format(xfs_buf_log_item, count)
-   - 准备xfs_buf_log_item->bli_formats. 如果count==1, 使用xfs_buf_log_item->__bli_format, 否则分配一个数组
+   - 创建xfs_buf_log_item->bli_formats
+   - 如果count==1, 使用xfs_buf_log_item->__bli_format, 否则分配一个数组
 
 ** xfs_buf_item_free_format(xfs_buf_log_item)
    - 释放xfs_buf_log_format数组
 
 ** xfs_buf_item_init(xfs_buf, xfs_mount)
    - 给xfs_buf创建xfs_buf_log_item,准备放到xfs_trans中.
-   - 如果xfs_buf->b_fspriv有效, 它已经指向xfs_log_item; 而且xfs_log_item->li_type == XFS_LI_BUF, 直接退出.
-   - 对于xfs_buf不可能有多个xfs_buf_log_item. 但可能有其他的xfs_log_item
-   - 构造xfs_buf_log_item, 初始化它内嵌的xfs_log_item
+
+   - 如果xfs_buf->b_fspriv有效, 它已经有一个xfs_log_item
+   - 如果xfs_log_item->li_type == XFS_LI_BUF, 直接退出.
+   - 一个xfs_buf不可能有多个xfs_buf_log_item. 但可能有其他的xfs_log_item
+
+   - 构造xfs_buf_log_item, 初始化内嵌的xfs_log_item
    > xfs_log_item_init(xfs_mount, xfs_log_item, XFS_LI_BUF, xfs_buf_item_ops)
-   - 设置xfs_buf->b_hold   xfs_buf->b_hold ++,  它会释放xfs_buf或把它放到lru队列
+   - 增加xfs_buf->b_hold ++, 设置xfs_buf_log_item->bli_buf = xfs_buf
    > xfs_buf_hold(xfs_buf)
-   - 初始化xfs_buf_log_format
+   - 创建xfs_buf_log_format, 果然根据xfs_buf_map的个数
    > xfs_buf_item_get_format(xfs_buf, xfs_buf->b_map_count)
-   - 使用xfs_buf的xfs_buf_map数组,初始化xfs_buf_log_format, 磁盘位置(blkno,len), blf_map_size是把len对齐XFS_BLF_CHUNK之后的值
-   - 最后把xfs_buf_log_item放到xfs_buf->b_fspriv链表中
+   - 使用xfs_buf的xfs_buf_map数组,计算xfs_buf_log_format磁盘位置(blkno,len)
+   - blf_map_size是把len对齐XFS_BLF_CHUNK之后的值
+   - 最后把xfs_buf_log_item放到xfs_buf->b_fspriv链表中, 使用xfs_log_item->li_bio_list
 
 ** xfs_buf_item_log_segment(xfs_buf_log_item, first, last, void *map)
    - 把xfs_buf中管理的一块数据在xfs_buf_log_format中标记出来,需要写到xlog磁盘.
    - map是xfs_buf_log_format->blf_data_map
    - first, last是字节单位,需要转化为XFS_BLK_CHUNK
 
+** xfs_buf_item_log_segment(xfs_buf_log_item, first, last, map)
+   - log的数据范围是(first, last), map应该是xfs_buf_log_format->blf_data_map, 表示位图
+   - 转化为单位XFS_BLF_SHIFT/XFS_BLF_CHUNK, 然后置位
+
 ** xfs_buf_item_log(xfs_buf_log_item, first, last)
-   - 首先标记xfs_buf_log_item->bli_flags的XFS_BLI_DIRTY
-   - 把xfs_buf的改动记录到xfs_buf_log_item中.
+   - 把xfs_buf的改动记录到xfs_buf_log_item中
+
+   - 设置xfs_buf_log_item->bli_flags的XFS_BLI_DIRTY
    - 遍历xfs_buf_log_format, 操作(first, last)范围内的
    > xfs_buf_item_log_segment(xfs_log_item, first, end, xfs_buf_log_format->blf_data_map)
 
 ** xfs_buf_item_dirty
-   - 判断xfs_buf_log_item是否需要处理  xfs_buf_log_item->bli_flags & XFS_BLI_DIRTY
+   - 判断xfs_buf_log_item是否有脏数据, 根据xfs_buf_log_item->bli_flags的XFS_BLI_DIRTY决定
 
 ** xfs_buf_item_free(xfs_buf_log_item)
    - 释放xfs_buf_log_item, xfs_buf_log_item, 只有内存释放动作
@@ -1147,13 +1245,16 @@ typedef struct xfs_buf {
    - 释放xfs_buf关联的xfs_buf_log_item, xfs_buf->b_fspriv链表上的第一个.
    - 释放xfs_buf->b_hold
    > xfs_buf_rele(xfs_buf)
-   - 然后是它自己
+   - 直接释放掉xfs_buf_log_item
    > xfs_buf_item_free(xfs_buf_log_item)
 
 ** xfs_buf_attach_iodone(xfs_buf, callback, xfs_log_item)
-   - 把xfs_log_item给xfs_buf->b_fspriv队列.
-   - 而且设置xfs_buf->b_iodone = xfs_buf_iodone_callbacks
-   - 而且设置xfs_log_item->li_cb = callback, 在xfs_buf_iodone_callbacks中会调用
+   - xfs_buf的回调函数是xfs_buf_iodone_callbacks, 它处理xfs_buf->b_fspriv链表中的xfs_log_item
+   - 只有xfs_dinode使用的xfs_buf才设置
+
+   - 这里把xfs_log_item放到链表中
+   - 设置xfs_buf->b_iodone = xfs_buf_iodone_callbacks
+   - 设置xfs_log_item->li_cb = callback, 在xfs_buf_iodone_callbacks中会调用
 
 ** xfs_buf_do_callbacks(xfs_buf)
    - 遍历xfs_buf->b_fspriv链表上所有的xfs_log_item
@@ -1161,20 +1262,23 @@ typedef struct xfs_buf {
    > xfs_log_item->li_cb(xfs_buf, xfs_log_item)
 
 ** xfs_buf_iodone_callbacks(xfs_buf)
-   - 这个是上面提到在xfs_buf->b_iodone调用的.
-   - 首选如果xfs_buf的io没有错误, 处理回调
+   - 这个是上面提到在xfs_buf->b_iodone函数
+
+   - 如果xfs_buf的有IO错误, 处理错误
+   - 如果是XBF_ASYNC, 异步IO, 重新提交. 如果重复提交失败,直接释放
+   - 设置XBF_STALE标志
+   > xfs_buf_stale(xfs_buf)
+   - 设置XBF_DONE标志
+   - 处理回调函数
    > xfs_buf_do_callbacks(xfs_buf)
-   - 然后是其他的回调
+   - 然后是其他的回调, 必须xfs_buf_ops里面的
    > xfs_buf_ioend
-   - 如果有错误, 也没有怎么处理!!
-   - 如果xfs_buf->b_flags & XBF_ASYNC ==1, 它是异步的,没人关心它的结果?!
-   - 如果xfs_buf->b_flags & XBF_STALE ==0, 说明它是可用的, 重新提交一遍
-   - 使用XBF_WRITE|XBF_ASYNC|XBF_DONE, 还是异步方式
-   > xfs_buf_iorequest(xfs_buf)
-   - 否则直接释放它
-   > xfs_buf_relse(xfs_buf)
 
 ** xfs_buf_iodone(xfs_buf, xfs_log_item)
+   - xfs_log_item->li_cb使用的回调函数, 当把它放到xfs_trans中时设置
+   - 在IO完成后自动释放xfs_ail中的xfs_log_item
+   - 对于xfs_buf, 必须有一个xfs_log_item, 或者关联的xfs_buf_log_item,使用这个回调函数, 在xfs_buf完成之后从xfs_ail释放
+
    - 先释放xfs_buf
    > xfs_buf_rele(xfs_buf)
    - 在xfs_cil中释放xfs_log_item
@@ -1185,30 +1289,35 @@ typedef struct xfs_buf {
 ** 总结
    - 首先这里实现了一套xfs_item_ops, 对应XFS_LI_BUF. 解释一下xfs_buf_log_item的生命.
    - IOP_SIZE = xfs_buf_item_size 
-     - 计算需要的xfs_log_iovec的数量. 首先xfs_buf_log_format使用一个,然后它管理的每个chunk数据块使用一个.
+     - 计算需要的xfs_log_iovec的数量. 首先xfs_buf_log_format使用一个,然后它管理的每块chunk数据块使用一个.
      - 在提交xfs_trans时使用, 它要把数据存到xfs_log_vec中.
-   - IOP_FORMAT = xfs_buf_item_format, 填充xfs_buf_log_format的信息, 没有复制数据,只是记录数据的位置等
-   - IOP_PIN = xfs_buf_item_pin, 对于xfs_buf_log_item, 增加bli_refcount/xfs_buf->b_pin_count, 方式释放掉. 在把它放到xfs_cil_ctx中时,设置这个标志
+
+   - IOP_FORMAT = xfs_buf_item_format, 填充xfs_buf_log_format的信息, 没有复制数据,只是记录数据的位置等. 但调用者会立即复制数据
+
+   - IOP_PIN = xfs_buf_item_pin, 对于xfs_buf_log_item, 增加bli_refcount/xfs_buf->b_pin_count, 释放xfs_buf给释放,或者提前写回. 在把它放到xfs_cil_ctx中时,设置这个标志
+
    - IOP_UNLOCK = xfs_buf_item_unlock
-     - 对于xfs_buf_log_item, 取出XFS_BLI_LOGGED/XFS_BLI_HOLD标志, 设置xfs_buf->b_transp = NULL, 使用xfs_buf/xfs_buf_log_item的使用计数. 
+     - 对于xfs_buf_log_item, 去掉XFS_BLI_LOGGED/XFS_BLI_HOLD标志, 设置xfs_buf->b_transp = NULL,释放xfs_buf/xfs_buf_log_item的使用计数. 
      - 如果xfs_buf_log_item没有改动的数据,可能要释放它自己.
-     - 在xfs_trans提交完成后, 需要释放xfs_trans, 同时解锁它的xfs_log_item
+     - 在xfs_trans提交完成后, 需要释放xfs_trans, 同时解锁它的xfs_log_item/xfs_log_item_desc
+
    - IOP_COMMITTING = xfs_buf_item_committing, 对于xfs_buf_log_item是空函数. 在xfs_trans释放时调用. 也就是在unlock之前
+
    - IOP_COMMITTED = xfs_buf_item_committed
      - 在xlog_in_core的回调中,处理xfs_cil_ctx时调用,即将把它放到ail队列中.
      - xfs_log_item->xfs_lsn_t表示它所在的xlog中的位置,xfs_ail根据它更新xlog的磁盘空间信息
-     - 大致看只有它加入到xfs_ail中才设置xfs_log_item->xfs_lsn_t.
-     - 如果xfs_log_item->xfs_lsn_t == -1, 不再在xlog中管理它, 它对xlog磁盘空间信息没有影响. 谁管他??
-     - 如果IOP_COMMITTED返回的xfs_lsn_t和提交它的xfs_lsn_t不一样时, 也不在把它放到ail队列中. 因为它已经在ail中?? 
+     - 如果IOP_COMMITTED返回的xfs_lsn_t和提交它的xfs_lsn_t不一样时,它可能被其他xfs_trans操作, 如果当前的xfs_lsn_t新,更新它的xfs_lsn_t.否则不处理
+
    - IOP_PUSH = xfs_buf_item_push
      - 要把它关联的xfs_buf数据写回磁盘. 如果没有人使用它, 把它放到一个队列中,一块启动IO. 
      - 在需要释放xfs_ail中xfs_buf_log_item时调用. 来回收xlog空间
+
    - IOP_UNPIN
      - 对于xfs_buf_log_item, 它只是释放xfs_buf_log_item->bli_refcount, xfs_buf_log_item->b_pin_count
      - 唤醒xfs_buf->b_waiters. 在写xfs_buf时等待这个锁! 这个锁保证xlog数据在原数据之前写进去.
      - 在xfs_buf_log_item填加到xfs_ail队列时使用.或者说是xfs_cil_ctx释放xfs_log_item时使用.
-   - 对外部提供的功能为给xfs_buf构造xfs_buf_log_item, 填加到xfs_trans中,而且标记需要log的数据. 都是给xfs_trans_buf.c中使用
-   - 在xfs_buf完成后,调用xfs_log_item->li_cb, 好像只有inode使用这个. 提供接口挂钩会回调函数. 在创建xfs_buf_log_item时就设置,没有很大的操作性.
+
+   - 在xfs_buf完成后,调用xfs_log_item->li_cb, inode有特殊需求, 而普通的xfs_buf, 
 
 * xfs_extfree_item.c
 
