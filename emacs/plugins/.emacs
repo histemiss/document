@@ -60,13 +60,13 @@
 (add-hook 'find-file-hook 'flymake-find-file-hook)
 
 ;;yas
-(add-to-list 'load-path "~/.emacs.d/plugins/yasnippet")
-(require 'yasnippet) ;; not yasnippet-bundle
+;;(add-to-list 'load-path "~/.emacs.d/plugins/yasnippet")
+;;(require 'yasnippet) ;; not yasnippet-bundle
 ;; Develop and keep personal snippets under ~/emacs.d/mysnippets
-(setq yas/root-directory "~/.emacs.d/plugins/yasnippet/snippets")
+;;(setq yas/root-directory "~/.emacs.d/plugins/yasnippet/snippets")
 ;; Load the snippets
-(yas/load-directory yas/root-directory)
-(setq yas-global-mode nil)
+;;(yas/load-directory yas/root-directory)
+;;(setq yas-global-mode nil)
 
 ;;auto-complete
 (add-to-list 'load-path "~/.emacs.d/plugins/ac")
