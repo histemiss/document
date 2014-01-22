@@ -1337,6 +1337,10 @@ typedef struct xfs_buf {
    #+end_src
 
 ** xfs_efi_log_item 
+   - 整个数据结构嵌在一块
+   - xfs_efi_log_format->efi_extents长度为16
+   - 如果超过16, 根据长度分配xfs_efi_log_item
+
    #+begin_src 
 	xfs_log_item_t		efi_item;
 	atomic_t		efi_next_extent;
@@ -1352,50 +1356,72 @@ typedef struct xfs_buf {
    - 如果xfs_efi_log_item->xfs_efi_log_format->efi_nextents > XFS_EFI_FAST_EXTENTS, 使用kmalloc分配. 否则是slab分配
 
 ** __xfs_efi_release(xfs_efi_log_item)
-   - 释放xfs_efi_log_item. 
-   - 如果xfs_efi_log_item->efi_flags没有XFS_EFI_COMMITTED, 才释放它. 并且从ail中释放.
-   - 否则清除标志,等待下一次释放
+   - 释放xfs_efi_log_item
+   
+   - 在xfs_efi_log_item->efi_refcount减为0时才释放
+   - 从xfs_ail中删除 
+   > xfs_trans_ail_delete(xfs_ail, xfs_efi_log_item->xfs_log_item, SHUTDOWN_LOG_IO_ERROR)
+   - 最后一个参数表示如果xfs_log_item不在xfs_ail, 直接关闭xfs系统
+   > xfs_efi_item_free(xfs_efi_log_item)
 
-** xfs_efi_item_size(xfs_log_item)
+** xfs_efi_item_sizeof(xfs_efi_log_item)
+   - xfs_efi_item_format的大小
+   - 还有xfs_extent的空间, 还要额外的xfs_efi_log_format->efi_extents-1
+
+** xfs_efi_item_size(xfs_log_item, nvecs, nbytes)
    - 只需要一个xfs_log_iovec, 保存xfs_efi_log_format
+   - nvecs += 1, nbytes是这个xfs_efi_log_item大小 
+   > xfs_efi_item_sizeof(xfs_efi_log_item)
 
 ** xfs_efi_item_format(xfs_log_item, xfs_log_iovec)
-   - xfs_log_iovec->i_len是xfs_efi_log_format大小还有xfs_extent数组
-   - xfs_efi_log_format->efi_size = 1, 应该是xfs_log_iovec的大小. 在xlog中它对应一个xlog_op_header
-   - xfs_log_iovec->i_type = XLOG_REG_TYPE_EFI_FORMAT. 
+   - 把xfs_efi_log_item->xfs_efi_log_format的地址给xfs_log_iovec
+
+   - 设置xfs_efi_log_format->efi_type 是XFS_LI_EFI, efi_size是1
+   - 但它还是本地CPU的数据类型, 而不是大端的??
+   - xfs_log_iovec->i_addr就是xfs_efi_log_format地址
+   - 计算xfs_log_iovec->i_len
+   > xfs_efi_item_sizeof(xfs_efi_log_item)
+   - 设置xfs_log_iovec->i_type = XLOG_REG_TYPE_EFI_FORMAT
    - xfs_log_iovec->i_addr指向xfs_efi_log_format
 
 ** xfs_efi_item_pin(xfs_log_item)
    - 空函数
 
 ** xfs_efi_item_unpin(xfs_log_item)
-   - 从xfs_trans中释放xfs_efi_log_item
+   - 在xfs_efi_log_item写回log队列后释放自己
+   - 使用xfs_efi_log_item->efi_refcount计数
    > __xfs_efi_releae(xfs_efi_log_item)
 
 ** xfs_efi_item_push(xfs_log_item)
-   - 返回XFS_ITEM_PINNED??
+   - 返回XFS_ITEM_PINNED
+   - 在它对应的efi提交之前, 释放操作不算完成,直接返回XFS_ITEM_PINNED
+   - 在efd完成后,自动释放对应的efi
 
 ** xfs_efi_item_unlock(xfs_log_item)
-   - 几乎是空函数
+   - 如果xfs_log_item->li_flags有XFS_LI_ABORTED, 直接释放自己 
 
 ** xfs_efi_item_committed(xfs_log_item, xfs_lsn_t)
-   - 设置xfs_efi_log_item->efi_flags的XFS_EFI_COMMITTED
+   - xfs_efi_log_item肯定没有在其他xlog_in_core中
+   - 直接返回参数xfs_lsn_t
 
 ** xfs_efi_item_committing(xfs_log_item, xfs_lsn_t)
    - 空函数
 
 ** xfs_efi_init(xfs_mount, nextents)
-   - 创建xfs_efi_log_item
+   - 创建xfs_efi_log_item, 只有xfs_buf_map个数
+
    - 初始化xfs_log_item
    > xfs_log_item_init(xfs_mount, xfs_log_item, XFS_LI_EFI, xfs_efi_item_ops)
    - 然后是xfs_efi_log_format
    - xfs_efi_item_format->efi_id是xfs_efi_log_item指针. 
 
 ** xfs_efi_copy_format(xfs_log_iovec, xfs_efi_log_format)
-   - 从xfs_log_iovec中复制到xfs_efi_log_format, 大小段变化
+   - 把xfs_log_iovec中数据复制到xfs_efi_log_format
+   - 这里只有子长的变化,而没有大小端的变化
 
 ** xfs_efi_release(xfs_efi_log_item, nextents)
-   - 使用xfs_efi_log_item->efi_next_extent保护?? 减到0时释放xfs_efi_log_item
+   - 使用xfs_efi_log_item->efi_next_extent计数保护
+   - 只有xfs_efi_log_item->efi_next_extent减为0时才释放xfs_efi_log_item
    > __xfs_efi_release(xfs_efi_log_item)
 
 ** xfs_efd_log_format 
@@ -1409,6 +1435,8 @@ typedef struct xfs_buf {
    #+end_src
 
 ** xfs_efd_log_item
+   - 这里索引了xfs_efi_log_item
+
    #+begin_src 
 	xfs_log_item_t		efd_item;
 	xfs_efi_log_item_t	*efd_efip;
@@ -1422,11 +1450,16 @@ typedef struct xfs_buf {
 ** xfs_efd_item_free(xfs_efd_log_item)
    - 和xfs_efi_log_item一样
 
-** xfs_efd_item_size(xfs_log_item)
-   - 返回1
+** xfs_efd_item_sizeof(xfs_efd_log_item)
+   - 计算它需要的xfs_log_iovec的长度
+   - xfs_efd_log_format的长度和后面xfs_extent数组长度
+
+** xfs_efd_item_size(xfs_log_item, nvecs, nbytes)
+   - 和上面efi一样
 
 ** xfs_efd_item_format(xfs_log_item, xfs_log_iovec)
    - 和efi一样
+   - 设置xfs_log_iovec->i_type = XLOG_REG_TYPE_EFD_FORMAT
 
 ** xfs_efd_item_pin(xfs_log_item)
    - 空函数
@@ -1434,7 +1467,7 @@ typedef struct xfs_buf {
 ** xfs_efd_item_unpin(xfs_log_item, remove)
    - 空
 
-** xfs_efd_item_ush(xfs_log_item)
+** xfs_efd_item_push(xfs_log_item)
    - 返回XFS_ITEM_PINNED
 
 ** xfs_efd_item_unlock(xfs_log_item)
@@ -1442,12 +1475,16 @@ typedef struct xfs_buf {
    > xfs_efd_item_free(xfs_efd_log_item)
 
 ** xfs_efd_item_committed(xfs_log_item, xfs_lsn_t)
+   - xfs_efi_log_item所在的xlog_in_core写回磁盘, 这里要把他们放到ail中
+   - 但不需要了, 他们放到ail中没有意义, 可以在这里直接释放他们
+   - 然后释放xlog_in_core收集的空间, 已经有了log, 可以直接释放操作
+
    - 如果没有问题XFS_LI_ABORTED, 处理efi
    > xfs_efi_release(xfs_efd_log_item->xfs_efi_log_item, xfs_efd_log_format->efd_nextents)
    - 还是释放xfs_efd_log_item 
    > xfs_efd_item_free(xfs_efd_log_item)
    - 返回-1，所以它不会放到ail中.
-   - xfs_efi_log_item回放到ail, 只有对应的efi才会释放它..
+   - xfs_efi_log_item会放到ail, 只有对应的efd才会释放它..
 
 ** xfs_efd_item_committing(xfs_log_item, xfs_lsn_t)
    - 空函数
